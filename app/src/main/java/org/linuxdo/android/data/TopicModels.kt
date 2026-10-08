@@ -1,5 +1,7 @@
 package org.linuxdo.android.data
 
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -143,11 +145,163 @@ data class Post(
     @SerialName("can_accept_answer") val canAcceptAnswer: Boolean = false,
     @SerialName("can_unaccept_answer") val canUnacceptAnswer: Boolean = false,
     @SerialName("accepted_answer") val acceptedAnswer: Boolean = false,
+    @SerialName("can_edit") val canEdit: Boolean = false,
+    @SerialName("can_delete") val canDelete: Boolean = false,
+    /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
+    val raw: String? = null,
 )
 
 @Serializable
 data class Boost(val id: Long, val cooked: String = "", val user: DiscourseUser? = null,
     @SerialName("can_delete") val canDelete: Boolean = false)
+
+/**
+ * 简评的长度。discourse-boosts 对"可见字符"和"表情"分别设限,任一项超了都会被服务端拒掉,
+ * 所以提交前必须先在本地算一遍 —— 否则用户要等一个来回才知道写长了。
+ */
+data class BoostLength(val visible: Int, val emoji: Int) {
+    val overVisible: Boolean get() = visible > MAX_VISIBLE
+    val overEmoji: Boolean get() = emoji > MAX_EMOJI
+    val submittable: Boolean get() = !overVisible && !overEmoji && (visible > 0 || emoji > 0)
+
+    companion object {
+        const val MAX_VISIBLE = 16
+        const val MAX_EMOJI = 5
+
+        /** 输入框的原始字符上限。给 `:shortcode:` 留足空间,不是服务端规则。 */
+        const val RAW_INPUT_CAP = 120
+    }
+}
+
+private val EMOJI_SHORTCODE = Regex(":[a-zA-Z0-9_+-]{1,40}:")
+private const val ZERO_WIDTH_JOINER = 0x200D
+
+/**
+ * 统计简评长度。
+ *
+ * 表情有两种写法:`:smile:` 这种 shortcode,和直接输入的 Unicode 表情。
+ * Unicode 这边按"基字符 + 紧跟的修饰符"算一个:肤色、变体选择符、ZWJ 连起来的后续字符
+ * 以及成对的区域指示符(国旗)都并入前一个表情,不另外计数。
+ *
+ * 这是对服务端规则的近似 —— 站方的确切计数方式没有公开,所以界面同时把实时计数显示出来,
+ * 真被拒时也仍然会把服务端原话展示给用户。
+ */
+fun measureBoost(raw: String): BoostLength {
+    var emoji = 0
+    val stripped = EMOJI_SHORTCODE.replace(raw.trim()) { emoji++; "" }
+    var visible = 0
+    var index = 0
+    var joinNext = false
+    var pendingRegional = false
+    while (index < stripped.length) {
+        val code = stripped.codePointAt(index)
+        index += Character.charCount(code)
+        when {
+            code == ZERO_WIDTH_JOINER -> joinNext = true
+            isEmojiModifier(code) -> Unit
+            isRegionalIndicator(code) -> {
+                // 两个区域指示符拼成一面国旗,只算一个表情。
+                if (pendingRegional) pendingRegional = false else { emoji++; pendingRegional = true }
+                joinNext = false
+            }
+            isEmojiBase(code) -> {
+                if (!joinNext) emoji++
+                joinNext = false
+                pendingRegional = false
+            }
+            else -> {
+                visible++
+                joinNext = false
+                pendingRegional = false
+            }
+        }
+    }
+    return BoostLength(visible, emoji)
+}
+
+private fun isEmojiModifier(code: Int): Boolean =
+    code in 0xFE00..0xFE0F || code in 0x1F3FB..0x1F3FF || code == 0x20E3
+
+private fun isRegionalIndicator(code: Int): Boolean = code in 0x1F1E6..0x1F1FF
+
+private fun isEmojiBase(code: Int): Boolean =
+    code in 0x1F000..0x1FAFF || code in 0x2600..0x27BF || code in 0x2B00..0x2BFF
+
+/**
+ * 站方对上传的限制。都以服务端实际报错为准,客户端先拦一道,免得用户传完才被拒。
+ *
+ * 服务端原话:
+ * - "允许的扩展名：jpg、jpeg、png、gif、heic、heif、webp、avif、svg、txt、pdf、doc、docx、csv、zip、7z、gz、xz、jxl、md"
+ * - "您尝试上传的文件太大（大小上限为 4 MB）"
+ */
+object UploadLimits {
+    const val MAX_BYTES = 4 * 1024 * 1024
+    private const val TOO_LARGE_MESSAGE = "文件超过 4 MB 上限"
+
+    val ALLOWED_EXTENSIONS = setOf(
+        "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "avif", "svg",
+        "txt", "pdf", "doc", "docx", "csv", "zip", "7z", "gz", "xz", "jxl", "md",
+    )
+
+    /** 能用 BitmapFactory 解码重编码的位图格式。GIF 会丢动画,SVG 是矢量,AVIF/JXL 解码支持不稳,都不碰。 */
+    private val COMPRESSIBLE = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
+
+    /** 解码时先降采样,限制位图占用的内存。 */
+    const val MAX_IMAGE_EDGE = 2560
+    const val JPEG_QUALITY = 85
+
+    fun extensionOf(fileName: String): String = fileName.substringAfterLast('.', "").lowercase()
+
+    fun isAllowed(fileName: String): Boolean = extensionOf(fileName) in ALLOWED_EXTENSIONS
+
+    fun isCompressibleImage(fileName: String): Boolean = extensionOf(fileName) in COMPRESSIBLE
+
+    fun rejectReason(fileName: String, bytes: Long?): String? = when {
+        bytes != null && bytes > MAX_BYTES -> TOO_LARGE_MESSAGE
+        bytes == 0L -> "文件为空，无法上传"
+        !isAllowed(fileName) ->
+            "不支持的文件类型 .${extensionOf(fileName).ifBlank { "未知" }}，可传：" +
+                ALLOWED_EXTENSIONS.joinToString("、")
+        else -> null
+    }
+
+    /** 元数据只做预检；实际最多读取上限加 1 字节,防止大小缺失、失真或文件在读取时变大。 */
+    fun readBytes(fileName: String, reportedSize: Long?, openStream: () -> InputStream?): ByteArray {
+        rejectReason(fileName, reportedSize)?.let { throw IllegalArgumentException(it) }
+        return (openStream() ?: throw IllegalStateException("无法读取所选文件")).use { input ->
+            val output = ByteArrayOutputStream(DEFAULT_BUFFER_SIZE)
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val remaining = MAX_BYTES - output.size()
+                var count = input.read(buffer, 0, minOf(buffer.size, remaining + 1))
+                if (count == 0) {
+                    val next = input.read()
+                    if (next == -1) break
+                    buffer[0] = next.toByte()
+                    count = 1
+                }
+                if (count == -1) break
+                require(count <= remaining) { TOO_LARGE_MESSAGE }
+                output.write(buffer, 0, count)
+            }
+            rejectReason(fileName, output.size().toLong())?.let { throw IllegalArgumentException(it) }
+            output.toByteArray()
+        }
+    }
+}
+
+/** 一次上传的结果。short_url 是 Discourse 的内部短链,要原样写进正文 raw。 */
+data class UploadedFile(
+    val shortUrl: String,
+    val fileName: String,
+    val width: Int = 0,
+    val height: Int = 0,
+) {
+    /** 拼成 Discourse 正文里的 Markdown。图片带尺寸,其余走 attachment 语法。 */
+    fun toMarkdown(): String =
+        if (width > 0 && height > 0) "![$fileName|${width}x$height]($shortUrl)"
+        else "[$fileName|attachment]($shortUrl)"
+}
 
 @Serializable
 data class Reaction(val id: String, val count: Int = 0, @SerialName("can_undo") val canUndo: Boolean = false)
@@ -193,6 +347,12 @@ data class PostStream(
     val stream: List<Long> = emptyList(),
 )
 
+/** 话题级权限。没有 can_create_post 字段的旧响应按"可回复"处理,由服务端最终裁决。 */
+@Serializable
+data class TopicDetails(
+    @SerialName("can_create_post") val canCreatePost: Boolean = true,
+)
+
 @Serializable
 data class TopicDetail(
     val id: Long,
@@ -200,7 +360,12 @@ data class TopicDetail(
     @SerialName("category_id") val categoryId: Int? = null,
     @SerialName("post_stream") val postStream: PostStream = PostStream(),
     @SerialName("valid_reactions") val validReactions: List<String> = emptyList(),
-)
+    val closed: Boolean = false,
+    val archived: Boolean = false,
+    val details: TopicDetails = TopicDetails(),
+) {
+    val canReply: Boolean get() = details.canCreatePost && !closed && !archived
+}
 
 data class SearchPage(
     val items: List<TopicListItem>,
@@ -226,6 +391,18 @@ enum class NotificationFilter(val label: String) {
         Likes -> type in setOf(5, 19, 25)
         Messages -> type in setOf(6, 7, 16)
     }
+
+    /**
+     * Discourse 的 `filter_by_types` 参数值(用户菜单各 tab 用的就是它)。
+     * 服务端若不认这个参数会直接忽略、返回全类型,此时由 Repository 的循环补页兜住,
+     * 所以带上它只会变快、不会变错。
+     */
+    val serverTypes: String get() = when (this) {
+        All -> ""
+        Replies -> "mentioned,replied,quoted,group_mentioned,chat_quoted"
+        Likes -> "liked,liked_consolidated,reaction"
+        Messages -> "private_message,invited_to_private_message,group_message_summary"
+    }
 }
 
 @Serializable
@@ -248,6 +425,18 @@ internal data class UnreadNotificationPage(
         ?: (notifications.size >= limit)
 }
 
+data class UnreadSummary(
+    val count: Int = 0,
+    val unreadFilters: Set<NotificationFilter> = emptySet(),
+    /**
+     * 每个分类各自的未读条数。
+     * 总 count 走的是铃铛口径 —— 只算回复类和私信类(见 NotificationCountItem.countsAsUnread),
+     * 点赞根本不计入。所以判断"某个分类有没有新东西"必须看这里的分项值,用 count 会让
+     * 点赞分类永远判定为没变化。
+     */
+    val unreadByFilter: Map<NotificationFilter, Int> = emptyMap(),
+)
+
 data class ProfileEntry(
     val id: String,
     val title: String,
@@ -264,6 +453,11 @@ data class ProfilePage(
     val fields: List<Pair<String, String>> = emptyList(),
     val entries: List<ProfileEntry> = emptyList(),
     val hasMore: Boolean = false,
+    /**
+     * 下一页游标。通知分区是服务端 offset —— 按类型筛选后"已显示条数"和 offset 不再等价,
+     * 用页码递推会漏掉被过滤掉的那些条目。其余分区游标就是页码。
+     */
+    val nextCursor: Int = 0,
 )
 
 /**

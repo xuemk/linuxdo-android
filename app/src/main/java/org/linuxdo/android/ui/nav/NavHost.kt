@@ -53,8 +53,8 @@ private val ShadowWidth = 8.dp
 /**
  * iOS 风格导航容器。
  *
- * progress 语义:0 = 当前页完全占据屏幕,1 = 当前页完全移出、上一页回到原位。
- * push 走 1→0,pop 与滑动返回走 0→1,两种转场共用这一个量,所以手势可以无缝打断动画。
+ * position 表示当前停留的栈深度:push 从 n 到 n+1,pop 从 n 到 n-1。
+ * 出栈后不再重置动画值,避免绘制层读到新进度、组合层仍沿用旧页面角色时闪屏。
  *
  * 注意:全局单例 WebView 不能放进这里 —— 它必须挂在导航之外的最外层,否则出栈会把它卸载,
  * Cloudflare 挑战就再也没法渲染。
@@ -68,7 +68,7 @@ fun IosNavHost(
 ) {
     val scope = rememberCoroutineScope()
     val holder = rememberSaveableStateHolder()
-    val progress = remember { Animatable(0f) }
+    val position = remember { Animatable(stack.entries.lastIndex.toFloat()) }
     var width by remember { mutableFloatStateOf(1f) }
 
     // 实际参与渲染的栈。push 立刻跟上真实栈;pop 要等退出动画播完才裁剪,
@@ -80,17 +80,20 @@ fun IosNavHost(
         when {
             target.size > rendered.size -> {
                 rendered = target
-                progress.snapTo(1f)
-                progress.animateTo(0f, PushSpec)
+                position.animateTo(target.lastIndex.toFloat(), PushSpec)
             }
             target.size < rendered.size -> {
                 val dropped = rendered.drop(target.size)
-                progress.animateTo(1f, PopSpec)
+                position.animateTo(target.lastIndex.toFloat(), PopSpec)
                 rendered = target
-                progress.snapTo(0f)
                 dropped.forEach { holder.removeState(it.id) }
             }
-            else -> rendered = target
+            else -> {
+                rendered = target
+                if (position.value != target.lastIndex.toFloat()) {
+                    position.animateTo(target.lastIndex.toFloat(), PopSpec)
+                }
+            }
         }
     }
 
@@ -121,15 +124,15 @@ fun IosNavHost(
                         tracker.addPointerInputChange(change)
                         change.consume()
                         val value = (travelled / width).coerceIn(0f, 1f)
-                        scope.launch { progress.snapTo(value) }
+                        scope.launch { position.snapTo(rendered.lastIndex - value) }
                     }
 
                     val velocity = tracker.calculateVelocity().x
-                    val shouldPop = progress.value > 0.5f || velocity > 400f
+                    val shouldPop = rendered.lastIndex - position.value > 0.5f || velocity > 400f
                     scope.launch {
                         // 出栈交给 stack,由上面的 LaunchedEffect 接着把动画播完,
                         // 这样手势返回和代码返回走同一条路径。
-                        if (shouldPop) stack.pop() else progress.animateTo(0f, PopSpec)
+                        if (shouldPop) stack.pop() else position.animateTo(rendered.lastIndex.toFloat(), PopSpec)
                     }
                 }
             },
@@ -139,8 +142,11 @@ fun IosNavHost(
         // 卸载重组一次,列表滚动位置就丢了。节点结构也必须恒定(投影/遮罩靠 alpha 开关,
         // 不靠条件插入),否则内容的组合位置照样会偏移。
         val lastIndex = rendered.lastIndex
+        // 一次返回多层时,下层应直接展示目标页。
+        val belowIndex = if (stack.entries.size < rendered.size) stack.entries.lastIndex else lastIndex - 1
+        val transitionSpan = (lastIndex - belowIndex).coerceAtLeast(1).toFloat()
         rendered.forEachIndexed { index, entry ->
-            if (index < lastIndex - 1) return@forEachIndexed
+            if (index != lastIndex && index != belowIndex) return@forEachIndexed
             val isTop = index == lastIndex
 
             key(entry.id) {
@@ -148,14 +154,11 @@ fun IosNavHost(
                     Modifier
                         .fillMaxSize()
                         .graphicsLayer {
-                            translationX = if (isTop) {
-                                progress.value * width
-                            } else {
-                                -BelowShift * width * (1f - progress.value)
-                            }
+                            val distance = (index - position.value) / transitionSpan
+                            translationX = distance * width * if (distance >= 0f) 1f else BelowShift
                         },
                 ) {
-                    // 当前页左侧的投影,画在页面之外;progress 为 0 时正好在屏幕外。
+                    // 当前页左侧的投影,画在页面之外;页面归位时正好在屏幕外。
                     Box(
                         Modifier
                             .offset(x = -ShadowWidth)
@@ -176,7 +179,7 @@ fun IosNavHost(
                         Modifier
                             .fillMaxSize()
                             .graphicsLayer {
-                                alpha = if (isTop) 0f else 0.12f * (1f - progress.value)
+                                alpha = 0.12f * ((position.value - index) / transitionSpan).coerceIn(0f, 1f)
                             }
                             .background(Color.Black),
                     )

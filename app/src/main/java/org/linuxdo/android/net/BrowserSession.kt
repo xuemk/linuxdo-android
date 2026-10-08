@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -123,7 +124,37 @@ class BrowserSession(
     }
 
     suspend fun openUrl(url: String) = withContext(Dispatchers.Main) {
-        webView().loadUrl(url)
+        val view = webView()
+        awaitFirstLayout(view)
+        view.loadUrl(url)
+    }
+
+    /**
+     * 等 WebView 完成首次布局再加载页面。
+     *
+     * AndroidView 的 factory 刚创建出 WebView 时还没测量,宽高是 0。此时 loadUrl,
+     * 像 Cloudflare 挑战页那种用 `100vh` + flex 垂直居中的静态页面会按 0 高度算出
+     * "中心",把内容全堆在顶部;等 WebView 测量完成变大,页面不监听 resize 也就不会重排,
+     * 于是看到的就是内容偏上、顶部元素被切掉半截。
+     */
+    private suspend fun awaitFirstLayout(view: WebView) {
+        if (view.width > 0 && view.height > 0) return
+        withTimeoutOrNull(LAYOUT_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                val listener = object : View.OnLayoutChangeListener {
+                    override fun onLayoutChange(
+                        v: View?, left: Int, top: Int, right: Int, bottom: Int,
+                        oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int,
+                    ) {
+                        if (right - left <= 0 || bottom - top <= 0) return
+                        view.removeOnLayoutChangeListener(this)
+                        if (continuation.isActive) continuation.resume(Unit)
+                    }
+                }
+                view.addOnLayoutChangeListener(listener)
+                continuation.invokeOnCancellation { view.removeOnLayoutChangeListener(listener) }
+            }
+        }
     }
 
     suspend fun currentUrl(): String? = withContext(Dispatchers.Main) { webView().url }
@@ -219,5 +250,6 @@ class BrowserSession(
         const val TAG = "BrowserSession"
         const val BRIDGE_NAME = "__ldb"
         const val POLL_INTERVAL_MS = 700L
+        const val LAYOUT_TIMEOUT_MS = 1_500L
     }
 }

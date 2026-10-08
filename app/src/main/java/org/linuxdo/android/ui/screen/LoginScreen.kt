@@ -165,16 +165,17 @@ fun LoginScreen(
                     placeholder = "请输入密码",
                     leadingIcon = { LockIcon() },
                     trailingContent = {
-                        Text(
-                            if (passwordVisible) "隐藏" else "明文",
-                            fontSize = 13.sp,
-                            color = AccentBlue,
-                            modifier = Modifier
+                        Box(
+                            Modifier
+                                .size(40.dp)
                                 .clip(RoundedCornerShape(4.dp))
-                                .clickable { passwordVisible = !passwordVisible }
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                        )
+                                .clickable { passwordVisible = !passwordVisible },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            EyeIcon(open = passwordVisible)
+                        }
                     },
+
                     visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Password,
@@ -240,9 +241,10 @@ fun LoginScreen(
                         leadingIcon = { ShieldIcon() },
                         modifier = Modifier.weight(1f),
                         keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Number,
+                            keyboardType = KeyboardType.Ascii,
                             imeAction = ImeAction.Done,
                         ),
+
                         keyboardActions = KeyboardActions(onDone = {
                             keyboard?.hide(); focusManager.clearFocus()
                         }),
@@ -605,5 +607,43 @@ private fun ShieldIcon() {
             close()
         }
         drawPath(path, Color(0xFFBBC4D6))
+    }
+}
+
+/** 眼睛图标：open=true 时眼睛睁开（可见），open=false 时加一条斜线（隐藏） */
+@Composable
+private fun EyeIcon(open: Boolean) {
+    val color = if (open) AccentBlue else Color(0xFFBBC4D6)
+    Canvas(Modifier.size(22.dp)) {
+        val w = size.width; val h = size.height
+        val cx = w / 2f; val cy = h / 2f
+
+        // 外轮廓：眼睛形状
+        val eyePath = Path().apply {
+            moveTo(w * 0.05f, cy)
+            cubicTo(cx * 0.5f, h * 0.25f, cx * 1.5f, h * 0.25f, w * 0.95f, cy)
+            cubicTo(cx * 1.5f, h * 0.75f, cx * 0.5f, h * 0.75f, w * 0.05f, cy)
+            close()
+        }
+        drawPath(eyePath, color, style = androidx.compose.ui.graphics.drawscope.Stroke(width = w * 0.08f))
+
+        // 瞳孔
+        drawCircle(color, radius = w * 0.14f, center = Offset(cx, cy))
+
+        // 关闭态：斜线穿过
+        if (!open) {
+            val slashPath = Path().apply {
+                moveTo(w * 0.2f, h * 0.2f)
+                lineTo(w * 0.8f, h * 0.8f)
+            }
+            drawPath(
+                slashPath,
+                Color(0xFFBBC4D6),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(
+                    width = w * 0.09f,
+                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                ),
+            )
+        }
     }
 }

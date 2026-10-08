@@ -62,8 +62,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    LaunchedEffect(lifecycle, state.screen) {
-        if (state.screen == Screen.List) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+    LaunchedEffect(lifecycle, state.screen, state.latest.initialLoading) {
+        if (state.screen == Screen.List && !state.latest.initialLoading) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshUnread(force = true)
             while (true) { delay(Config.UNREAD_POLL_INTERVAL_MS); viewModel.refreshUnread() }
         }
@@ -71,13 +71,6 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
     LaunchedEffect(state.screen) {
         if (showWeb) {
-            while (true) {
-                delay(1_000)
-                viewModel.pollVerification()
-            }
-        }
-        // 邮箱 token 登录时也需要轮询（WebView 在后台静默打开 email-login 链接）
-        if (state.screen == Screen.Login && loginUiState.loading) {
             while (true) {
                 delay(1_000)
                 viewModel.pollVerification()
@@ -127,7 +120,10 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 modifier = Modifier
                     .fillMaxSize()
                     .zIndex(if (showWeb) 1f else -1f)
-                    .padding(top = if (showWeb) IosMetrics.navBarHeight else 0.dp),
+                    // top padding 恒定留给 WebTopBar。不能跟着 showWeb 变 ——
+                    // 那会让 WebView 在切到验证屏的同一帧里改变高度,而用 100vh 垂直居中的
+                    // 挑战页按旧高度排完版就不再重排了,结果就是内容位置偏掉。
+                    .padding(top = IosMetrics.navBarHeight),
             )
         }
     }
@@ -150,6 +146,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
     val categoryTopics by viewModel.categoryTopics.collectAsStateWithLifecycle()
     val search by viewModel.search.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
+    val notificationFilter by viewModel.notificationFilter.collectAsStateWithLifecycle()
+    val composer by viewModel.composer.collectAsStateWithLifecycle()
     val treeView by viewModel.treeView.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val browsing = state.screen == Screen.List
@@ -201,6 +199,16 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 onDeleteBoost = { postId, boostId -> viewModel.deleteBoost(route.topicId, postId, boostId) },
                                 onRefreshPost = { viewModel.refreshPost(route.topicId, it) },
                                 onSolution = { viewModel.setSolution(route.topicId, it) },
+                                composer = composer,
+                                onOpenComposer = viewModel::openComposer,
+                                onDraftChange = viewModel::updateDraft,
+                                onSubmitComposer = viewModel::submitComposer,
+                                onCloseComposer = viewModel::closeComposer,
+                                onDeletePost = { viewModel.deletePost(route.topicId, it) },
+                                onReloadFromStart = { viewModel.reloadFromStart(route.topicId) },
+                                onCreatedPostShown = { viewModel.clearCreatedPost(route.topicId) },
+                                onAttach = viewModel::attachToComposer,
+                                topicId = route.topicId,
                                 active = active,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) },
                             )
@@ -232,6 +240,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 onLogout = viewModel::logout,
                                 active = active,
                                 onReadNotification = viewModel::readNotification,
+                                notificationFilter = notificationFilter,
+                                onNotificationFilter = viewModel::setNotificationFilter,
+                                unreadFilters = state.unreadFilters,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
 
@@ -243,7 +254,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },
                                 onDiagnostics = { stack.push(Route.Diagnostics) }, onSettings = { stack.push(Route.Settings) },
                                 active = active, notificationOnly = true, onBack = { stack.pop() },
-                                onReadNotification = viewModel::readNotification)
+                                onReadNotification = viewModel::readNotification,
+                                notificationFilter = notificationFilter,
+                                onNotificationFilter = viewModel::setNotificationFilter,
+                                unreadFilters = state.unreadFilters)
+
 
                             Route.Diagnostics -> DiagnosticsScreen(
                                 state = state,

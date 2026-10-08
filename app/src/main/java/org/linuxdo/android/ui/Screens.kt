@@ -66,6 +66,9 @@ import androidx.compose.ui.text.font.FontWeight
 import org.linuxdo.android.ui.screen.ErrorNotice
 import org.linuxdo.android.ui.screen.EmptyNotice
 
+/** 列表攒够这么多条才允许继续自动翻页;不足则改成手动按钮。 */
+private const val AUTO_LOAD_THRESHOLD = 20
+
 @Composable
 fun ProfileScreen(
     username: String?,
@@ -79,6 +82,10 @@ fun ProfileScreen(
     notificationOnly: Boolean = false,
     onBack: (() -> Unit)? = null,
     onReadNotification: (Long) -> Unit = {},
+    notificationFilter: NotificationFilter = NotificationFilter.All,
+    onNotificationFilter: (NotificationFilter) -> Unit = {},
+    unreadFilters: Set<NotificationFilter> = emptySet(),
+
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
 ) {
@@ -86,10 +93,9 @@ fun ProfileScreen(
     var previousSection by rememberSaveable { mutableStateOf(section) }
     val list = rememberLazyListState()
     val state = states[section] ?: ProfileUiState()
-    var notificationFilter by rememberSaveable { mutableStateOf(NotificationFilter.All) }
-    val visibleEntries = if (section == ProfileSection.Notifications) state.content.entries.filter {
-        notificationFilter.includes(it.notificationType)
-    } else state.content.entries
+    // 通知已经在服务端按分类取回,这里不再二次过滤 —— 否则会把"分类下有但本页未命中"
+    // 的情况显示成空列表。
+    val visibleEntries = state.content.entries
     val nearEnd by remember { derivedStateOf {
         (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 3
     } }
@@ -100,8 +106,11 @@ fun ProfileScreen(
             list.scrollToItem(0)
         }
     }
+    // 自动翻页只在已经攒够一屏时继续。条目不足一页却还有更多时改成手动按钮:
+    // 低频分类(私信)每翻一页可能只命中一两条,自动翻页会变成一个永远转不完的 spinner。
     LaunchedEffect(active, nearEnd, state, notificationFilter) {
-        if (active && nearEnd && state.loaded && !state.loading && state.error == null && state.content.hasMore && visibleEntries.isNotEmpty()) {
+        if (active && nearEnd && state.loaded && !state.loading && state.error == null &&
+            state.content.hasMore && visibleEntries.size >= AUTO_LOAD_THRESHOLD) {
             onLoad(section, false, true)
         }
     }
@@ -157,14 +166,27 @@ fun ProfileScreen(
                 NotificationFilter.entries.forEach { filter ->
                     val selected = notificationFilter == filter
                     val color = if (selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel
+                    val hasUnread = filter != NotificationFilter.All && (
+                        filter in unreadFilters || visibleEntries.any { it.unread && filter.includes(it.notificationType) }
+                    )
                     Row(Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
                         .background(if (selected) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card)
-                        .clickable { notificationFilter = filter }.padding(vertical = 11.dp),
+                        .clickable { onNotificationFilter(filter) }.padding(vertical = 11.dp),
                         horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                        if (hasUnread) {
+                            Box(
+                                Modifier
+                                    .size(6.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFFF3B30))
+                            )
+                            Spacer(Modifier.width(4.dp))
+                        }
                         NotificationTabIcon(filter, color)
                         Text(filter.label, style = IosTheme.type.subheadline, color = color, modifier = Modifier.padding(start = 6.dp))
                     }
                 }
+
             }
         }
         if (state.loading && !state.loaded) item("loading") { IosLoadingBox() }
@@ -220,12 +242,20 @@ fun ProfileScreen(
                 }
             }
         }
-        if (state.loaded && visibleEntries.isEmpty() && state.content.fields.isEmpty() && state.error == null) {
-            item("empty") {
-                if (section == ProfileSection.Notifications && state.content.hasMore) {
-                    IosTextAction("加载更早通知") { onLoad(section, false, true) }
-                } else EmptyNotice()
+        // 还有更多但不足一屏:给个明确的手动入口,而不是让列表自己转圈翻页。
+        if (state.loaded && !state.loading && state.error == null && state.content.hasMore &&
+            visibleEntries.size < AUTO_LOAD_THRESHOLD && state.content.fields.isEmpty()) {
+            item("load-more") {
+                Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
+                    IosTextAction(if (visibleEntries.isEmpty()) "这一页没有更多，继续往前找" else "加载更早的记录") {
+                        onLoad(section, false, true)
+                    }
+                }
             }
+        }
+        if (state.loaded && visibleEntries.isEmpty() && state.content.fields.isEmpty() &&
+            state.error == null && !state.content.hasMore) {
+            item("empty") { EmptyNotice() }
         }
         if (state.loading && state.loaded) item("more") { IosLoadingBox() }
         item("actions") {

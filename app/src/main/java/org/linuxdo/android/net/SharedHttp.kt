@@ -16,7 +16,8 @@ import org.linuxdo.android.data.SessionStore
  */
 fun buildSharedHttpClient(store: SessionStore, userAgent: String): OkHttpClient =
     OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(Config.CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        // 读超时保持较长:Coil 的图片请求复用同一个客户端,大图需要时间读完。
         .readTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
         .addNetworkInterceptor(SessionHeaderInterceptor(store, userAgent))

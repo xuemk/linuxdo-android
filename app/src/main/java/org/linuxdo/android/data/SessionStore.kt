@@ -35,26 +35,56 @@ class SessionStore(context: Context) {
         prefs.edit().putString(KEY_USER_AGENT, userAgent).apply()
     }
 
-    /** 以 WebView 现场 Cookie 为准同步到加密存储,返回当前有效的 Cookie。 */
+    /**
+     * 以 WebView 现场 Cookie 为准同步到加密存储,返回当前有效的 Cookie。
+     *
+     * **合并,不是整份替换。** WebView 里缺某个 Cookie 不等于服务端撤销了它 ——
+     * Cloudflare 会给匿名请求也种上 __cf_bm/cf_clearance,所以"WebView 非空"完全可能是
+     * "只剩 CF 的 Cookie、_t 已经丢了"(系统清理 WebView 存储、进程被杀、过挑战都可能)。
+     * 整份覆盖会把存储里完好的 _t 抹掉,而那是最后一份备份,抹掉就真掉登录且不可恢复。
+     * 真正的撤销走 applyResponseCookies 的过期分支,或 clear()/clearSessionCookie()。
+     */
     fun syncFromWebView(): Map<String, String> {
         val web = parseCookieHeader(CookieManager.getInstance().getCookie(Config.BASE_URL))
-        if (web.isEmpty()) return storedCookies()
-        if (web != storedCookies()) save(web)
-        return web
+        val stored = storedCookies()
+        if (web.isEmpty()) return stored
+        val merged = stored + web
+        if (merged != stored) save(merged)
+        return merged
     }
 
-    /** WebView Cookie 为空而加密存储有值时,把存储的 Cookie 写回 WebView。 */
-    fun restoreToWebViewIfEmpty() {
+    /**
+     * 把加密存储里有、而 WebView 里缺的 Cookie 补回 WebView。
+     *
+     * 不能只在 WebView 完全为空时才恢复:CF 的 Cookie 会让 WebView 看起来"非空",
+     * 而真正要紧的 _t 可能已经没了。只补缺失项,WebView 里已有的不动 —— 那些更新。
+     */
+    fun restoreMissingToWebView() {
         val manager = CookieManager.getInstance()
         manager.setAcceptCookie(true)
-        val web = parseCookieHeader(manager.getCookie(Config.BASE_URL))
-        if (web.isNotEmpty()) return
         val stored = storedCookies()
         if (stored.isEmpty()) return
-        stored.forEach { (name, value) ->
+        val web = parseCookieHeader(manager.getCookie(Config.BASE_URL))
+        val missing = stored.filterKeys { it !in web }
+        if (missing.isEmpty()) return
+        missing.forEach { (name, value) ->
             manager.setCookie(Config.BASE_URL, "$name=$value; Domain=${Config.HOST}; Path=/; Secure")
         }
         manager.flush()
+    }
+
+    /**
+     * 只丢掉会话凭据,保留 CF 等其他 Cookie。
+     *
+     * 服务端明确判定未登录时才调用。合并式同步会一直保着 _t,不主动清掉的话每次启动都会
+     * 拿这个已经失效的 token 白跑一次 /session/current,还可能被重新塞回 WebView。
+     */
+    fun clearSessionCookie() {
+        save(storedCookies() - Config.SESSION_COOKIE)
+        CookieManager.getInstance().apply {
+            setCookie(Config.BASE_URL, "${Config.SESSION_COOKIE}=; Max-Age=0; Domain=${Config.HOST}; Path=/")
+            flush()
+        }
     }
 
     /** 应用 OkHttp 响应里的 Set-Cookie,同时写入加密存储与 WebView,保证两边一致。 */
