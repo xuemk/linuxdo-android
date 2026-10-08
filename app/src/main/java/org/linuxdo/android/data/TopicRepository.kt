@@ -303,6 +303,67 @@ class TopicRepository(
     }
 
     /**
+     * 使用账号密码登录。
+     * 流程：GET /session/csrf → POST /session。
+     * 成功返回 true，凭据错误返回 false，CF 挑战抛 NeedsInteractiveVerification。
+     */
+    suspend fun sessionLogin(login: String, password: String): Boolean = gate.withLock {
+        throttle()
+        val transport = transportProvider()
+        // 1. 获取 CSRF token
+        val csrfResult = transport.get("/session/csrf.json")
+        lastRequestAt = SystemClock.elapsedRealtime()
+        if (csrfResult.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
+        if (csrfResult.status !in 200..299) throw HttpStatusException(csrfResult.status, "无法获取 CSRF token")
+        val csrf = json.parseToJsonElement(csrfResult.body).jsonObject["csrf"]
+            ?.jsonPrimitive?.contentOrNull
+            ?: throw IllegalStateException("CSRF 响应缺少 token 字段")
+
+        // 2. 发送登录请求
+        throttle()
+        val safeLogin = login.replace("\"", "\\\"")
+        val safePwd = password.replace("\"", "\\\"").replace("\\", "\\\\")
+        val body = "{\"login\":\"$safeLogin\",\"password\":\"$safePwd\",\"second_factor_method\":1}"
+        val loginResult = transport.write("/session.json", "POST", body, csrf)
+        lastRequestAt = SystemClock.elapsedRealtime()
+        diagnostics.recordStatus(transport.name, loginResult.status, "/session")
+        if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截")
+        if (loginResult.status == 429) throw HttpStatusException(429, "请求过于频繁，请稍后再试")
+        val responseObj = try {
+            json.parseToJsonElement(loginResult.body).jsonObject
+        } catch (e: Exception) {
+            return@withLock loginResult.status in 200..299
+        }
+        val error = responseObj["error"]?.jsonPrimitive?.contentOrNull
+        if (!error.isNullOrBlank()) { diagnostics.log("登录失败: $error"); return@withLock false }
+        responseObj["user"] != null
+    }
+
+    /**
+     * 向指定邮箱发送一次性登录链接邮件（Discourse magic link）。
+     * 用户从邮件链接中复制 token，再交由 ViewModel.loginWithEmailCode 处理。
+     */
+    suspend fun sendEmailLogin(email: String) = gate.withLock {
+        throttle()
+        val transport = transportProvider()
+        val csrfResult = transport.get("/session/csrf.json")
+        lastRequestAt = SystemClock.elapsedRealtime()
+        if (csrfResult.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
+        if (csrfResult.status !in 200..299) throw HttpStatusException(csrfResult.status, "无法获取 CSRF token")
+        val csrf = json.parseToJsonElement(csrfResult.body).jsonObject["csrf"]
+            ?.jsonPrimitive?.contentOrNull
+            ?: throw IllegalStateException("CSRF 响应缺少 token 字段")
+        throttle()
+        val safeEmail = email.replace("\"", "\\\"")
+        val body = "{\"login\":\"$safeEmail\"}"
+        val result = transport.write("/u/email-login.json", "POST", body, csrf)
+        lastRequestAt = SystemClock.elapsedRealtime()
+        diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
+        if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
+        if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
+    }
+
+    /**
      * 列表行要显示真实分类名与颜色,所以第一次取列表时顺带把分类表拉下来。
      * 分类加载失败不应让列表失败 —— 退化为不显示分类标签。
      */

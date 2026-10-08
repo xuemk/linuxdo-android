@@ -29,6 +29,13 @@ import org.linuxdo.android.net.NetworkPath
 import org.linuxdo.android.ui.screen.TopicListUiState
 
 enum class Screen { Boot, Login, Verify, List }
+
+data class LoginUiState(
+    val loading: Boolean = false,
+    val sendingCode: Boolean = false,
+    val error: String? = null,
+    val emailSent: Boolean = false,
+)
 enum class ThemeMode(val label: String) { System("跟随系统"), Light("浅色"), Dark("深色") }
 enum class DetailLoad { Topic, Next, Previous }
 
@@ -123,6 +130,80 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         it.name == container.preferences.getString("theme_mode", ThemeMode.System.name)
     } ?: ThemeMode.System)
     val themeMode = _themeMode.asStateFlow()
+
+    private val _loginUiState = MutableStateFlow(LoginUiState())
+    val loginUiState: StateFlow<LoginUiState> = _loginUiState.asStateFlow()
+
+    fun dismissLoginError() {
+        _loginUiState.update { it.copy(error = null, emailSent = false) }
+    }
+
+    /** 账号密码登录：先拿 CSRF token，再 POST /session。 */
+    fun loginWithPassword(login: String, password: String) {
+        if (_loginUiState.value.loading) return
+        viewModelScope.launch {
+            _loginUiState.update { it.copy(loading = true, error = null) }
+            try {
+                val result = repository.sessionLogin(login, password)
+                if (result) {
+                    diagnostics.log("原生密码登录成功，回调 boot()")
+                    _loginUiState.update { it.copy(loading = false) }
+                    boot()
+                } else {
+                    _loginUiState.update { it.copy(loading = false, error = "用户名或密码错误，请检查后重试。") }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: org.linuxdo.android.net.NeedsInteractiveVerification) {
+                _loginUiState.update { it.copy(loading = false) }
+                enterWebScreen(Screen.Verify, error.message.orEmpty())
+            } catch (error: Exception) {
+                _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请稍后重试。") }
+            }
+        }
+    }
+
+    /** 发送邮箱一次性登录链接。 */
+    fun sendLoginEmail(email: String) {
+        if (_loginUiState.value.sendingCode) return
+        viewModelScope.launch {
+            _loginUiState.update { it.copy(sendingCode = true, error = null, emailSent = false) }
+            try {
+                repository.sendEmailLogin(email)
+                _loginUiState.update { it.copy(sendingCode = false, emailSent = true) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: org.linuxdo.android.net.NeedsInteractiveVerification) {
+                _loginUiState.update { it.copy(sendingCode = false) }
+                enterWebScreen(Screen.Verify, error.message.orEmpty())
+            } catch (error: Exception) {
+                _loginUiState.update { it.copy(sendingCode = false, error = error.message ?: "发送失败，请稍后重试。") }
+            }
+        }
+    }
+
+    /**
+     * 用用户从邮件链接中复制的 token 完成登录。
+     * Discourse 的邮件登录链接格式为 /session/email-login/{token}，
+     * 在 WebView 中打开该 URL 即可完成 Cookie 注入，随后 pollVerification() 会检测到 _t cookie。
+     */
+    fun loginWithEmailCode(email: String, token: String) {
+        if (_loginUiState.value.loading) return
+        viewModelScope.launch {
+            _loginUiState.update { it.copy(loading = true, error = null) }
+            try {
+                // 在 WebView 中打开 email-login 链接完成认证
+                browser.openUrl("${org.linuxdo.android.Config.BASE_URL}/session/email-login/$token")
+                // pollVerification 会在检测到 _t cookie 后调用 boot()
+                _loginUiState.update { it.copy(loading = false) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _loginUiState.update { it.copy(loading = false, error = error.message ?: "验证失败，请检查 token 是否正确。") }
+            }
+        }
+    }
+
 
     fun setThemeMode(mode: ThemeMode) {
         _themeMode.value = mode
@@ -560,8 +641,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun enterWebScreen(screen: Screen, reason: String = "") {
         if (screen == Screen.Verify) diagnostics.recordInteractiveRequired(reason.ifBlank { "未知" })
         _state.update { it.copy(screen = screen) }
-        browser.openUrl(if (screen == Screen.Login) "${Config.BASE_URL}/login" else "${Config.BASE_URL}/")
+        // Login 现在是原生 Compose 页面，不需要在 WebView 里打开登录 URL。
+        // Verify 时打开根 URL 触发 Cloudflare 人机验证。
+        if (screen == Screen.Verify) {
+            browser.openUrl("${Config.BASE_URL}/")
+        }
     }
+
 
     private suspend fun loadLatest(page: Int, pullRefresh: Boolean) {
         val current = _state.value.latest

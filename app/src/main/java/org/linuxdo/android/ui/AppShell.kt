@@ -43,6 +43,7 @@ import org.linuxdo.android.ui.screen.TopicDetailScreen
 import org.linuxdo.android.ui.screen.CategoryListScreen
 import org.linuxdo.android.ui.screen.SearchScreen
 import org.linuxdo.android.ui.screen.TopicListUiState
+import org.linuxdo.android.ui.screen.LoginScreen
 import org.linuxdo.android.ui.nav.MainTab
 import org.linuxdo.android.ui.nav.TabBar
 
@@ -50,12 +51,14 @@ import org.linuxdo.android.ui.nav.TabBar
  * 应用外壳。
  *
  * 分层顺序是硬约束:全局单例 WebView 必须留在导航之外的最外层,靠 zIndex 切换显隐。
- * 它隐藏时仍要处在可见窗口内,否则 Cloudflare 的挑战页渲染不出来,静默重验证就永远失败。
+ * Login 屏现在改为原生 Compose 实现，WebView 只在 Verify（CF 挑战）时出现。
  */
 @Composable
 fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val showWeb = state.screen == Screen.Login || state.screen == Screen.Verify
+    val loginUiState by viewModel.loginUiState.collectAsStateWithLifecycle()
+    // WebView 只在需要 CF 安全验证时显示
+    val showWeb = state.screen == Screen.Verify
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
@@ -68,6 +71,13 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
     LaunchedEffect(state.screen) {
         if (showWeb) {
+            while (true) {
+                delay(1_000)
+                viewModel.pollVerification()
+            }
+        }
+        // 邮箱 token 登录时也需要轮询（WebView 在后台静默打开 email-login 链接）
+        if (state.screen == Screen.Login && loginUiState.loading) {
             while (true) {
                 delay(1_000)
                 viewModel.pollVerification()
@@ -89,11 +99,25 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 .imePadding()
                 .clipToBounds(),
         ) {
-            // 验证期间保留导航的组合身份,返回后恢复原页面与滚动位置。
+            // 验证期间保留导航的组合身份，返回后恢复原页面与滚动位置。
             if (state.username != null || state.screen == Screen.List) {
                 key(state.username) { MainNavigation(state, viewModel) }
             }
+
             if (state.screen == Screen.Boot) BootScreen()
+
+            // 原生登录页面（替换旧的 WebView 登录页）
+            if (state.screen == Screen.Login) {
+                LoginScreen(
+                    state = loginUiState,
+                    onPasswordLogin = viewModel::loginWithPassword,
+                    onSendEmailCode = viewModel::sendLoginEmail,
+                    onEmailCodeLogin = viewModel::loginWithEmailCode,
+                    onDismissError = viewModel::dismissLoginError,
+                )
+            }
+
+            // Verify 屏的顶部说明条
             if (showWeb) WebTopBar(state.screen)
 
             val context = LocalContext.current
