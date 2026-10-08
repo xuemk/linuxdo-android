@@ -54,15 +54,30 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import android.content.ContentValues
+import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.webkit.MimeTypeMap
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
+import java.io.File
+import java.net.URLDecoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Request
+import org.linuxdo.android.App
 import org.linuxdo.android.data.Post
 import org.linuxdo.android.data.BoostLength
 import org.linuxdo.android.data.measureBoost
@@ -264,9 +279,12 @@ fun TopicDetailScreen(
                     collapsed = if (post.id in collapsed) collapsed - post.id else collapsed + post.id
                 }
                 if (post.replyCount > row.childCount && post.id !in state.completedReplies) {
-                    IosTextAction(if (state.loading) "加载中…" else "更多回复", textStyle = IosTheme.type.subheadline) {
-                        collapsed = collapsed - post.id
-                        onLoadReplies(post.id)
+                    val replyLoading = post.id in state.loadingReplies
+                    IosTextAction(if (replyLoading) "加载中…" else "更多回复", textStyle = IosTheme.type.subheadline) {
+                        if (!replyLoading) {
+                            collapsed = collapsed - post.id
+                            onLoadReplies(post.id)
+                        }
                     }
                 }
             }
@@ -901,13 +919,14 @@ private fun CookedContent(blocks: List<CookedBlock>, onPicture: (String) -> Unit
                     Box(Modifier.width(3.dp).height(28.dp).background(IosTheme.colors.separator))
                     Box(Modifier.weight(1f).padding(10.dp)) { CookedContent(block.blocks, onPicture) }
                 }
-                is CookedBlock.Picture -> Column {
-                    AsyncImage(block.url, block.description, contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 100.dp, max = 360.dp)
-                            .clickable { onPicture(block.url) })
-                    Text("点按查看图片", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel,
-                        modifier = Modifier.clickable { onPicture(block.url) }.padding(vertical = 4.dp))
-                }
+                is CookedBlock.Picture -> AsyncImage(
+                    model = block.url,
+                    contentDescription = block.description,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxWidth()
+                        .heightIn(min = 100.dp, max = 360.dp)
+                        .clickable { onPicture(block.originalUrl) },
+                )
                 is CookedBlock.ListBlock -> block.entries.forEachIndexed { index, entry ->
                     Row {
                         Text(block.start?.let { "${it + index}. " } ?: "• ", modifier = Modifier.widthIn(min = 22.dp))
@@ -923,8 +942,10 @@ private fun CookedContent(blocks: List<CookedBlock>, onPicture: (String) -> Unit
 @Composable
 private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
     val colors = IosTheme.colors
+    val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
-    val annotated = remember(runs, colors, uriHandler) {
+    val scope = rememberCoroutineScope()
+    val annotated = remember(runs, colors, uriHandler, context) {
         buildAnnotatedString {
             runs.forEach { run ->
                 val emoji = run.emojiUrl
@@ -941,7 +962,22 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
                     val link = run.href
                     if (link == null) append(run.text) else withLink(LinkAnnotation.Url(
                         link, TextLinkStyles(style = SpanStyle(color = colors.accent)),
-                        linkInteractionListener = { runCatching { uriHandler.openUri(link) } },
+                        linkInteractionListener = {
+                            if (run.isAttachment) {
+                                Toast.makeText(context, "正在下载文件…", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    val result = saveMediaToPublicStorage(
+                                        context = context,
+                                        url = link,
+                                        suggestedName = run.text.trim(),
+                                        asImage = false,
+                                    )
+                                    Toast.makeText(context, result, Toast.LENGTH_LONG).show()
+                                }
+                            } else {
+                                runCatching { uriHandler.openUri(link) }
+                            }
+                        },
                     )) { append(run.text) }
                 }
             }
@@ -959,22 +995,236 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
 
 @Composable
 private fun ImageViewer(url: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var zoom by remember(url) { mutableFloatStateOf(1f) }
     var offset by remember(url) { mutableStateOf(Offset.Zero) }
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-        Box(Modifier.fillMaxSize().background(Color.Black).pointerInput(url) {
-            detectTransformGestures { _, pan, scale, _ ->
-                zoom = (zoom * scale).coerceIn(1f, 5f)
-                offset = if (zoom > 1f) offset + pan else Offset(0f, (offset.y + pan.y).coerceAtLeast(0f))
-                if (zoom == 1f && offset.y > 100.dp.toPx()) onDismiss()
-            }
-        }) {
-            AsyncImage(url, "图片预览", contentScale = ContentScale.Fit,
+    var saving by remember(url) { mutableStateOf(false) }
+    val originalRequest = remember(url, context) {
+        ImageRequest.Builder(context)
+            .data(url)
+            .size(Size.ORIGINAL)
+            .crossfade(true)
+            .build()
+    }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            Modifier.fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(url) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            if (zoom > 1.05f) {
+                                zoom = 1f
+                                offset = Offset.Zero
+                            } else {
+                                zoom = 2.5f
+                            }
+                        },
+                    )
+                }
+                .pointerInput(url) {
+                    detectTransformGestures { _, pan, scale, _ ->
+                        val nextZoom = (zoom * scale).coerceIn(1f, 6f)
+                        zoom = nextZoom
+                        offset = if (nextZoom > 1f) {
+                            offset + pan
+                        } else {
+                            Offset(0f, (offset.y + pan.y).coerceAtLeast(0f))
+                        }
+                        if (nextZoom == 1f && offset.y > 100.dp.toPx()) onDismiss()
+                    }
+                },
+        ) {
+            AsyncImage(
+                model = originalRequest,
+                contentDescription = "图片预览",
+                contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize().graphicsLayer {
-                    scaleX = zoom; scaleY = zoom; translationX = offset.x; translationY = offset.y
-                })
-            Text("关闭", color = Color.White,
-                modifier = Modifier.align(Alignment.TopEnd).systemBarsPadding().clickable(onClick = onDismiss).padding(20.dp))
+                    scaleX = zoom
+                    scaleY = zoom
+                    translationX = offset.x
+                    translationY = offset.y
+                },
+            )
+            Row(
+                Modifier.align(Alignment.TopEnd)
+                    .systemBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = if (saving) "保存中…" else "保存",
+                    color = Color.White,
+                    style = IosTheme.type.subheadline,
+                    modifier = Modifier.clip(RoundedCornerShape(50))
+                        .background(Color.White.copy(alpha = 0.18f))
+                        .clickable(enabled = !saving) {
+                            saving = true
+                            scope.launch {
+                                val msg = saveMediaToPublicStorage(
+                                    context = context,
+                                    url = url,
+                                    suggestedName = null,
+                                    asImage = true,
+                                )
+                                saving = false
+                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                Text(
+                    text = "关闭",
+                    color = Color.White,
+                    style = IosTheme.type.subheadline,
+                    modifier = Modifier.clip(RoundedCornerShape(50))
+                        .background(Color.White.copy(alpha = 0.18f))
+                        .clickable(onClick = onDismiss)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            }
         }
     }
+}
+
+private suspend fun saveMediaToPublicStorage(
+    context: Context,
+    url: String,
+    suggestedName: String?,
+    asImage: Boolean,
+): String {
+    val app = context.applicationContext as App
+    val container = app.container
+    withContext(Dispatchers.Main) { container.sessionStore.syncFromWebView() }
+    return withContext(Dispatchers.IO) {
+        runCatching {
+            val request = Request.Builder().url(url).get().build()
+            var response = container.httpClient.newCall(request).execute()
+            if (response.code == 403 && response.header("cf-mitigated") != null) {
+                response.close()
+                val cleared = container.browser.clearChallenge("download")
+                if (cleared) {
+                    response = container.httpClient.newCall(request).execute()
+                } else {
+                    return@withContext "下载被安全校验拦截，请重试"
+                }
+            }
+            response.use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext "下载失败 (HTTP ${resp.code})"
+                }
+                val body = resp.body ?: return@withContext "下载失败：响应内容为空"
+                val headerMime = resp.header("Content-Type")
+                    ?.substringBefore(';')
+                    ?.trim()
+                    ?.lowercase()
+                    ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
+                val fileName = resolveDownloadFileName(
+                    disposition = resp.header("Content-Disposition"),
+                    finalUrl = resp.request.url.toString(),
+                    suggestedName = suggestedName,
+                    mimeType = headerMime,
+                    asImage = asImage,
+                )
+                val ext = fileName.substringAfterLast('.', "").lowercase()
+                val resolvedMime = headerMime
+                    ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    ?: if (asImage) "image/jpeg" else "application/octet-stream"
+
+                val saveAsPicture = asImage && resolvedMime.startsWith("image/")
+                val resolver = context.contentResolver
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val collection = if (saveAsPicture) {
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    } else {
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                    }
+                    val relativeDir = if (saveAsPicture) {
+                        Environment.DIRECTORY_PICTURES + "/LinuxDo"
+                    } else {
+                        Environment.DIRECTORY_DOWNLOADS + "/LinuxDo"
+                    }
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val itemUri = resolver.insert(collection, values)
+                        ?: return@withContext "无法创建本地文件"
+                    try {
+                        resolver.openOutputStream(itemUri)?.use { out ->
+                            body.byteStream().use { input -> input.copyTo(out) }
+                        } ?: return@withContext "无法写入本地文件"
+                        val doneValues = ContentValues().apply {
+                            put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        }
+                        resolver.update(itemUri, doneValues, null, null)
+                    } catch (e: Throwable) {
+                        resolver.delete(itemUri, null, null)
+                        throw e
+                    }
+                    if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
+                } else {
+                    val baseDir = context.getExternalFilesDir(
+                        if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
+                    ) ?: context.filesDir
+                    if (!baseDir.exists()) baseDir.mkdirs()
+                    val outFile = File(baseDir, fileName)
+                    outFile.outputStream().use { out ->
+                        body.byteStream().use { input -> input.copyTo(out) }
+                    }
+                    "已保存到：${outFile.absolutePath}"
+                }
+            }
+        }.getOrElse { err ->
+            "保存失败：${err.message ?: "网络异常"}"
+        }
+    }
+}
+
+private fun resolveDownloadFileName(
+    disposition: String?,
+    finalUrl: String,
+    suggestedName: String?,
+    mimeType: String?,
+    asImage: Boolean,
+): String {
+    val fromDisposition = disposition?.let { header ->
+        val utf8Match = Regex("filename\\*=UTF-8''([^;]+)", RegexOption.IGNORE_CASE).find(header)
+        val stdMatch = Regex("filename=\"?([^\";]+)\"?", RegexOption.IGNORE_CASE).find(header)
+        val raw = utf8Match?.groupValues?.getOrNull(1) ?: stdMatch?.groupValues?.getOrNull(1)
+        raw?.let { runCatching { URLDecoder.decode(it.trim(), "UTF-8") }.getOrDefault(it.trim()) }
+    }?.takeIf { it.isNotBlank() }
+
+    val fromUrl = runCatching {
+        Uri.parse(finalUrl).lastPathSegment?.trim()
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    val cleanSuggested = suggestedName
+        ?.replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_")
+        ?.trim()
+        ?.takeIf { it.isNotBlank() && '.' in it && it.length <= 120 }
+
+    var base = (fromDisposition ?: cleanSuggested ?: fromUrl ?: "linuxdo_${System.currentTimeMillis()}")
+        .replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_")
+        .trim()
+
+    if ('.' !in base) {
+        val ext = mimeType?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+            ?: when (mimeType) {
+                "image/jpeg" -> "jpg"
+                "image/png" -> "png"
+                "image/webp" -> "webp"
+                "image/gif" -> "gif"
+                else -> if (asImage) "jpg" else "bin"
+            }
+        base = "$base.$ext"
+    }
+    return base
 }

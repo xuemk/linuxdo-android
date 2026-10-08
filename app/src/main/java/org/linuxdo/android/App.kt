@@ -36,8 +36,8 @@ class AppContainer(context: Context) {
     val userAgent: String = resolveUserAgent(context, sessionStore)
     val browser = BrowserSession(context, userAgent, sessionStore, diagnostics)
 
-    /** JSON 请求与图片共用,保证 UA 与 Cookie 一致。 */
-    private val httpClient = buildSharedHttpClient(sessionStore, userAgent)
+    /** JSON 请求、图片与附件下载共用,保证 UA 与 Cookie 一致。 */
+    val httpClient = buildSharedHttpClient(sessionStore, userAgent)
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
         .okHttpClient(httpClient)

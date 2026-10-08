@@ -128,7 +128,17 @@ class TopicRepository(
     suspend fun categoryById(id: Int?): Category? = id?.let { categories()[it] }
 
     suspend fun fetchReplies(postId: Long, after: Int): List<Post> =
-        json.decodeFromString(request("/posts/$postId/replies.json?after=$after"))
+        run {
+            val root = json.parseToJsonElement(request("/posts/$postId/replies.json?after=$after"))
+            val array = when (root) {
+                is JsonArray -> root
+                is JsonObject -> (root["post_stream"] as? JsonObject)?.get("posts") as? JsonArray
+                    ?: root["replies"] as? JsonArray
+                    ?: root["posts"] as? JsonArray
+                else -> null
+            } ?: return@run emptyList()
+            array.map { json.decodeFromJsonElement(Post.serializer(), it) }
+        }
 
     suspend fun toggleReaction(postId: Long, reaction: String): Post {
         require(reaction.matches(Regex("[a-zA-Z0-9_+:-]+")))

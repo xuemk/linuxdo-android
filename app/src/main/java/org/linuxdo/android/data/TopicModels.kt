@@ -308,12 +308,29 @@ data class Reaction(val id: String, val count: Int = 0, @SerialName("can_undo") 
 
 data class TreePost(val post: Post, val depth: Int, val childCount: Int, val parentMissing: Boolean)
 
+private val ASIDE_TAG = Regex("""<aside\b[^>]*>""", RegexOption.IGNORE_CASE)
+private val DATA_POST_ATTR = Regex("""\bdata-post\s*=\s*["'](\d+)["']""", RegexOption.IGNORE_CASE)
+private val DATA_TOPIC_ATTR = Regex("""\bdata-topic\s*=\s*["'](\d+)["']""", RegexOption.IGNORE_CASE)
+
+/**
+ * 优先取服务端显式 reply_to_post_number；若为空（例如通过引用 `[quote="..., post:13"]` 回复），
+ * 则从 cooked 首个同话题 quote 块提取 data-post 作为父楼层号，使客户端树形挂载与服务端 reply_count 口径对齐。
+ */
+fun Post.effectiveReplyToPostNumber(): Int? {
+    replyToPostNumber?.let { return it }
+    if (!cooked.contains("quote", ignoreCase = true)) return null
+    val aside = ASIDE_TAG.find(cooked)?.value ?: return null
+    val quotedTopic = DATA_TOPIC_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toLongOrNull()
+    if (quotedTopic != null && topicId > 0L && quotedTopic != topicId) return null
+    return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 && it < postNumber }
+}
+
 /** 缺失父楼层时保留为根节点,避免分页时漏掉可见回复。 */
 fun threadRows(posts: List<Post>, collapsed: Set<Long> = emptySet()): List<TreePost> {
     val ordered = posts.distinctBy { it.id }.sortedBy { it.postNumber }
     val byNumber = ordered.associateBy { it.postNumber }
     val children = ordered.groupBy { post ->
-        val parent = post.replyToPostNumber?.let { byNumber[it] }
+        val parent = post.effectiveReplyToPostNumber()?.let { byNumber[it] }
         if (parent != null && parent.postNumber < post.postNumber) parent.id else null
     }
     val result = mutableListOf<TreePost>()
@@ -334,7 +351,7 @@ fun postAncestorIds(posts: List<Post>, postNumber: Int): Set<Long> {
     var current = byNumber[postNumber] ?: return emptySet()
     val ancestors = mutableSetOf<Long>()
     while (true) {
-        val parent = current.replyToPostNumber?.let { byNumber[it] } ?: break
+        val parent = current.effectiveReplyToPostNumber()?.let { byNumber[it] } ?: break
         if (parent.postNumber >= current.postNumber || !ancestors.add(parent.id)) break
         current = parent
     }

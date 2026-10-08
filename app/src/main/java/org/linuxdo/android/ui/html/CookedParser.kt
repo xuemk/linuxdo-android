@@ -14,13 +14,14 @@ data class InlineText(
     val code: Boolean = false,
     val href: String? = null,
     val emojiUrl: String? = null,
+    val isAttachment: Boolean = false,
 )
 
 sealed interface CookedBlock {
     data class Paragraph(val runs: List<InlineText>) : CookedBlock
     data class Code(val text: String) : CookedBlock
     data class Quote(val blocks: List<CookedBlock>) : CookedBlock
-    data class Picture(val url: String, val description: String) : CookedBlock
+    data class Picture(val url: String, val description: String, val originalUrl: String = url) : CookedBlock
     data class ListBlock(val entries: List<List<CookedBlock>>, val start: Int?) : CookedBlock
     data object Divider : CookedBlock
 }
@@ -33,10 +34,64 @@ fun contentUrl(value: String): String? = runCatching {
     }?.toASCIIString()
 }.getOrNull()
 
+private val ATTACHMENT_EXTENSIONS = setOf(
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz",
+    "apk", "apks", "xapk", "ipa", "exe", "msi", "dmg", "pkg", "deb", "rpm",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt",
+    "json", "xml", "yaml", "yml", "toml", "ini", "conf", "log", "sql",
+    "sh", "bat", "ps1", "py", "jar", "iso", "mp3", "flac", "wav", "mp4", "mkv", "mov",
+)
+
+private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "avif", "heic")
+
+fun isDownloadableAttachmentUrl(url: String): Boolean {
+    val uri = runCatching { URI(url) }.getOrNull() ?: return false
+    val path = uri.path?.lowercase().orEmpty()
+    if (path.startsWith("/uploads/short-url/") || path.startsWith("/uploads/default/")) {
+        val ext = path.substringAfterLast('.', "")
+        if (ext !in IMAGE_EXTENSIONS) return true
+    }
+    val ext = path.substringAfterLast('.', "")
+    return ext in ATTACHMENT_EXTENSIONS
+}
+
 class CookedParser(private val onUnknown: (String) -> Unit = {}) {
     private val reported = mutableSetOf<String>()
 
     fun parse(html: String): List<CookedBlock> = blocks(Jsoup.parseBodyFragment(html).body().childNodes())
+
+    private fun isLightboxMeta(element: Element): Boolean =
+        element.hasClass("meta") ||
+            element.hasClass("filename") ||
+            element.hasClass("informations")
+
+    private fun resolvePictureUrls(img: Element): Pair<String, String>? {
+        val rawSrc = contentUrl(img.attr("src"))
+        val srcsetBest = img.attr("srcset")
+            .split(",")
+            .mapNotNull { entry ->
+                val candidate = entry.trim().substringBefore(" ").trim()
+                contentUrl(candidate)
+            }
+            .lastOrNull()
+        val lightboxHref = img.parents()
+            .firstOrNull { it.normalName() == "a" && (it.hasClass("lightbox") || it.hasAttr("data-download-href")) }
+            ?.let { anchor ->
+                contentUrl(anchor.attr("href")) ?: contentUrl(anchor.attr("data-download-href"))
+            }
+        val originalUrl = lightboxHref ?: srcsetBest ?: rawSrc ?: return null
+        val displayUrl = srcsetBest ?: lightboxHref ?: rawSrc ?: originalUrl
+        return displayUrl to originalUrl
+    }
+
+    private fun pictureBlockOf(img: Element): CookedBlock.Picture? {
+        val urls = resolvePictureUrls(img) ?: return null
+        return CookedBlock.Picture(
+            url = urls.first,
+            description = img.attr("alt").ifBlank { "帖子图片" },
+            originalUrl = urls.second,
+        )
+    }
 
     private fun blocks(nodes: List<Node>): List<CookedBlock> {
         val output = mutableListOf<CookedBlock>()
@@ -47,6 +102,12 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         }
         for (node in nodes) {
             val element = node as? Element
+            if (element != null && isLightboxMeta(element)) continue
+            if (element != null && (element.hasClass("lightbox-wrapper") || element.hasClass("lightbox"))) {
+                flush()
+                element.select("img:not(.emoji)").mapNotNullTo(output, ::pictureBlockOf)
+                continue
+            }
             when (element?.normalName()) {
                 "script", "style", "noscript" -> Unit
                 "pre" -> { flush(); output += CookedBlock.Code(element.wholeText().trimEnd()) }
@@ -74,8 +135,8 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     if (element.hasClass("emoji")) pending += inline(element)
                     else {
                         flush()
-                        val url = contentUrl(element.attr("src"))
-                        if (url != null) output += CookedBlock.Picture(url, element.attr("alt").ifBlank { "帖子图片" })
+                        val pic = pictureBlockOf(element)
+                        if (pic != null) output += pic
                         else pending += InlineText(element.attr("alt"))
                     }
                 }
@@ -98,13 +159,20 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
     private fun inline(node: Node, style: InlineText = InlineText("")): List<InlineText> {
         if (node is TextNode) return listOf(style.copy(text = node.text()))
         if (node !is Element) return emptyList()
+        if (isLightboxMeta(node)) return emptyList()
         val updated = when (node.normalName()) {
             "script", "style", "noscript" -> return emptyList()
             "br" -> return listOf(style.copy(text = "\n"))
             "strong", "b" -> style.copy(bold = true)
             "em", "i" -> style.copy(italic = true)
             "code" -> style.copy(code = true)
-            "a" -> style.copy(href = contentUrl(node.attr("href")))
+            "a" -> {
+                val resolvedHref = contentUrl(node.attr("href"))
+                val attachment = node.hasClass("attachment") ||
+                    node.hasAttr("download") ||
+                    (resolvedHref != null && isDownloadableAttachmentUrl(resolvedHref))
+                style.copy(href = resolvedHref, isAttachment = style.isAttachment || attachment)
+            }
             "img" -> return listOf(style.copy(text = node.attr("alt"), emojiUrl = contentUrl(node.attr("src"))))
             "span", "s", "del", "u", "small", "sup", "sub", "mark", "kbd" -> style
             else -> {

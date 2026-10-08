@@ -32,6 +32,7 @@ import org.linuxdo.android.data.ProfileSection
 import org.linuxdo.android.data.ProfilePage
 import org.linuxdo.android.data.NotificationFilter
 import org.linuxdo.android.data.UploadLimits
+import org.linuxdo.android.data.effectiveReplyToPostNumber
 import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkPath
@@ -57,6 +58,7 @@ data class DetailUiState(
     val error: String? = null,
     val replyCursors: Map<Long, Int> = emptyMap(),
     val completedReplies: Set<Long> = emptySet(),
+    val loadingReplies: Set<Long> = emptySet(),
     val reactingPosts: Set<Long> = emptySet(),
     val reactionErrors: Map<Long, String> = emptyMap(),
     val emojiUrls: Map<String, String> = emptyMap(),
@@ -443,9 +445,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val requested = if (previous) current.previousIds.takeLast(20) else current.remaining.take(20)
                     val posts = repository.fetchPosts(id, requested)
                     _details.update {
-                        it + (id to current.copy(
-                            posts = (current.posts + posts).distinctBy { post -> post.id }.sortedBy { post -> post.postNumber },
-                            consumedIds = current.consumedIds + requested,
+                        val latest = it[id] ?: current
+                        it + (id to latest.copy(
+                            posts = (latest.posts + posts).distinctBy { post -> post.id }.sortedBy { post -> post.postNumber },
+                            consumedIds = latest.consumedIds + requested,
                             windowStartId = if (previous) requested.first() else current.windowStartId,
                             error = null, failedLoad = DetailLoad.Topic,
                         ))
@@ -977,25 +980,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadReplies(topicId: Long, postId: Long) {
         val current = _details.value[topicId] ?: return
-        if (current.loading || current.reactingPosts.isNotEmpty() || postId in current.completedReplies) return
-        pageJobs["topic:$topicId"] = viewModelScope.launch {
-            _details.update { it + (topicId to current.copy(loading = true, error = null)) }
+        if (postId in current.loadingReplies || current.reactingPosts.isNotEmpty() || postId in current.completedReplies) return
+        val after = current.replyCursors[postId] ?: 1
+        pageJobs["replies:$topicId:$postId"] = viewModelScope.launch {
+            _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies + postId, error = null)) } ?: states }
             try {
-                val replies = repository.fetchReplies(postId, current.replyCursors[postId] ?: 1)
+                val replies = repository.fetchReplies(postId, after)
                 val cursor = replies.maxOfOrNull { it.postNumber }
-                _details.update { it + (topicId to current.copy(
-                    posts = (current.posts + replies).distinctBy { post -> post.id }.sortedBy { post -> post.postNumber },
-                    consumedIds = current.consumedIds + replies.map { post -> post.id },
-                    replyCursors = if (cursor == null) current.replyCursors else current.replyCursors + (postId to cursor),
-                    completedReplies = if (replies.isEmpty()) current.completedReplies + postId else current.completedReplies,
+                _details.update { states ->
+                    val latest = states[topicId] ?: return@update states
+                    val parent = latest.posts.firstOrNull { it.id == postId }
+                    val parentNumber = parent?.postNumber
+                    val normalizedReplies = replies.map { reply ->
+                        if (parentNumber != null && reply.postNumber > parentNumber) {
+                            reply.copy(replyToPostNumber = parentNumber)
+                        } else {
+                            reply
+                        }
+                    }
+                    val replyById = normalizedReplies.associateBy { it.id }
+                    val patchedExisting = latest.posts.map { existing ->
+                        val fetched = replyById[existing.id] ?: return@map existing
+                        val targetParent = fetched.effectiveReplyToPostNumber() ?: parentNumber
+                        val existingParent = existing.effectiveReplyToPostNumber()
+                        val hasLoadedParent = existingParent != null && latest.posts.any { it.postNumber == existingParent && it.postNumber < existing.postNumber }
+                        if (!hasLoadedParent && targetParent != null && existing.postNumber > targetParent) {
+                            existing.copy(replyToPostNumber = targetParent)
+                        } else {
+                            existing
+                        }
+                    }
+                    val existingIds = patchedExisting.map { it.id }.toSet()
+                    val mergedPosts = (patchedExisting + normalizedReplies.filterNot { it.id in existingIds }).sortedBy { it.postNumber }
+                    val childCount = if (parentNumber != null) {
+                        mergedPosts.count { it.postNumber > parentNumber && it.effectiveReplyToPostNumber() == parentNumber }
+                    } else 0
+                    val isDone = replies.size < 20 || (parent != null && childCount >= parent.replyCount)
+                    states + (topicId to latest.copy(
+                        posts = mergedPosts,
+                        consumedIds = latest.consumedIds + replies.map { post -> post.id },
+                        replyCursors = if (cursor == null) latest.replyCursors else latest.replyCursors + (postId to cursor),
+                        completedReplies = if (isDone) latest.completedReplies + postId else latest.completedReplies,
                 )) }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _details.update { it + (topicId to current.copy(error = error.message ?: "回复加载失败")) }
+                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(error = error.message ?: "回复加载失败")) } ?: states }
                 handlePageFailure(error) { loadReplies(topicId, postId) }
             } finally {
-                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loading = false)) } ?: states }
+                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies - postId)) } ?: states }
             }
         }
     }
