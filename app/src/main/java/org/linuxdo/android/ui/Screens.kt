@@ -74,6 +74,7 @@ fun ProfileScreen(
     onOpenTopic: (Long, String, Int?) -> Unit,
     onDiagnostics: () -> Unit,
     onSettings: () -> Unit,
+    onLogout: () -> Unit = {},
     active: Boolean,
     notificationOnly: Boolean = false,
     onBack: (() -> Unit)? = null,
@@ -104,6 +105,8 @@ fun ProfileScreen(
             onLoad(section, false, true)
         }
     }
+    var showLogoutDialog by remember { mutableStateOf(false) }
+
     IosLargeTitleScaffold(title = if (notificationOnly) "通知" else "我的", listState = list, onBack = onBack,
         scrollToTopRequest = scrollToTopRequest,
         trailing = { if (!notificationOnly) Row(verticalAlignment = Alignment.CenterVertically) {
@@ -117,9 +120,25 @@ fun ProfileScreen(
                         Text(username ?: "尚未确认登录状态", style = IosTheme.type.title3)
                         Text("你的社区足迹", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
                     }
+                    // 退出登录按钮
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(IosTheme.colors.destructive.copy(alpha = 0.1f))
+                            .clickable { showLogoutDialog = true }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "退出登录",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.destructive,
+                        )
+                    }
                 }
             }
         }
+
         item("sections") {
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -218,7 +237,31 @@ fun ProfileScreen(
             }
         }
     }
+
+    // 退出登录确认对话框（防止误触）
+    if (showLogoutDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showLogoutDialog = false },
+            title = { Text("退出登录") },
+            text = { Text("确认要退出登录吗？退出后需要重新登录才能访问社区。") },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { showLogoutDialog = false; onLogout() }
+                ) {
+                    Text("退出", color = IosTheme.colors.destructive)
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { showLogoutDialog = false }
+                ) {
+                    Text("取消")
+                }
+            },
+        )
+    }
 }
+
 
 @Composable
 private fun NotificationTabIcon(filter: NotificationFilter, color: Color) {

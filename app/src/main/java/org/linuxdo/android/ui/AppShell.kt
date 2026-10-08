@@ -228,10 +228,13 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                             Route.Profile -> ProfileScreen(state.username, profile, viewModel::loadProfile,
                                 onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
-                                onSettings = { stack.push(Route.Settings) }, active = active,
+                                onSettings = { stack.push(Route.Settings) },
+                                onLogout = viewModel::logout,
+                                active = active,
                                 onReadNotification = viewModel::readNotification,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
+
 
                             Route.Settings -> SettingsScreen(treeView, viewModel::setTreeView, onBack = { stack.pop() },
                                 themeMode = themeMode, onThemeMode = viewModel::setThemeMode)
