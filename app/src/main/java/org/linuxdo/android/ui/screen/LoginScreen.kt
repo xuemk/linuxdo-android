@@ -83,6 +83,9 @@ fun LoginScreen(
     onEmailCodeLogin: (email: String, token: String, secondFactorToken: String?, secondFactorMethod: Int) -> Unit,
     onDismissError: () -> Unit,
     onResetSecondFactor: () -> Unit = {},
+    onStartWebAuth: () -> Unit = {},
+    onDismissRiskControl: () -> Unit = {},
+    onCancelWebAuth: () -> Unit = {},
 ) {
     // Tab 选择：0=账号密码，1=验证码
     var tab by rememberSaveable { mutableStateOf(0) }
@@ -393,8 +396,78 @@ fun LoginScreen(
                 )
             }
 
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(20.dp))
+
+            // 网页授权认证登录快捷入口
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { onStartWebAuth() }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "使用网页授权认证登录",
+                    fontSize = 13.sp,
+                    color = AccentBlue,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+
+            Spacer(Modifier.height(32.dp))
         }
+    }
+
+    // L站安全风控提示对话框（403）
+    if (state.showRiskControlDialog) {
+        AlertDialog(
+            onDismissRequest = onDismissRiskControl,
+            title = { Text("L站安全风控提示") },
+            text = {
+                Text("检测到当前登录触发 L 站安全风控 (403)，无法直接通过原生表单登录。\n\n请使用网页授权认证完成登录。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDismissRiskControl()
+                    onStartWebAuth()
+                }) {
+                    Text("网页授权认证", color = AccentBlue, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissRiskControl) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+
+    // 网页授权进行中提示
+    if (state.webAuthLoading) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("网页授权认证") },
+            text = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                ) {
+                    IosActivityIndicator(diameter = 28.dp, color = AccentBlue)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        state.webAuthMessage ?: "正在进行网页授权认证...",
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = onCancelWebAuth) {
+                    Text("取消")
+                }
+            },
+        )
     }
 
     // 忘记密码提示对话框

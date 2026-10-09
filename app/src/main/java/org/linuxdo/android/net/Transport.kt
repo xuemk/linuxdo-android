@@ -62,6 +62,9 @@ class SecondFactorRequiredException(
     message: String = "该账号已开启两步验证，请输入验证码",
 ) : Exception(message)
 
+/** 登录或关键请求被服务端判定为风险控制 (HTTP 403)，需要转入网页授权认证。 */
+class RiskControlException(message: String = "账号触发 L 站安全风控 (403)，需要使用网页授权认证") : Exception(message)
+
 class HttpStatusException(val status: Int, detail: String = "") :
     Exception("HTTP $status $detail".trim())
 

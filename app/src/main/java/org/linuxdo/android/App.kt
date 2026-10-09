@@ -13,6 +13,7 @@ import org.linuxdo.android.net.BrowserSession
 import org.linuxdo.android.net.NetworkPath
 import org.linuxdo.android.net.OkHttpTransport
 import org.linuxdo.android.net.Transport
+import org.linuxdo.android.net.UserApiKeyAuthService
 import org.linuxdo.android.net.WebViewFetchTransport
 import org.linuxdo.android.net.buildSharedHttpClient
 
@@ -38,6 +39,7 @@ class AppContainer(context: Context) {
 
     /** JSON 请求、图片与附件下载共用,保证 UA 与 Cookie 一致。 */
     val httpClient = buildSharedHttpClient(sessionStore, userAgent)
+    val userApiKeyAuthService = UserApiKeyAuthService(sessionStore, httpClient, diagnostics)
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
         .okHttpClient(httpClient)

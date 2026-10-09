@@ -100,6 +100,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
             if (state.screen == Screen.Boot) BootScreen()
 
+            val context = LocalContext.current
+
             // 原生登录页面（替换旧的 WebView 登录页）
             if (state.screen == Screen.Login) {
                 LoginScreen(
@@ -109,13 +111,15 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     onEmailCodeLogin = viewModel::loginWithEmailCode,
                     onDismissError = viewModel::dismissLoginError,
                     onResetSecondFactor = viewModel::resetSecondFactor,
+                    onStartWebAuth = { viewModel.startWebAuth(context) },
+                    onDismissRiskControl = viewModel::dismissRiskControlDialog,
+                    onCancelWebAuth = viewModel::cancelWebAuth,
                 )
             }
 
             // Verify 屏的顶部说明条
             if (showWeb) WebTopBar(state.screen)
 
-            val context = LocalContext.current
             AndroidView(
                 factory = { browser.attach(context) },
                 onRelease = { browser.detach() },

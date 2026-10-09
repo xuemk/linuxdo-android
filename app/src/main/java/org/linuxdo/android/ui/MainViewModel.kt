@@ -44,7 +44,10 @@ import org.linuxdo.android.data.threadRows
 import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkPath
+import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
+import android.content.Context
+import android.content.Intent
 import org.linuxdo.android.ui.screen.TopicListUiState
 
 enum class Screen { Boot, Login, Verify, List }
@@ -74,6 +77,9 @@ data class LoginUiState(
     val emailSent: Boolean = false,
     val secondFactorRequired: Boolean = false,
     val backupEnabled: Boolean = false,
+    val showRiskControlDialog: Boolean = false,
+    val webAuthLoading: Boolean = false,
+    val webAuthMessage: String? = null,
 )
 enum class ThemeMode(val label: String) { System("跟随系统"), Light("浅色"), Dark("深色") }
 enum class DetailLoad { Topic, Next, Previous }
@@ -191,6 +197,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val store = container.sessionStore
     private val browser = container.browser
     val diagnostics = container.diagnostics
+    private val userApiKeyAuthService = container.userApiKeyAuthService
 
     private val _state = MutableStateFlow(UiState(userAgent = container.userAgent))
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -560,6 +567,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _loginUiState.update { it.copy(secondFactorRequired = false, backupEnabled = false, error = null) }
     }
 
+    fun dismissRiskControlDialog() {
+        _loginUiState.update { it.copy(showRiskControlDialog = false) }
+    }
+
     /** 账号密码登录：先拿 CSRF token，再 POST /session（支持 2FA 两步验证）。 */
     fun loginWithPassword(
         login: String,
@@ -593,6 +604,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: NeedsInteractiveVerification) {
                 _loginUiState.update { it.copy(loading = false) }
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
+            } catch (error: RiskControlException) {
+                diagnostics.log("密码登录遇到 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+            } catch (error: HttpStatusException) {
+                if (error.status == 403) {
+                    diagnostics.log("密码登录遇到 403 状态: ${error.message}")
+                    _loginUiState.update {
+                        it.copy(
+                            loading = false,
+                            showRiskControlDialog = true,
+                            error = null,
+                        )
+                    }
+                } else {
+                    _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请稍后重试。") }
+                }
             } catch (error: Exception) {
                 _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请稍后重试。") }
             }
@@ -612,6 +645,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: NeedsInteractiveVerification) {
                 _loginUiState.update { it.copy(sendingCode = false) }
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
+            } catch (error: RiskControlException) {
+                diagnostics.log("发送邮箱验证码遇到 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        sendingCode = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+            } catch (error: HttpStatusException) {
+                if (error.status == 403) {
+                    diagnostics.log("发送邮箱验证码遇到 403 状态: ${error.message}")
+                    _loginUiState.update {
+                        it.copy(
+                            sendingCode = false,
+                            showRiskControlDialog = true,
+                            error = null,
+                        )
+                    }
+                } else {
+                    _loginUiState.update { it.copy(sendingCode = false, error = error.message ?: "发送失败，请稍后重试。") }
+                }
             } catch (error: Exception) {
                 _loginUiState.update { it.copy(sendingCode = false, error = error.message ?: "发送失败，请稍后重试。") }
             }
@@ -655,6 +710,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _loginUiState.update { it.copy(loading = false) }
                 pendingEmailLoginToken = sanitizedToken
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
+            } catch (error: RiskControlException) {
+                diagnostics.log("邮箱 token 登录遇到 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+            } catch (error: HttpStatusException) {
+                if (error.status == 403) {
+                    diagnostics.log("邮箱 token 登录遇到 403 状态: ${error.message}")
+                    _loginUiState.update {
+                        it.copy(
+                            loading = false,
+                            showRiskControlDialog = true,
+                            error = null,
+                        )
+                    }
+                } else {
+                    _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请检查 token 是否正确。") }
+                }
             } catch (error: Exception) {
                 _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请检查 token 是否正确。") }
             }
@@ -681,12 +758,96 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 _state.update { it.copy(screen = Screen.Login) }
+            } catch (error: RiskControlException) {
+                diagnostics.log("重试邮件登录遇到 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+                _state.update { it.copy(screen = Screen.Login) }
             } catch (error: Exception) {
                 _loginUiState.update {
                     it.copy(loading = false, error = error.message ?: "登录失败，请重新获取验证码。")
                 }
                 _state.update { it.copy(screen = Screen.Login) }
             }
+        }
+    }
+
+    /** 发起网页授权认证（拉起系统浏览器或外部应用） */
+    fun startWebAuth(context: Context) {
+        viewModelScope.launch {
+            _loginUiState.update {
+                it.copy(
+                    showRiskControlDialog = false,
+                    webAuthLoading = true,
+                    webAuthMessage = "正在准备网页授权...",
+                    error = null,
+                )
+            }
+            try {
+                val url = userApiKeyAuthService.buildAuthorizeUrl()
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = true,
+                        webAuthMessage = "已调起浏览器，请在网页中完成授权...",
+                    )
+                }
+            } catch (e: Exception) {
+                diagnostics.log("拉起网页授权失败: ${e.message}")
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = false,
+                        webAuthMessage = null,
+                        error = "无法打开浏览器，请检查是否安装了浏览器应用",
+                    )
+                }
+            }
+        }
+    }
+
+    /** 接收深链回调并兑换令牌 */
+    fun handleWebAuthCallback(uri: Uri) {
+        viewModelScope.launch {
+            _loginUiState.update {
+                it.copy(
+                    webAuthLoading = true,
+                    webAuthMessage = "正在兑换登录令牌并验证...",
+                    error = null,
+                )
+            }
+            try {
+                userApiKeyAuthService.handleAuthRedirect(uri)
+                diagnostics.log("网页授权登录成功，重新加载会话")
+                _loginUiState.update { LoginUiState() }
+                boot()
+            } catch (e: Exception) {
+                diagnostics.log("网页授权登录兑换失败: ${e.message}")
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = false,
+                        webAuthMessage = null,
+                        error = e.message ?: "网页授权登录失败，请重试",
+                    )
+                }
+            }
+        }
+    }
+
+    fun cancelWebAuth() {
+        userApiKeyAuthService.cancel()
+        _loginUiState.update {
+            it.copy(
+                webAuthLoading = false,
+                webAuthMessage = null,
+            )
         }
     }
 

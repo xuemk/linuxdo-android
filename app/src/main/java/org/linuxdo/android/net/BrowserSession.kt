@@ -2,6 +2,7 @@ package org.linuxdo.android.net
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.MutableContextWrapper
 import android.net.Uri
 import android.os.Looper
@@ -13,6 +14,7 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import java.util.UUID
@@ -78,6 +80,22 @@ class BrowserSession(
             setAcceptThirdPartyCookies(webView, true)
         }
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val uri = request?.url
+                if (uri != null && uri.scheme == "discourse" && uri.host == "auth_redirect") {
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        appContext.startActivity(intent)
+                        return true
+                    } catch (e: Exception) {
+                        Log.e(TAG, "启动深链失败: ${e.message}")
+                    }
+                }
+                return super.shouldOverrideUrlLoading(view, request)
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 Log.d(TAG, "onPageStarted: $url")
             }

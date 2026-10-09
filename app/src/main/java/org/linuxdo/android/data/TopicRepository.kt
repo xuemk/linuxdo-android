@@ -32,6 +32,7 @@ import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.LoginRejectedException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkTimeoutException
+import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
@@ -591,6 +592,7 @@ class TopicRepository(
         diagnostics.recordStatus(transport.name, loginResult.status, "/session")
         if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截")
         if (loginResult.status == 0) throw NetworkTimeoutException()
+        if (loginResult.status == 403) throw RiskControlException("登录请求被 L 站风控拦截 (403)")
         if (loginResult.status == 429) throw HttpStatusException(429, "请求过于频繁，请稍后再试")
         val responseObj = try {
             json.parseToJsonElement(loginResult.body).jsonObject
@@ -639,6 +641,7 @@ class TopicRepository(
         diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
+        if (result.status == 403) throw RiskControlException("发邮件请求被 L 站风控拦截 (403)")
         if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
     }
 
@@ -646,6 +649,7 @@ class TopicRepository(
         val result = loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
         if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
+        if (result.status == 403) throw RiskControlException("获取 CSRF 被 L 站风控拦截 (403)")
         if (result.status !in 200..299) throw HttpStatusException(result.status, "无法获取 CSRF token")
         return json.parseToJsonElement(result.body).jsonObject["csrf"]
             ?.jsonPrimitive?.contentOrNull
@@ -681,6 +685,7 @@ class TopicRepository(
         diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
+        if (result.status == 403) throw RiskControlException("邮件登录请求被 L 站风控拦截 (403)")
 
         val body = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
         val serverError = body?.get("error")?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
