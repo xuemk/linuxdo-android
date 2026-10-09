@@ -40,14 +40,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.material3.Text
 import androidx.compose.foundation.Canvas
 
+// 远距离回顶只播放顶部附近三项的滚动,避免浏览越深、动画越久。
+private const val ScrollToTopAnchorIndex = 3
+
 /** 回顶请求由各 Tab 独立递增;保存消费位置,避免切回页面时再次回顶。 */
 @Composable
 internal fun ScrollToTopOnRequest(listState: LazyListState, request: Int) {
     var handled by rememberSaveable { mutableIntStateOf(0) }
     LaunchedEffect(request) {
         if (request > 0 && request != handled) {
-            listState.scrollToItem(0)
+            // 先消费请求:手势或切换 Tab 打断动画后,不应在恢复页面时重播。
             handled = request
+            if (listState.firstVisibleItemIndex >= ScrollToTopAnchorIndex) {
+                listState.scrollToItem(ScrollToTopAnchorIndex)
+            }
+            listState.animateScrollToItem(0)
         }
     }
 }
