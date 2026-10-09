@@ -53,6 +53,15 @@ class NetworkTimeoutException : Exception("连接超时，请检查网络")
  */
 class LoginRejectedException(message: String) : Exception(message)
 
+/**
+ * 账号开启了两步验证（2FA：TOTP 动态口令或备用恢复码），需要用户输入验证码后再次提交。
+ */
+class SecondFactorRequiredException(
+    val totpEnabled: Boolean = true,
+    val backupEnabled: Boolean = false,
+    message: String = "该账号已开启两步验证，请输入验证码",
+) : Exception(message)
+
 class HttpStatusException(val status: Int, detail: String = "") :
     Exception("HTTP $status $detail".trim())
 

@@ -57,6 +57,7 @@ import org.linuxdo.android.ui.nav.TabBar
 fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val loginUiState by viewModel.loginUiState.collectAsStateWithLifecycle()
+    val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     // WebView 只在需要 CF 安全验证时显示
     val showWeb = state.screen == Screen.Verify
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
@@ -107,6 +108,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     onSendEmailCode = viewModel::sendLoginEmail,
                     onEmailCodeLogin = viewModel::loginWithEmailCode,
                     onDismissError = viewModel::dismissLoginError,
+                    onResetSecondFactor = viewModel::resetSecondFactor,
                 )
             }
 
@@ -125,6 +127,15 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     // 挑战页按旧高度排完版就不再重排了,结果就是内容位置偏掉。
                     .padding(top = IosMetrics.navBarHeight),
             )
+
+            val updateInfo = updateState.updateInfo
+            if (updateState.showDialog && updateInfo != null) {
+                UpdateDialog(
+                    currentVersion = updateState.currentVersion,
+                    info = updateInfo,
+                    onDismiss = viewModel::dismissUpdateDialog,
+                )
+            }
         }
     }
 }
@@ -150,6 +161,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
     val composer by viewModel.composer.collectAsStateWithLifecycle()
     val treeView by viewModel.treeView.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
+    val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val browsing = state.screen == Screen.List
     val openNotifications = {
         if (stack.current != Route.Notifications) stack.push(Route.Notifications)
@@ -188,6 +200,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 state = details[route.topicId] ?: DetailUiState(loading = true),
                                 onBack = { stack.pop() },
                                 onRetry = { viewModel.retryTopic(route.topicId, route.postNumber) },
+                                onRefresh = { viewModel.refreshTopic(route.topicId) },
                                 onLoadMore = { viewModel.loadTopic(route.topicId, more = true) },
                                 onLoadPrevious = { viewModel.loadTopic(route.topicId, previous = true) },
                                 initialPostNumber = route.postNumber,
@@ -209,6 +222,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 onCreatedPostShown = { viewModel.clearCreatedPost(route.topicId) },
                                 onAttach = viewModel::attachToComposer,
                                 topicId = route.topicId,
+                                onOpenTopic = { id, title, postNumber ->
+                                    stack.push(Route.TopicDetail(id, title, postNumber))
+                                },
                                 active = active,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) },
                             )
@@ -247,8 +263,15 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel) {
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
 
 
-                            Route.Settings -> SettingsScreen(treeView, viewModel::setTreeView, onBack = { stack.pop() },
-                                themeMode = themeMode, onThemeMode = viewModel::setThemeMode)
+                            Route.Settings -> SettingsScreen(
+                                treeView = treeView,
+                                onTreeView = viewModel::setTreeView,
+                                onBack = { stack.pop() },
+                                themeMode = themeMode,
+                                onThemeMode = viewModel::setThemeMode,
+                                updateState = updateState,
+                                onCheckUpdate = { viewModel.checkForUpdates(manual = true) },
+                            )
 
                             Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
                                 onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },

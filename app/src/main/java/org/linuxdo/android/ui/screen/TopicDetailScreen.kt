@@ -19,7 +19,10 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -72,17 +75,20 @@ import coil.request.ImageRequest
 import coil.size.Size
 import java.io.File
 import java.net.URLDecoder
+import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import org.linuxdo.android.App
+import org.linuxdo.android.Config
 import org.linuxdo.android.data.Post
 import org.linuxdo.android.data.BoostLength
 import org.linuxdo.android.data.measureBoost
 import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.TreePost
+import org.linuxdo.android.data.DEFAULT_SUB_REPLY_LIMIT
 import org.linuxdo.android.data.threadRows
 import org.linuxdo.android.data.postAncestorIds
 import org.linuxdo.android.ui.IosTextAction
@@ -96,6 +102,9 @@ import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
 
+private val LocalOpenTopic = compositionLocalOf<((Long, String, Int?) -> Unit)?> { null }
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TopicDetailScreen(
     title: String,
@@ -122,37 +131,28 @@ fun TopicDetailScreen(
     onCreatedPostShown: () -> Unit,
     onAttach: (Uri) -> Unit,
     topicId: Long,
+    onRefresh: () -> Unit = {},
+    onOpenTopic: (Long, String, Int?) -> Unit = { _, _, _ -> },
     active: Boolean = true,
     initialPostNumber: Int? = null,
     trailing: @Composable () -> Unit = {},
 ) {
     val list = rememberLazyListState()
+    val pullState = rememberPullToRefreshState()
     val scope = rememberCoroutineScope()
     var picture by remember { mutableStateOf<String?>(null) }
     var collapsed by rememberSaveable { mutableStateOf(emptyList<Long>()) }
+    var expanded by rememberSaveable { mutableStateOf(emptyList<Long>()) }
     var located by rememberSaveable(initialPostNumber) { mutableStateOf(initialPostNumber == null) }
     var highlightedPost by remember { mutableStateOf<Long?>(null) }
     var manageTarget by remember { mutableStateOf<Post?>(null) }
     var deleteTarget by remember { mutableStateOf<Post?>(null) }
-    val rows = remember(state.posts, treeView, collapsed) {
-        if (treeView) threadRows(state.posts, collapsed.toSet())
+    val topicAuthorUsername = remember(state.posts) {
+        state.posts.firstOrNull { it.postNumber == 1 }?.username
+    }
+    val rows = remember(state.posts, treeView, collapsed, expanded) {
+        if (treeView) threadRows(state.posts, collapsed.toSet(), expanded.toSet())
         else state.posts.sortedBy { it.postNumber }.map { TreePost(it, 0, 0, false) }
-    }
-    LaunchedEffect(active, initialPostNumber, state.posts, treeView, located) {
-        if (active && !located && treeView && initialPostNumber != null) {
-            val ancestors = postAncestorIds(state.posts, initialPostNumber)
-            collapsed = collapsed.filterNot { it in ancestors }
-        }
-    }
-    LaunchedEffect(active, initialPostNumber, rows, state.loading, state.error, located, state.previousIds.isNotEmpty()) {
-        if (active && !located && !state.loading && state.error == null && initialPostNumber != null) {
-            val index = rows.indexOfFirst { it.post.postNumber == initialPostNumber }
-            if (index >= 0) {
-                list.scrollToItem(index + 1 + if (state.previousIds.isNotEmpty()) 1 else 0)
-                highlightedPost = rows[index].post.id
-                located = true
-            }
-        }
     }
     LaunchedEffect(highlightedPost) {
         if (highlightedPost != null) {
@@ -181,14 +181,17 @@ fun TopicDetailScreen(
     // 写操作全局互斥(ViewModel 侧也是),所以其他楼层的按钮要禁用;
     // 但转圈只画在真正被操作的那一条上,否则点一下"解决方案"整页都在转。
     val writeBusy = state.reactingPosts.isNotEmpty() || composer.submitting
-    // 树形视图下,刚发的回复会挂在父楼层之下 —— 父楼层若是折叠的,用户会以为回复失败。
+    // 树形视图下,刚发的回复会挂在父楼层之下 —— 父楼层若是折叠或仅预览前3条,需自动展开以便直接看到新回复。
     var lastTarget by remember { mutableStateOf<ComposerTarget?>(null) }
     LaunchedEffect(composer.target) {
         val previous = lastTarget
         lastTarget = composer.target
         if (composer.target == null && previous is ComposerTarget.ReplyTo) {
-            state.posts.firstOrNull { it.postNumber == previous.postNumber }
-                ?.let { parent -> collapsed = collapsed - parent.id }
+            val ancestors = postAncestorIds(state.posts, previous.postNumber)
+            val directParent = state.posts.firstOrNull { it.postNumber == previous.postNumber }?.id
+            val targets = ancestors + setOfNotNull(directParent)
+            collapsed = collapsed.filterNot { it in targets }
+            expanded = (expanded + targets).distinct()
         }
     }
     val hasPinnedRoot = state.previousIds.isNotEmpty() &&
@@ -201,6 +204,32 @@ fun TopicDetailScreen(
         val topErrorCount = if (showTopError && state.error != null) 1 else 0
         val gapBefore = if (state.previousIds.isNotEmpty() && (!hasPinnedRoot || rowIndex >= 1)) 1 else 0
         return 1 + topErrorCount + gapBefore + rowIndex
+    }
+
+    LaunchedEffect(active, initialPostNumber, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty()) {
+        if (active && !located && !state.loading && state.error == null && initialPostNumber != null) {
+            val targetPost = state.posts.firstOrNull { it.postNumber == initialPostNumber } ?: return@LaunchedEffect
+            if (treeView) {
+                val ancestors = postAncestorIds(state.posts, initialPostNumber)
+                val needUncollapse = collapsed.any { it in ancestors }
+                val needExpand = ancestors.any { it !in expanded }
+                if (needUncollapse || needExpand) {
+                    if (needUncollapse) collapsed = collapsed.filterNot { it in ancestors }
+                    if (needExpand) expanded = (expanded + ancestors).distinct()
+                    return@LaunchedEffect
+                }
+            }
+            val index = rows.indexOfFirst { it.post.postNumber == initialPostNumber }
+            if (index >= 0) {
+                list.scrollToItem(lazyIndexOf(index))
+                withFrameNanos { }
+                if (list.layoutInfo.visibleItemsInfo.none { it.key == targetPost.id }) {
+                    list.scrollToItem(lazyIndexOf(index))
+                }
+                highlightedPost = targetPost.id
+                located = true
+            }
+        }
     }
 
     // 向上回填前序切片时锁定当前首个可见楼层锚点，新楼层前置插入后在同一帧恢复视口位置，防止跳屏。
@@ -246,8 +275,19 @@ fun TopicDetailScreen(
     }
 
     // 发完回复一步到位直接定格在新楼层并高亮（与 Web 端渲染完直达底部体验一致，不做长距离逐层滚动动画）。
-    LaunchedEffect(state.createdPostId, rows) {
+    LaunchedEffect(state.createdPostId, state.posts, rows, treeView) {
         val created = state.createdPostId ?: return@LaunchedEffect
+        val createdPost = state.posts.firstOrNull { it.id == created }
+        if (treeView && createdPost != null) {
+            val ancestors = postAncestorIds(state.posts, createdPost.postNumber)
+            val needUncollapse = collapsed.any { it in ancestors }
+            val needExpand = ancestors.any { it !in expanded }
+            if (needUncollapse || needExpand) {
+                if (needUncollapse) collapsed = collapsed.filterNot { it in ancestors }
+                if (needExpand) expanded = (expanded + ancestors).distinct()
+                return@LaunchedEffect
+            }
+        }
         val index = rows.indexOfFirst { it.post.id == created }
         if (index < 0) return@LaunchedEffect
         highlightedPost = created
@@ -261,86 +301,295 @@ fun TopicDetailScreen(
     @Composable
     fun RenderPostEntry(row: TreePost) {
         val post = row.post
-        Column(Modifier.padding(start = (row.depth.coerceAtMost(3) * 12).dp)) {
-            PostRow(post, onPicture = { picture = it }, onUnknownTag = onUnknownTag,
-                reactions = state.topic?.validReactions.orEmpty(),
-                emojiUrls = state.emojiUrls,
-                busy = writeBusy, pending = post.id in state.reactingPosts,
-                error = state.reactionErrors[post.id],
-                onReact = { onReact(post.id, it) }, onBoost = { onBoost(post.id, it) },
-                onDeleteBoost = { onDeleteBoost(post.id, it) }, onRefresh = { onRefreshPost(post.id) },
-                onSolution = { onSolution(post.id) }, highlighted = highlightedPost == post.id,
-                canReply = canReply,
-                onReply = { onOpenComposer(ComposerTarget.ReplyTo(topicId, post.postNumber, post.username)) },
-                onManage = { manageTarget = post })
-            if (treeView) Row(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
-                if (row.childCount > 0) IosTextAction(if (post.id in collapsed) "展开 ${row.childCount} 条回复" else "收起回复",
-                    textStyle = IosTheme.type.subheadline) {
-                    collapsed = if (post.id in collapsed) collapsed - post.id else collapsed + post.id
-                }
-                if (post.replyCount > row.childCount && post.id !in state.completedReplies) {
-                    val replyLoading = post.id in state.loadingReplies
-                    IosTextAction(if (replyLoading) "加载中…" else "更多回复", textStyle = IosTheme.type.subheadline) {
-                        if (!replyLoading) {
-                            collapsed = collapsed - post.id
-                            onLoadReplies(post.id)
-                        }
+        val isTopicAuthor = topicAuthorUsername != null && post.username == topicAuthorUsername
+        if (!treeView || row.depth == 0) {
+            val hasExpandedSubtree = treeView && row.subtreeSize > 0 && post.id !in collapsed
+            val unloadedTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
+            val hasUnloadedRootReplies = treeView && unloadedTargetId != null
+            val showCollapsedSubtreeBar = treeView && !hasExpandedSubtree && (row.allLoadedCount > 0 || hasUnloadedRootReplies)
+            Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
+                PostRow(
+                    post = post,
+                    isTopicAuthor = isTopicAuthor,
+                    compactBottom = hasExpandedSubtree || showCollapsedSubtreeBar,
+                    showReplyToHint = !treeView,
+                    onPicture = { picture = it },
+                    onUnknownTag = onUnknownTag,
+                    reactions = state.topic?.validReactions.orEmpty(),
+                    emojiUrls = state.emojiUrls,
+                    busy = writeBusy,
+                    pending = post.id in state.reactingPosts,
+                    error = state.reactionErrors[post.id],
+                    onReact = { onReact(post.id, it) },
+                    onBoost = { onBoost(post.id, it) },
+                    onDeleteBoost = { onDeleteBoost(post.id, it) },
+                    onRefresh = { onRefreshPost(post.id) },
+                    onSolution = { onSolution(post.id) },
+                    highlighted = highlightedPost == post.id,
+                    canReply = canReply,
+                    onReply = { onOpenComposer(ComposerTarget.ReplyTo(topicId, post.postNumber, post.username)) },
+                    onManage = { manageTarget = post },
+                )
+                if (showCollapsedSubtreeBar) {
+                    val replyLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
+                    val totalHint = maxOf(row.totalSubtreeCount, row.allLoadedCount, post.replyCount, row.childCount)
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 14.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.fieldBackground)
+                            .clickable(enabled = !replyLoading) {
+                                collapsed = collapsed - post.id
+                                if (row.allLoadedCount > DEFAULT_SUB_REPLY_LIMIT || unloadedTargetId != null) {
+                                    expanded = (expanded + post.id).distinct()
+                                }
+                                if (unloadedTargetId != null) {
+                                    collapsed = collapsed - unloadedTargetId
+                                    onLoadReplies(unloadedTargetId)
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 9.dp),
+                    ) {
+                        Text(
+                            text = if (replyLoading) "正在加载回复…" else "查看全部 $totalHint 条回复 >",
+                            style = IosTheme.type.footnote,
+                            fontWeight = FontWeight.Medium,
+                            color = IosTheme.colors.accent,
+                        )
                     }
                 }
+                if (!hasExpandedSubtree) {
+                    IosDivider()
+                }
             }
-            IosDivider()
+        } else {
+            // ── 贴吧式“楼中楼”子回复区域（默认最多展示前 3 条预览，点击展开全部，与主评论同宽） ──
+            val selfHasMore = post.replyCount > row.childCount && post.id !in state.completedReplies
+            val isRootExpanded = row.rootPostId in expanded
+            val topCorner = if (row.isFirstInSubtree) 10.dp else 0.dp
+            val boxShape = RoundedCornerShape(
+                topStart = topCorner,
+                topEnd = topCorner,
+                bottomStart = 0.dp,
+                bottomEnd = 0.dp,
+            )
+            Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .clip(boxShape)
+                        .background(IosTheme.colors.fieldBackground),
+                ) {
+                    if (!row.isFirstInSubtree) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp)
+                                .height(0.5.dp)
+                                .background(IosTheme.colors.separator.copy(alpha = 0.6f)),
+                        )
+                    }
+                    SubReplyRow(
+                        row = row,
+                        isTopicAuthor = isTopicAuthor,
+                        onPicture = { picture = it },
+                        onUnknownTag = onUnknownTag,
+                        reactions = state.topic?.validReactions.orEmpty(),
+                        emojiUrls = state.emojiUrls,
+                        busy = writeBusy,
+                        pending = post.id in state.reactingPosts,
+                        error = state.reactionErrors[post.id],
+                        onReact = { onReact(post.id, it) },
+                        onBoost = { onBoost(post.id, it) },
+                        onDeleteBoost = { onDeleteBoost(post.id, it) },
+                        onRefresh = { onRefreshPost(post.id) },
+                        highlighted = highlightedPost == post.id,
+                        canReply = canReply,
+                        onReply = { onOpenComposer(ComposerTarget.ReplyTo(topicId, post.postNumber, post.username)) },
+                        onManage = { manageTarget = post },
+                        selfHasMore = selfHasMore && !row.isLastInSubtree && isRootExpanded,
+                        selfLoadingReplies = post.id in state.loadingReplies,
+                        onLoadSelfReplies = {
+                            expanded = (expanded + row.rootPostId).distinct()
+                            collapsed = collapsed - post.id
+                            onLoadReplies(post.id)
+                        },
+                    )
+                }
+                if (row.isLastInSubtree) {
+                    val moreTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
+                    val moreLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
+                    val hasHiddenLoaded = row.allLoadedCount > row.subtreeSize
+                    val canExpandMore = hasHiddenLoaded || moreTargetId != null
+                    val totalReplies = maxOf(row.totalSubtreeCount, row.allLoadedCount, row.subtreeSize)
+                    val showCollapseButton = isRootExpanded || !canExpandMore
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 14.dp)
+                            .clip(RoundedCornerShape(bottomStart = 10.dp, bottomEnd = 10.dp))
+                            .background(IosTheme.colors.fieldBackground)
+                            .then(
+                                if (canExpandMore && !showCollapseButton) {
+                                    Modifier.clickable(enabled = !moreLoading) {
+                                        expanded = (expanded + row.rootPostId).distinct()
+                                        collapsed = collapsed - row.rootPostId
+                                        if (moreTargetId != null) {
+                                            collapsed = collapsed - moreTargetId
+                                            onLoadReplies(moreTargetId)
+                                        }
+                                    }
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (canExpandMore) {
+                            Text(
+                                text = if (moreLoading) "正在加载回复…" else "查看全部 $totalReplies 条回复 >",
+                                style = IosTheme.type.footnote,
+                                fontWeight = FontWeight.Medium,
+                                color = IosTheme.colors.accent,
+                                modifier = if (showCollapseButton) {
+                                    Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .clickable(enabled = !moreLoading) {
+                                            expanded = (expanded + row.rootPostId).distinct()
+                                            collapsed = collapsed - row.rootPostId
+                                            if (moreTargetId != null) {
+                                                collapsed = collapsed - moreTargetId
+                                                onLoadReplies(moreTargetId)
+                                            }
+                                        }
+                                        .padding(vertical = 2.dp)
+                                } else {
+                                    Modifier.padding(vertical = 2.dp)
+                                },
+                            )
+                        } else {
+                            Text(
+                                text = "共 $totalReplies 条回复",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                        }
+                        if (showCollapseButton) {
+                            Text(
+                                text = "收起回复",
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .clickable {
+                                        val rootId = row.rootPostId
+                                        val visibleRoot = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key == rootId }
+                                        val rootRowIndex = rows.indexOfFirst { it.post.id == rootId }
+                                        val needScrollToRoot = visibleRoot == null || visibleRoot.offset < 0
+                                        if (row.allLoadedCount > DEFAULT_SUB_REPLY_LIMIT && rootId in expanded) {
+                                            expanded = expanded - rootId
+                                        } else {
+                                            expanded = expanded - rootId
+                                            collapsed = (collapsed + rootId).distinct()
+                                        }
+                                        if (needScrollToRoot && rootRowIndex >= 0) {
+                                            val targetLazyIndex = lazyIndexOf(rootRowIndex)
+                                            scope.launch {
+                                                list.scrollToItem(targetLazyIndex, 0)
+                                            }
+                                        }
+                                    }
+                                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                    IosDivider()
+                }
+            }
         }
     }
 
-    Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
-        IosNavBar(title = state.topic?.title ?: title, onBack = onBack, trailing = trailing)
-        Box(Modifier.weight(1f)) {
-        LazyColumn(state = list, modifier = Modifier.fillMaxSize()) {
-            item("title") {
-                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(state.topic?.title ?: title, style = IosTheme.type.title3)
-                    state.category?.let { CategoryTag(it) }
-                }
-            }
-            if (showTopError) state.error?.let { message ->
-                item("top-error") { ErrorNotice(message, onRetry) }
-            }
-            items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
-            if (state.previousIds.isNotEmpty()) item("load-previous") {
-                PreviousSliceGap(
-                    hiddenCount = state.previousIds.size,
-                    loading = state.loading,
-                    onClick = triggerLoadPrevious,
-                )
-            }
-            items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
-            if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
-                item("loading") { IosLoadingBox() }
-            }
-            if (!showTopError) state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
-            if (!state.loading && state.topic != null && state.posts.isEmpty() && state.error == null) {
-                item("empty") { EmptyNotice() }
-            }
-            if (state.posts.isNotEmpty() && state.remaining.isEmpty() && !state.loading && state.error == null) {
-                item("end") { Text(if (state.previousIds.isEmpty()) "已显示全部可见楼层" else "已到话题末尾",
-                    color = IosTheme.colors.secondaryLabel,
-                    style = IosTheme.type.footnote, modifier = Modifier.padding(20.dp)) }
-            }
-        }
-            // 右下角纵向排列:回复按钮在上、阅读进度在下。用 Column 堆叠而不是各自
-            // align(BottomEnd),这样回复按钮永远压不到进度数字上。
-            Column(
-                Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 16.dp),
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+    CompositionLocalProvider(LocalOpenTopic provides onOpenTopic) {
+        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
+            IosNavBar(title = state.topic?.title ?: title, onBack = onBack, trailing = trailing)
+            PullToRefreshBox(
+                isRefreshing = state.refreshing,
+                onRefresh = onRefresh,
+                state = pullState,
+                modifier = Modifier.weight(1f),
+                indicator = {
+                    val fraction = pullState.distanceFraction
+                    if (state.refreshing || fraction > 0f) {
+                        Box(
+                            Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 12.dp)
+                                .graphicsLayer {
+                                    alpha = if (state.refreshing) 1f else min(1f, fraction * 1.4f)
+                                },
+                        ) {
+                            IosActivityIndicator(diameter = 22.dp)
+                        }
+                    }
+                },
             ) {
-                if (canReply) ReplyFab(enabled = !writeBusy) {
-                    onOpenComposer(ComposerTarget.NewReply(topicId))
-                }
-                if (currentPostNumber != null && totalPosts > 1) {
-                    ReadingProgressPill(current = currentPostNumber ?: 1, total = totalPosts) {
-                        // 1 楼还没取回来时(从通知直接跳进中间楼层),先从头重拉话题。
-                        if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                Box(Modifier.fillMaxSize()) {
+                    LazyColumn(
+                        state = list,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = 76.dp),
+                    ) {
+                        item("title") {
+                            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(state.topic?.title ?: title, style = IosTheme.type.title3)
+                                state.category?.let { CategoryTag(it) }
+                            }
+                        }
+                        if (showTopError) state.error?.let { message ->
+                            item("top-error") { ErrorNotice(message, onRetry) }
+                        }
+                        items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                        if (state.previousIds.isNotEmpty()) item("load-previous") {
+                            PreviousSliceGap(
+                                hiddenCount = state.previousIds.size,
+                                loading = state.loading,
+                                onClick = triggerLoadPrevious,
+                            )
+                        }
+                        items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                        if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
+                            item("loading") { IosLoadingBox() }
+                        }
+                        if (!showTopError) state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
+                        if (!state.loading && state.topic != null && state.posts.isEmpty() && state.error == null) {
+                            item("empty") { EmptyNotice() }
+                        }
+                        if (state.posts.isNotEmpty() && state.remaining.isEmpty() && !state.loading && state.error == null) {
+                            item("end") { Text(if (state.previousIds.isEmpty()) "已显示全部可见楼层" else "已到话题末尾",
+                                color = IosTheme.colors.secondaryLabel,
+                                style = IosTheme.type.footnote, modifier = Modifier.padding(20.dp)) }
+                        }
+                    }
+                    // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
+                    if (currentPostNumber != null && totalPosts > 1) {
+                        ReadingProgressPill(
+                            current = currentPostNumber ?: 1,
+                            total = totalPosts,
+                            modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
+                        ) {
+                            if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                        }
+                    }
+                    if (canReply) {
+                        Box(Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 16.dp)) {
+                            ReplyFab(enabled = !writeBusy) {
+                                onOpenComposer(ComposerTarget.NewReply(topicId))
+                            }
+                        }
                     }
                 }
             }
@@ -363,6 +612,48 @@ fun TopicDetailScreen(
         }
     }
 }
+
+private data class InternalTopicLink(
+    val topicId: Long,
+    val postNumber: Int? = null,
+)
+
+/**
+ * 解析站内（linux.do）帖子链接，支持：
+ * - `https://linux.do/t/{slug}/{topicId}`
+ * - `https://linux.do/t/{slug}/{topicId}/{postNumber}`
+ * - `https://linux.do/t/{topicId}`
+ * - `https://linux.do/t/{topicId}/{postNumber}`
+ */
+private fun parseInternalTopicUrl(url: String): InternalTopicLink? = runCatching {
+    val uri = Uri.parse(url)
+    val host = uri.host?.lowercase() ?: return null
+    if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return null
+    val segments = uri.pathSegments ?: return null
+    if (segments.size < 2 || segments[0] != "t") return null
+    val secondAsId = segments[1].toLongOrNull()
+    when {
+        secondAsId == null -> {
+            val topicId = segments.getOrNull(2)?.toLongOrNull() ?: return null
+            val postNum = segments.getOrNull(3)?.toIntOrNull()?.takeIf { it > 1 }
+            InternalTopicLink(topicId = topicId, postNumber = postNum)
+        }
+        segments.size == 2 -> InternalTopicLink(topicId = secondAsId, postNumber = null)
+        segments.size >= 4 -> {
+            val topicId = segments[2].toLongOrNull() ?: return null
+            val postNum = segments[3].toIntOrNull()?.takeIf { it > 1 }
+            InternalTopicLink(topicId = topicId, postNumber = postNum)
+        }
+        else -> {
+            val thirdAsLong = segments[2].toLongOrNull() ?: return null
+            if (thirdAsLong > secondAsId && thirdAsLong >= 1000L) {
+                InternalTopicLink(topicId = thirdAsLong, postNumber = null)
+            } else {
+                InternalTopicLink(topicId = secondAsId, postNumber = thirdAsLong.toInt().takeIf { it > 1 })
+            }
+        }
+    }
+}.getOrNull()
 
 /**
  * Discourse 风格的前序未加载楼层折叠条 + 骨架屏（Skeleton Placeholder）。
@@ -659,20 +950,57 @@ private fun DeleteConfirmDialog(post: Post, onDismiss: () -> Unit, onConfirm: ()
 }
 
 @Composable
-@OptIn(ExperimentalFoundationApi::class)
-private fun PostRow(post: Post, onPicture: (String) -> Unit, onUnknownTag: (String) -> Unit,
-    reactions: List<String>, emojiUrls: Map<String, String>, busy: Boolean, pending: Boolean,
-    error: String?, onReact: (String) -> Unit,
-    onBoost: (String) -> Unit, onDeleteBoost: (Long) -> Unit, onRefresh: () -> Unit, onSolution: () -> Unit,
-    canReply: Boolean, onReply: () -> Unit, onManage: () -> Unit,
-    highlighted: Boolean = false) {
-    val blocks by produceState<List<CookedBlock>?>(null, post.cooked) {
-        value = withContext(Dispatchers.Default) { CookedParser(onUnknownTag).parse(post.cooked) }
+private fun AuthorBadge() {
+    Box(
+        Modifier
+            .padding(start = 5.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(IosTheme.colors.accent.copy(alpha = 0.14f))
+            .padding(horizontal = 5.dp, vertical = 1.dp),
+    ) {
+        Text(
+            text = "楼主",
+            style = IosTheme.type.caption.copy(fontSize = 11.sp),
+            fontWeight = FontWeight.Medium,
+            color = IosTheme.colors.accent,
+        )
     }
+}
+
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
+private fun PostRow(
+    post: Post,
+    isTopicAuthor: Boolean = false,
+    compactBottom: Boolean = false,
+    showReplyToHint: Boolean = true,
+    onPicture: (String) -> Unit,
+    onUnknownTag: (String) -> Unit,
+    reactions: List<String>,
+    emojiUrls: Map<String, String>,
+    busy: Boolean,
+    pending: Boolean,
+    error: String?,
+    onReact: (String) -> Unit,
+    onBoost: (String) -> Unit,
+    onDeleteBoost: (Long) -> Unit,
+    onRefresh: () -> Unit,
+    onSolution: () -> Unit,
+    canReply: Boolean,
+    onReply: () -> Unit,
+    onManage: () -> Unit,
+    highlighted: Boolean = false,
+) {
+    val blocks = remember(post.cooked) { CookedParser.parseCached(post.cooked, onUnknownTag) }
     val background = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card
     val canManage = post.canEdit || post.canDelete
-    Column(Modifier.fillMaxWidth().background(background).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(background)
+            .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = if (compactBottom) 8.dp else 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
         // 长按放在头部这一行,而不是整条楼层:正文裹在 SelectionContainer 里,
         // 长按那里是"选择文本",两个手势会抢。
         Row(
@@ -684,36 +1012,177 @@ private fun PostRow(post: Post, onPicture: (String) -> Unit, onUnknownTag: (Stri
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            AsyncImage(avatarUrlOf(post.avatarTemplate), post.username,
-                modifier = Modifier.size(32.dp).clip(CircleShape), contentScale = ContentScale.Crop)
+            AsyncImage(
+                avatarUrlOf(post.avatarTemplate),
+                post.username,
+                modifier = Modifier.size(32.dp).clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
-                Text(post.username, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(post.username, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold)
+                    if (isTopicAuthor) AuthorBadge()
+                }
                 Text(RelativeTime.format(post.createdAt), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
             }
             Text("#${post.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
         }
-        post.replyToPostNumber?.takeIf { it > 0 }?.let { parent ->
-            Text("回复 #$parent", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+        if (showReplyToHint) {
+            post.replyToPostNumber?.takeIf { it > 0 }?.let { parent ->
+                Text("回复 #$parent", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+            }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.footnote, color = Color(0xFF30B85B))
-        if (blocks == null) IosLoadingBox() else CookedContent(blocks.orEmpty(), onPicture)
-        PostActions(post, reactions, emojiUrls, busy, pending, error, onReact, onBoost, onDeleteBoost,
-            onRefresh, onSolution, canReply, onReply)
+        CookedContent(blocks, onPicture)
+        PostActions(
+            post, reactions, emojiUrls, busy, pending, error, onReact, onBoost, onDeleteBoost,
+            onRefresh, onSolution, canReply, onReply,
+        )
+    }
+}
+
+/**
+ * 贴吧式“楼中楼”单条回复行：紧凑展示在主楼层正下方的圆角灰底容器内，
+ * 二级及以上回复自动显示“A 回复 B”，支持点赞、简评、回复及长按编辑/删除。
+ */
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
+private fun SubReplyRow(
+    row: TreePost,
+    isTopicAuthor: Boolean,
+    onPicture: (String) -> Unit,
+    onUnknownTag: (String) -> Unit,
+    reactions: List<String>,
+    emojiUrls: Map<String, String>,
+    busy: Boolean,
+    pending: Boolean,
+    error: String?,
+    onReact: (String) -> Unit,
+    onBoost: (String) -> Unit,
+    onDeleteBoost: (Long) -> Unit,
+    onRefresh: () -> Unit,
+    highlighted: Boolean,
+    canReply: Boolean,
+    onReply: () -> Unit,
+    onManage: () -> Unit,
+    selfHasMore: Boolean,
+    selfLoadingReplies: Boolean,
+    onLoadSelfReplies: () -> Unit,
+) {
+    val post = row.post
+    val blocks = remember(post.cooked) { CookedParser.parseCached(post.cooked, onUnknownTag) }
+    val canManage = post.canEdit || post.canDelete
+    val bg = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(bg)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().then(
+                if (canManage) Modifier
+                    .semantics { contentDescription = "长按 #${post.postNumber} 可编辑或删除" }
+                    .combinedClickable(enabled = !busy, onClick = {}, onLongClick = onManage)
+                else Modifier,
+            ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            AsyncImage(
+                avatarUrlOf(post.avatarTemplate),
+                post.username,
+                modifier = Modifier.size(20.dp).clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Row(
+                Modifier.weight(1f).padding(start = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = post.username,
+                    style = IosTheme.type.footnote,
+                    fontWeight = FontWeight.SemiBold,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+                if (isTopicAuthor) AuthorBadge()
+                row.replyToUsername?.takeIf { it.isNotBlank() }?.let { targetUser ->
+                    Text(
+                        text = " 回复 ",
+                        style = IosTheme.type.footnote,
+                        color = IosTheme.colors.label,
+                    )
+                    Text(
+                        text = targetUser,
+                        style = IosTheme.type.footnote,
+                        fontWeight = FontWeight.SemiBold,
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                }
+            }
+            Text(
+                text = "${RelativeTime.format(post.createdAt)} · #${post.postNumber}",
+                style = IosTheme.type.caption,
+                color = IosTheme.colors.tertiaryLabel,
+            )
+        }
+        if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.caption, color = Color(0xFF30B85B))
+        CookedContent(blocks, onPicture, subReply = true)
+        PostActions(
+            post = post,
+            reactions = reactions,
+            emojiUrls = emojiUrls,
+            busy = busy,
+            pending = pending,
+            error = error,
+            onReact = onReact,
+            onBoost = onBoost,
+            onDeleteBoost = onDeleteBoost,
+            onRefresh = onRefresh,
+            onSolution = {},
+            canReply = canReply,
+            onReply = onReply,
+            compact = true,
+        )
+        if (selfHasMore) {
+            Text(
+                text = if (selfLoadingReplies) "正在加载回复…" else "查看该层更多回复 >",
+                style = IosTheme.type.caption,
+                fontWeight = FontWeight.Medium,
+                color = IosTheme.colors.accent,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .clickable(enabled = !selfLoadingReplies, onClick = onLoadSelfReplies)
+                    .padding(vertical = 2.dp),
+            )
+        }
     }
 }
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
-private fun PostActions(post: Post, reactions: List<String>, emojiUrls: Map<String, String>,
-    busy: Boolean, pending: Boolean, error: String?,
-    onReact: (String) -> Unit, onBoost: (String) -> Unit, onDeleteBoost: (Long) -> Unit,
-    onRefresh: () -> Unit, onSolution: () -> Unit,
-    canReply: Boolean, onReply: () -> Unit) {
+private fun PostActions(
+    post: Post,
+    reactions: List<String>,
+    emojiUrls: Map<String, String>,
+    busy: Boolean,
+    pending: Boolean,
+    error: String?,
+    onReact: (String) -> Unit,
+    onBoost: (String) -> Unit,
+    onDeleteBoost: (Long) -> Unit,
+    onRefresh: () -> Unit,
+    onSolution: () -> Unit,
+    canReply: Boolean,
+    onReply: () -> Unit,
+    compact: Boolean = false,
+) {
     var chooseReaction by remember { mutableStateOf(false) }
     var composeBoost by remember { mutableStateOf(false) }
     var draft by rememberSaveable(post.id) { mutableStateOf("") }
     var visibleBoosts by rememberSaveable(post.id) { mutableIntStateOf(8) }
     var deleteId by remember { mutableStateOf<Long?>(null) }
+    val touchSize = if (compact) 34.dp else 44.dp
     LaunchedEffect(post.canBoost) { if (!post.canBoost) { composeBoost = false; draft = "" } }
     if (post.reactions.any { it.count > 0 }) {
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -728,8 +1197,8 @@ private fun PostActions(post: Post, reactions: List<String>, emojiUrls: Map<Stri
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
         // 只有这一条楼层在提交时才转圈。
         if (pending) IosActivityIndicator()
-        if (post.canAcceptAnswer || post.canUnacceptAnswer || post.acceptedAnswer) {
-            Box(Modifier.size(44.dp).semantics { contentDescription = if (post.acceptedAnswer) "取消解决方案" else "设为解决方案" }
+        if (!compact && (post.canAcceptAnswer || post.canUnacceptAnswer || post.acceptedAnswer)) {
+            Box(Modifier.size(touchSize).semantics { contentDescription = if (post.acceptedAnswer) "取消解决方案" else "设为解决方案" }
                 .clickable(enabled = !busy && (post.canAcceptAnswer || post.canUnacceptAnswer), onClick = onSolution),
                 contentAlignment = Alignment.Center) {
                 PostActionIcon(PostAction.Solution, selected = post.acceptedAnswer)
@@ -737,16 +1206,16 @@ private fun PostActions(post: Post, reactions: List<String>, emojiUrls: Map<Stri
         }
         val selected = post.currentUserReaction?.id
         val canReact = !busy && !post.yours && (selected == null || post.currentUserReaction?.canUndo == true)
-        Box(Modifier.size(44.dp).semantics { contentDescription = "点赞，长按选择表情" }
+        Box(Modifier.size(touchSize).semantics { contentDescription = "点赞，长按选择表情" }
             .combinedClickable(enabled = canReact, onClick = { onReact("heart") }, onLongClick = { chooseReaction = true }),
             contentAlignment = Alignment.Center) {
             PostActionIcon(PostAction.Like, selected = selected != null)
         }
-        if (post.canBoost) Box(Modifier.size(44.dp).semantics { contentDescription = "写简评" }
+        if (post.canBoost) Box(Modifier.size(touchSize).semantics { contentDescription = "写简评" }
             .clickable(enabled = !busy) { composeBoost = !composeBoost }, contentAlignment = Alignment.Center) {
             PostActionIcon(PostAction.Boost, selected = composeBoost)
         }
-        if (canReply) Box(Modifier.size(44.dp).semantics { contentDescription = "回复这条内容" }
+        if (canReply) Box(Modifier.size(touchSize).semantics { contentDescription = "回复这条内容" }
             .clickable(enabled = !busy, onClick = onReply), contentAlignment = Alignment.Center) {
             PostActionIcon(PostAction.Reply, selected = false)
         }
@@ -755,7 +1224,7 @@ private fun PostActions(post: Post, reactions: List<String>, emojiUrls: Map<Stri
         Text(it, style = IosTheme.type.footnote, color = Color(0xFFFF453A))
         IosTextAction("刷新状态", textStyle = IosTheme.type.footnote, onClick = onRefresh)
     }
-    if (composeBoost) Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(IosTheme.colors.fieldBackground).padding(12.dp)) {
+    if (composeBoost) Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(if (compact) IosTheme.colors.card else IosTheme.colors.fieldBackground).padding(12.dp)) {
         val length = remember(draft) { measureBoost(draft) }
         val over = length.overVisible || length.overEmoji
         BasicTextField(draft, onValueChange = { if (it.length <= BoostLength.RAW_INPUT_CAP) draft = it },
@@ -782,14 +1251,13 @@ private fun PostActions(post: Post, reactions: List<String>, emojiUrls: Map<Stri
         }
     }
     if (post.boosts.isNotEmpty()) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+      val chipBg = if (compact) IosTheme.colors.card else IosTheme.colors.fieldBackground
       FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         post.boosts.take(visibleBoosts).forEach { boost ->
             key(boost.id) {
-                val content by produceState<List<CookedBlock>>(emptyList(), boost.cooked) {
-                    value = withContext(Dispatchers.Default) { CookedParser().parse(boost.cooked) }
-                }
+                val content = remember(boost.cooked) { CookedParser.parseCached(boost.cooked) }
                 Row(Modifier.widthIn(max = 260.dp).clip(RoundedCornerShape(50))
-                    .background(IosTheme.colors.fieldBackground)
+                    .background(chipBg)
                     .combinedClickable(enabled = boost.canDelete && !busy, onClick = {}, onLongClick = { deleteId = boost.id })
                     .padding(horizontal = 5.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     AsyncImage(avatarUrlOf(boost.user?.avatarTemplate), boost.user?.username,
@@ -905,32 +1373,72 @@ private fun PostActionIcon(action: PostAction, selected: Boolean, tint: Color? =
 }
 
 @Composable
-private fun CookedContent(blocks: List<CookedBlock>, onPicture: (String) -> Unit, compact: Boolean = false) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+private fun CookedContent(
+    blocks: List<CookedBlock>,
+    onPicture: (String) -> Unit,
+    compact: Boolean = false,
+    subReply: Boolean = false,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(if (compact || subReply) 6.dp else 10.dp)) {
         blocks.forEach { block ->
             when (block) {
-                is CookedBlock.Paragraph -> RichParagraph(block.runs, compact)
+                is CookedBlock.Paragraph -> RichParagraph(block.runs, compact = compact, subReply = subReply)
                 is CookedBlock.Code -> SelectionContainer {
                     Text(block.text, fontFamily = FontFamily.Monospace, style = IosTheme.type.footnote,
-                        modifier = Modifier.fillMaxWidth().background(IosTheme.colors.fieldBackground)
-                            .horizontalScroll(rememberScrollState()).padding(12.dp))
+                        modifier = Modifier.fillMaxWidth().background(
+                            if (subReply) IosTheme.colors.card else IosTheme.colors.fieldBackground,
+                        ).horizontalScroll(rememberScrollState()).padding(10.dp))
                 }
-                is CookedBlock.Quote -> Row(Modifier.fillMaxWidth().background(IosTheme.colors.fieldBackground)) {
+                is CookedBlock.Quote -> Row(
+                    Modifier.fillMaxWidth().background(
+                        if (subReply) IosTheme.colors.card else IosTheme.colors.fieldBackground,
+                    ),
+                ) {
                     Box(Modifier.width(3.dp).height(28.dp).background(IosTheme.colors.separator))
-                    Box(Modifier.weight(1f).padding(10.dp)) { CookedContent(block.blocks, onPicture) }
+                    Box(Modifier.weight(1f).padding(10.dp)) {
+                        CookedContent(block.blocks, onPicture, compact = compact, subReply = subReply)
+                    }
                 }
-                is CookedBlock.Picture -> AsyncImage(
-                    model = block.url,
-                    contentDescription = block.description,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth()
-                        .heightIn(min = 100.dp, max = 360.dp)
-                        .clickable { onPicture(block.originalUrl) },
-                )
+                is CookedBlock.Picture -> {
+                    val maxPortraitHeight = if (subReply) 220.dp else 320.dp
+                    val ratioModifier = if (block.width > 0 && block.height > 0) {
+                        val rawRatio = block.width.toFloat() / block.height.toFloat()
+                        if (rawRatio >= 0.85f) {
+                            // 横图或近似方图：撑满宽度，高度由比例唯一确定，不加 heightIn 以避免与 fillMaxWidth 产生无解约束导致溢出重叠
+                            Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(rawRatio.coerceAtMost(4f))
+                                .clip(RoundedCornerShape(8.dp))
+                        } else {
+                            // 竖屏长截图（如手机截图）：固定高度上限并按比例自适应宽度（左对齐，与网页端一致），既锁死高度防滚动抖动，又绝不越界遮挡文字
+                            Modifier
+                                .height(maxPortraitHeight)
+                                .aspectRatio(rawRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
+                                .clip(RoundedCornerShape(8.dp))
+                        }
+                    } else {
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 80.dp, max = maxPortraitHeight)
+                            .clip(RoundedCornerShape(8.dp))
+                    }
+                    AsyncImage(
+                        model = block.url,
+                        contentDescription = block.description,
+                        contentScale = ContentScale.Fit,
+                        modifier = ratioModifier.clickable { onPicture(block.originalUrl) },
+                    )
+                }
                 is CookedBlock.ListBlock -> block.entries.forEachIndexed { index, entry ->
                     Row {
-                        Text(block.start?.let { "${it + index}. " } ?: "• ", modifier = Modifier.widthIn(min = 22.dp))
-                        Box(Modifier.weight(1f)) { CookedContent(entry, onPicture) }
+                        Text(
+                            text = block.start?.let { "${it + index}. " } ?: "• ",
+                            style = if (subReply) IosTheme.type.subheadline else IosTheme.type.body,
+                            modifier = Modifier.widthIn(min = 22.dp),
+                        )
+                        Box(Modifier.weight(1f)) {
+                            CookedContent(entry, onPicture, compact = compact, subReply = subReply)
+                        }
                     }
                 }
                 CookedBlock.Divider -> IosFullDivider()
@@ -940,10 +1448,12 @@ private fun CookedContent(blocks: List<CookedBlock>, onPicture: (String) -> Unit
 }
 
 @Composable
-private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
+private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subReply: Boolean = false) {
     val colors = IosTheme.colors
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
+    val openTopic = LocalOpenTopic.current
+    val updatedOpenTopic by rememberUpdatedState(openTopic)
     val scope = rememberCoroutineScope()
     val annotated = remember(runs, colors, uriHandler, context) {
         buildAnnotatedString {
@@ -975,7 +1485,22 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
                                     Toast.makeText(context, result, Toast.LENGTH_LONG).show()
                                 }
                             } else {
-                                runCatching { uriHandler.openUri(link) }
+                                val internalTarget = parseInternalTopicUrl(link)
+                                val opener = updatedOpenTopic
+                                if (internalTarget != null && opener != null) {
+                                    val rawLabel = run.text.trim()
+                                    val titleHint = if (rawLabel.isNotBlank() &&
+                                        !rawLabel.startsWith("http://", ignoreCase = true) &&
+                                        !rawLabel.startsWith("https://", ignoreCase = true)
+                                    ) {
+                                        rawLabel
+                                    } else {
+                                        "话题 #${internalTarget.topicId}"
+                                    }
+                                    opener(internalTarget.topicId, titleHint, internalTarget.postNumber)
+                                } else {
+                                    runCatching { uriHandler.openUri(link) }
+                                }
                             }
                         },
                     )) { append(run.text) }
@@ -984,13 +1509,20 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false) {
         }
     }
     val inline = runs.mapNotNull { it.emojiUrl }.distinct().associateWith { url ->
-        val size = if (compact) 14.sp else 20.sp
+        val size = when {
+            compact -> 14.sp
+            subReply -> 17.sp
+            else -> 20.sp
+        }
         InlineTextContent(Placeholder(size, size, PlaceholderVerticalAlign.TextCenter)) {
             AsyncImage(url, "表情", modifier = Modifier.fillMaxSize())
         }
     }
-    if (compact) Text(annotated, style = IosTheme.type.caption, inlineContent = inline)
-    else SelectionContainer { Text(annotated, style = IosTheme.type.body, inlineContent = inline) }
+    when {
+        compact -> Text(annotated, style = IosTheme.type.caption, inlineContent = inline)
+        subReply -> SelectionContainer { Text(annotated, style = IosTheme.type.subheadline, inlineContent = inline) }
+        else -> SelectionContainer { Text(annotated, style = IosTheme.type.body, inlineContent = inline) }
+    }
 }
 
 @Composable

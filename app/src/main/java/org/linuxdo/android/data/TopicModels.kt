@@ -306,7 +306,24 @@ data class UploadedFile(
 @Serializable
 data class Reaction(val id: String, val count: Int = 0, @SerialName("can_undo") val canUndo: Boolean = false)
 
-data class TreePost(val post: Post, val depth: Int, val childCount: Int, val parentMissing: Boolean)
+const val DEFAULT_SUB_REPLY_LIMIT = 3
+
+data class TreePost(
+    val post: Post,
+    val depth: Int,
+    val childCount: Int,
+    val parentMissing: Boolean,
+    val replyToUsername: String? = null,
+    val rootPostId: Long = post.id,
+    val isFirstInSubtree: Boolean = false,
+    val isLastInSubtree: Boolean = false,
+    val rootChildCount: Int = childCount,
+    val rootReplyCount: Int = post.replyCount,
+    val subtreeSize: Int = childCount,
+    val allLoadedCount: Int = subtreeSize,
+    val totalSubtreeCount: Int = maxOf(childCount, post.replyCount),
+    val unloadedCandidateIds: List<Long> = emptyList(),
+)
 
 private val ASIDE_TAG = Regex("""<aside\b[^>]*>""", RegexOption.IGNORE_CASE)
 private val DATA_POST_ATTR = Regex("""\bdata-post\s*=\s*["'](\d+)["']""", RegexOption.IGNORE_CASE)
@@ -317,30 +334,119 @@ private val DATA_TOPIC_ATTR = Regex("""\bdata-topic\s*=\s*["'](\d+)["']""", Rege
  * 则从 cooked 首个同话题 quote 块提取 data-post 作为父楼层号，使客户端树形挂载与服务端 reply_count 口径对齐。
  */
 fun Post.effectiveReplyToPostNumber(): Int? {
-    replyToPostNumber?.let { return it }
+    replyToPostNumber?.takeIf { it > 1 }?.let { return it }
     if (!cooked.contains("quote", ignoreCase = true)) return null
     val aside = ASIDE_TAG.find(cooked)?.value ?: return null
     val quotedTopic = DATA_TOPIC_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toLongOrNull()
     if (quotedTopic != null && topicId > 0L && quotedTopic != topicId) return null
-    return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 && it < postNumber }
+    return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 1 && it < postNumber }
 }
 
-/** 缺失父楼层时保留为根节点,避免分页时漏掉可见回复。 */
-fun threadRows(posts: List<Post>, collapsed: Set<Long> = emptySet()): List<TreePost> {
+/** 缺失父楼层时保留为根节点,避免分页时漏掉可见回复。1 楼为主贴，不挂载楼中楼子回复。 */
+fun threadRows(
+    posts: List<Post>,
+    collapsed: Set<Long> = emptySet(),
+    expanded: Set<Long> = emptySet(),
+    previewLimit: Int = DEFAULT_SUB_REPLY_LIMIT,
+): List<TreePost> {
     val ordered = posts.distinctBy { it.id }.sortedBy { it.postNumber }
     val byNumber = ordered.associateBy { it.postNumber }
     val children = ordered.groupBy { post ->
         val parent = post.effectiveReplyToPostNumber()?.let { byNumber[it] }
-        if (parent != null && parent.postNumber < post.postNumber) parent.id else null
+        if (parent != null && parent.postNumber > 1 && parent.postNumber < post.postNumber) parent.id else null
     }
     val result = mutableListOf<TreePost>()
-    val pending = java.util.ArrayDeque<Pair<Post, Int>>()
-    children[null].orEmpty().asReversed().forEach { pending.addLast(it to 0) }
-    while (pending.isNotEmpty()) {
-        val (post, depth) = pending.removeLast()
-        val replies = children[post.id].orEmpty()
-        result += TreePost(post, depth, replies.size, post.replyToPostNumber?.let { it > 1 && it !in byNumber } == true)
-        if (post.id !in collapsed) replies.asReversed().forEach { pending.addLast(it to depth + 1) }
+    data class SubNode(val post: Post, val depth: Int, val parentUsername: String?)
+
+    for (root in children[null].orEmpty()) {
+        val rootDirectReplies = children[root.id].orEmpty()
+        // 先无视折叠/预览状态统计整棵子树的全部已加载后代及服务端未加载差额，确保预览和收起后条数统计始终准确。
+        val allDescendants = mutableListOf<SubNode>()
+        if (rootDirectReplies.isNotEmpty()) {
+            val fullStack = java.util.ArrayDeque<SubNode>()
+            rootDirectReplies.asReversed().forEach { fullStack.addLast(SubNode(it, 1, null)) }
+            while (fullStack.isNotEmpty()) {
+                val current = fullStack.removeLast()
+                allDescendants += current
+                children[current.post.id].orEmpty().asReversed().forEach { child ->
+                    fullStack.addLast(SubNode(child, current.depth + 1, current.post.username))
+                }
+            }
+        }
+        val isFirstPost = root.postNumber == 1
+        val effectiveRootReplyCount = if (isFirstPost) 0 else root.replyCount
+        val totalSubtreeCount = if (isFirstPost) {
+            0
+        } else {
+            maxOf(rootDirectReplies.size, effectiveRootReplyCount) +
+                allDescendants.sumOf { node ->
+                    maxOf(children[node.post.id].orEmpty().size, node.post.replyCount)
+                }
+        }
+        val unloadedCandidateIds = if (isFirstPost) {
+            emptyList()
+        } else {
+            buildList {
+                if (effectiveRootReplyCount > rootDirectReplies.size) add(root.id)
+                allDescendants.forEach { node ->
+                    if (node.post.replyCount > children[node.post.id].orEmpty().size) {
+                        add(node.post.id)
+                    }
+                }
+            }
+        }
+
+        val uncollapsedDescendants = mutableListOf<SubNode>()
+        if (root.id !in collapsed && rootDirectReplies.isNotEmpty()) {
+            val stack = java.util.ArrayDeque<SubNode>()
+            rootDirectReplies.asReversed().forEach { stack.addLast(SubNode(it, 1, null)) }
+            while (stack.isNotEmpty()) {
+                val current = stack.removeLast()
+                uncollapsedDescendants += current
+                if (current.post.id !in collapsed) {
+                    children[current.post.id].orEmpty().asReversed().forEach { child ->
+                        stack.addLast(SubNode(child, current.depth + 1, current.post.username))
+                    }
+                }
+            }
+        }
+        val descendants = if (root.id !in expanded && previewLimit > 0) {
+            uncollapsedDescendants.take(previewLimit)
+        } else {
+            uncollapsedDescendants
+        }
+        result += TreePost(
+            post = root,
+            depth = 0,
+            childCount = rootDirectReplies.size,
+            parentMissing = root.replyToPostNumber?.let { it > 1 && it !in byNumber } == true,
+            rootPostId = root.id,
+            rootChildCount = rootDirectReplies.size,
+            rootReplyCount = effectiveRootReplyCount,
+            subtreeSize = descendants.size,
+            allLoadedCount = allDescendants.size,
+            totalSubtreeCount = totalSubtreeCount,
+            unloadedCandidateIds = unloadedCandidateIds,
+        )
+        descendants.forEachIndexed { idx, node ->
+            val replies = children[node.post.id].orEmpty()
+            result += TreePost(
+                post = node.post,
+                depth = node.depth,
+                childCount = replies.size,
+                parentMissing = node.post.replyToPostNumber?.let { it > 1 && it !in byNumber } == true,
+                replyToUsername = node.parentUsername,
+                rootPostId = root.id,
+                isFirstInSubtree = idx == 0,
+                isLastInSubtree = idx == descendants.lastIndex,
+                rootChildCount = rootDirectReplies.size,
+                rootReplyCount = root.replyCount,
+                subtreeSize = descendants.size,
+                allLoadedCount = allDescendants.size,
+                totalSubtreeCount = totalSubtreeCount,
+                unloadedCandidateIds = unloadedCandidateIds,
+            )
+        }
     }
     return result
 }
@@ -404,7 +510,7 @@ enum class NotificationFilter(val label: String) {
 
     fun includes(type: Int): Boolean = when (this) {
         All -> true
-        Replies -> type in setOf(1, 2, 3, 15, 43)
+        Replies -> type in setOf(1, 2, 3, 15, 33, 43)
         Likes -> type in setOf(5, 19, 25)
         Messages -> type in setOf(6, 7, 16)
     }
@@ -416,7 +522,7 @@ enum class NotificationFilter(val label: String) {
      */
     val serverTypes: String get() = when (this) {
         All -> ""
-        Replies -> "mentioned,replied,quoted,group_mentioned,chat_quoted"
+        Replies -> "mentioned,replied,quoted,group_mentioned,chat_quoted,boost"
         Likes -> "liked,liked_consolidated,reaction"
         Messages -> "private_message,invited_to_private_message,group_message_summary"
     }

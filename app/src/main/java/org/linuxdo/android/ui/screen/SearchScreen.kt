@@ -69,7 +69,7 @@ fun SearchScreen(state: SearchUiState, onQuery: (String) -> Unit, onLoadMore: ()
                 modifier = Modifier.weight(1f).onFocusChanged { focused = it.isFocused }
                     .background(fieldColor, RoundedCornerShape(10.dp)).padding(10.dp),
                 decorationBox = { field -> Box {
-                    if (state.query.isEmpty()) Text("搜索话题", color = IosTheme.colors.secondaryLabel)
+                    if (state.query.isEmpty()) Text("输入关键词查找话题", color = IosTheme.colors.secondaryLabel)
                     field()
                 } })
             Text("取消", color = IosTheme.colors.accent, modifier = Modifier.clickable {
@@ -85,9 +85,6 @@ fun SearchScreen(state: SearchUiState, onQuery: (String) -> Unit, onLoadMore: ()
                     .clickable { focusManager.clearFocus(); showSort = true }.padding(horizontal = 12.dp, vertical = 9.dp))
         }
         LazyColumn(state = list, modifier = Modifier.weight(1f)) {
-            if (state.query.isBlank()) item("prompt") {
-                Text("输入关键词查找话题", color = IosTheme.colors.secondaryLabel, modifier = Modifier.padding(24.dp))
-            }
             if (state.results.initialLoading) item("loading") { IosLoadingBox() }
             state.results.error?.let { message -> item("error") { ErrorNotice(message) { onQuery(state.query) } } }
             if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {

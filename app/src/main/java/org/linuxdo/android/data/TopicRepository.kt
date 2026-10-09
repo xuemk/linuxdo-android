@@ -4,7 +4,11 @@ import android.os.SystemClock
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
@@ -19,6 +23,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonElement
 import java.net.URI
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
 import org.jsoup.Jsoup
@@ -27,8 +32,10 @@ import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.LoginRejectedException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkTimeoutException
+import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
+import org.linuxdo.android.ui.html.CookedParser
 
 @Serializable
 private data class TopicListPayload(
@@ -114,7 +121,7 @@ class TopicRepository(
     suspend fun fetchTopic(id: Long, postNumber: Int? = null, burst: Boolean = false): TopicDetail {
         val position = postNumber?.takeIf { it > 1 }?.let { "/$it" }.orEmpty()
         val body = request("/t/$id$position.json?track_visit=false", burst = burst)
-        return json.decodeFromString(body)
+        return json.decodeFromString<TopicDetail>(body).also { CookedParser.prewarm(it.postStream.posts) }
     }
 
     suspend fun fetchPosts(topicId: Long, ids: List<Long>): List<Post> {
@@ -122,7 +129,7 @@ class TopicRepository(
         val query = ids.joinToString("&") { "post_ids%5B%5D=$it" }
         return json.decodeFromString<PostStreamResponse>(
             request("/t/$topicId/posts.json?$query&track_visit=false"),
-        ).postStream.posts
+        ).postStream.posts.also { CookedParser.prewarm(it) }
     }
 
     suspend fun categoryById(id: Int?): Category? = id?.let { categories()[it] }
@@ -137,7 +144,7 @@ class TopicRepository(
                     ?: root["posts"] as? JsonArray
                 else -> null
             } ?: return@run emptyList()
-            array.map { json.decodeFromJsonElement(Post.serializer(), it) }
+            array.map { json.decodeFromJsonElement(Post.serializer(), it) }.also { CookedParser.prewarm(it) }
         }
 
     suspend fun toggleReaction(postId: Long, reaction: String): Post {
@@ -390,7 +397,8 @@ class TopicRepository(
                         action.text("title").ifBlank { "社区活动" },
                         listOf(activityLabel(action.text("action_type")), Jsoup.parseBodyFragment(action.text("excerpt")).text(),
                             action.text("created_at").take(10)).filter { it.isNotBlank() }.joinToString(" · "),
-                        action.number("topic_id"))
+                        action.number("topic_id"),
+                        postNumber = action.text("post_number").toIntOrNull()?.takeIf { it > 0 })
                 }, hasMore = actions.size >= 30, nextCursor = cursor + 1)
             }
             ProfileSection.Notifications -> fetchNotifications(cursor, notificationFilter)
@@ -443,16 +451,41 @@ class TopicRepository(
 
     private fun toNotificationEntry(notice: JsonObject): ProfileEntry {
         val data = notice["data"] as? JsonObject ?: JsonObject(emptyMap())
-        return ProfileEntry(notice.text("id"),
-            Jsoup.parseBodyFragment(notice.text("fancy_title").ifBlank { data.text("fancy_title") }.ifBlank { data.text("topic_title") }).text()
-                .ifBlank { notificationLabel(notice.text("notification_type")) },
-            listOf(notificationLabel(notice.text("notification_type")), data.text("display_username"),
-                notice.text("created_at").take(10)).filter { it.isNotBlank() }.joinToString(" · "),
-            notice.number("topic_id"), unread = notice.text("read") == "false",
-            notificationType = notice.text("notification_type").toIntOrNull() ?: 0,
+        val rawType = notice.text("notification_type").toIntOrNull() ?: 0
+        val message = data.text("message")
+        val resolvedType = when {
+            rawType == 14 && message.contains("assigned", ignoreCase = true) -> 34
+            else -> rawType
+        }
+        val resolvedPostNumber = notice.text("post_number").toIntOrNull()?.takeIf { it > 0 }
+            ?: data.text("original_post_number").toIntOrNull()?.takeIf { it > 0 }
+            ?: data.text("post_number").toIntOrNull()?.takeIf { it > 0 }
+        val badgeName = data.text("badge_name")
+        val rawTitle = when {
+            resolvedType == 12 && badgeName.isNotBlank() -> "获得了 '$badgeName'"
+            else -> notice.text("fancy_title").ifBlank { data.text("fancy_title") }.ifBlank { data.text("topic_title") }
+        }
+        val baseActor = data.text("display_username").ifBlank { notice.text("acting_user_name") }.ifBlank { null }
+        val count = data.text("count").toIntOrNull() ?: 0
+        val resolvedActor = if (baseActor != null && count > 1) {
+            "$baseActor 和其他 ${count - 1} 人"
+        } else {
+            baseActor
+        }
+        val label = notificationLabel(resolvedType.toString())
+        return ProfileEntry(
+            id = notice.text("id"),
+            title = Jsoup.parseBodyFragment(rawTitle).text().ifBlank { label },
+            subtitle = listOf(label, resolvedActor.orEmpty(), notice.text("created_at").take(10))
+                .filter { it.isNotBlank() }
+                .joinToString(" · "),
+            topicId = notice.number("topic_id") ?: data.number("topic_id"),
+            unread = notice.text("read") == "false",
+            notificationType = resolvedType,
             avatarUrl = avatarUrlOf(notice.text("acting_user_avatar_template")),
-            actor = data.text("display_username").ifBlank { notice.text("acting_user_name") }.ifBlank { null },
-            postNumber = notice.text("post_number").toIntOrNull()?.takeIf { it > 0 })
+            actor = resolvedActor,
+            postNumber = resolvedPostNumber,
+        )
     }
 
     private suspend fun objectRequest(path: String, burst: Boolean = false): JsonObject =
@@ -467,9 +500,12 @@ class TopicRepository(
     }
 
     private fun notificationLabel(type: String): String = when (type) {
-        "1" -> "提及"; "2" -> "回复"; "3" -> "引用"; "5", "19" -> "收到赞"
-        "6", "7", "16" -> "私信"; "9" -> "发布话题"; "10" -> "移动话题"; "12" -> "获赠徽章"; "15" -> "提及"
-        "25" -> "表情回应"; "43" -> "简评"; "800" -> "关注"; "801" -> "关注的人发布话题"; "802" -> "关注的人回复"; else -> "社区通知"
+        "1", "15" -> "提及"; "2" -> "回复"; "3" -> "引用"; "4" -> "编辑"; "5", "19" -> "收到赞"
+        "6", "7", "16" -> "私信"; "8" -> "接受邀请"; "9", "17" -> "发布话题"; "10" -> "移动话题"
+        "11", "38" -> "链接"; "12" -> "获赠徽章"; "13" -> "话题邀请"; "14" -> "解决方案"
+        "25" -> "表情回应"; "27" -> "活动提醒"; "28" -> "活动邀请"; "29", "32" -> "聊天提及"
+        "30" -> "聊天消息"; "31" -> "聊天邀请"; "33" -> "聊天引用"; "34" -> "指派"; "43" -> "简评"
+        "800" -> "关注"; "801" -> "关注的人发布话题"; "802" -> "关注的人回复"; else -> "社区通知"
     }
 
     /** 冷启动从本地持久化 JSON 预热分类缓存（0ms 内存就绪，避免首屏阻塞等待网络）。 */
@@ -522,23 +558,36 @@ class TopicRepository(
     }
 
     /**
-     * 使用账号密码登录。
+     * 使用账号密码登录（支持两步验证 2FA：TOTP 动态口令与备用恢复码）。
      * 流程：GET /session/csrf → POST /session。
-     * 成功返回 true，凭据错误返回 false，CF 挑战抛 NeedsInteractiveVerification，
-     * 连不上服务器抛 NetworkTimeoutException。
+     * 成功返回 true，凭据错误返回 false，需要两步验证抛 SecondFactorRequiredException，
+     * CF 挑战抛 NeedsInteractiveVerification，连不上服务器抛 NetworkTimeoutException。
      */
-    suspend fun sessionLogin(login: String, password: String): Boolean = gate.withLock {
+    suspend fun sessionLogin(
+        login: String,
+        password: String,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+    ): Boolean = gate.withLock {
+        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
         // 1. 获取 CSRF token
-        val csrf = loginCsrf(transport)
+        val csrf = loginCsrf(transport, deadlineNs)
 
-        // 2. 发送登录请求
-        throttle()
-        val safeLogin = login.replace("\"", "\\\"")
-        val safePwd = password.replace("\\", "\\\\").replace("\"", "\\\"")
-        val body = "{\"login\":\"$safeLogin\",\"password\":\"$safePwd\",\"second_factor_method\":1}"
-        val loginResult = loginCall("/session.json") { transport.write("/session.json", "POST", body, csrf) }
+        // 2. 发送登录请求（登录固定两步请求，第二步走突发间隔）
+        throttle(burst = true)
+        val fields = mutableMapOf<String, JsonElement>(
+            "login" to JsonPrimitive(login),
+            "password" to JsonPrimitive(password),
+            "second_factor_method" to JsonPrimitive(secondFactorMethod),
+        )
+        val trimmedToken = secondFactorToken?.trim().orEmpty()
+        if (trimmedToken.isNotEmpty()) {
+            fields["second_factor_token"] = JsonPrimitive(trimmedToken)
+        }
+        val body = JsonObject(fields).toString()
+        val loginResult = loginCall("/session.json", deadlineNs) { transport.write("/session.json", "POST", body, csrf) }
         diagnostics.recordStatus(transport.name, loginResult.status, "/session")
         if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截")
         if (loginResult.status == 0) throw NetworkTimeoutException()
@@ -549,7 +598,28 @@ class TopicRepository(
             return@withLock loginResult.status in 200..299
         }
         val error = responseObj["error"]?.jsonPrimitive?.contentOrNull
-        if (!error.isNullOrBlank()) { diagnostics.log("登录失败: $error"); return@withLock false }
+        val reason = responseObj["reason"]?.jsonPrimitive?.contentOrNull
+        val totpEnabled = responseObj["totp_enabled"]?.jsonPrimitive?.booleanOrNull == true
+        val backupEnabled = responseObj["backup_enabled"]?.jsonPrimitive?.booleanOrNull == true
+        val hasMulti2fa = responseObj["multiple_second_factor_methods"] != null
+        val isSecondFactor = reason == "invalid_second_factor" || totpEnabled || backupEnabled || hasMulti2fa
+        if (isSecondFactor) {
+            if (trimmedToken.isEmpty()) {
+                diagnostics.log("账号已开启 2FA，等待输入两步验证码")
+                throw SecondFactorRequiredException(
+                    totpEnabled = totpEnabled || !backupEnabled,
+                    backupEnabled = backupEnabled,
+                    message = error?.takeIf { it.isNotBlank() } ?: "该账号已开启两步验证，请输入验证码",
+                )
+            } else {
+                diagnostics.log("2FA 验证码错误: $error")
+                throw LoginRejectedException(error?.takeIf { it.isNotBlank() } ?: "两步验证码错误或已过期，请重试")
+            }
+        }
+        if (!error.isNullOrBlank()) {
+            diagnostics.log("登录失败: $error")
+            return@withLock false
+        }
         responseObj["user"] != null
     }
 
@@ -558,21 +628,22 @@ class TopicRepository(
      * 用户从邮件链接中复制 token，再交由 ViewModel.loginWithEmailCode 处理。
      */
     suspend fun sendEmailLogin(email: String) = gate.withLock {
+        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
-        val csrf = loginCsrf(transport)
-        throttle()
+        val csrf = loginCsrf(transport, deadlineNs)
+        throttle(burst = true)
         val safeEmail = email.replace("\"", "\\\"")
         val body = "{\"login\":\"$safeEmail\"}"
-        val result = loginCall("/u/email-login.json") { transport.write("/u/email-login.json", "POST", body, csrf) }
+        val result = loginCall("/u/email-login.json", deadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
         diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
         if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
     }
 
-    private suspend fun loginCsrf(transport: Transport): String {
-        val result = loginCall("/session/csrf.json") { transport.get("/session/csrf.json") }
+    private suspend fun loginCsrf(transport: Transport, deadlineNs: Long = 0L): String {
+        val result = loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
         if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
         if (result.status !in 200..299) throw HttpStatusException(result.status, "无法获取 CSRF token")
@@ -582,32 +653,56 @@ class TopicRepository(
     }
 
     /**
-     * 用邮件里的 token 完成登录。
-     *
-     * 必须发 POST。Discourse 把这一步拆成了两个动作:
-     *   GET  /session/email-login/:token → SessionController#email_login_info
-     *        只做 token 预检,渲染一个"完成登录"确认页,**不建立会话**;
-     *   POST /session/email-login/:token → SessionController#email_login
-     *        才真正走 log_on_user 下发 _t。
-     * 早先用 WebView 打开 GET 地址,拿到的永远是那个确认页 —— 会话建不起来,
-     * 自然会被 boot() 判定为未登录并弹回登录页。
+     * 用邮件里的 token 完成登录（支持携带两步验证码）。
      */
-    suspend fun emailLoginWithToken(token: String) = gate.withLock {
+    suspend fun emailLoginWithToken(
+        token: String,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+    ) = gate.withLock {
+        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
-        val csrf = loginCsrf(transport)
-        throttle()
+        val csrf = loginCsrf(transport, deadlineNs)
+        throttle(burst = true)
         val path = "/session/email-login/${encode(token)}"
-        val result = loginCall(path) { transport.write(path, "POST", "{}", csrf) }
+        val trimmed2fa = secondFactorToken?.trim().orEmpty()
+        val reqBody = if (trimmed2fa.isNotEmpty()) {
+            JsonObject(
+                mapOf(
+                    "second_factor_token" to JsonPrimitive(trimmed2fa),
+                    "second_factor_method" to JsonPrimitive(secondFactorMethod),
+                ),
+            ).toString()
+        } else {
+            "{}"
+        }
+        val result = loginCall(path, deadlineNs) { transport.write(path, "POST", reqBody, csrf) }
         diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
         if (result.status == 0) throw NetworkTimeoutException()
 
-        // 注意:token 失效、未通过审核、二次验证不通过这些情况,Discourse 都是
-        // `render json: { error: ... }` —— HTTP 状态码仍是 200。只看状态码会把失败当成功,
-        // 然后在 boot() 里莫名其妙地退回登录页,所以这里必须先看 error 字段。
         val body = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
         val serverError = body?.get("error")?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        val reason = body?.get("reason")?.jsonPrimitive?.contentOrNull
+        val secondFactorRequired = body?.get("second_factor_required")?.jsonPrimitive?.booleanOrNull == true ||
+            body?.get("totp_enabled")?.jsonPrimitive?.booleanOrNull == true ||
+            reason == "invalid_second_factor" ||
+            (trimmed2fa.isEmpty() && serverError != null && (
+                serverError.contains("两步") ||
+                    serverError.contains("二步") ||
+                    serverError.contains("验证") ||
+                    serverError.contains("second factor", ignoreCase = true) ||
+                    serverError.contains("authentication code", ignoreCase = true)
+                ))
+        if (secondFactorRequired && trimmed2fa.isEmpty()) {
+            diagnostics.log("邮件登录要求 2FA: ${serverError ?: "second_factor_required"}")
+            throw SecondFactorRequiredException(
+                totpEnabled = true,
+                backupEnabled = true,
+                message = "该账号已开启两步验证，请输入两步验证码",
+            )
+        }
         if (serverError != null) {
             diagnostics.log("邮件登录被拒: $serverError")
             throw LoginRejectedException(serverError)
@@ -619,18 +714,35 @@ class TopicRepository(
 
     /**
      * 登录链路的硬超时。
-     * OkHttp 的 connectTimeout 只覆盖建连,DNS 解析卡住时不生效;而 withTimeout 抛的
-     * TimeoutCancellationException 是 CancellationException 的子类,会被上层各处
-     * `catch (CancellationException) { throw }` 原样抛出、绕过错误提示,所以必须就地换成
-     * NetworkTimeoutException。
+     * OkHttp 的 connectTimeout 只覆盖建连,DNS 解析卡住时不生效;同时把实际网络调用放在独立
+     * SupervisorJob 异步协程中等待,即使底层发生不可中断的同步阻塞 I/O,withTimeout 也能在
+     * 到达预算时立即脱离并取消底层请求,保证 6 秒总超时严格生效。
      */
-    private suspend fun loginCall(path: String, call: suspend () -> TransportResult): TransportResult = try {
-        withTimeout(Config.LOGIN_CALL_TIMEOUT_MS) { call() }
-    } catch (timeout: TimeoutCancellationException) {
-        diagnostics.log("登录请求超时: $path")
-        throw NetworkTimeoutException()
-    } finally {
-        lastRequestAt = SystemClock.elapsedRealtime()
+    private suspend fun loginCall(
+        path: String,
+        deadlineNs: Long = 0L,
+        call: suspend () -> TransportResult,
+    ): TransportResult {
+        val timeoutMs = if (deadlineNs > 0L) {
+            ((deadlineNs - System.nanoTime()) / 1_000_000L).coerceAtMost(Config.LOGIN_CALL_TIMEOUT_MS)
+        } else {
+            Config.LOGIN_CALL_TIMEOUT_MS
+        }
+        if (timeoutMs <= 0L) {
+            diagnostics.log("登录请求超时: $path")
+            throw NetworkTimeoutException()
+        }
+        val deferred = CoroutineScope(Dispatchers.IO + SupervisorJob()).async { call() }
+        return try {
+            withTimeout(timeoutMs) { deferred.await() }
+        } catch (timeout: TimeoutCancellationException) {
+            deferred.cancel()
+            diagnostics.log("登录请求超时: $path")
+            throw NetworkTimeoutException()
+        } finally {
+            deferred.cancel()
+            lastRequestAt = SystemClock.elapsedRealtime()
+        }
     }
 
     /**

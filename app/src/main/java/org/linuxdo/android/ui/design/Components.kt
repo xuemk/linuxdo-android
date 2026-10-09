@@ -145,7 +145,7 @@ fun IosChevron(modifier: Modifier = Modifier, color: Color = IosTheme.colors.ter
 fun IosActivityIndicator(
     modifier: Modifier = Modifier,
     diameter: Dp = 20.dp,
-    color: Color = IosTheme.colors.tertiaryLabel,
+    color: Color = IosTheme.colors.spinner,
 ) {
     val segments = 8
     val phase by rememberInfiniteTransition(label = "spinner").animateFloat(
@@ -155,18 +155,18 @@ fun IosActivityIndicator(
         label = "phase",
     )
     Canvas(modifier.size(diameter)) {
-        val stroke = size.minDimension / 9f
+        val stroke = size.minDimension / 8.2f
         val outer = size.minDimension / 2f - stroke / 2f
-        val inner = outer * 0.5f
+        val inner = outer * 0.48f
         val center = Offset(size.width / 2f, size.height / 2f)
         val head = floor(phase).toInt()
         repeat(segments) { index ->
             val radians = (index * 360.0 / segments - 90.0) * Math.PI / 180.0
             val dx = cos(radians).toFloat()
             val dy = sin(radians).toFloat()
-            // 距离当前头部越远越淡,形成 iOS 那种拖尾。
+            // 距离当前头部越远越淡,形成 iOS 那种拖尾;抬高底色透明度确保浅色/深色背景下拉刷新时都清晰可见。
             val distance = (index - head + segments) % segments
-            val alpha = 0.15f + 0.85f * (1f - distance.toFloat() / segments)
+            val alpha = 0.28f + 0.72f * (1f - distance.toFloat() / segments)
             drawLine(
                 color = color.copy(alpha = color.alpha * alpha),
                 start = Offset(center.x + dx * inner, center.y + dy * inner),

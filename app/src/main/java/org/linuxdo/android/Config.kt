@@ -39,4 +39,30 @@ object Config {
 
     /** Discourse 登录后下发的认证 Cookie 名。 */
     const val SESSION_COOKIE = "_t"
+
+    /** 应用版本检查与升级（公开 APK 分发仓库 xuemk/linuxdo-android 根目录 version.json）。 */
+    val UPDATE_VERSION_JSON_URLS = listOf(
+        "https://api.github.com/repos/xuemk/linuxdo-android/contents/version.json",
+        "https://raw.githubusercontent.com/xuemk/linuxdo-android/master/version.json",
+        "https://fastly.jsdelivr.net/gh/xuemk/linuxdo-android@master/version.json",
+    )
+    const val UPDATE_RELEASES_API_URL = "https://api.github.com/repos/xuemk/linuxdo-android/releases/latest"
+    const val UPDATE_RELEASES_PAGE_URL = "https://github.com/xuemk/linuxdo-android/releases/latest"
+
+    /** 远端 version.json 尚未推送到仓库时的本地兜底清单（与根目录 version.json 保持一致，便于本地预演测试）。 */
+    const val FALLBACK_VERSION_MANIFEST_JSON = """
+        {
+          "versionCode": 8,
+          "versionName": "1.1.0",
+          "forceUpdate": false,
+          "minVersionCode": 1,
+          "title": "v1.1.0 版本更新",
+          "changelog": [
+            "1、支持2FA登录",
+            "2、优化详情页面UI展示",
+            "3、新增应用内升级机制"
+          ],
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.1.0/linuxdo-1.1.0-release.apk"
+        }
+    """
 }

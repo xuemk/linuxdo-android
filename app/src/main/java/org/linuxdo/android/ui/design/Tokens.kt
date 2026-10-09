@@ -13,6 +13,7 @@ data class IosColors(
     val label: Color,
     val secondaryLabel: Color,
     val tertiaryLabel: Color,
+    val spinner: Color,
     val separator: Color,
     val groupedBackground: Color,
     val card: Color,
@@ -34,6 +35,7 @@ val LightIosColors = IosColors(
     // iOS 的 secondaryLabel/tertiaryLabel 是带透明度的黑,不是实心灰。
     secondaryLabel = Color(0x993C3C43),
     tertiaryLabel = Color(0x4D3C3C43),
+    spinner = Color(0xCC3C3C43),
     separator = Color(0x4A3C3C43),
     groupedBackground = Color(0xFFF2F2F7),
     card = Color(0xFFFFFFFF),
@@ -50,6 +52,7 @@ val DarkIosColors = IosColors(
     label = Color(0xFFFFFFFF),
     secondaryLabel = Color(0x99EBEBF5),
     tertiaryLabel = Color(0x4DEBEBF5),
+    spinner = Color(0xCCEBEBF5),
     separator = Color(0x99545458),
     // iOS 深色的分组背景是纯黑,卡片才是 #1C1C1E。
     groupedBackground = Color(0xFF000000),

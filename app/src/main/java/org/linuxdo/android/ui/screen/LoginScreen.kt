@@ -78,10 +78,11 @@ private val TabInactive   = Color(0xFF9AA5BB)
 @Composable
 fun LoginScreen(
     state: LoginUiState,
-    onPasswordLogin: (login: String, password: String) -> Unit,
+    onPasswordLogin: (login: String, password: String, secondFactorToken: String?, secondFactorMethod: Int) -> Unit,
     onSendEmailCode: (email: String) -> Unit,
-    onEmailCodeLogin: (email: String, token: String) -> Unit,
+    onEmailCodeLogin: (email: String, token: String, secondFactorToken: String?, secondFactorMethod: Int) -> Unit,
     onDismissError: () -> Unit,
+    onResetSecondFactor: () -> Unit = {},
 ) {
     // Tab 选择：0=账号密码，1=验证码
     var tab by rememberSaveable { mutableStateOf(0) }
@@ -96,8 +97,22 @@ fun LoginScreen(
     var emailText by rememberSaveable { mutableStateOf("") }
     var codeText by rememberSaveable { mutableStateOf("") }
 
+    // 两步验证 (2FA) 状态：1=TOTP 6位动态口令，2=备用恢复码
+    var secondFactorText by rememberSaveable { mutableStateOf("") }
+    var secondFactorMethod by rememberSaveable { mutableStateOf(1) }
+    val secondFactorFocus = remember { FocusRequester() }
+
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
+
+    LaunchedEffect(state.secondFactorRequired) {
+        if (state.secondFactorRequired) {
+            runCatching { secondFactorFocus.requestFocus() }
+        } else {
+            secondFactorText = ""
+            secondFactorMethod = 1
+        }
+    }
 
     // 错误自动消除
     LaunchedEffect(state.error) {
@@ -143,7 +158,13 @@ fun LoginScreen(
             Spacer(Modifier.height(32.dp))
 
             // Tab 切换
-            LoginTabBar(selected = tab, onSelect = { tab = it })
+            LoginTabBar(selected = tab, onSelect = {
+                if (tab != it) {
+                    tab = it
+                    secondFactorText = ""
+                    onResetSecondFactor()
+                }
+            })
 
             Spacer(Modifier.height(28.dp))
 
@@ -151,7 +172,10 @@ fun LoginScreen(
                 // ── 账号密码登录 ──
                 LoginField(
                     value = loginText,
-                    onValueChange = { loginText = it },
+                    onValueChange = {
+                        loginText = it
+                        if (state.secondFactorRequired) onResetSecondFactor()
+                    },
                     placeholder = "请输入用户名/手机号/邮箱",
                     leadingIcon = { UserIcon() },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
@@ -161,7 +185,10 @@ fun LoginScreen(
 
                 LoginField(
                     value = passwordText,
-                    onValueChange = { passwordText = it },
+                    onValueChange = {
+                        passwordText = it
+                        if (state.secondFactorRequired) onResetSecondFactor()
+                    },
                     placeholder = "请输入密码",
                     leadingIcon = { LockIcon() },
                     trailingContent = {
@@ -179,15 +206,45 @@ fun LoginScreen(
                     visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Password,
-                        imeAction = ImeAction.Done,
+                        imeAction = if (state.secondFactorRequired) ImeAction.Next else ImeAction.Done,
                     ),
                     keyboardActions = KeyboardActions(onDone = {
                         keyboard?.hide(); focusManager.clearFocus()
                         if (loginText.isNotBlank() && passwordText.isNotBlank()) {
-                            onPasswordLogin(loginText.trim(), passwordText)
+                            onPasswordLogin(
+                                loginText.trim(),
+                                passwordText,
+                                secondFactorText.takeIf { state.secondFactorRequired },
+                                secondFactorMethod,
+                            )
                         }
                     }),
                 )
+
+                if (state.secondFactorRequired) {
+                    Spacer(Modifier.height(16.dp))
+                    SecondFactorSection(
+                        value = secondFactorText,
+                        onValueChange = { secondFactorText = it },
+                        method = secondFactorMethod,
+                        onMethodChange = {
+                            secondFactorMethod = it
+                            secondFactorText = ""
+                        },
+                        focusRequester = secondFactorFocus,
+                        onDone = {
+                            keyboard?.hide(); focusManager.clearFocus()
+                            if (loginText.isNotBlank() && passwordText.isNotBlank() && secondFactorText.isNotBlank()) {
+                                onPasswordLogin(
+                                    loginText.trim(),
+                                    passwordText,
+                                    secondFactorText.trim(),
+                                    secondFactorMethod,
+                                )
+                            }
+                        },
+                    )
+                }
 
                 // 忘记密码
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -203,15 +260,25 @@ fun LoginScreen(
                     )
                 }
 
-                Spacer(Modifier.height(32.dp))
+                Spacer(Modifier.height(28.dp))
+
+                val canSubmitPwd = loginText.isNotBlank() &&
+                    passwordText.isNotBlank() &&
+                    (!state.secondFactorRequired || secondFactorText.isNotBlank()) &&
+                    !state.loading
 
                 LoginButton(
-                    text = "登录",
+                    text = if (state.secondFactorRequired) "验证并登录" else "登录",
                     loading = state.loading,
-                    enabled = loginText.isNotBlank() && passwordText.isNotBlank() && !state.loading,
+                    enabled = canSubmitPwd,
                     onClick = {
                         keyboard?.hide(); focusManager.clearFocus()
-                        onPasswordLogin(loginText.trim(), passwordText)
+                        onPasswordLogin(
+                            loginText.trim(),
+                            passwordText,
+                            secondFactorText.trim().takeIf { state.secondFactorRequired },
+                            secondFactorMethod,
+                        )
                     },
                 )
             } else {
@@ -236,13 +303,16 @@ fun LoginScreen(
                 ) {
                     LoginField(
                         value = codeText,
-                        onValueChange = { codeText = it },
+                        onValueChange = {
+                            codeText = it
+                            if (state.secondFactorRequired) onResetSecondFactor()
+                        },
                         placeholder = "请输入验证码",
                         leadingIcon = { ShieldIcon() },
                         modifier = Modifier.weight(1f),
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Ascii,
-                            imeAction = ImeAction.Done,
+                            imeAction = if (state.secondFactorRequired) ImeAction.Next else ImeAction.Done,
                         ),
 
                         keyboardActions = KeyboardActions(onDone = {
@@ -263,6 +333,31 @@ fun LoginScreen(
                     )
                 }
 
+                if (state.secondFactorRequired) {
+                    Spacer(Modifier.height(16.dp))
+                    SecondFactorSection(
+                        value = secondFactorText,
+                        onValueChange = { secondFactorText = it },
+                        method = secondFactorMethod,
+                        onMethodChange = {
+                            secondFactorMethod = it
+                            secondFactorText = ""
+                        },
+                        focusRequester = secondFactorFocus,
+                        onDone = {
+                            keyboard?.hide(); focusManager.clearFocus()
+                            if (emailText.isNotBlank() && codeText.isNotBlank() && secondFactorText.isNotBlank()) {
+                                onEmailCodeLogin(
+                                    emailText.trim(),
+                                    codeText.trim(),
+                                    secondFactorText.trim(),
+                                    secondFactorMethod,
+                                )
+                            }
+                        },
+                    )
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 // 提示文字
@@ -275,15 +370,25 @@ fun LoginScreen(
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                Spacer(Modifier.height(32.dp))
+                Spacer(Modifier.height(28.dp))
+
+                val canSubmitEmail = emailText.isNotBlank() &&
+                    codeText.isNotBlank() &&
+                    (!state.secondFactorRequired || secondFactorText.isNotBlank()) &&
+                    !state.loading
 
                 LoginButton(
-                    text = "登录",
+                    text = if (state.secondFactorRequired) "验证并登录" else "登录",
                     loading = state.loading,
-                    enabled = emailText.isNotBlank() && codeText.isNotBlank() && !state.loading,
+                    enabled = canSubmitEmail,
                     onClick = {
                         keyboard?.hide(); focusManager.clearFocus()
-                        onEmailCodeLogin(emailText.trim(), codeText.trim())
+                        onEmailCodeLogin(
+                            emailText.trim(),
+                            codeText.trim(),
+                            secondFactorText.trim().takeIf { state.secondFactorRequired },
+                            secondFactorMethod,
+                        )
                     },
                 )
             }
@@ -325,6 +430,62 @@ fun LoginScreen(
             confirmButton = {
                 TextButton(onClick = onDismissError) { Text("知道了") }
             },
+        )
+    }
+}
+
+// ── 两步验证 (2FA) 输入区域 ──────────────────────────────────────────
+
+@Composable
+private fun SecondFactorSection(
+    value: String,
+    onValueChange: (String) -> Unit,
+    method: Int,
+    onMethodChange: (Int) -> Unit,
+    focusRequester: FocusRequester,
+    onDone: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(alpha = 0.7f))
+            .border(1.dp, AccentBlue.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (method == 1) "两步验证 · 动态口令 (TOTP)" else "两步验证 · 备用恢复码",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF1A2340),
+            )
+            Text(
+                if (method == 1) "改用备用码" else "改用动态口令",
+                fontSize = 12.sp,
+                color = AccentBlue,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .clickable { onMethodChange(if (method == 1) 2 else 1) }
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            )
+        }
+        LoginField(
+            value = value,
+            onValueChange = onValueChange,
+            placeholder = if (method == 1) "请输入 6 位身份验证器验证码" else "请输入备用恢复码",
+            leadingIcon = { ShieldIcon() },
+            modifier = Modifier.focusRequester(focusRequester),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = if (method == 1) KeyboardType.NumberPassword else KeyboardType.Ascii,
+                imeAction = ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = { onDone() }),
         )
     }
 }

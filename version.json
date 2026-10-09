@@ -1,0 +1,13 @@
+{
+  "versionCode": 8,
+  "versionName": "1.1.0",
+  "forceUpdate": false,
+  "minVersionCode": 1,
+  "title": "v1.1.0 版本更新",
+  "changelog": [
+    "1、支持2FA登录",
+    "2、优化详情页面UI展示",
+    "3、新增应用内升级机制"
+  ],
+  "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.1.0/linuxdo-1.1.0-release.apk"
+}

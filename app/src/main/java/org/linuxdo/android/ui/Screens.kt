@@ -52,6 +52,14 @@ import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.net.NetworkPath
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosGroupCard
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosRow
@@ -223,19 +231,78 @@ fun ProfileScreen(
                     if (section == ProfileSection.Notifications && entry.unread) entry.id.toLongOrNull()?.let(onReadNotification)
                     entry.topicId?.let { onOpenTopic(it, entry.title, entry.postNumber) }
                 }) {
-                    if (entry.unread) Text("•", color = IosTheme.colors.accent, modifier = Modifier.padding(end = 8.dp))
-                    entry.avatarUrl?.let { url ->
-                        AsyncImage(url, entry.actor, modifier = Modifier.size(32.dp).clip(CircleShape))
+                    if (entry.unread) Text("•", color = IosTheme.colors.accent, modifier = Modifier.padding(end = 6.dp))
+                    if (notification) {
+                        NotificationAvatarWithBadge(
+                            avatarUrl = entry.avatarUrl,
+                            actor = entry.actor,
+                            notificationType = entry.notificationType,
+                            unread = entry.unread,
+                        )
                         Spacer(Modifier.width(10.dp))
+                    } else {
+                        entry.avatarUrl?.let { url ->
+                            AsyncImage(url, entry.actor, modifier = Modifier.size(32.dp).clip(CircleShape))
+                            Spacer(Modifier.width(10.dp))
+                        }
                     }
                     Column(Modifier.weight(1f).padding(vertical = if (notification) 0.dp else 4.dp)) {
-                        entry.actor?.let { actor -> Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(actor, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                            if (notification) Text(entry.subtitle.substringAfterLast(" · ").takeLast(5),
-                                style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
-                        } }
-                        Text(entry.title, style = if (notification) IosTheme.type.subheadline else IosTheme.type.body,
-                            maxLines = if (notification) 2 else 3)
+                        if (notification) {
+                            val typeTag = notificationTypeTag(entry.notificationType)
+                            val dateStr = entry.subtitle.substringAfterLast(" · ").takeLast(5)
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(
+                                    Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    if (!entry.actor.isNullOrBlank()) {
+                                        Text(
+                                            text = entry.actor,
+                                            style = IosTheme.type.footnote,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1,
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+                                    Box(
+                                        Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(notificationTypeTint(entry.notificationType).copy(alpha = 0.13f))
+                                            .padding(horizontal = 5.dp, vertical = 1.dp),
+                                    ) {
+                                        Text(
+                                            text = typeTag,
+                                            style = IosTheme.type.caption.copy(fontSize = 11.sp),
+                                            fontWeight = FontWeight.Medium,
+                                            color = notificationTypeTint(entry.notificationType),
+                                        )
+                                    }
+                                }
+                                if (dateStr.isNotBlank()) {
+                                    Text(
+                                        text = dateStr,
+                                        style = IosTheme.type.caption,
+                                        color = IosTheme.colors.secondaryLabel,
+                                        modifier = Modifier.padding(start = 6.dp),
+                                    )
+                                }
+                            }
+                        } else {
+                            entry.actor?.let { actor ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(actor, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                        Text(
+                            text = entry.title,
+                            style = if (notification) IosTheme.type.subheadline else IosTheme.type.body,
+                            maxLines = if (notification) 2 else 3,
+                            modifier = Modifier.padding(top = if (notification) 2.dp else 0.dp),
+                        )
                         if (!notification && entry.subtitle.isNotBlank()) Text(entry.subtitle, style = IosTheme.type.footnote,
                             color = IosTheme.colors.secondaryLabel, maxLines = 3, modifier = Modifier.padding(top = 6.dp))
                     }
@@ -292,6 +359,204 @@ fun ProfileScreen(
     }
 }
 
+@Composable
+private fun notificationTypeTint(type: Int): Color = when (type) {
+    5, 19 -> Color(0xFFFF3B30)
+    25 -> Color(0xFFFF9500)
+    14 -> Color(0xFF30B85B)
+    12 -> Color(0xFFAF52DE)
+    43 -> Color(0xFF5856D6)
+    else -> IosTheme.colors.accent
+}
+
+private fun notificationTypeTag(type: Int): String = when (type) {
+    1, 15 -> "提及"
+    2 -> "回复"
+    3 -> "引用"
+    4 -> "编辑"
+    5, 19 -> "赞了你"
+    6, 7, 16 -> "私信"
+    8 -> "接受邀请"
+    9, 17 -> "新帖"
+    10 -> "移动"
+    11, 38 -> "链接"
+    12 -> "徽章"
+    13 -> "话题邀请"
+    14 -> "解决方案"
+    25 -> "表情回应"
+    27 -> "活动提醒"
+    28 -> "活动邀请"
+    29, 32 -> "聊天提及"
+    30 -> "聊天消息"
+    31 -> "聊天邀请"
+    33 -> "聊天引用"
+    34 -> "指派"
+    43 -> "简评"
+    800, 801, 802 -> "关注动态"
+    else -> "通知"
+}
+
+/**
+ * 参照 Discourse Web 通知列表样式：在圆形头像右上角叠加带白/底色描边的类型角标图标，
+ * 一眼区分回复(弯箭头)、点赞(爱心)、表情回应(笑脸点赞)、采纳解答(勾选框)、徽章(星章)、简评(小火箭)、私信(信封)。
+ */
+@Composable
+private fun NotificationAvatarWithBadge(
+    avatarUrl: String?,
+    actor: String?,
+    notificationType: Int,
+    unread: Boolean,
+) {
+    val cardColor = IosTheme.colors.card
+    val badgeIconColor = when {
+        unread -> IosTheme.colors.accent
+        IosTheme.colors.isDark -> Color(0xFFD1D1D6)
+        else -> Color(0xFF3A3A3C)
+    }
+    Box(Modifier.size(38.dp)) {
+        if (avatarUrl != null) {
+            AsyncImage(
+                model = avatarUrl,
+                contentDescription = actor,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .size(34.dp)
+                    .clip(CircleShape),
+            )
+        } else {
+            Box(
+                Modifier
+                    .align(Alignment.BottomStart)
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .background(IosTheme.colors.fieldBackground),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = actor?.firstOrNull()?.uppercase() ?: "★",
+                    style = IosTheme.type.footnote,
+                    fontWeight = FontWeight.Bold,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+            }
+        }
+        Box(
+            Modifier
+                .align(Alignment.TopEnd)
+                .size(18.dp)
+                .clip(CircleShape)
+                .background(cardColor),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.size(13.dp)) {
+                scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+                    val shape = Path()
+                    when (notificationType) {
+                        // 回复 / 提及 / 引用 / 聊天引用 / 关注回复：左弯箭头 (↩)
+                        1, 2, 3, 9, 15, 33, 801, 802 -> {
+                            shape.moveTo(10f, 5f); shape.lineTo(3f, 11f); shape.lineTo(10f, 17f)
+                            shape.lineTo(10f, 13f); shape.cubicTo(17f, 12f, 19f, 15f, 21f, 20f)
+                            shape.cubicTo(21f, 10f, 17f, 8f, 10f, 9f); shape.close()
+                            drawPath(shape, badgeIconColor)
+                        }
+                        // 点赞 / 合并点赞：实心爱心 (❤)
+                        5, 19 -> {
+                            shape.moveTo(12f, 21f); shape.cubicTo(10f, 19f, 2.5f, 13f, 2.5f, 8f)
+                            shape.cubicTo(2.5f, 2.5f, 9.5f, 1.5f, 12f, 6.2f)
+                            shape.cubicTo(14.5f, 1.5f, 21.5f, 2.5f, 21.5f, 8f)
+                            shape.cubicTo(21.5f, 13f, 14f, 19f, 12f, 21f); shape.close()
+                            drawPath(shape, badgeIconColor)
+                        }
+                        // 表情回应：圆脸 + 微笑弧线 + 右侧小拇指
+                        25 -> {
+                            drawCircle(badgeIconColor, radius = 7.5f, center = Offset(9.5f, 12f), style = Stroke(2.2f))
+                            drawCircle(badgeIconColor, radius = 1.2f, center = Offset(7f, 10.2f))
+                            drawCircle(badgeIconColor, radius = 1.2f, center = Offset(12f, 10.2f))
+                            drawArc(
+                                color = badgeIconColor,
+                                startAngle = 25f,
+                                sweepAngle = 130f,
+                                useCenter = false,
+                                topLeft = Offset(6.5f, 11f),
+                                size = androidx.compose.ui.geometry.Size(6f, 4.5f),
+                                style = Stroke(2f),
+                            )
+                            shape.moveTo(18f, 11f); shape.lineTo(19.5f, 7f); shape.lineTo(21.5f, 7.8f)
+                            shape.lineTo(20.5f, 11f); shape.lineTo(23f, 11f); shape.lineTo(22.2f, 16.5f)
+                            shape.lineTo(18f, 16.5f); shape.close()
+                            drawPath(shape, badgeIconColor)
+                        }
+                        // 采纳解决方案：圆角方框 + 对勾 (☑)
+                        14 -> {
+                            if (unread) {
+                                drawRoundRect(
+                                    color = badgeIconColor,
+                                    topLeft = Offset(3f, 3f),
+                                    size = androidx.compose.ui.geometry.Size(18f, 18f),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f),
+                                    style = Stroke(2.4f),
+                                )
+                                shape.moveTo(7.5f, 12.2f); shape.lineTo(10.6f, 15.3f); shape.lineTo(16.8f, 9f)
+                                drawPath(shape, badgeIconColor, style = Stroke(2.4f))
+                            } else {
+                                drawRoundRect(
+                                    color = badgeIconColor,
+                                    topLeft = Offset(3f, 3f),
+                                    size = androidx.compose.ui.geometry.Size(18f, 18f),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f),
+                                )
+                                shape.moveTo(7.5f, 12.2f); shape.lineTo(10.6f, 15.3f); shape.lineTo(16.8f, 9f)
+                                drawPath(shape, cardColor, style = Stroke(2.4f))
+                            }
+                        }
+                        // 获赠徽章：多角星章 (☀)
+                        12 -> {
+                            val points = 12
+                            val outerR = 9.5f
+                            val innerR = 7.2f
+                            for (i in 0 until points * 2) {
+                                val r = if (i % 2 == 0) outerR else innerR
+                                val angle = i * Math.PI / points
+                                val x = 12f + (r * kotlin.math.cos(angle)).toFloat()
+                                val y = 12f + (r * kotlin.math.sin(angle)).toFloat()
+                                if (i == 0) shape.moveTo(x, y) else shape.lineTo(x, y)
+                            }
+                            shape.close()
+                            drawPath(shape, badgeIconColor)
+                        }
+                        // 简评 (Boost)：小火箭 (🚀)
+                        43 -> {
+                            shape.moveTo(20f, 4f)
+                            shape.cubicTo(15f, 4f, 10.5f, 7.5f, 8.5f, 12f)
+                            shape.lineTo(5f, 13f); shape.lineTo(7.5f, 15.5f)
+                            shape.lineTo(8.5f, 15.5f); shape.lineTo(11f, 19f)
+                            shape.lineTo(12f, 15.5f)
+                            shape.cubicTo(16.5f, 13.5f, 20f, 9f, 20f, 4f)
+                            shape.close()
+                            drawPath(shape, badgeIconColor)
+                            drawCircle(cardColor, radius = 1.6f, center = Offset(14.5f, 9.5f))
+                        }
+                        // 私信：信封 (✉)
+                        6, 7, 16 -> {
+                            shape.moveTo(3f, 6f); shape.lineTo(21f, 6f); shape.lineTo(21f, 18f)
+                            shape.lineTo(3f, 18f); shape.close()
+                            shape.moveTo(3f, 7f); shape.lineTo(12f, 13.5f); shape.lineTo(21f, 7f)
+                            drawPath(shape, badgeIconColor, style = Stroke(2.2f))
+                        }
+                        // 其他通知：小铃铛
+                        else -> {
+                            shape.moveTo(5f, 17f); shape.lineTo(7f, 14f); shape.lineTo(7f, 9f)
+                            shape.cubicTo(7f, 2.5f, 17f, 2.5f, 17f, 9f)
+                            shape.lineTo(17f, 14f); shape.lineTo(19f, 17f); shape.close()
+                            drawPath(shape, badgeIconColor)
+                            drawCircle(badgeIconColor, 1.8f, Offset(12f, 20f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun NotificationTabIcon(filter: NotificationFilter, color: Color) {
@@ -329,8 +594,15 @@ private fun NotificationTabIcon(filter: NotificationFilter, color: Color) {
 }
 
 @Composable
-fun SettingsScreen(treeView: Boolean, onTreeView: (Boolean) -> Unit, onBack: () -> Unit,
-    themeMode: ThemeMode, onThemeMode: (ThemeMode) -> Unit) {
+fun SettingsScreen(
+    treeView: Boolean,
+    onTreeView: (Boolean) -> Unit,
+    onBack: () -> Unit,
+    themeMode: ThemeMode,
+    onThemeMode: (ThemeMode) -> Unit,
+    updateState: UpdateUiState = UpdateUiState(),
+    onCheckUpdate: () -> Unit = {},
+) {
     IosLargeTitleScaffold(title = "设置", onBack = onBack) {
         item("appearance") {
             SectionTitle("外观")
@@ -350,12 +622,255 @@ fun SettingsScreen(treeView: Boolean, onTreeView: (Boolean) -> Unit, onBack: () 
                 IosRow(onClick = { onTreeView(!treeView) }) {
                     Column(Modifier.weight(1f)) {
                         Text("树形查看话题", style = IosTheme.type.body)
-                        Text("按回复关系排列，关闭后按楼层顺序显示", style = IosTheme.type.footnote,
-                            color = IosTheme.colors.secondaryLabel, modifier = Modifier.padding(top = 4.dp))
+                        Text(
+                            "按回复关系排列，关闭后按楼层顺序显示",
+                            style = IosTheme.type.footnote,
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
                     }
                     IosSwitch(checked = treeView, onCheckedChange = onTreeView)
                 }
             }
+        }
+        item("about") {
+            SectionTitle("版本与更新")
+            IosGroupCard {
+                IosRow {
+                    Text("当前版本", style = IosTheme.type.body, modifier = Modifier.weight(1f))
+                    Text(
+                        "v${updateState.currentVersion}",
+                        style = IosTheme.type.subheadline,
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                }
+                IosDivider()
+                IosRow(onClick = onCheckUpdate) {
+                    Column(Modifier.weight(1f)) {
+                        Text("检查更新", style = IosTheme.type.body)
+                        updateState.statusMessage?.let { msg ->
+                            Text(
+                                msg,
+                                style = IosTheme.type.footnote,
+                                color = if (updateState.updateInfo != null) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
+                    }
+                    when {
+                        updateState.checking -> IosActivityIndicator(diameter = 18.dp)
+                        updateState.updateInfo != null -> {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Box(
+                                    Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(Color(0xFFFF3B30))
+                                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        "NEW v${updateState.updateInfo.latestVersion}",
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        lineHeight = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                }
+                                Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
+                            }
+                        }
+                        else -> Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun UpdateDialog(
+    currentVersion: String,
+    info: UpdateInfo,
+    onDismiss: (ignoreThisVersion: Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    Dialog(
+        onDismissRequest = { if (!info.mandatory) onDismiss(false) },
+        properties = DialogProperties(
+            dismissOnBackPress = !info.mandatory,
+            dismissOnClickOutside = !info.mandatory,
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(
+                            if (info.mandatory) {
+                                IosTheme.colors.destructive.copy(alpha = 0.14f)
+                            } else {
+                                IosTheme.colors.accent.copy(alpha = 0.14f)
+                            },
+                        )
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        text = if (info.mandatory) "必升版本" else "发现新版本",
+                        style = IosTheme.type.footnote,
+                        color = if (info.mandatory) IosTheme.colors.destructive else IosTheme.colors.accent,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                Text(
+                    text = "v$currentVersion → v${info.latestVersion}",
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = info.title,
+                style = IosTheme.type.title3,
+                color = IosTheme.colors.label,
+            )
+
+            Spacer(Modifier.height(10.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 64.dp, max = 220.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.fieldBackground)
+                    .padding(12.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    text = info.changelog,
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.label,
+                    lineHeight = 19.sp,
+                )
+            }
+
+            if (info.mandatory) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "当前版本包含关键协议或安全更新，请升级至最新版本后继续使用。",
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.destructive,
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(IosTheme.colors.accent)
+                    .clickable {
+                        openInDefaultBrowser(context, info.downloadUrl)
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "立即升级 (v${info.latestVersion})",
+                    style = IosTheme.type.body,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            if (!info.mandatory) {
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onDismiss(true) }
+                            .padding(vertical = 8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "忽略此版本",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.secondaryLabel,
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onDismiss(false) }
+                            .padding(vertical = 8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "稍后提醒",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.accent,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 优先调用系统设置中的“默认浏览器”打开升级链接，避免被装有特定下载接管过滤器的第三方应用（如某些下载器）误拦截。
+ */
+fun openInDefaultBrowser(context: android.content.Context, url: String) {
+    val uri = Uri.parse(url)
+    // 1. 构造一个纯网页意图，向系统 PackageManager 查询系统设置中指定的真正“默认浏览器”
+    val probeIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://linux.do")).apply {
+        addCategory(Intent.CATEGORY_BROWSABLE)
+    }
+    val defaultBrowserPkg = runCatching {
+        context.packageManager
+            .resolveActivity(probeIntent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+            ?.activityInfo?.packageName
+            ?.takeIf { it != "android" && it != "com.google.android.packageinstaller" }
+    }.getOrNull()
+
+    val targetIntent = Intent(Intent.ACTION_VIEW, uri).apply {
+        addCategory(Intent.CATEGORY_BROWSABLE)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (!defaultBrowserPkg.isNullOrBlank()) {
+            setPackage(defaultBrowserPkg)
+        }
+    }
+    val launched = runCatching {
+        context.startActivity(targetIntent)
+        true
+    }.getOrDefault(false)
+
+    if (!launched) {
+        // 兜底：若指定包名启动失败，移除包名并使用通用选择器唤起
+        runCatching {
+            val fallback = Intent(Intent.ACTION_VIEW, uri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(fallback)
         }
     }
 }

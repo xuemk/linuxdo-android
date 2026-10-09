@@ -1,13 +1,20 @@
 package org.linuxdo.android.net
 
 import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import org.linuxdo.android.Config
@@ -61,23 +68,7 @@ class OkHttpTransport(
             .header("X-CSRF-Token", csrf)
             .post(body)
             .build()
-        return try {
-            withContext(Dispatchers.IO) {
-                client.newCall(request).execute().use { response ->
-                    val setCookies = Cookie.parseAll(response.request.url, response.headers)
-                    val text = response.body?.string().orEmpty()
-                    val mitigated = response.header("cf-mitigated")
-                    withContext(Dispatchers.Main) { store.applyResponseCookies(setCookies) }
-                    TransportResult(
-                        status = response.code,
-                        body = text,
-                        challenged = ChallengeDetector.isChallenge(response.code, mitigated, text),
-                    )
-                }
-            }
-        } catch (error: IOException) {
-            TransportResult(0, error.message.orEmpty(), false)
-        }
+        return runRequest(request)
     }
 
     private suspend fun execute(path: String, csrf: String? = null, method: String = "GET", body: String? = null): TransportResult {
@@ -92,22 +83,50 @@ class OkHttpTransport(
                 .header("X-CSRF-Token", csrf) }
             .build()
 
-        return try {
-            withContext(Dispatchers.IO) {
-                client.newCall(request).execute().use { response ->
-                    val setCookies = Cookie.parseAll(response.request.url, response.headers)
-                    val body = response.body?.string().orEmpty()
-                    val mitigated = response.header("cf-mitigated")
-                    withContext(Dispatchers.Main) { store.applyResponseCookies(setCookies) }
-                    TransportResult(
-                        status = response.code,
-                        body = body,
-                        challenged = ChallengeDetector.isChallenge(response.code, mitigated, body),
-                    )
+        return runRequest(request)
+    }
+
+    private suspend fun runRequest(request: Request): TransportResult = try {
+        val (setCookies, result) = suspendCancellableCoroutine<Pair<List<Cookie>, TransportResult>> { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(e)
+                    }
                 }
-            }
-        } catch (error: IOException) {
-            TransportResult(0, error.message.orEmpty(), false)
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { resp ->
+                            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                            val text = resp.body?.string().orEmpty()
+                            val mitigated = resp.header("cf-mitigated")
+                            val transportResult = TransportResult(
+                                status = resp.code,
+                                body = text,
+                                challenged = ChallengeDetector.isChallenge(resp.code, mitigated, text),
+                            )
+                            if (continuation.isActive) {
+                                continuation.resume(cookies to transportResult)
+                            }
+                        }
+                    } catch (error: IOException) {
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(error)
+                        }
+                    }
+                }
+            })
         }
+        if (setCookies.isNotEmpty()) {
+            withContext(Dispatchers.Main) { store.applyResponseCookies(setCookies) }
+        }
+        result
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: IOException) {
+        TransportResult(0, error.message.orEmpty(), false)
     }
 }

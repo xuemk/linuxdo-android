@@ -1,11 +1,13 @@
 package org.linuxdo.android.ui.html
 
+import android.util.LruCache
 import java.net.URI
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
 import org.linuxdo.android.Config
+import org.linuxdo.android.data.Post
 
 data class InlineText(
     val text: String,
@@ -21,7 +23,13 @@ sealed interface CookedBlock {
     data class Paragraph(val runs: List<InlineText>) : CookedBlock
     data class Code(val text: String) : CookedBlock
     data class Quote(val blocks: List<CookedBlock>) : CookedBlock
-    data class Picture(val url: String, val description: String, val originalUrl: String = url) : CookedBlock
+    data class Picture(
+        val url: String,
+        val description: String,
+        val originalUrl: String = url,
+        val width: Int = 0,
+        val height: Int = 0,
+    ) : CookedBlock
     data class ListBlock(val entries: List<List<CookedBlock>>, val start: Int?) : CookedBlock
     data object Divider : CookedBlock
 }
@@ -60,6 +68,27 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
 
     fun parse(html: String): List<CookedBlock> = blocks(Jsoup.parseBodyFragment(html).body().childNodes())
 
+    companion object {
+        private val blockCache = LruCache<String, List<CookedBlock>>(600)
+
+        fun parseCached(html: String, onUnknown: (String) -> Unit = {}): List<CookedBlock> {
+            if (html.isBlank()) return emptyList()
+            synchronized(blockCache) { blockCache.get(html) }?.let { return it }
+            val parsed = CookedParser(onUnknown).parse(html)
+            synchronized(blockCache) { blockCache.put(html, parsed) }
+            return parsed
+        }
+
+        fun prewarm(posts: Iterable<Post>) {
+            for (post in posts) {
+                parseCached(post.cooked)
+                for (boost in post.boosts) {
+                    parseCached(boost.cooked)
+                }
+            }
+        }
+    }
+
     private fun isLightboxMeta(element: Element): Boolean =
         element.hasClass("meta") ||
             element.hasClass("filename") ||
@@ -86,10 +115,14 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
 
     private fun pictureBlockOf(img: Element): CookedBlock.Picture? {
         val urls = resolvePictureUrls(img) ?: return null
+        val w = img.attr("width").toIntOrNull()?.takeIf { it > 0 } ?: 0
+        val h = img.attr("height").toIntOrNull()?.takeIf { it > 0 } ?: 0
         return CookedBlock.Picture(
             url = urls.first,
             description = img.attr("alt").ifBlank { "帖子图片" },
             originalUrl = urls.second,
+            width = w,
+            height = h,
         )
     }
 

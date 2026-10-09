@@ -21,7 +21,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import okhttp3.Request
 import org.linuxdo.android.App
+import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.Category
@@ -33,18 +40,40 @@ import org.linuxdo.android.data.ProfilePage
 import org.linuxdo.android.data.NotificationFilter
 import org.linuxdo.android.data.UploadLimits
 import org.linuxdo.android.data.effectiveReplyToPostNumber
+import org.linuxdo.android.data.threadRows
 import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkPath
+import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.ui.screen.TopicListUiState
 
 enum class Screen { Boot, Login, Verify, List }
+
+data class UpdateInfo(
+    val latestVersion: String,
+    val title: String,
+    val changelog: String,
+    val downloadUrl: String,
+    val releasePageUrl: String,
+    val mandatory: Boolean,
+)
+
+data class UpdateUiState(
+    val currentVersion: String = BuildConfig.VERSION_NAME.substringBefore("-"),
+    val currentVersionCode: Int = BuildConfig.VERSION_CODE,
+    val checking: Boolean = false,
+    val updateInfo: UpdateInfo? = null,
+    val showDialog: Boolean = false,
+    val statusMessage: String? = null,
+)
 
 data class LoginUiState(
     val loading: Boolean = false,
     val sendingCode: Boolean = false,
     val error: String? = null,
     val emailSent: Boolean = false,
+    val secondFactorRequired: Boolean = false,
+    val backupEnabled: Boolean = false,
 )
 enum class ThemeMode(val label: String) { System("跟随系统"), Light("浅色"), Dark("深色") }
 enum class DetailLoad { Topic, Next, Previous }
@@ -55,6 +84,7 @@ data class DetailUiState(
     val consumedIds: Set<Long> = emptySet(),
     val category: Category? = null,
     val loading: Boolean = false,
+    val refreshing: Boolean = false,
     val error: String? = null,
     val replyCursors: Map<Long, Int> = emptyMap(),
     val completedReplies: Set<Long> = emptySet(),
@@ -212,27 +242,355 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _loginUiState = MutableStateFlow(LoginUiState())
     val loginUiState: StateFlow<LoginUiState> = _loginUiState.asStateFlow()
 
+    private val _updateState = MutableStateFlow(UpdateUiState())
+    val updateState: StateFlow<UpdateUiState> = _updateState.asStateFlow()
+
+    fun dismissUpdateDialog(ignoreThisVersion: Boolean = false) {
+        val current = _updateState.value
+        val info = current.updateInfo ?: return
+        if (info.mandatory) return
+        if (ignoreThisVersion) {
+            container.preferences.edit { putString("ignored_update_version", info.latestVersion) }
+        }
+        _updateState.update { it.copy(showDialog = false) }
+    }
+
+    /**
+     * 检查最新版本，优先读取公开仓库根目录的 `version.json` 静态版本清单，
+     * 若 `version.json` 不可达则回退至 GitHub Releases 接口。
+     *
+     * 必升级触发规则（满足任一即为必升级）：
+     * 1. `version.json` 中 `forceUpdate: true`
+     * 2. `version.json` 中 `minVersionCode` 大于当前 `versionCode`（或 `minVersionName` 高于当前版本）
+     * 3. 回退 Release 正文包含 `[force]`、`[mandatory]`、`[必升]`、`[min_version: X.Y.Z]` 或 `[min_code: N]`
+     */
+    fun checkForUpdates(manual: Boolean = false) {
+        if (_updateState.value.checking) return
+        viewModelScope.launch {
+            _updateState.update {
+                it.copy(
+                    checking = true,
+                    statusMessage = if (manual) "正在检查新版本..." else it.statusMessage,
+                )
+            }
+            try {
+                val currentVersion = _updateState.value.currentVersion
+                val currentCode = _updateState.value.currentVersionCode
+                val info = withContext(Dispatchers.IO) {
+                    for (manifestUrl in Config.UPDATE_VERSION_JSON_URLS) {
+                        val manifestJson = runCatching {
+                            val req = Request.Builder()
+                                .url(manifestUrl)
+                                .header("Accept", "application/vnd.github.raw+json, application/json;q=0.9")
+                                .header("Cache-Control", "no-cache")
+                                .header("User-Agent", container.userAgent)
+                                .get()
+                                .build()
+                            container.httpClient.newCall(req).execute().use { resp ->
+                                if (!resp.isSuccessful) {
+                                    throw HttpStatusException(resp.code, "Manifest HTTP ${resp.code}")
+                                }
+                                resp.body?.string().orEmpty()
+                            }
+                        }.getOrNull()
+                        if (!manifestJson.isNullOrBlank()) {
+                            val (parsed, manifestInfo) = parseVersionManifest(manifestJson, currentVersion, currentCode)
+                            if (parsed) {
+                                return@withContext manifestInfo
+                            }
+                        }
+                    }
+
+                    val (_, localManifestInfo) = parseVersionManifest(
+                        Config.FALLBACK_VERSION_MANIFEST_JSON,
+                        currentVersion,
+                        currentCode,
+                    )
+                    if (localManifestInfo != null) {
+                        return@withContext localManifestInfo
+                    }
+
+                    val apiJson = runCatching {
+                        val req = Request.Builder()
+                            .url(Config.UPDATE_RELEASES_API_URL)
+                            .header("Accept", "application/vnd.github+json")
+                            .header("User-Agent", container.userAgent)
+                            .get()
+                            .build()
+                        container.httpClient.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) {
+                                throw HttpStatusException(resp.code, "GitHub API HTTP ${resp.code}")
+                            }
+                            resp.body?.string().orEmpty()
+                        }
+                    }.getOrNull()
+
+                    if (!apiJson.isNullOrBlank()) {
+                        parseReleaseUpdateInfo(apiJson, currentVersion, currentCode)
+                    } else {
+                        // 兜底：若 api.github.com 触发匿名限流或连接受阻，直接请求 GitHub Releases 页面利用 302 重定向提取最新 tag。
+                        val req = Request.Builder()
+                            .url(Config.UPDATE_RELEASES_PAGE_URL)
+                            .header("Accept", "text/html,application/xhtml+xml")
+                            .header("User-Agent", container.userAgent)
+                            .get()
+                            .build()
+                        container.httpClient.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) {
+                                throw HttpStatusException(resp.code, "GitHub Releases HTTP ${resp.code}")
+                            }
+                            val finalUrl = resp.request.url.toString()
+                            val html = resp.body?.string().orEmpty()
+                            parseReleaseHtmlFallback(finalUrl, html, currentVersion, currentCode)
+                        }
+                    }
+                }
+                if (info != null) {
+                    val ignoredVersion = container.preferences.getString("ignored_update_version", null)
+                    val shouldPopup = info.mandatory || manual || ignoredVersion != info.latestVersion
+                    diagnostics.log("检测到新版本: v${info.latestVersion} (必升=${info.mandatory})")
+                    _updateState.update {
+                        it.copy(
+                            checking = false,
+                            updateInfo = info,
+                            showDialog = shouldPopup,
+                            statusMessage = "发现新版本 v${info.latestVersion}",
+                        )
+                    }
+                } else {
+                    diagnostics.log("版本检查完成: 当前已是最新 (v$currentVersion)")
+                    _updateState.update {
+                        it.copy(
+                            checking = false,
+                            updateInfo = null,
+                            showDialog = false,
+                            statusMessage = if (manual) "当前已是最新版本 (v$currentVersion)" else null,
+                        )
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("检查更新失败: ${error.message}")
+                _updateState.update {
+                    it.copy(
+                        checking = false,
+                        statusMessage = if (manual) "检查更新失败，请稍后重试" else it.statusMessage,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun parseVersionManifest(
+        rawJson: String,
+        currentVersion: String,
+        currentCode: Int,
+    ): Pair<Boolean, UpdateInfo?> {
+        val outer = runCatching { Json.parseToJsonElement(rawJson).jsonObject }.getOrNull() ?: return false to null
+        val root = if (outer["versionName"] == null && outer["encoding"]?.jsonPrimitive?.contentOrNull == "base64") {
+            val encoded = outer["content"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val decoded = runCatching {
+                String(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+            }.getOrNull().orEmpty()
+            runCatching { Json.parseToJsonElement(decoded).jsonObject }.getOrNull() ?: return false to null
+        } else {
+            outer
+        }
+
+        val latestVersion = root["versionName"]?.jsonPrimitive?.contentOrNull
+            ?.removePrefix("v")?.removePrefix("V")?.substringBefore("-")?.trim().orEmpty()
+        if (latestVersion.isEmpty()) return false to null
+
+        val latestCode = root["versionCode"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+        val isNewer = if (latestCode > 0 && currentCode > 0) {
+            latestCode > currentCode || compareVersions(latestVersion, currentVersion) > 0
+        } else {
+            compareVersions(latestVersion, currentVersion) > 0
+        }
+        if (!isNewer) return true to null
+
+        val title = root["title"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: "v$latestVersion 版本更新"
+        val changelogElement = root["changelog"]
+        val changelog = when {
+            changelogElement == null -> ""
+            runCatching { changelogElement.jsonArray }.isSuccess -> {
+                changelogElement.jsonArray
+                    .mapNotNull { runCatching { it.jsonPrimitive.contentOrNull?.trim() }.getOrNull() }
+                    .filter { it.isNotEmpty() }
+                    .joinToString("\n")
+            }
+            else -> runCatching { changelogElement.jsonPrimitive.contentOrNull?.trim().orEmpty() }.getOrDefault("")
+        }.ifBlank { "优化使用体验并修复已知问题。" }
+
+        val forceUpdate = root["forceUpdate"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+        val minVersionCode = root["minVersionCode"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+        val minVersionName = root["minVersionName"]?.jsonPrimitive?.contentOrNull
+            ?.removePrefix("v")?.removePrefix("V")?.trim()
+        val mandatory = forceUpdate ||
+            (minVersionCode != null && currentCode < minVersionCode) ||
+            (!minVersionName.isNullOrBlank() && compareVersions(currentVersion, minVersionName) < 0)
+
+        val apkUrl = root["apkUrl"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: Config.UPDATE_RELEASES_PAGE_URL
+        val releasePageUrl = root["releasePageUrl"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: Config.UPDATE_RELEASES_PAGE_URL
+
+        return true to UpdateInfo(
+            latestVersion = latestVersion,
+            title = title,
+            changelog = changelog,
+            downloadUrl = apkUrl,
+            releasePageUrl = releasePageUrl,
+            mandatory = mandatory,
+        )
+    }
+
+    private fun parseReleaseUpdateInfo(
+        rawJson: String,
+        currentVersion: String,
+        currentCode: Int,
+    ): UpdateInfo? {
+        val root = runCatching { Json.parseToJsonElement(rawJson).jsonObject }.getOrNull() ?: return null
+        val tagName = root["tag_name"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+        val latestVersion = tagName.removePrefix("v").removePrefix("V").substringBefore("-").trim()
+        if (latestVersion.isEmpty() || compareVersions(latestVersion, currentVersion) <= 0) {
+            return null
+        }
+        val releaseName = root["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: "v$latestVersion 版本更新"
+        val htmlUrl = root["html_url"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: Config.UPDATE_RELEASES_PAGE_URL
+        val assets = root["assets"]?.jsonArray.orEmpty()
+        val apkUrl = assets.firstNotNullOfOrNull { element ->
+            val obj = element.jsonObject
+            val name = obj["name"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val url = obj["browser_download_url"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            if (name.endsWith(".apk", ignoreCase = true) && url.isNotBlank()) url else null
+        } ?: htmlUrl
+
+        val rawBody = root["body"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        return buildUpdateInfo(latestVersion, releaseName, rawBody, apkUrl, htmlUrl, currentVersion, currentCode)
+    }
+
+    private fun parseReleaseHtmlFallback(
+        finalUrl: String,
+        html: String,
+        currentVersion: String,
+        currentCode: Int,
+    ): UpdateInfo? {
+        val tagName = finalUrl.substringAfter("/releases/tag/", "").substringBefore("?").substringBefore("#").trim()
+            .ifBlank {
+                Regex("""/releases/tag/(v?[0-9][^"'/\s<>]*)""").find(html)?.groupValues?.getOrNull(1).orEmpty()
+            }
+        val latestVersion = tagName.removePrefix("v").removePrefix("V").substringBefore("-").trim()
+        if (latestVersion.isEmpty() || compareVersions(latestVersion, currentVersion) <= 0) {
+            return null
+        }
+        val repoBase = Config.UPDATE_RELEASES_PAGE_URL.substringBefore("/releases")
+        val apkUrl = "$repoBase/releases/download/$tagName/linuxdo-$latestVersion-release.apk"
+        val bodyText = runCatching {
+            org.jsoup.Jsoup.parse(html).select(".markdown-body").firstOrNull()?.wholeText()?.trim().orEmpty()
+        }.getOrDefault("")
+        return buildUpdateInfo(
+            latestVersion = latestVersion,
+            releaseName = "v$latestVersion 版本更新",
+            rawBody = bodyText,
+            apkUrl = apkUrl,
+            htmlUrl = finalUrl.ifBlank { Config.UPDATE_RELEASES_PAGE_URL },
+            currentVersion = currentVersion,
+            currentCode = currentCode,
+        )
+    }
+
+    private fun buildUpdateInfo(
+        latestVersion: String,
+        releaseName: String,
+        rawBody: String,
+        apkUrl: String,
+        htmlUrl: String,
+        currentVersion: String,
+        currentCode: Int,
+    ): UpdateInfo {
+        val hasForceFlag = Regex("""\[(force|mandatory|必升)]|force_update\s*:\s*true""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(rawBody)
+        val minVersionMatch = Regex("""\[min_version\s*:\s*v?([0-9.]+)]""", RegexOption.IGNORE_CASE)
+            .find(rawBody)?.groupValues?.getOrNull(1)
+        val minCodeMatch = Regex("""\[min_code\s*:\s*(\d+)]""", RegexOption.IGNORE_CASE)
+            .find(rawBody)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val belowMinVersion = minVersionMatch != null && compareVersions(currentVersion, minVersionMatch) < 0
+        val belowMinCode = minCodeMatch != null && currentCode < minCodeMatch
+        val mandatory = hasForceFlag || belowMinVersion || belowMinCode
+
+        val cleanChangelog = rawBody
+            .replace(Regex("""\[(force|mandatory|必升)]""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\[min_version\s*:\s*v?[0-9.]+]""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\[min_code\s*:\s*\d+]""", RegexOption.IGNORE_CASE), "")
+            .trim()
+            .ifBlank { "优化使用体验并修复已知问题。" }
+
+        return UpdateInfo(
+            latestVersion = latestVersion,
+            title = releaseName,
+            changelog = cleanChangelog,
+            downloadUrl = apkUrl,
+            releasePageUrl = htmlUrl,
+            mandatory = mandatory,
+        )
+    }
+
+    private fun compareVersions(v1: String, v2: String): Int {
+        val parts1 = v1.split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
+        val parts2 = v2.split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
+        val maxLen = maxOf(parts1.size, parts2.size)
+        for (i in 0 until maxLen) {
+            val a = parts1.getOrElse(i) { 0 }
+            val b = parts2.getOrElse(i) { 0 }
+            if (a != b) return a.compareTo(b)
+        }
+        return 0
+    }
+
     fun dismissLoginError() {
         _loginUiState.update { it.copy(error = null, emailSent = false) }
     }
 
-    /** 账号密码登录：先拿 CSRF token，再 POST /session。 */
-    fun loginWithPassword(login: String, password: String) {
+    fun resetSecondFactor() {
+        _loginUiState.update { it.copy(secondFactorRequired = false, backupEnabled = false, error = null) }
+    }
+
+    /** 账号密码登录：先拿 CSRF token，再 POST /session（支持 2FA 两步验证）。 */
+    fun loginWithPassword(
+        login: String,
+        password: String,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+    ) {
         if (_loginUiState.value.loading) return
         viewModelScope.launch {
             _loginUiState.update { it.copy(loading = true, error = null) }
             try {
-                val result = repository.sessionLogin(login, password)
+                val result = repository.sessionLogin(login, password, secondFactorToken, secondFactorMethod)
                 if (result) {
                     diagnostics.log("原生密码登录成功，回调 boot()")
-                    _loginUiState.update { it.copy(loading = false) }
+                    _loginUiState.update { LoginUiState() }
                     boot()
                 } else {
                     _loginUiState.update { it.copy(loading = false, error = "用户名或密码错误，请检查后重试。") }
                 }
             } catch (error: CancellationException) {
                 throw error
-            } catch (error: org.linuxdo.android.net.NeedsInteractiveVerification) {
+            } catch (error: SecondFactorRequiredException) {
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        secondFactorRequired = true,
+                        backupEnabled = error.backupEnabled,
+                        error = null,
+                    )
+                }
+            } catch (error: NeedsInteractiveVerification) {
                 _loginUiState.update { it.copy(loading = false) }
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
             } catch (error: Exception) {
@@ -251,7 +609,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _loginUiState.update { it.copy(sendingCode = false, emailSent = true) }
             } catch (error: CancellationException) {
                 throw error
-            } catch (error: org.linuxdo.android.net.NeedsInteractiveVerification) {
+            } catch (error: NeedsInteractiveVerification) {
                 _loginUiState.update { it.copy(sendingCode = false) }
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
             } catch (error: Exception) {
@@ -261,15 +619,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 用用户从邮件链接中复制的 token 完成登录。
-     *
-     * 直接 POST /session/email-login/{token}，不走 WebView。
-     * 早先的实现是让 WebView 打开那个 URL —— 但 GET 只是 token 预检、渲染一个
-     * "完成登录"确认页，并不建立会话，所以用户会看到网页确认页然后被弹回登录页。
+     * 用用户从邮件链接中复制的 token 完成登录（支持 2FA 两步验证）。
      */
-    fun loginWithEmailCode(email: String, token: String) {
+    fun loginWithEmailCode(
+        email: String,
+        token: String,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+    ) {
         if (_loginUiState.value.loading) return
-        // 在 try 之外声明:catch 分支要用它记录待重放的 token。
         val sanitizedToken = token.trim()
         viewModelScope.launch {
             _loginUiState.update { it.copy(loading = true, error = null) }
@@ -278,15 +636,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _loginUiState.update { it.copy(loading = false, error = "请输入邮件链接中的 token") }
                     return@launch
                 }
-                repository.emailLoginWithToken(sanitizedToken)
-                // 会话 Cookie 已由 Transport 层落盘,boot() 会再同步一次并复核登录态。
+                repository.emailLoginWithToken(sanitizedToken, secondFactorToken, secondFactorMethod)
                 diagnostics.log("邮件 token 登录成功,复核会话")
-                _loginUiState.update { it.copy(loading = false) }
+                _loginUiState.update { LoginUiState() }
                 boot()
             } catch (error: CancellationException) {
                 throw error
-            } catch (error: org.linuxdo.android.net.NeedsInteractiveVerification) {
-                // 只有写请求被 CF 拦下时才需要用户出面验证。记下 token 待验证通过后重放。
+            } catch (error: SecondFactorRequiredException) {
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        secondFactorRequired = true,
+                        backupEnabled = error.backupEnabled,
+                        error = null,
+                    )
+                }
+            } catch (error: NeedsInteractiveVerification) {
                 _loginUiState.update { it.copy(loading = false) }
                 pendingEmailLoginToken = sanitizedToken
                 enterWebScreen(Screen.Verify, error.message.orEmpty())
@@ -302,12 +667,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _loginUiState.update { it.copy(loading = true, error = null) }
             try {
                 repository.emailLoginWithToken(sanitizedToken)
-                _loginUiState.update { it.copy(loading = false) }
+                _loginUiState.update { LoginUiState() }
                 boot()
             } catch (error: CancellationException) {
                 throw error
+            } catch (error: SecondFactorRequiredException) {
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        secondFactorRequired = true,
+                        backupEnabled = error.backupEnabled,
+                        error = null,
+                    )
+                }
+                _state.update { it.copy(screen = Screen.Login) }
             } catch (error: Exception) {
-                // token 是一次性的,重放失败通常意味着它已被消耗或过期,只能让用户重新取一次。
                 _loginUiState.update {
                     it.copy(loading = false, error = error.message ?: "登录失败，请重新获取验证码。")
                 }
@@ -432,12 +806,80 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             retry = true, postNumber = postNumber)
     }
 
+    fun refreshTopic(id: Long, silent: Boolean = false) {
+        val current = _details.value[id] ?: return
+        if (current.loading || current.refreshing || current.reactingPosts.isNotEmpty()) return
+        if (pageJobs["topic:$id"]?.isActive == true) return
+        pageJobs["topic:$id"] = viewModelScope.launch {
+            if (!silent) {
+                _details.update { states ->
+                    states[id]?.let { states + (id to it.copy(refreshing = true, error = null)) } ?: states
+                }
+            }
+            try {
+                val freshTopic = repository.fetchTopic(id)
+                val freshById = freshTopic.postStream.posts.associateBy { it.id }
+                val latest = _details.value[id] ?: current
+                val wasAtEnd = latest.remaining.isEmpty()
+                val updatedExisting = latest.posts.map { freshById[it.id] ?: it }
+                var mergedPosts = (updatedExisting + freshTopic.postStream.posts)
+                    .distinctBy { it.id }
+                    .sortedBy { it.postNumber }
+                var consumed = latest.consumedIds + freshTopic.postStream.posts.map { it.id }
+
+                val windowIdx = freshTopic.postStream.stream.indexOf(latest.windowStartId).coerceAtLeast(0)
+                val newRemaining = freshTopic.postStream.stream.drop(windowIdx).filterNot { it in consumed }
+                // 若刷新前用户已看完旧楼层，且服务端出现了新回复，直接把最新一批新回复拉下来并入列表。
+                if (wasAtEnd && newRemaining.isNotEmpty()) {
+                    val tailBatch = newRemaining.take(20)
+                    val fetchedTail = runCatching { repository.fetchPosts(id, tailBatch) }.getOrNull()
+                    if (fetchedTail != null) {
+                        mergedPosts = (mergedPosts + fetchedTail).distinctBy { it.id }.sortedBy { it.postNumber }
+                        consumed = consumed + tailBatch
+                    }
+                }
+                _details.update { states ->
+                    val cur = states[id] ?: return@update states
+                    states + (id to cur.copy(
+                        topic = freshTopic,
+                        posts = mergedPosts,
+                        consumedIds = consumed,
+                        refreshing = false,
+                        error = null,
+                    ))
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (!silent) {
+                    _details.update { states ->
+                        states[id]?.let {
+                            states + (id to it.copy(error = error.message ?: "刷新失败", failedLoad = DetailLoad.Topic))
+                        } ?: states
+                    }
+                    handlePageFailure(error) { refreshTopic(id, silent = false) }
+                }
+            } finally {
+                _details.update { states ->
+                    states[id]?.let { states + (id to it.copy(refreshing = false)) } ?: states
+                }
+            }
+        }
+    }
+
     fun loadTopic(id: Long, more: Boolean = false, retry: Boolean = false, postNumber: Int? = null, previous: Boolean = false) {
         val current = _details.value[id] ?: DetailUiState()
         val targetLoaded = postNumber == null || current.posts.any { it.postNumber == postNumber }
-        if (current.loading || current.reactingPosts.isNotEmpty() || (!more && !previous && current.topic != null && !retry && targetLoaded)) return
+        val isExplicitJump = !more && !previous && postNumber != null && !targetLoaded
+        if (current.reactingPosts.isNotEmpty() || (current.loading && !isExplicitJump)) return
+        if (!more && !previous && current.topic != null && !retry && targetLoaded) {
+            // 再次进入已缓存的话题时，后台增量同步最新 postStream 与新增回复，避免卡在旧评论数。
+            if (postNumber == null) refreshTopic(id, silent = true)
+            return
+        }
         if (more && current.remaining.isEmpty()) return
         if (previous && current.previousIds.isEmpty()) return
+        pageJobs["topic:$id"]?.cancel()
         pageJobs["topic:$id"] = viewModelScope.launch {
             _details.update { it + (id to current.copy(loading = true, error = null)) }
             try {
@@ -457,7 +899,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val topic = repository.fetchTopic(id, postNumber)
                     val category = repository.categoryById(topic.categoryId)
                     val emojis = repository.emojiUrls()
-                    val posts = if (postNumber != null) (topic.postStream.posts + current.posts).distinctBy { it.id }.sortedBy { it.postNumber }
+                    val rootPost = current.posts.filter { it.postNumber == 1 }
+                    val posts = if (postNumber != null) (rootPost + topic.postStream.posts).distinctBy { it.id }.sortedBy { it.postNumber }
                         else topic.postStream.posts.distinctBy { it.id }
                     val missing = postNumber != null && posts.none { it.postNumber == postNumber }
                     _details.update {
@@ -885,8 +1328,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             states + (topicId to current.copy(
                 topic = topic,
                 posts = (current.posts + post).distinctBy { it.id }.sortedBy { it.postNumber }
-                    // 父楼层的 reply_count 同步 +1,否则"更多回复"的计数判断会漏掉服务端其余回复。
-                    .map { if (it.postNumber == post.replyToPostNumber) it.copy(replyCount = it.replyCount + 1) else it },
+                    // 父楼层的 reply_count 同步 +1,否则"更多回复"的计数判断会漏掉服务端其余回复。1 楼为主贴不挂楼中楼。
+                    .map { if (it.postNumber == post.replyToPostNumber && it.postNumber > 1) it.copy(replyCount = it.replyCount + 1) else it },
                 consumedIds = current.consumedIds + post.id,
                 windowStartId = current.windowStartId ?: post.id,
                 createdPostId = post.id,
@@ -948,7 +1391,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     states + (topicId to latest.copy(
                         topic = topic,
                         posts = latest.posts.filterNot { it.id == postId }.map {
-                            if (it.postNumber == removed?.replyToPostNumber) it.copy(replyCount = (it.replyCount - 1).coerceAtLeast(0)) else it
+                            if (it.postNumber == removed?.replyToPostNumber && it.postNumber > 1) {
+                                it.copy(replyCount = (it.replyCount - 1).coerceAtLeast(0))
+                            } else it
                         },
                         consumedIds = latest.consumedIds - postId,
                         windowStartId = if (latest.windowStartId == postId) {
@@ -980,55 +1425,95 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadReplies(topicId: Long, postId: Long) {
         val current = _details.value[topicId] ?: return
-        if (postId in current.loadingReplies || current.reactingPosts.isNotEmpty() || postId in current.completedReplies) return
-        val after = current.replyCursors[postId] ?: 1
-        pageJobs["replies:$topicId:$postId"] = viewModelScope.launch {
-            _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies + postId, error = null)) } ?: states }
+        if (postId in current.loadingReplies || current.reactingPosts.isNotEmpty()) return
+        val tree = threadRows(current.posts)
+        val matchedNode = tree.firstOrNull { it.post.id == postId }
+        val rootPostId = matchedNode?.rootPostId ?: postId
+        val rootNode = tree.firstOrNull { it.post.id == rootPostId }
+        val pendingSubtreeIds = rootNode?.unloadedCandidateIds?.filterNot { it in current.completedReplies }.orEmpty()
+        if (postId in current.completedReplies && pendingSubtreeIds.isEmpty()) return
+
+        val activeLoadingIds = mutableSetOf(postId, rootPostId)
+        pageJobs["replies:$topicId:$rootPostId"] = viewModelScope.launch {
+            _details.update { states ->
+                states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies + activeLoadingIds, error = null)) } ?: states
+            }
             try {
-                val replies = repository.fetchReplies(postId, after)
-                val cursor = replies.maxOfOrNull { it.postNumber }
-                _details.update { states ->
-                    val latest = states[topicId] ?: return@update states
-                    val parent = latest.posts.firstOrNull { it.id == postId }
-                    val parentNumber = parent?.postNumber
-                    val normalizedReplies = replies.map { reply ->
-                        if (parentNumber != null && reply.postNumber > parentNumber) {
-                            reply.copy(replyToPostNumber = parentNumber)
-                        } else {
-                            reply
+                var iterations = 0
+                val maxIterations = 30
+                while (isActive && iterations < maxIterations) {
+                    iterations++
+                    val snapshot = _details.value[topicId] ?: break
+                    val currentTree = threadRows(snapshot.posts)
+                    val currentRootRow = currentTree.firstOrNull { it.post.id == rootPostId }
+                    val nextCandidateId = if (postId !in snapshot.completedReplies) {
+                        postId
+                    } else {
+                        currentRootRow?.unloadedCandidateIds?.firstOrNull { it !in snapshot.completedReplies }
+                    } ?: break
+
+                    if (nextCandidateId !in activeLoadingIds) {
+                        activeLoadingIds.add(nextCandidateId)
+                        _details.update { states ->
+                            states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies + nextCandidateId)) } ?: states
                         }
                     }
-                    val replyById = normalizedReplies.associateBy { it.id }
-                    val patchedExisting = latest.posts.map { existing ->
-                        val fetched = replyById[existing.id] ?: return@map existing
-                        val targetParent = fetched.effectiveReplyToPostNumber() ?: parentNumber
-                        val existingParent = existing.effectiveReplyToPostNumber()
-                        val hasLoadedParent = existingParent != null && latest.posts.any { it.postNumber == existingParent && it.postNumber < existing.postNumber }
-                        if (!hasLoadedParent && targetParent != null && existing.postNumber > targetParent) {
-                            existing.copy(replyToPostNumber = targetParent)
-                        } else {
-                            existing
+
+                    val after = snapshot.replyCursors[nextCandidateId] ?: 1
+                    val replies = repository.fetchReplies(nextCandidateId, after)
+                    val cursor = replies.maxOfOrNull { it.postNumber }
+
+                    _details.update { states ->
+                        val latest = states[topicId] ?: return@update states
+                        val parent = latest.posts.firstOrNull { it.id == nextCandidateId }
+                        val parentNumber = parent?.postNumber
+                        val normalizedReplies = replies.map { reply ->
+                            if (parentNumber != null && reply.postNumber > parentNumber) {
+                                reply.copy(replyToPostNumber = parentNumber)
+                            } else {
+                                reply
+                            }
+                        }
+                        val replyById = normalizedReplies.associateBy { it.id }
+                        val patchedExisting = latest.posts.map { existing ->
+                            val fetched = replyById[existing.id] ?: return@map existing
+                            val targetParent = fetched.effectiveReplyToPostNumber() ?: parentNumber
+                            val existingParent = existing.effectiveReplyToPostNumber()
+                            val hasLoadedParent = existingParent != null && latest.posts.any { it.postNumber == existingParent && it.postNumber < existing.postNumber }
+                            if (!hasLoadedParent && targetParent != null && existing.postNumber > targetParent) {
+                                existing.copy(replyToPostNumber = targetParent)
+                            } else {
+                                existing
+                            }
+                        }
+                        val existingIds = patchedExisting.map { it.id }.toSet()
+                        val mergedPosts = (patchedExisting + normalizedReplies.filterNot { it.id in existingIds }).sortedBy { it.postNumber }
+                        val childCount = if (parentNumber != null) {
+                            mergedPosts.count { it.postNumber > parentNumber && it.effectiveReplyToPostNumber() == parentNumber }
+                        } else 0
+                        val progressed = cursor != null && cursor > after
+                        val isCandidateDone = replies.isEmpty() || replies.size < 20 || !progressed || (parent != null && childCount >= parent.replyCount)
+                        states + (topicId to latest.copy(
+                            posts = mergedPosts,
+                            consumedIds = latest.consumedIds + replies.map { post -> post.id },
+                            replyCursors = if (cursor == null) latest.replyCursors else latest.replyCursors + (nextCandidateId to cursor),
+                            completedReplies = if (isCandidateDone) latest.completedReplies + nextCandidateId else latest.completedReplies,
+                        ))
+                    }
+
+                    if (replies.isEmpty()) {
+                        _details.update { states ->
+                            states[topicId]?.let { states + (topicId to it.copy(completedReplies = it.completedReplies + nextCandidateId)) } ?: states
                         }
                     }
-                    val existingIds = patchedExisting.map { it.id }.toSet()
-                    val mergedPosts = (patchedExisting + normalizedReplies.filterNot { it.id in existingIds }).sortedBy { it.postNumber }
-                    val childCount = if (parentNumber != null) {
-                        mergedPosts.count { it.postNumber > parentNumber && it.effectiveReplyToPostNumber() == parentNumber }
-                    } else 0
-                    val isDone = replies.size < 20 || (parent != null && childCount >= parent.replyCount)
-                    states + (topicId to latest.copy(
-                        posts = mergedPosts,
-                        consumedIds = latest.consumedIds + replies.map { post -> post.id },
-                        replyCursors = if (cursor == null) latest.replyCursors else latest.replyCursors + (postId to cursor),
-                        completedReplies = if (isDone) latest.completedReplies + postId else latest.completedReplies,
-                )) }
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(error = error.message ?: "回复加载失败")) } ?: states }
                 handlePageFailure(error) { loadReplies(topicId, postId) }
             } finally {
-                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies - postId)) } ?: states }
+                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loadingReplies = it.loadingReplies - activeLoadingIds)) } ?: states }
             }
         }
     }
@@ -1131,6 +1616,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         boot()
+        checkForUpdates(manual = false)
     }
 
     fun boot() {

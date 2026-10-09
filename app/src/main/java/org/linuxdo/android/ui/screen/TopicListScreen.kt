@@ -31,6 +31,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -196,8 +200,7 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
 }
 
 /**
- * 置顶标记内联进标题,而不是做成固定宽度的徽章 —— 360dp 宽的屏上,
- * 徽章会把标题挤到换行,内联则随文本流排版。
+ * 置顶标记内联进标题文本流,和标题共占 2 行配额,不在标题上方额外占一行。
  */
 private fun titleWithBadges(topic: Topic, accent: Color) = buildAnnotatedString {
     if (topic.pinned) {
