@@ -36,9 +36,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
@@ -83,6 +85,10 @@ fun IosLargeTitleScaffold(
     customLargeTitle: (@Composable () -> Unit)? = null,
     customCollapsedTitle: (@Composable () -> Unit)? = null,
     floatingOverlay: (@Composable BoxScope.() -> Unit)? = null,
+    pageOffsetXProvider: (() -> Float)? = null,
+    secondaryListState: LazyListState? = null,
+    secondaryPageOffsetXProvider: (() -> Float)? = null,
+    secondaryContent: (LazyListScope.() -> Unit)? = null,
     content: LazyListScope.() -> Unit,
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
@@ -103,10 +109,44 @@ fun IosLargeTitleScaffold(
         IosMetrics.navBarHeight
     }
 
-    Box(modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
+    Box(modifier.fillMaxSize().clipToBounds().background(IosTheme.colors.groupedBackground)) {
+        if (secondaryContent != null && secondaryListState != null && secondaryPageOffsetXProvider != null) {
+            LazyColumn(
+                state = secondaryListState,
+                userScrollEnabled = false,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        translationX = secondaryPageOffsetXProvider()
+                    },
+                contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding),
+            ) {
+                if (showLargeTitle) {
+                    item(key = "ios-large-title-secondary-spacer") {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(titleBoxHeight),
+                        )
+                    }
+                }
+                secondaryContent()
+            }
+        }
+
         LazyColumn(
             state = listState,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (pageOffsetXProvider != null) {
+                        Modifier.graphicsLayer {
+                            translationX = pageOffsetXProvider()
+                        }
+                    } else {
+                        Modifier
+                    }
+                ),
             contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding),
         ) {
             if (showLargeTitle) {
@@ -115,6 +155,15 @@ fun IosLargeTitleScaffold(
                         Modifier
                             .fillMaxWidth()
                             .height(titleBoxHeight)
+                            .then(
+                                if (pageOffsetXProvider != null) {
+                                    Modifier.graphicsLayer {
+                                        translationX = -pageOffsetXProvider()
+                                    }
+                                } else {
+                                    Modifier
+                                }
+                            )
                             .padding(horizontal = IosMetrics.screenPadding),
                         contentAlignment = Alignment.BottomStart,
                     ) {
@@ -198,10 +247,10 @@ fun IosNavBar(
                         .fillMaxWidth()
                         .alpha(titleAlpha)
                         .padding(
-                            start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 8.dp,
+                            start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 48.dp,
                             end = if (onBack != null) 56.dp else 48.dp,
                         ),
-                    contentAlignment = if (onBack != null) Alignment.Center else Alignment.CenterStart,
+                    contentAlignment = Alignment.Center,
                 ) {
                     customTitle()
                 }

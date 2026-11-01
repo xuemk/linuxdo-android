@@ -29,8 +29,14 @@ keystore.properties
 *.pdf
 /tunnel/
 *.so
+!/app/src/main/jniLibs/**/*.so
 *.aar
-!/app/libs/tunnel-release.aar
 .ck.db
 .diag.log
 .tmp_shots/
+screen*.png
+*.xml.dump
+*.dump.xml
+sheet_dump.xml
+uidump.xml
+

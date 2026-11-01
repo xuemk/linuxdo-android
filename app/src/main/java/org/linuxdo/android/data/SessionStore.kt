@@ -19,6 +19,20 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlinx.serialization.json.Json
 import org.linuxdo.android.Config
 
+internal object NoExcerptModeMigration {
+    private const val KEY_APPLIED = "feed_no_excerpt_default_v1"
+
+    @Synchronized
+    fun applyTo(preferences: SharedPreferences) {
+        if (preferences.getBoolean(KEY_APPLIED, false)) return
+        preferences.edit()
+            .putString(SessionStore.KEY_FEED_DISPLAY_MODE, "no_excerpt")
+            .remove(SessionStore.KEY_FEED_GRAPHIC_MODE)
+            .putBoolean(KEY_APPLIED, true)
+            .apply()
+    }
+}
+
 /**
  * 会话 Cookie 的加密持久化,同时负责与 WebView CookieManager 双向同步。
  *
@@ -449,7 +463,6 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     suspend fun clearBusinessCookies() = replaceBusinessCookies(token = null, forumSession = null)
-
     /** 判断当前是否已登录社区凭据。 */
     fun hasSession(): Boolean = storedCookies().containsKey(Config.SESSION_COOKIE)
 
@@ -595,6 +608,40 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         plainPrefs.edit().putBoolean("user_customized_skin", customized).apply()
     }
 
+    fun isAutoReadClipboardEnabled(): Boolean =
+        plainPrefs.getBoolean("auto_read_clipboard", true)
+
+    fun setAutoReadClipboardEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean("auto_read_clipboard", enabled).apply()
+    }
+
+    fun getLastHandledClipboardUrl(): String =
+        plainPrefs.getString("last_handled_clipboard_url", "").orEmpty()
+
+    fun setLastHandledClipboardUrl(url: String) {
+        plainPrefs.edit().putString("last_handled_clipboard_url", url).apply()
+    }
+
+    fun getClipboardConsumedTextHash(): String =
+        plainPrefs.getString("clipboard_consumed_text_hash", "").orEmpty()
+
+    fun isClipboardConsumptionMarkerVerified(): Boolean =
+        plainPrefs.getBoolean("clipboard_consumption_marker_verified", false)
+
+    fun setClipboardConsumedText(textHash: String, markerVerified: Boolean) {
+        plainPrefs.edit()
+            .putString("clipboard_consumed_text_hash", textHash)
+            .putBoolean("clipboard_consumption_marker_verified", markerVerified)
+            .apply()
+    }
+
+    fun getLastHandledClipboardTimestamp(): Long =
+        plainPrefs.getLong("last_handled_clipboard_timestamp", 0L)
+
+    fun setLastHandledClipboardTimestamp(timestamp: Long) {
+        plainPrefs.edit().putLong("last_handled_clipboard_timestamp", timestamp).apply()
+    }
+
     fun getString(key: String): String? = plainPrefs.getString(key, null)
 
     fun putString(key: String, value: String) {
@@ -652,6 +699,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     private val plainPrefs: SharedPreferences = context.getSharedPreferences(PREFS_PLAIN_NAME, Context.MODE_PRIVATE)
+    init {
+        NoExcerptModeMigration.applyTo(plainPrefs)
+    }
     private val json = Json { ignoreUnknownKeys = true }
 
     fun saveCategoryOrder(ids: List<Long>) {
@@ -737,8 +787,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             val legacy = plainPrefs.getBoolean(KEY_AUTO_REFRESH_INCOMING, false)
             return if (legacy) AutoRefreshInterval.MIN_1 else AutoRefreshInterval.OFF
         }
-        // 初次使用默认开启实时 15 秒感知
-        return AutoRefreshInterval.REALTIME
+        return AutoRefreshInterval.SEC_20
     }
 
     fun setAutoRefreshInterval(interval: AutoRefreshInterval) {
@@ -925,9 +974,17 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 存的是节点的 [org.linuxdo.android.net.DohServer.url]，
      * null 表示未选择（使用预设默认节点）。
      */
-    override fun getDohServerUrl(): String? = plainPrefs.getString(KEY_DOH_SERVER_URL, null)
+    override fun getDohServerUrl(): String? {
+        val saved = plainPrefs.getString(KEY_DOH_SERVER_URL, null) ?: return null
+        if (saved.contains("kudo.ddd.oaifree.com")) {
+            val migrated = saved.replace("kudo.ddd.oaifree.com", "neo.ddd.oaifree.com")
+            plainPrefs.edit().putString(KEY_DOH_SERVER_URL, migrated).apply()
+            return migrated
+        }
+        return saved
+    }
 
-    override fun setDohServerUrl(url: String?) {
+    fun setDohServerUrl(url: String?) {
         if (url == null) {
             plainPrefs.edit().remove(KEY_DOH_SERVER_URL).apply()
         } else {
@@ -943,37 +1000,31 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     /** 是否开启智能定时低延迟优选与自动切换（默认开启） */
-    override fun isDohAutoOptimizeEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_AUTO_OPTIMIZE, true)
+    fun isDohAutoOptimizeEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_AUTO_OPTIMIZE, true)
 
-    override fun setDohAutoOptimizeEnabled(enabled: Boolean) {
+    fun setDohAutoOptimizeEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_DOH_AUTO_OPTIMIZE, enabled).apply()
     }
 
     /** 是否在开启系统代理/VPN 时强制保持 DoH + ECH 直连（防止直连分流规则导致阻断，默认关闭由系统让渡） */
-    override fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
+    fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
 
-    override fun setDohForceOverProxyEnabled(enabled: Boolean) {
+    fun setDohForceOverProxyEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_DOH_FORCE_OVER_PROXY, enabled).apply()
     }
 
-    /** 首页信息流显示模式（图文/小图/纯文），向后兼容旧 Boolean 值 */
-    fun getFeedDisplayMode(): String {
-        // 向后兼容：若新 key 无值，检查旧 Boolean key
-        val stored = plainPrefs.getString(KEY_FEED_DISPLAY_MODE, null)
-        if (stored != null) return stored
-        val oldGraphic = plainPrefs.getBoolean(KEY_FEED_GRAPHIC_MODE, true)
-        return if (oldGraphic) "graphic" else "small_image"
-    }
+    /** 首页信息流显示模式：强制全量收敛为无正文模式（图文模式代码保留后续再优化） */
+    fun getFeedDisplayMode(): String = "no_excerpt"
 
     fun setFeedDisplayMode(mode: String) {
-        plainPrefs.edit().putString(KEY_FEED_DISPLAY_MODE, mode).apply()
+        plainPrefs.edit().putString(KEY_FEED_DISPLAY_MODE, "no_excerpt").apply()
     }
 
-    // 兼容旧接口（供历史调用点过渡）
-    fun isFeedGraphicMode(): Boolean = getFeedDisplayMode() == "graphic"
+    // 兼容旧接口（强制关闭图文大卡片）
+    fun isFeedGraphicMode(): Boolean = false
 
     fun setFeedGraphicMode(enabled: Boolean) {
-        setFeedDisplayMode(if (enabled) "graphic" else "small_image")
+        setFeedDisplayMode("no_excerpt")
     }
 
     /** 搜索历史记录（最多保留20条，最新在最前） */
@@ -1146,12 +1197,15 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
 enum class AutoRefreshInterval(val code: Int, val label: String, val seconds: Long) {
     OFF(0, "关闭", 0L),
-    REALTIME(1, "实时 (15秒)", 15L),
+    SEC_20(7, "20 秒", 20L),
+    SEC_30(1, "30 秒", 30L),
     MIN_1(2, "1 分钟", 60L),
     MIN_2(3, "2 分钟", 120L),
     MIN_5(4, "5 分钟", 300L),
     MIN_10(5, "10 分钟", 600L),
     MIN_15(6, "15 分钟", 900L);
+
+    fun nextDelayMs(): Long = if (this == SEC_20) kotlin.random.Random.nextLong(18_000L, 25_001L) else seconds * 1_000L
 
     companion object {
         fun fromCode(code: Int): AutoRefreshInterval = entries.firstOrNull { it.code == code } ?: OFF

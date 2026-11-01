@@ -107,7 +107,7 @@ class SecondFactorRequiredException(
     message: String = "该账号已开启两步验证，请输入验证码",
 ) : Exception(message)
 
-class HttpStatusException(val status: Int, detail: String = "") :
+class HttpStatusException(val status: Int, detail: String = "", val retryAfterSeconds: Long? = null) :
     Exception("HTTP $status $detail".trim())
 
 /** 服务端已明确限流。调用方应等待冷却结束，不能把它当作需要过盾的验证失败。 */

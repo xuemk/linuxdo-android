@@ -12,6 +12,7 @@ sealed interface Route : Serializable {
     data class TopicDetail(val topicId: Long, val title: String, val postNumber: Int? = null) : Route
     data object CategoryList : Route
     data class CategoryTopics(val categoryId: Int, val slug: String, val name: String) : Route
+    data class TagTopics(val tag: String) : Route
     data object Search : Route
     data object Profile : Route
     data object Diagnostics : Route

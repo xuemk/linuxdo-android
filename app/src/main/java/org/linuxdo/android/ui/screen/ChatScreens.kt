@@ -45,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -357,8 +358,11 @@ private fun PublicChannelRow(channel: ChatChannelSummary, onClick: () -> Unit) {
                     }
                 }
                 Text(
-                    text = lastMessage?.let { "${it.user?.name ?: it.user?.username.orEmpty()}: ${it.message.ifBlank { it.cooked }}" }
-                        ?: channel.categoryName ?: "暂无新消息",
+                    text = lastMessage?.let {
+                        val sender = it.user?.name ?: it.user?.username.orEmpty()
+                        val msg = renderEmojiShortcodes(it.message.ifBlank { it.cooked }, keepUnknown = true).orEmpty()
+                        "$sender: $msg"
+                    } ?: channel.categoryName ?: "暂无新消息",
                     style = TextStyle(fontSize = 13.sp, color = IosTheme.colors.secondaryLabel),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -415,8 +419,11 @@ private fun DirectMessageRow(channel: ChatChannelSummary, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = lastMessage?.let { "${it.user?.name ?: it.user?.username.orEmpty()}: ${it.message.ifBlank { it.cooked }}" }
-                        ?: "暂无对话",
+                    text = lastMessage?.let {
+                        val sender = it.user?.name ?: it.user?.username.orEmpty()
+                        val msg = renderEmojiShortcodes(it.message.ifBlank { it.cooked }, keepUnknown = true).orEmpty()
+                        "$sender: $msg"
+                    } ?: "暂无对话",
                     style = TextStyle(fontSize = 13.sp, color = IosTheme.colors.secondaryLabel),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -457,6 +464,7 @@ fun ChatRoomScreen(
     active: Boolean,
     currentUsername: String? = null,
     onLoad: (Long, Boolean) -> Unit,
+    onLoadPast: (Long) -> Unit = {},
     onSend: (Long, String, List<Long>) -> Unit,
     onUploadAttachment: (Long, Uri, (AttachedMedia) -> Unit, (String) -> Unit) -> Unit = { _, _, _, _ -> },
     onOpenUser: (String) -> Unit = {},
@@ -504,9 +512,41 @@ fun ChatRoomScreen(
         }
     }
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
+    var initialScrollDone by remember(channelId) { mutableStateOf(false) }
+    var prevFirstMessageId by remember(channelId) { mutableStateOf<Long?>(null) }
+    var prevLastMessageId by remember(channelId) { mutableStateOf<Long?>(null) }
+    val canLoadMorePast = state.canLoadMorePastByChannel[channelId] ?: true
+    val isLoadingPast = state.loadingPastChannelId == channelId
+
+    LaunchedEffect(messages) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        val currentFirstId = messages.first().id
+        val currentLastId = messages.last().id
+        if (!initialScrollDone) {
+            initialScrollDone = true
+            listState.scrollToItem(messages.lastIndex)
+        } else if (prevFirstMessageId != null && currentFirstId != prevFirstMessageId) {
+            val addedCount = messages.indexOfFirst { it.id == prevFirstMessageId }.takeIf { it > 0 } ?: 0
+            if (addedCount > 0) {
+                val newIndex = listState.firstVisibleItemIndex + addedCount
+                val offset = listState.firstVisibleItemScrollOffset
+                listState.scrollToItem(newIndex, offset)
+            }
+        } else if (prevLastMessageId != null && currentLastId != prevLastMessageId) {
+            val totalItems = listState.layoutInfo.totalItemsCount
+            val lastVisibleIndex = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            if (totalItems - lastVisibleIndex <= 3) {
+                listState.animateScrollToItem(messages.lastIndex)
+            }
+        }
+        prevFirstMessageId = currentFirstId
+        prevLastMessageId = currentLastId
+    }
+
+    val firstVisibleIndex by remember { derivedStateOf { listState.firstVisibleItemIndex } }
+    LaunchedEffect(firstVisibleIndex, canLoadMorePast, isLoadingPast, initialScrollDone) {
+        if (firstVisibleIndex <= 2 && canLoadMorePast && !isLoadingPast && messages.isNotEmpty() && initialScrollDone) {
+            onLoadPast(channelId)
         }
     }
 
@@ -537,6 +577,34 @@ fun ChatRoomScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 10.dp),
             ) {
+                if (isLoadingPast) {
+                    item(key = "loading_past_indicator") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            IosActivityIndicator(diameter = 18.dp, color = IosTheme.colors.accent)
+                        }
+                    }
+                } else if (!canLoadMorePast && messages.size >= 50) {
+                    item(key = "all_history_loaded") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                "已加载全部历史消息",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                        }
+                    }
+                }
+
                 items(messages, key = { it.id }) { message ->
                     val isMe = currentUsername != null && message.user?.username == currentUsername
                     ChatMessageBubble(
@@ -785,8 +853,9 @@ private fun ChatMessageBubble(
 ) {
     val user = message.user
     val textContent = remember(message.message, message.cooked) {
-        if (message.message.isNotBlank()) message.message
+        val raw = if (message.message.isNotBlank()) message.message
         else android.text.Html.fromHtml(message.cooked, android.text.Html.FROM_HTML_MODE_COMPACT).toString().trim()
+        renderEmojiShortcodes(raw, keepUnknown = true).orEmpty()
     }
     val timeStr = remember(message.createdAt) { RelativeTime.format(message.createdAt) }
 

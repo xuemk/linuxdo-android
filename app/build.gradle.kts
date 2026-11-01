@@ -13,8 +13,8 @@ android {
         applicationId = "org.linuxdo.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
-        versionName = "1.4.0"
+        versionCode = 17
+        versionName = "1.5.0"
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -40,6 +40,12 @@ android {
         compose = true
         buildConfig = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -56,8 +62,7 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // DoH (DNS over HTTPS) 支持：纯 Kotlin 实现，无本地库，增量 < 30KB
     implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
-    // 原生 DoH + ECH 安全直连 SDK（闭源二进制 AAR，包含深度混淆网络层与 native 动态库）
-    implementation(files("libs/tunnel-release.aar"))
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
@@ -73,4 +78,7 @@ dependencies {
     // WebView 代理导流:ProxyController 只存在于该库,framework 的 WebView 没有公开代理 API。
     // zero-doh-local-proxy-tunnel 方案的 WebView 侧接入(task 3.1)强依赖它。
     implementation("androidx.webkit:webkit:1.12.1")
+
+    // GeckoView: Firefox 内核网络栈与渲染引擎 (含 DoH/TRR + TLS 1.3 ECH + 官方 NSS 指纹)
+    implementation("org.mozilla.geckoview:geckoview-arm64-v8a:135.0.20250130195129")
 }

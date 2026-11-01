@@ -102,6 +102,11 @@ fun InAppBrowserSheet(
 
     DisposableEffect(webView) {
         webView.webViewClient = object : WebViewClient() {
+            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                mainFrameError = "网页渲染进程异常终止，请刷新重试"
+                return true
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val destination = request.url
                 val scheme = destination.scheme?.lowercase().orEmpty()

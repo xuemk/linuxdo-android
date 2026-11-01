@@ -357,7 +357,7 @@ fun SearchScreen(
                 if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {
                     item("empty") { EmptyNotice() }
                 }
-                itemsIndexed(state.results.items, key = { _, item -> item.topic.id }) { index, item ->
+                itemsIndexed(state.results.items, key = { index, item -> "${item.topic.id}_$index" }) { index, item ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()

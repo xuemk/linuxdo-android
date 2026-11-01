@@ -1,6 +1,7 @@
 package org.linuxdo.android
 
 import android.content.Intent
+import android.content.ClipboardManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -10,6 +11,12 @@ import org.linuxdo.android.ui.MainViewModel
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
+    private val clipboardManager by lazy {
+        getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
+    }
+    private var clipboardListener: ClipboardManager.OnPrimaryClipChangedListener? = null
+    private var clipboardListenerGeneration = 0
+    private var clipboardResumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -17,6 +24,7 @@ class MainActivity : ComponentActivity() {
             viewModel.handleWebAuthCallback(uri)
         }
         handleNotificationIntent(intent)
+        handleDeepLinkIntent(intent)
         val browser = (application as App).container.browser
         setContent {
             AppShell(viewModel, browser)
@@ -25,6 +33,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        clipboardResumed = true
         // 先回收后台久置的旧连接，再放行下面的未读刷新等首批请求。
         (application as App).container.onAppForeground()
         val sessionStore = (application as App).container.sessionStore
@@ -41,6 +50,58 @@ class MainActivity : ComponentActivity() {
             }
         }
         viewModel.refreshUnread(force = true)
+        window.decorView.postDelayed({
+            if (!isFinishing && !isDestroyed) {
+                viewModel.checkClipboard(this)
+                observeClipboardChanges()
+            }
+        }, 300L)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            viewModel.checkClipboard(this)
+            observeClipboardChanges()
+        } else {
+            stopObservingClipboardChanges()
+        }
+    }
+
+    private fun observeClipboardChanges() {
+        if (clipboardListener != null) return
+        val generation = ++clipboardListenerGeneration
+        window.decorView.post {
+            if (generation != clipboardListenerGeneration || !clipboardResumed ||
+                !hasWindowFocus() || isFinishing || isDestroyed
+            ) return@post
+            // 获焦点后读取快照，再监听后续变化；消费状态由文本尾缀判断。
+            viewModel.checkClipboard(this)
+            val listener = ClipboardManager.OnPrimaryClipChangedListener {
+                if (generation == clipboardListenerGeneration && clipboardResumed && hasWindowFocus()) {
+                    viewModel.checkClipboard(this)
+                }
+            }
+            clipboardManager?.addPrimaryClipChangedListener(listener)
+            clipboardListener = listener
+        }
+    }
+
+    private fun stopObservingClipboardChanges() {
+        clipboardListenerGeneration++
+        clipboardListener?.let { clipboardManager?.removePrimaryClipChangedListener(it) }
+        clipboardListener = null
+    }
+
+    override fun onPause() {
+        clipboardResumed = false
+        stopObservingClipboardChanges()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        stopObservingClipboardChanges()
+        super.onDestroy()
     }
 
     override fun onStop() {
@@ -73,6 +134,16 @@ class MainActivity : ComponentActivity() {
             viewModel.handleWebAuthCallback(uri)
         }
         handleNotificationIntent(intent)
+        handleDeepLinkIntent(intent)
+    }
+
+    private fun handleDeepLinkIntent(intent: Intent?) {
+        val uri = intent?.data ?: return
+        val url = uri.toString()
+        if (uri.scheme == "discourse" && uri.host == "auth_redirect") return
+        val link = org.linuxdo.android.data.parseInternalTopicUrl(url) ?: return
+        intent.data = null
+        viewModel.navigateToTopicFromNotification(link.topicId, link.postNumber)
     }
 
     private fun handleNotificationIntent(intent: Intent?) {

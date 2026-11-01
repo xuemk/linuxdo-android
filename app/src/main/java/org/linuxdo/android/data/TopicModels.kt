@@ -58,6 +58,10 @@ enum class FloatingAction(
     val description: String,
 ) {
     CreateTopic("create_topic", "发帖", "发帖", "快速发布新话题"),
+    Bookmarks("bookmarks", "我的收藏", "收藏", "查看我收藏的话题"),
+    Following("following", "我的关注", "关注", "查看关注的用户与话题"),
+    Likes("likes", "点赞", "点赞", "查看我的点赞与获赞"),
+    Replies("replies", "回帖", "回帖", "查看我发表的回复"),
     Connect("connect", "等级积分", "等级积分", "查看升级进度与我的积分"),
     History("history", "历史", "历史", "查看阅读历史记录"),
     Chat("chat", "聊天", "聊天", "进入实时聊天室"),
@@ -67,22 +71,24 @@ enum class FloatingAction(
     Categories("categories", "分类", "分类", "浏览全部话题分类");
 
     companion object {
-        val DEFAULT_ACTIONS = listOf(CreateTopic, Connect, History, Chat, Sort)
+        const val MAX_ACTIONS = 5
+        val DEFAULT_ACTIONS = listOf(CreateTopic, Bookmarks, History, Following, Sort)
+        private const val OLD_DEFAULT_SERIALIZED_2 = "create_topic,bookmarks,following,likes,replies"
         private const val OLD_DEFAULT_SERIALIZED = "create_topic,sort,drafts,search,categories"
 
         fun fromId(id: String?): FloatingAction? =
             entries.firstOrNull { it.id.equals(id, ignoreCase = true) || it.name.equals(id, ignoreCase = true) }
 
         fun parseActions(serialized: String?): List<FloatingAction> {
-            if (serialized.isNullOrBlank() || serialized == OLD_DEFAULT_SERIALIZED) return DEFAULT_ACTIONS
+            if (serialized.isNullOrBlank() || serialized == OLD_DEFAULT_SERIALIZED || serialized == OLD_DEFAULT_SERIALIZED_2) return DEFAULT_ACTIONS
             val list = serialized.split(",")
                 .mapNotNull { fromId(it.trim()) }
                 .distinct()
-            return if (list.isEmpty()) DEFAULT_ACTIONS else list.take(8)
+            return if (list.isEmpty()) DEFAULT_ACTIONS else list.take(MAX_ACTIONS)
         }
 
         fun serializeActions(actions: List<FloatingAction>): String =
-            actions.distinct().take(8).joinToString(",") { it.id }
+            actions.distinct().take(MAX_ACTIONS).joinToString(",") { it.id }
     }
 }
 
@@ -130,6 +136,131 @@ object TagNameSerializer : KSerializer<String> {
     override fun serialize(encoder: Encoder, value: String) = encoder.encodeString(value)
 }
 
+object FlexibleStringSerializer : KSerializer<String> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("FlexibleString", PrimitiveKind.STRING)
+
+    override fun deserialize(decoder: Decoder): String {
+        val element = (decoder as JsonDecoder).decodeJsonElement()
+        return when (element) {
+            is JsonPrimitive -> element.content
+            else -> element.toString().trim('"')
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: String) = encoder.encodeString(value)
+}
+
+@Serializable
+data class DiscourseTag(
+    @Serializable(with = FlexibleStringSerializer::class) val id: String = "",
+    val name: String = "",
+    val text: String = "",
+    val count: Int = 0,
+    @SerialName("topic_count") val topicCount: Int = 0,
+    @SerialName("staff_topic_count") val staffTopicCount: Int = 0,
+    @SerialName("pm_count") val pmCount: Int = 0,
+    val description: String? = null,
+) {
+    val displayName: String
+        get() = name.ifBlank { text.ifBlank { id } }
+
+    val effectiveCount: Int
+        get() = maxOf(count, topicCount, staffTopicCount)
+}
+
+@Serializable
+data class DiscourseTagGroupItem(
+    @Serializable(with = FlexibleStringSerializer::class) val id: String = "",
+    val name: String = "",
+    val tags: List<DiscourseTag> = emptyList(),
+)
+
+@Serializable
+data class DiscourseCategoryTagsItem(
+    @Serializable(with = FlexibleStringSerializer::class) val id: String = "",
+    val tags: List<DiscourseTag> = emptyList(),
+)
+
+@Serializable
+data class DiscourseTagsExtras(
+    @SerialName("tag_groups") val tagGroups: List<DiscourseTagGroupItem> = emptyList(),
+    val categories: List<DiscourseCategoryTagsItem> = emptyList(),
+)
+
+@Serializable
+data class DiscourseTagsResponse(
+    val tags: List<DiscourseTag> = emptyList(),
+    val extras: DiscourseTagsExtras? = null,
+) {
+    /**
+     * 对齐 FluxDO (getSiteTagGroups)：
+     * 开启 tags_listed_by_group 的站点（如 Linux.do）大部分核心标签位于 extras.tag_groups（及 extras.categories）中，
+     * 顶层 tags 仅存放未归入分组的兜底标签。汇总全部分组、分类及顶层标签，合并真实话题数并按话题数倒序排序。
+     */
+    fun allTagsSorted(): List<DiscourseTag> {
+        val merged = linkedMapOf<String, DiscourseTag>()
+
+        fun upsertGlobal(tag: DiscourseTag) {
+            val key = tag.displayName.trim()
+            if (key.isEmpty()) return
+            val normalizedCount = tag.effectiveCount
+            val existing = merged[key]
+            if (existing == null) {
+                merged[key] = tag.copy(
+                    name = tag.name.ifBlank { key },
+                    text = tag.text.ifBlank { key },
+                    count = normalizedCount,
+                )
+            } else {
+                merged[key] = existing.copy(
+                    count = maxOf(existing.count, normalizedCount),
+                    description = existing.description ?: tag.description,
+                )
+            }
+        }
+
+        // 1. 优先解析 extras.tag_groups（与 FluxDO 顺序一致）
+        extras?.tagGroups?.forEach { group ->
+            group.tags.forEach(::upsertGlobal)
+        }
+
+        // 2. 解析顶层未分组标签 tags
+        tags.forEach(::upsertGlobal)
+
+        // 3. 解析 extras.categories（分类限定标签，同一标签跨多个分类时累加分类内计数并与全局计数取最大值）
+        val categorySums = linkedMapOf<String, Int>()
+        extras?.categories?.forEach { categoryGroup ->
+            val seenInCategory = hashSetOf<String>()
+            categoryGroup.tags.forEach { tag ->
+                val key = tag.displayName.trim()
+                if (key.isNotEmpty() && seenInCategory.add(key)) {
+                    val c = tag.effectiveCount
+                    categorySums[key] = (categorySums[key] ?: 0) + c
+                    if (key !in merged) {
+                        merged[key] = tag.copy(
+                            name = tag.name.ifBlank { key },
+                            text = tag.text.ifBlank { key },
+                            count = c,
+                        )
+                    }
+                }
+            }
+        }
+        categorySums.forEach { (key, sumCount) ->
+            val existing = merged[key] ?: return@forEach
+            if (sumCount > existing.count) {
+                merged[key] = existing.copy(count = sumCount)
+            }
+        }
+
+        return merged.values.sortedWith(
+            compareByDescending<DiscourseTag> { it.count }
+                .thenBy { it.displayName.lowercase() }
+        )
+    }
+}
+
 @Serializable
 data class Topic(
     val id: Long,
@@ -154,6 +285,7 @@ data class Topic(
     @SerialName("last_poster_username") val lastPosterUsername: String? = null,
     val posters: List<Poster> = emptyList(),
     @SerialName("notification_level") val notificationLevel: Int? = null,
+    @SerialName("highest_post_number") val highestPostNumber: Int? = null,
 ) {
     /**
      * 列表要显示的"总回复数",口径与网页端一致。
@@ -220,12 +352,13 @@ private fun normalizeTopicImageUrl(rawUrl: String?): String? {
 data class Poster(
     @SerialName("user_id") val userId: Long? = null,
     val description: String? = null,
+    val user: DiscourseUser? = null,
 )
 
 @Serializable
 data class DiscourseUser(
-    val id: Long,
-    val username: String,
+    val id: Long = 0L,
+    val username: String = "",
     val name: String? = null,
     @SerialName("avatar_template") val avatarTemplate: String? = null,
     @SerialName("animated_avatar") val animatedAvatar: String? = null,
@@ -417,6 +550,62 @@ object CustomSectionIconMapper {
     }
 }
 
+data class InternalTopicLink(
+    val topicId: Long,
+    val postNumber: Int? = null,
+)
+
+/**
+ * ???????????????????????????? linux.do ?????
+ * ?? (??? URL, ???? InternalTopicLink)?
+ */
+fun parseTopicLinkFromText(text: String?): Pair<String, InternalTopicLink>? {
+    if (text.isNullOrBlank()) return null
+    val regex = Regex("""https?://(?:[a-zA-Z0-9\-]+\.)?linux\.do/t/[^\s\r\n"'<>()\[\]\uFF08\uFF09\u3010\u3011\u300A\u300B\u201C\u201D\u2018\u2019\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A,!?]+""")
+    val match = regex.find(text) ?: return null
+    var rawUrl = match.value.trim()
+    rawUrl = rawUrl.trimEnd('.', ',', '!', '?', ';', ':', ')', ']', '}', '>', '\u3002', '\uff0c', '\uff01', '\uff1f', '\uff1b', '\uff1a', '\uff09', '\u3011', '\u201d', '\u2019')
+    val link = parseInternalTopicUrl(rawUrl) ?: return null
+    return Pair(rawUrl, link)
+}
+
+/**
+ * ?????linux.do?????????
+ * - `https://linux.do/t/{slug}/{topicId}`
+ * - `https://linux.do/t/{slug}/{topicId}/{postNumber}`
+ * - `https://linux.do/t/{topicId}`
+ * - `https://linux.do/t/{topicId}/{postNumber}`
+ */
+fun parseInternalTopicUrl(url: String): InternalTopicLink? = runCatching {
+    val uri = android.net.Uri.parse(url)
+    val host = uri.host?.lowercase() ?: return null
+    if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return null
+    val segments = uri.pathSegments ?: return null
+    if (segments.size < 2 || segments[0] != "t") return null
+    val secondAsId = segments[1].toLongOrNull()
+    when {
+        secondAsId == null -> {
+            val topicId = segments.getOrNull(2)?.toLongOrNull() ?: return null
+            val postNum = segments.getOrNull(3)?.toIntOrNull()?.takeIf { it > 1 }
+            InternalTopicLink(topicId = topicId, postNumber = postNum)
+        }
+        segments.size == 2 -> InternalTopicLink(topicId = secondAsId, postNumber = null)
+        segments.size >= 4 -> {
+            val topicId = segments[2].toLongOrNull() ?: return null
+            val postNum = segments[3].toIntOrNull()?.takeIf { it > 1 }
+            InternalTopicLink(topicId = topicId, postNumber = postNum)
+        }
+        else -> {
+            val thirdAsLong = segments[2].toLongOrNull() ?: return null
+            if (thirdAsLong > secondAsId && thirdAsLong >= 1000L) {
+                InternalTopicLink(topicId = thirdAsLong, postNumber = null)
+            } else {
+                InternalTopicLink(topicId = secondAsId, postNumber = thirdAsLong.toInt().takeIf { it > 1 })
+            }
+        }
+    }
+}.getOrNull()
+
 enum class TopicNotificationLevel(
     val code: Int,
     val title: String,
@@ -475,6 +664,24 @@ data class TopicPage(
     val items: List<TopicListItem>,
     val hasMore: Boolean,
 )
+
+/** 只回写统计快照；保留行顺序、作者、已读状态和本地操作状态。 */
+internal fun mergeTopicCounters(items: List<TopicListItem>, fresh: Map<Long, Topic>): List<TopicListItem> {
+    var changed = false
+    val merged = items.map { item ->
+        val source = fresh[item.topic.id] ?: return@map item
+        val topic = item.topic.copy(postsCount = source.postsCount, replyCount = source.replyCount,
+            views = source.views, lastPostedAt = source.lastPostedAt,
+            highestPostNumber = source.highestPostNumber ?: item.topic.highestPostNumber.takeIf { source.postsCount <= item.topic.postsCount })
+        if (topic == item.topic) item else item.copy(topic = topic).also { changed = true }
+    }
+    return if (changed) merged else items
+}
+
+internal fun mergeConfirmedTopicRead(topic: Topic, confirmedPosts: Set<Int>): Topic {
+    val highest = confirmedPosts.maxOrNull() ?: return topic
+    return topic.copy(unseen = false, lastReadPostNumber = maxOf(topic.lastReadPostNumber ?: 0, highest))
+}
 
 /** 服务端草稿条目（兼容创建新话题草稿与话题回复草稿）。 */
 data class DraftItem(
@@ -573,6 +780,18 @@ data class DiscoursePoll(
     @SerialName("chart_type") val chartType: String? = null,
     val title: String? = null,
 )
+
+/**
+ * Discourse / LINUX DO 信任等级称号映射 (TL0 ~ TL4)
+ */
+fun trustLevelTitle(level: Int?): String = when (level) {
+    0 -> "访问者"
+    1 -> "基本用户"
+    2 -> "活跃用户"
+    3 -> "领袖"
+    4 -> "领导者"
+    else -> "活跃用户"
+}
 
 @Serializable
 data class UserCardData(
@@ -694,6 +913,8 @@ data class ChatUserSummary(
 @Serializable
 data class ChatMessagesPage(
     val messages: List<ChatMessageSummary> = emptyList(),
+    val canLoadMorePast: Boolean = false,
+    val canLoadMoreFuture: Boolean = false,
 )
 
 enum class PostFlagReason(val id: Int, val title: String, val description: String) {
@@ -858,6 +1079,7 @@ data class UploadedFile(
     val fileName: String,
     val width: Int = 0,
     val height: Int = 0,
+    val url: String? = null,
 ) {
     /** 拼成 Discourse 正文里的 Markdown。图片带尺寸,其余走 attachment 语法。 */
     fun toMarkdown(): String =
@@ -1089,6 +1311,8 @@ data class TopicDetail(
     val closed: Boolean = false,
     val archived: Boolean = false,
     val details: TopicDetails = TopicDetails(),
+    @SerialName("message_bus_last_id") val messageBusLastId: Long? = null,
+    @SerialName("highest_post_number") val highestPostNumber: Int? = null,
 ) {
     val canReply: Boolean get() = details.canCreatePost && !closed && !archived
 }

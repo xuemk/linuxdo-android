@@ -6,11 +6,12 @@ import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlin.random.Random
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
@@ -58,6 +59,17 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import org.linuxdo.android.net.ActiveSessionRequest
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.FormBody
+import okhttp3.Response
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.CookieJar
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 data class DiscourseTagInfo(
     val name: String,
@@ -98,6 +110,59 @@ private data class PostStreamResponse(
 )
 
 @Serializable
+data class TopicBusMessage(
+    val channel: String,
+    @SerialName("message_id") val messageId: Long,
+    val data: JsonElement = JsonNull,
+)
+
+internal class MessageBusConfiguration(
+    val baseUrl: HttpUrl,
+    val sharedSessionKey: String?,
+    val csrfToken: String?,
+) {
+    val sendCookies: Boolean get() {
+        val site = Config.BASE_URL.toHttpUrl()
+        return sharedSessionKey.isNullOrBlank() && baseUrl.scheme == site.scheme &&
+            baseUrl.host == site.host && baseUrl.port == site.port
+    }
+
+    fun pollUrl(clientId: String): HttpUrl = baseUrl.newBuilder()
+        .addPathSegment("message-bus").addPathSegment(clientId).addPathSegment("poll").build()
+
+    override fun toString(): String = "MessageBusConfiguration(host=${baseUrl.host})"
+}
+
+/** 读取站点自身发布的轮询地址和凭据，兼容 Discourse 两种预加载 HTML 形式。 */
+internal fun parseMessageBusConfiguration(html: String): MessageBusConfiguration {
+    val document = Jsoup.parse(html)
+    val element = document.getElementById("data-preloaded") ?: document.selectFirst("[data-preloaded]")
+    val raw = if (element?.tagName() == "script") element.data() else element?.attr("data-preloaded")
+    require(!raw.isNullOrBlank()) { "页面未包含站点预加载配置" }
+    val preloaded = Json.parseToJsonElement(raw) as? JsonObject
+    val settingsValue = preloaded?.get("siteSettings")
+    val settings = when (settingsValue) {
+        is JsonObject -> settingsValue
+        is JsonPrimitive -> settingsValue.contentOrNull?.let { Json.parseToJsonElement(it) as? JsonObject }
+        else -> null
+    }
+    require(settings != null) { "页面未包含 siteSettings" }
+    val pollingValue = settings["long_polling_base_url"]
+    require(pollingValue == null || pollingValue == JsonNull || (pollingValue is JsonPrimitive && pollingValue.isString)) {
+        "轮询地址格式无效"
+    }
+    val polling = (pollingValue as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+    val baseUrl = Config.BASE_URL.toHttpUrl().resolve(polling.ifBlank { "/" })
+    require(baseUrl != null && baseUrl.isHttps && baseUrl.username.isEmpty() && baseUrl.password.isEmpty() &&
+        baseUrl.query == null && baseUrl.fragment == null) { "轮询地址必须是 HTTPS 站点地址" }
+    fun meta(name: String): String? = document.selectFirst("meta[name=$name]")?.attr("content")
+        ?.trim()?.takeIf { it.isNotEmpty() }?.also { value ->
+            require(value.none { it == '\r' || it == '\n' || it == '\u0000' }) { "站点凭据格式无效" }
+        }
+    return MessageBusConfiguration(baseUrl, meta("shared_session_key"), meta("csrf-token"))
+}
+
+@Serializable
 private data class SearchResults(
     @SerialName("more_full_page_results") val more: Boolean = false,
 )
@@ -119,6 +184,11 @@ class TopicRepository(
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
     private val ldcAuthGate = Mutex()
+    private val csrfGate = Mutex()
+    private val pollingConfigGate = Mutex()
+    private var pollingConfigGeneration: Long? = null
+    private var pollingConfig: MessageBusConfiguration? = null
+    private var nextPollingConfigAttemptAt = 0L
     // 双轨调度器 (策略二)：getSemaphore, postGate 及滑动窗口限流器全部位于 companion object，全进程单例共享
 
     init {
@@ -223,6 +293,8 @@ class TopicRepository(
     private var categoryCache: Map<Int, Category>? = null
     private val categoryGate = Mutex()
     private var categoryListCache: List<Category>? = null
+    private var tagListCache: List<DiscourseTag>? = null
+    private val tagGate = Mutex()
     private var emojiCache: Map<String, String>? = null
 
     suspend fun emojiUrls(): Map<String, String> {
@@ -263,7 +335,7 @@ class TopicRepository(
             if (ascending != null) add("ascending=$ascending")
         }.joinToString("&")
         val path = "${feed.apiPath}?$query"
-        val body = request(path, burst = page == 0, present = present)
+        val body = request(path, burst = page == 0, present = present, retryAllowed = present)
         val result = withContext(Dispatchers.Default) {
             toPage(
                 response = json.decodeFromString(body),
@@ -296,6 +368,7 @@ class TopicRepository(
             "/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?$query",
             burst = page == 0,
             present = present,
+            retryAllowed = present,
         )
         return withContext(Dispatchers.Default) {
             toPage(
@@ -389,9 +462,11 @@ class TopicRepository(
         postNumber: Int? = null,
         burst: Boolean = false,
         trackVisit: Boolean = true,
+        present: Boolean = true,
     ): TopicDetail {
         val position = postNumber?.takeIf { it > 1 }?.let { "/$it" }.orEmpty()
-        val body = request("/t/$id$position.json?track_visit=$trackVisit", burst = burst, present = true)
+        val body = request("/t/$id$position.json?track_visit=${present && trackVisit}",
+            burst = burst, present = present, retryAllowed = present)
         return withContext(Dispatchers.Default) {
             json.decodeFromString<TopicDetail>(body).also { detail ->
                 CookedParser.prewarm(detail.postStream.posts)
@@ -423,97 +498,22 @@ class TopicRepository(
 
     private val prefetchingIds = java.util.Collections.synchronizedSet(mutableSetOf<Long>())
 
-    /**
-     * 用搜索结果一次补齐列表中多个首楼摘要。搜索结果并不作为列表数据源，
-     * 只采纳与当前话题 ID 对得上的 in:first 命中，避免搜索排序影响列表本身。
-     */
-    suspend fun prefetchSearchExcerpts(topicIds: Collection<Long>, query: String) {
-        val requestedIds = topicIds.asSequence()
-            .filter { it > 0L && ExcerptCache.get(it) == null }
-            .toSet()
-        if (requestedIds.isEmpty() || query.isBlank() || isSilentPrefetchBackingOff()) return
 
-        val body = try {
-            request("/search.json?q=${encode(query)}", present = false)
-        } catch (error: Exception) {
-            if (error !is CancellationException) enterSilentPrefetchBackoff(error)
-            throw error
-        }
-        val excerpts = withContext(Dispatchers.Default) {
-            json.decodeFromString<SearchResponse>(body).posts.asSequence()
-                .filter { it.postNumber == 1 && it.topicId in requestedIds }
-                .mapNotNull { post ->
-                    post.blurb.trim().takeIf { it.isNotEmpty() }?.let { post.topicId to it }
-                }
-                .toMap()
-        }
-        excerpts.forEach { (topicId, excerpt) -> ExcerptCache.record(topicId, excerpt) }
-    }
-
-    /**
-     * 单楼轻量端点嗅探（GET /t/{topic_id}/1.json）。
-     * 仅返回首楼数据（不到 2KB），解析真实 HTML 渲染文本与第一张高清封面图。
-     */
-    private suspend fun fetchTopicOp(topicId: Long): Pair<String?, String?>? {
-        return try {
-            val body = request("/t/$topicId/1.json", present = false)
-            withContext(Dispatchers.Default) {
-                val element = json.parseToJsonElement(body).jsonObject
-                val postStream = element["post_stream"]?.jsonObject
-                val posts = postStream?.get("posts")?.jsonArray
-                val firstPost = posts?.firstOrNull()?.jsonObject ?: return@withContext null
-                val cooked = firstPost["cooked"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                if (cooked.isBlank()) return@withContext null
-
-                val doc = Jsoup.parseBodyFragment(cooked)
-                doc.select("aside.quote, .lightbox-wrapper .meta, script, style").remove()
-                val text = doc.text().replace(Regex("""\s+"""), " ").trim()
-                val plainText = if (text.length > 150) text.take(150) else text
-
-                val firstImg = doc.select("img").firstOrNull { img ->
-                    val src = img.attr("src")
-                    !img.hasClass("emoji") &&
-                    !img.hasClass("avatar") &&
-                    !src.contains("/user_avatar/") &&
-                    !src.contains("/images/emoji/") &&
-                    (src.startsWith("http") || src.startsWith("/"))
-                }
-                val coverUrl = firstImg?.attr("src")?.let { src ->
-                    if (src.startsWith("//")) "https:$src"
-                    else if (src.startsWith("/")) "${Config.BASE_URL}$src"
-                    else src
-                }
-                (plainText.takeIf { it.isNotBlank() } to coverUrl)
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            // 撞盾必须向上抛：吞成 null 会让调用方回退 /raw 再打一枪。
-            if (enterSilentPrefetchBackoff(error)) throw error
-            null
-        }
-    }
-
-    private suspend fun fetchRawOpFallback(topicId: Long): Pair<String?, String?>? {
-        return try {
-            val raw = request("/raw/$topicId", present = false)
-            withContext(Dispatchers.Default) {
-                val plainText = rawExcerptToPlainText(raw).takeIf { it.isNotEmpty() }
-                val coverUrl = extractMarkdownFirstImage(raw)
-                (plainText to coverUrl)
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            enterSilentPrefetchBackoff(error)
-            null
+    private suspend fun fetchRawOp(topicId: Long, beforeDispatch: () -> Unit): Pair<String?, String?> {
+        // 不带楼层号的 /raw/{id} 会导出整篇话题；重试只由预览调度器统一计量。
+        val raw = request("/raw/$topicId/1", present = false, retryAllowed = false, beforeDispatch = beforeDispatch)
+        return withContext(Dispatchers.Default) {
+            val plainText = rawExcerptToPlainText(raw).take(150).takeIf { it.isNotEmpty() }
+            val coverUrl = extractMarkdownFirstImage(raw)
+            plainText to coverUrl
         }
     }
 
     private fun extractMarkdownFirstImage(raw: String): String? {
-        val mdMatch = Regex("""!\[[^\]]*]\((https?://[^)\s]+|/uploads/[^)\s]+)""").find(raw)
+        val mdMatch = Regex("""!\[[^\]]*]\((https?://[^)\s]+|/uploads/[^)\s]+|upload://[^)\s]+)""").find(raw)
         if (mdMatch != null) {
             val url = mdMatch.groupValues[1]
+            if (url.startsWith("upload://")) return "${Config.BASE_URL}/uploads/short-url/${url.removePrefix("upload://")}"
             return if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
         }
         val htmlMatch = Regex("""<img\b[^>]*src=["'](https?://[^"'\s]+|/uploads/[^"'\s]+)["']""", RegexOption.IGNORE_CASE).find(raw)
@@ -525,28 +525,42 @@ class TopicRepository(
     }
 
     /**
-     * 仅拉取首楼的原始文本与封面图，供未命中的可视列表项兜底。
-     * 优先单楼端点，失败回退到 raw 接口，绝不进入完整话题详情页或改变阅读状态。
+     * 单次首楼请求返回明确结果；是否重试交给持有可见性和总预算的调用方。
      */
-    suspend fun prefetchExcerpt(topicId: Long): String? {
-        if (topicId <= 0L) return null
-        ExcerptCache.get(topicId)?.let { return it }
-        if (isSilentPrefetchBackingOff()) return null
-        if (!ApiQuotaPool.EXCERPT_PREFETCH.tryAcquire()) return null
-        if (!prefetchingIds.add(topicId)) return null
+    internal suspend fun prefetchExcerpt(topicId: Long, beforeDispatch: () -> Unit = {}): ExcerptFetchResult {
+        if (topicId <= 0L) return ExcerptFetchResult(ExcerptFetchOutcome.PERMANENT_FAILURE)
+        if (ExcerptCache.get(topicId) != null) return ExcerptFetchResult(ExcerptFetchOutcome.COMPLETE)
+        if (isSilentPrefetchBackingOff() || isRateLimitCoolingDown()) return ExcerptFetchResult(ExcerptFetchOutcome.BLOCKED)
+        if (!ApiQuotaPool.EXCERPT_PREFETCH.tryAcquire() || !prefetchingIds.add(topicId)) {
+            return ExcerptFetchResult(ExcerptFetchOutcome.DEFERRED, ApiQuotaPool.EXCERPT_PREFETCH.remainingWaitMs().coerceAtLeast(1_000L))
+        }
         return try {
-            val op = fetchTopicOp(topicId) ?: fetchRawOpFallback(topicId)
-            val plainText = op?.first
-            val coverUrl = op?.second
+            val op = fetchRawOp(topicId, beforeDispatch)
+            val plainText = op.first
+            val coverUrl = op.second
             if (!plainText.isNullOrBlank() || !coverUrl.isNullOrBlank()) {
                 ExcerptCache.record(topicId, plainText, coverUrl)
             }
-            if (op != null) ApiQuotaPool.EXCERPT_PREFETCH.onSuccess()
-            plainText
+            ApiQuotaPool.EXCERPT_PREFETCH.onSuccess()
+            ExcerptFetchResult(if (plainText == null && coverUrl == null) ExcerptFetchOutcome.EMPTY else ExcerptFetchOutcome.COMPLETE)
         } catch (error: CancellationException) {
             throw error
-        } catch (_: Exception) {
-            null
+        } catch (error: Exception) {
+            val challenged = enterSilentPrefetchBackoff(error)
+            val status = when (error) {
+                is HttpStatusException -> error.status
+                is RateLimitException -> 429
+                is NetworkTimeoutException -> 0
+                else -> -1
+            }
+            val retryAfterMs = when (error) {
+                is RateLimitException -> error.retryAfterMs
+                is HttpStatusException -> error.retryAfterSeconds?.coerceIn(0L, Long.MAX_VALUE / 1_000L)?.times(1_000L) ?: 0L
+                else -> 0L
+            }
+            val outcome = ExcerptFetchOutcome.fromStatus(status, challenged)
+            diagnostics.logThrottled("excerpt-result-$status", "预览请求结果: HTTP=$status 处理=$outcome")
+            ExcerptFetchResult(outcome, retryAfterMs)
         } finally {
             prefetchingIds.remove(topicId)
         }
@@ -596,6 +610,10 @@ class TopicRepository(
      */
     private var timingsCooldownUntil = 0L
 
+    fun readTimingsCooldownRemainingMs(): Long = maxOf(
+        rateLimitRemainingMs(), timingsCooldownUntil - SystemClock.elapsedRealtime(), 0L,
+    )
+
     /**
      * 路径 B 已证明能过 timings 时置位：A 的 OkHttp 指纹/出口拿着同一枚 cf_clearance 仍会被
      * POST 写规则挑战，继续先打 A 只会每次多吃一个 403，所以后续心跳直接走 B。
@@ -620,12 +638,25 @@ class TopicRepository(
         cachedCsrfToken = null
     }
 
-    suspend fun recordTopicTimings(topicId: Long, topicTimeMs: Long, postNumbers: List<Int>): Boolean {
+    suspend fun recordTopicTimings(
+        topicId: Long,
+        topicTimeMs: Long,
+        postTimesMs: Map<Int, Long>,
+        isReadingActive: () -> Boolean,
+    ): Boolean {
+        val generation = sessionStore?.sessionGeneration
+        suspend fun ensureReadingActive() {
+            currentCoroutineContext().ensureActive()
+            if (!isReadingActive() || sessionStore?.sessionChanging == true ||
+                generation != sessionStore?.sessionGeneration
+            ) throw CancellationException("阅读已暂停或会话已切换")
+        }
+        ensureReadingActive()
         if (sessionStore?.sessionChanging == true) {
             diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 会话切换中")
             return false
         }
-        if (topicId <= 0L) return false
+        if (topicId <= 0L || topicTimeMs <= 0L) return false
         if (isRateLimitCoolingDown()) {
             diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 429 冷却还剩 ${rateLimitRemainingMs() / 1000}s")
             return false
@@ -635,7 +666,9 @@ class TopicRepository(
             diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 熔断冷却还剩 ${(timingsCooldownUntil - now) / 1000}s")
             return false
         }
-        val numbers = postNumbers.filter { it > 0 }.distinct().sorted()
+        val timings = postTimesMs.filter { (number, time) -> number > 0 && time >= TopicReadTracker.MIN_POST_DWELL_MS }
+            .mapValues { (_, time) -> time.coerceAtMost(MAX_POST_TIME_MS) }
+        val numbers = timings.keys.sorted()
         if (numbers.isEmpty()) {
             diagnostics.log("阅读进度未上报: 话题 $topicId 没有可见楼层")
             return false
@@ -643,28 +676,20 @@ class TopicRepository(
 
         val currentUserId = sessionStore?.currentUserId() ?: 0L
 
-        // ── 自动去重校验 ──
-        // 1. 真实已同步去重校验：当且仅当当前账号在当前批次的所有楼层此前都已被确认成功同步，才判定为去重并返回 true（上层安全剔除）
-        if (isTopicPostsReported(currentUserId, topicId, numbers)) {
-            diagnostics.log("阅读进度去重: 用户 $currentUserId 话题 $topicId ${numbers.size} 个楼层此前已全部成功同步，跳过请求")
-            return true
-        }
-
-        // 2. 避免在途重入并发：若当前话题已有正在发送的同步任务，返回 false！
-        // 关键：绝不虚报 true！返回 false 让上层 ViewModel 保留未发送的楼层，等在途完成后下一周期合并上报，绝不丢楼层
-        if (!inFlightTimingsTopics.add(topicId)) {
-            diagnostics.log("阅读进度待合并: 话题 $topicId 已有正在进行的同步任务，保留本批至下次合并")
+        // 楼层已读不代表后续真实阅读时间重复；只拦截并发批次。
+        val requestMarker = Any()
+        if (inFlightTimingsTopics.putIfAbsent(topicId, requestMarker) != null) {
+            diagnostics.log("阅读进度跳过: 话题 $topicId 已有正在进行的同步任务")
             return false
         }
 
         try {
-            val topicTime = topicTimeMs.coerceIn(MIN_READ_TIME_MS, MAX_TOPIC_TIME_MS)
-            val perPost = (topicTime / numbers.size).coerceIn(MIN_READ_TIME_MS, MAX_POST_TIME_MS)
+            val topicTime = topicTimeMs.coerceAtMost(MAX_TOPIC_TIME_MS)
             // Rails 的嵌套参数写法:timings[楼层号]=停留毫秒数。JSON body 在这个端点上不被认。
             val form = buildString {
                 append("topic_id=").append(topicId)
                 append("&topic_time=").append(topicTime)
-                numbers.forEach { number -> append("&timings%5B").append(number).append("%5D=").append(perPost) }
+                numbers.forEach { number -> append("&timings%5B").append(number).append("%5D=").append(timings.getValue(number)) }
             }
             val primaryTransport = transportProvider()
             val fallbackTransport = fallbackTransportProvider?.invoke()
@@ -672,10 +697,12 @@ class TopicRepository(
 
             suspend fun sendViaFallback(transport: Transport, csrfFallback: String?): TransportResult? = try {
                 postGate.withLock {
+                    ensureReadingActive()
                     if (isRateLimitCoolingDown()) return@withLock null
                     throttlePost(burst = true)
                     if (isRateLimitCoolingDown()) return@withLock null
                     val fallbackCsrf = transport.obtainCsrfToken() ?: csrfFallback ?: return@withLock null
+                    ensureReadingActive()
                     try {
                         transport.write("/topics/timings", "POST", form, fallbackCsrf, Transport.FORM_CONTENT_TYPE, present = false)
                     } finally {
@@ -692,6 +719,7 @@ class TopicRepository(
             if (preferWebViewTimings && fallbackTransport != null) {
                 val ready = fallbackTransport.isReady()
                 val preferred = if (ready) sendViaFallback(fallbackTransport, cachedCsrfToken) else null
+                ensureReadingActive()
                 diagnostics.log(
                     "[诊断] timings 优先路径 B ready=$ready status=${preferred?.status ?: "未发出"} challenged=${preferred?.challenged}" +
                         " body=${preferred?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
@@ -723,17 +751,24 @@ class TopicRepository(
             }
 
             // ── 尝试路径 A (OkHttp) ──
+            val csrfStartedAt = SystemClock.elapsedRealtime()
             val primaryCsrf = cachedCsrf()
+            val csrfElapsedMs = SystemClock.elapsedRealtime() - csrfStartedAt
             if (primaryCsrf.isNullOrBlank()) {
                 diagnostics.log("阅读进度未上报: CSRF Token 缺失 (hasCsrf=false)")
                 return false
             }
 
+            val queuedAt = SystemClock.elapsedRealtime()
+            var requestStartedAt = 0L
             val primaryResult = try {
                 postGate.withLock {
+                    ensureReadingActive()
                     if (isRateLimitCoolingDown()) return@withLock null
                     throttlePost()
+                    ensureReadingActive()
                     if (isRateLimitCoolingDown()) return@withLock null
+                    requestStartedAt = SystemClock.elapsedRealtime()
                     try {
                         primaryTransport.write("/topics/timings", "POST", form, primaryCsrf, Transport.FORM_CONTENT_TYPE, present = false)
                     } finally {
@@ -747,6 +782,11 @@ class TopicRepository(
                 return false
             }
 
+            ensureReadingActive()
+            if (requestStartedAt > 0L) diagnostics.log(
+                "阅读同步耗时: 话题 $topicId, CSRF ${csrfElapsedMs}ms, " +
+                    "排队 ${requestStartedAt - queuedAt}ms, POST ${SystemClock.elapsedRealtime() - requestStartedAt}ms",
+            )
             if (primaryResult == null) {
                 diagnostics.log("[诊断] 阅读进度跳过: 发送前进入 429 冷却")
                 return false
@@ -782,18 +822,23 @@ class TopicRepository(
                 cachedCsrfToken = null
                 sessionStore?.calibrateForumSessionForBadCsrf()
                 val newCsrf = runCatching { obtainCsrf(forceRefresh = true) }.getOrNull()
+                ensureReadingActive()
                 if (newCsrf != null) {
                     val retryResult = try {
                         postGate.withLock {
                             if (isRateLimitCoolingDown()) return@withLock null
                             throttlePost(burst = true)
+                            ensureReadingActive()
                             try {
                                 primaryTransport.write("/topics/timings", "POST", form, newCsrf, Transport.FORM_CONTENT_TYPE, present = false)
                             } finally {
                                 markPostCompleted()
                             }
                         }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) { null }
+                    ensureReadingActive()
                     diagnostics.log(
                         "[诊断] timings BAD CSRF 重试结果 status=${retryResult?.status ?: "未发出"} challenged=${retryResult?.challenged}" +
                             " body=${retryResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
@@ -811,14 +856,15 @@ class TopicRepository(
             if (primaryResult.challenged && fallbackTransport != null) {
                 if (isRateLimitCoolingDown()) return false
                 diagnostics.log("阅读进度遭遇 Cloudflare 挑战，转交 ${fallbackTransport.name} 走原生 Chromium 网络栈兜底")
-                // 使用 NonCancellable 保护静默重验证与当次兜底上报：
-                // 避免用户看帖几秒退回列表（leaveTopic 取消单帖协程）时把正在进行的 WebView 静默过盾腰斩并误报风控横幅
-                val fallbackHandled = withContext(NonCancellable) {
+                val fallbackHandled = kotlinx.coroutines.coroutineScope {
+                    ensureReadingActive()
                     val alreadyReady = fallbackTransport.isReady()
                     val fallbackReady = alreadyReady || fallbackTransport.revalidate("timings 挑战兜底")
+                    ensureReadingActive()
                     diagnostics.log("[诊断] timings 兜底就绪 alreadyReady=$alreadyReady ready=$fallbackReady")
                     if (fallbackReady) {
                         val fallbackResult = sendViaFallback(fallbackTransport, primaryCsrf)
+                        ensureReadingActive()
                         diagnostics.log(
                             "[诊断] timings 兜底结果 status=${fallbackResult?.status ?: "未发出"} challenged=${fallbackResult?.challenged}" +
                                 " body=${fallbackResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
@@ -826,16 +872,15 @@ class TopicRepository(
                         if (fallbackResult != null && fallbackResult.status == 429) {
                             val cooldown = enterRateLimitCooldown("/topics/timings", fallbackResult.retryAfterSeconds)
                             timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
-                            return@withContext false
+                            return@coroutineScope false
                         }
                         if (fallbackResult != null && fallbackResult.status in 200..299) {
                             timingsCooldownUntil = 0L
                             markTimingsSynced()
                             preferWebViewTimings = true
                             recordTopicPostsReported(currentUserId, topicId, numbers)
-                            val fallbackCsrf = fallbackTransport.obtainCsrfToken()
-                            diagnostics.log("阅读进度已同步(${fallbackTransport.name} 兜底成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s, hasCsrf=${!fallbackCsrf.isNullOrBlank()}")
-                            return@withContext true
+                            diagnostics.log("阅读进度已同步(${fallbackTransport.name} 兜底成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s")
+                            return@coroutineScope true
                         }
                     }
                     null
@@ -859,7 +904,7 @@ class TopicRepository(
             diagnostics.log("[诊断] 阅读进度上报协程被取消: 话题 $topicId (${cancelled.message.orEmpty().take(40)})")
             throw cancelled
         } finally {
-            inFlightTimingsTopics.remove(topicId)
+            inFlightTimingsTopics.remove(topicId, requestMarker)
         }
     }
 
@@ -871,27 +916,165 @@ class TopicRepository(
         diagnostics.log("[诊断] Cookie清单($stage): $inventory")
     }
 
-    private suspend fun obtainCsrf(forceRefresh: Boolean = false): String {
+    private suspend fun obtainCsrf(forceRefresh: Boolean = false): String = csrfGate.withLock {
         if (!forceRefresh) {
-            cachedCsrfToken?.takeIf { it.isNotBlank() }?.let { return it }
+            cachedCsrfToken?.takeIf { it.isNotBlank() }?.let { return@withLock it }
         }
+        val generation = sessionStore?.sessionGeneration
         val token = objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
+        if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
         cachedCsrfToken = token
-        return token
+        token
     }
 
-    private suspend fun cachedCsrf(): String? {
-        return runCatching { obtainCsrf() }.getOrNull()
+    private suspend fun cachedCsrf(): String? = try { obtainCsrf() }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: NeedsInteractiveVerification) {
+            timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
+            onTimingsVerificationRequired?.invoke()
+            null
+        }
+        catch (error: HttpStatusException) {
+            if (error.status == 403) timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
+            null
+        }
+        catch (_: Exception) { null }
+
+    private suspend fun getPollingConfiguration(generation: Long): MessageBusConfiguration = pollingConfigGate.withLock {
+        if (pollingConfigGeneration != generation) {
+            pollingConfigGeneration = generation
+            pollingConfig = null
+            nextPollingConfigAttemptAt = 0L
+        }
+        pollingConfig?.let { return@withLock it }
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextPollingConfigAttemptAt) {
+            throw HttpStatusException(503, "轮询配置读取正在退避", (nextPollingConfigAttemptAt - now + 999L) / 1_000L)
+        }
+        nextPollingConfigAttemptAt = now + 120_000L
+        // 绝对地址让传输层请求 HTML；每个会话只取一次，不逐话题抓取首页。
+        val config = try {
+            val html = request(Config.BASE_URL + "/", present = false, retryAllowed = false)
+            withContext(Dispatchers.Default) { parseMessageBusConfiguration(html) }
+        } catch (cancelled: CancellationException) {
+            nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 3_000L
+            throw cancelled
+        } catch (error: Exception) {
+            diagnostics.log("话题订阅配置未就绪，120秒后可重试(${error.javaClass.simpleName})")
+            throw error
+        }
+        ensureRequestAllowed()
+        if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+        pollingConfig = config
+        nextPollingConfigAttemptAt = 0L
+        csrfGate.withLock {
+            if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+            if (cachedCsrfToken.isNullOrBlank()) cachedCsrfToken = config.csrfToken
+        }
+        diagnostics.log("话题订阅使用站点配置: ${config.baseUrl.host}, 共享认证=${!config.sharedSessionKey.isNullOrBlank()}")
+        config
     }
 
-    suspend fun fetchPosts(topicId: Long, ids: List<Long>): List<Post> {
+    suspend fun fetchPosts(topicId: Long, ids: List<Long>, present: Boolean = true): List<Post> {
         require(ids.size in 1..20)
         val query = ids.joinToString("&") { "post_ids%5B%5D=$it" }
-        val body = request("/t/$topicId/posts.json?$query&track_visit=false")
+        val body = request("/t/$topicId/posts.json?$query&track_visit=false",
+            present = present, retryAllowed = present)
         return withContext(Dispatchers.Default) {
             json.decodeFromString<PostStreamResponse>(body).postStream.posts.also { CookedParser.prewarm(it) }
         }
     }
+
+    /** MessageBus 的 Dont-Chunk 长轮询；不占用整个后台 GET 闸门等待服务端消息。 */
+    suspend fun pollTopicMessages(topicId: Long, clientId: String, cursor: Long, sequence: Long): List<TopicBusMessage> =
+        topicPollGate.withLock {
+            val generation = sessionStore?.sessionGeneration ?: return@withLock emptyList()
+            val path = "/message-bus/$clientId/poll"
+            val config = getPollingConfiguration(generation)
+            backgroundGetGate.withLock {
+                val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
+                if (wait > 0L) delay(wait)
+                ensureRequestAllowed()
+                throwIfRateLimitCoolingDown()
+                if (isSilentPrefetchBackingOff()) throw NeedsInteractiveVerification("话题订阅正在退避")
+                acquireGetSlot { isRateLimitCoolingDown() }
+                currentCoroutineContext().ensureActive()
+                lastBackgroundGetAt = SystemClock.elapsedRealtime()
+            }
+            val sharedClient = requireNotNull(httpClientProvider?.invoke())
+            val client = sharedClient.newBuilder()
+                .readTimeout(70, TimeUnit.SECONDS)
+                .callTimeout(75, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
+                .followRedirects(false)
+                .cookieJar(CookieJar.NO_COOKIES)
+                .build()
+            val request = Request.Builder()
+                .url(config.pollUrl(clientId))
+                .header("Accept", "application/json")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Dont-Chunk", "true")
+                .header("Discourse-Background", "true")
+                .header("X-SILENCE-LOGGER", "true")
+                .header("Origin", Config.BASE_URL)
+                .header("Referer", "${Config.BASE_URL}/t/$topicId")
+                .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation, sendCookies = config.sendCookies))
+                .apply {
+                    config.sharedSessionKey?.let { header("X-Shared-Session-Key", it) }
+                    sessionStore.userAgentOrNull()?.let { header("User-Agent", it) }
+                }
+                .post(FormBody.Builder().add("/topic/$topicId", cursor.toString())
+                    .add("__seq", sequence.toString()).build())
+                .build()
+            val result = suspendCancellableCoroutine<TransportResult> { continuation ->
+                val call = client.newCall(request)
+                continuation.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (continuation.isActive) continuation.resumeWith(Result.failure(e))
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        try {
+                            response.use { incoming ->
+                                val body = incoming.body?.string().orEmpty()
+                                val result = TransportResult(
+                                    status = incoming.code,
+                                    body = body,
+                                    challenged = ChallengeDetector.isChallenge(incoming.code, incoming.header("cf-mitigated"), body),
+                                    retryAfterSeconds = HttpHeaderUtils.extractRetryAfterSeconds(
+                                        incoming.header("Retry-After"), incoming.header("x-ratelimit-reset"), body),
+                                )
+                                if (continuation.isActive) continuation.resumeWith(Result.success(result))
+                            }
+                        } catch (error: Exception) {
+                            if (continuation.isActive) continuation.resumeWith(Result.failure(error))
+                        }
+                    }
+                })
+            }
+            if (generation != sessionStore.sessionGeneration || sessionStore.sessionChanging) {
+                throw CancellationException("会话已切换")
+            }
+            if (result.status in setOf(401, 403, 404)) {
+                pollingConfig = null
+                nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 120_000L
+            }
+            when {
+                result.status == 429 -> {
+                    if (result.challenged) enterSilentPrefetchBackoff(NeedsInteractiveVerification("话题订阅被挑战拦截"))
+                    throw enterRateLimitCooldown(path, maxOf(if (result.challenged) 120L else 15L, result.retryAfterSeconds ?: 0L),
+                        cfChallenge = result.challenged)
+                }
+                result.challenged || result.status == 403 -> {
+                    val error = NeedsInteractiveVerification("话题订阅被拦截，停止自动请求")
+                    enterSilentPrefetchBackoff(error)
+                    throw error
+                }
+                result.status !in 200..299 -> throw HttpStatusException(result.status, "话题订阅失败", result.retryAfterSeconds)
+                else -> json.decodeFromString<List<TopicBusMessage>>(result.body)
+            }
+        }
 
     suspend fun categoryById(id: Int?): Category? = id?.let { categories()[it] }
 
@@ -1400,16 +1583,38 @@ class TopicRepository(
             .sortedByDescending { it.lastMessage?.createdAt.orEmpty() }
     }
 
-    suspend fun fetchChatMessages(channelId: Long, fromLastRead: Boolean = true): List<ChatMessageSummary> {
+    suspend fun fetchChatMessages(
+        channelId: Long,
+        fromLastRead: Boolean = true,
+        direction: String? = null,
+        targetMessageId: Long? = null,
+    ): ChatMessagesPage {
+        val params = mutableListOf("page_size=50")
+        if (direction != null) {
+            params.add("direction=$direction")
+        } else if (fromLastRead) {
+            params.add("fetch_from_last_read=true")
+        }
+        if (targetMessageId != null) {
+            params.add("target_message_id=$targetMessageId")
+        }
         val body = request(
-            "/chat/api/channels/$channelId/messages?page_size=50&fetch_from_last_read=$fromLastRead",
+            "/chat/api/channels/$channelId/messages?" + params.joinToString("&"),
         )
         val root = json.parseToJsonElement(body).jsonObject
-        return root.arrayObjects("messages").mapNotNull { message ->
+        val messages = root.arrayObjects("messages").mapNotNull { message ->
             runCatching {
                 json.decodeFromJsonElement<ChatMessageSummary>(message).copy(channelId = channelId)
             }.getOrNull()
         }
+        val meta = root["meta"] as? JsonObject
+        val canLoadMorePast = meta?.get("can_load_more_past")?.jsonPrimitive?.booleanOrNull ?: false
+        val canLoadMoreFuture = meta?.get("can_load_more_future")?.jsonPrimitive?.booleanOrNull ?: false
+        return ChatMessagesPage(
+            messages = messages,
+            canLoadMorePast = canLoadMorePast,
+            canLoadMoreFuture = canLoadMoreFuture,
+        )
     }
 
     suspend fun markChatChannelRead(channelId: Long, messageId: Long?) {
@@ -1911,6 +2116,7 @@ class TopicRepository(
                 fileName = root.text("original_filename").ifBlank { fileName },
                 width = root.text("width").toIntOrNull() ?: 0,
                 height = root.text("height").toIntOrNull() ?: 0,
+                url = root.text("url").takeIf { it.isNotBlank() },
             )
         }
     }
@@ -1933,14 +2139,18 @@ class TopicRepository(
         ).jsonObject
         return json.decodeFromJsonElement(response["poll"] ?: error("投票响应缺少结果"))
     }
-
     suspend fun fetchUnreadSummary(scope: NotificationScope): UnreadSummary {
         // Discourse 的 /notifications.json 不支持 filter=unread 参数；不带 recent=true 时会返回账号
         // 自注册以来的全量历史分页，导致 while 循环把多年前未逐条点击的陈年记录累加为 99+ 且耗时十余秒。
         // 统一使用 recent=true&limit=50&silent=true，与网页端顶栏铃铛及后台 NotificationWorker 严格同源。
-        val page = json.decodeFromString<UnreadNotificationPage>(
-            request("/notifications.json?recent=true&limit=50&silent=true", present = false),
+        return parseUnreadSummary(
+            request(LOGIN_CF_GATE_PATH, present = false),
+            scope,
         )
+    }
+
+    private fun parseUnreadSummary(payload: String, scope: NotificationScope): UnreadSummary {
+        val page = json.decodeFromString<UnreadNotificationPage>(payload)
         val fresh = page.notifications.distinctBy { it.id }
         val count = fresh.count { it.countsAsUnread(scope) }
         val unreadByType = mutableMapOf<Int, Int>()
@@ -2079,7 +2289,6 @@ class TopicRepository(
         )
         val known = categories()
         val posts = response.posts.groupBy { it.topicId }
-        val seen = reading?.seenTopicIds().orEmpty()
         return SearchPage(
             items = response.topics.map { topic ->
                 val author = posts[topic.id]?.firstOrNull()
@@ -2087,7 +2296,7 @@ class TopicRepository(
                 val effectiveLevelCode = cachedLevel ?: topic.notificationLevel?.takeIf { it in 0..3 && it != 1 }
                 val notificationLevel = effectiveLevelCode?.let { TopicNotificationLevel.fromCode(it) }
                 TopicListItem(
-                    topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
+                    topic = reading?.mergeReadState(topic) ?: topic,
                     authorUsername = author?.username,
                     authorName = author?.name,
                     avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
@@ -2319,22 +2528,71 @@ class TopicRepository(
         )
     }
 
+    @Volatile private var cachedAllBadgesRaw: Pair<Long, JsonObject?>? = null
+    private val allBadgesGate = Mutex()
+
+    private suspend fun getAllBadgesRaw(): JsonObject? {
+        val now = SystemClock.elapsedRealtime()
+        cachedAllBadgesRaw?.let { (time, data) ->
+            if (now - time < 120_000L && data != null) return data
+        }
+        return allBadgesGate.withLock {
+            val second = cachedAllBadgesRaw
+            if (second != null && now - second.first < 120_000L && second.second != null) {
+                return@withLock second.second
+            }
+            val fetched = runCatching { objectRequest("/badges.json") }.getOrNull()
+            if (fetched != null) {
+                cachedAllBadgesRaw = Pair(SystemClock.elapsedRealtime(), fetched)
+            }
+            fetched ?: second?.second
+        }
+    }
+
+    private val userBadgesMemoryCache = ConcurrentHashMap<String, Pair<Long, List<UserBadgeItem>>>()
+    private val inFlightUserBadges = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<List<UserBadgeItem>>>()
+
     /**
      * 获取用户徽章数据：
-     * 1. 请求官方接口 /user-badges/{username}.json?grouped=true 获取用户已获得的徽章；
-     * 2. 请求全站徽章池 /badges.json 补全未获得的徽章；
-     * 3. 严格使用官方名称、描述 (HTML 清洗) 与图标/图片；
-     * 4. 优先排序已获取的徽章，后排未获取的徽章。
+     * 1. 内存 30s 缓存防刷 + In-flight Single-Flight 去重，避免同屏重复拉取；
+     * 2. 请求官方接口 /user-badges/{username}.json?grouped=true 获取用户已获得的徽章；
+     * 3. 请求全站徽章池 /badges.json (带 120s 内存缓存) 补全未获得的徽章；
+     * 4. 严格使用官方名称、描述 (HTML 清洗) 与图标/图片；
+     * 5. 优先排序已获取的徽章，后排未获取的徽章。
      */
-    suspend fun fetchUserBadges(username: String): List<UserBadgeItem> = withContext(Dispatchers.IO) {
+    suspend fun fetchUserBadges(username: String, forceRefresh: Boolean = false): List<UserBadgeItem> = withContext(Dispatchers.IO) {
+        val key = username.lowercase().trim().removePrefix("@")
+        val now = SystemClock.elapsedRealtime()
+        if (!forceRefresh) {
+            userBadgesMemoryCache[key]?.let { (time, list) ->
+                if (now - time < 30_000L && list.isNotEmpty()) {
+                    return@withContext list
+                }
+            }
+        }
+        val inFlight = inFlightUserBadges[key]
+        if (inFlight != null && inFlight.isActive) {
+            return@withContext inFlight.await()
+        }
+        val deferred = async {
+            try {
+                doFetchUserBadges(username)
+            } finally {
+                inFlightUserBadges.remove(key)
+            }
+        }
+        inFlightUserBadges[key] = deferred
+        deferred.await()
+    }
+
+    private suspend fun doFetchUserBadges(username: String): List<UserBadgeItem> {
+        val key = username.lowercase().trim().removePrefix("@")
         val userPath = URLEncoder.encode(username, "UTF-8")
         val userBadgesRaw = runCatching {
             objectRequest("/user-badges/$userPath.json?grouped=true")
         }.getOrNull()
 
-        val allBadgesRaw = runCatching {
-            objectRequest("/badges.json")
-        }.getOrNull()
+        val allBadgesRaw = getAllBadgesRaw()
 
         val userBadgesList = userBadgesRaw?.objects("user_badges").orEmpty()
         val earnedMap = mutableMapOf<Long, Pair<String?, Int>>() // badgeId -> (grantedAt, count)
@@ -2401,7 +2659,8 @@ class TopicRepository(
                 .thenByDescending { it.grantCount }
         )
         saveCachedUserBadges(username, sorted)
-        sorted
+        userBadgesMemoryCache[key] = Pair(SystemClock.elapsedRealtime(), sorted)
+        return sorted
     }
 
     suspend fun fetchUserBoosts(username: String, beforeBoostId: Long? = null): Pair<List<UserReplyItem>, Long?> {
@@ -2717,6 +2976,78 @@ class TopicRepository(
         categoryListCache ?: json.decodeFromString<CategoryListResponse>(
             request("/categories.json?include_subcategories=true"),
         ).categoryList.categories.also { categoryListCache = it }
+    }
+
+    fun cachedTagList(): List<DiscourseTag>? = tagListCache
+
+    fun seedTagsFromJson(rawJson: String) {
+        try {
+            val list = json.decodeFromString<DiscourseTagsResponse>(rawJson).allTagsSorted()
+            if (list.isNotEmpty()) {
+                tagListCache = list
+            }
+        } catch (error: Exception) {
+            diagnostics.log("预填标签缓存失败: ${error.message}")
+        }
+    }
+
+    suspend fun fetchTags(): List<DiscourseTag> = tagGate.withLock {
+        tagListCache ?: json.decodeFromString<DiscourseTagsResponse>(
+            request("/tags.json"),
+        ).allTagsSorted().also { tagListCache = it }
+    }
+
+    suspend fun refreshTagsFromServer(): Pair<List<DiscourseTag>, String>? = tagGate.withLock {
+        val raw = request("/tags.json")
+        val freshList = json.decodeFromString<DiscourseTagsResponse>(raw).allTagsSorted()
+        val changed = tagListCache != freshList
+        tagListCache = freshList
+        if (changed) freshList to raw else null
+    }
+
+    suspend fun fetchTagTopics(
+        tag: String,
+        page: Int,
+        present: Boolean = true,
+        order: String? = null,
+        ascending: Boolean? = null,
+    ): TopicPage {
+        val params = mutableListOf<String>()
+        if (page > 0) {
+            params.add("page=$page")
+        }
+        if (!order.isNullOrBlank()) {
+            params.add("order=$order")
+            if (ascending != null) {
+                params.add("ascending=$ascending")
+            }
+        }
+        val querySuffix = if (params.isNotEmpty()) "?${params.joinToString("&")}" else ""
+        val encodedTag = encode(tag).replace("+", "%20")
+        val raw = try {
+            request(
+                "/tag/$encodedTag/l/latest.json$querySuffix",
+                burst = page == 0,
+                present = present,
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: NeedsInteractiveVerification) {
+            throw error
+        } catch (_: Exception) {
+            val fallbackQuery = if (params.isEmpty()) "?page=$page" else "?page=$page&${params.filterNot { it.startsWith("page=") }.joinToString("&")}".trimEnd('&')
+            request(
+                "/tag/$encodedTag.json$fallbackQuery",
+                burst = page == 0,
+                present = present,
+            )
+        }
+        return withContext(Dispatchers.Default) {
+            toPage(
+                json.decodeFromString<TopicListResponse>(raw),
+                awaitCategories = false,
+            )
+        }
     }
 
     /** 返回当前登录用户名;未登录(Discourse 返回 404)时为 null。这才是"登录态是否有效"的真实判断。 */
@@ -3287,8 +3618,17 @@ class TopicRepository(
             val backupEnabled = responseObj["backup_enabled"]?.jsonPrimitive?.booleanOrNull == true
             val securityKeyEnabled = responseObj["security_key_enabled"]?.jsonPrimitive?.booleanOrNull == true
             val hasMulti2fa = responseObj["multiple_second_factor_methods"] != null
-            val isSecondFactor = reason?.contains("second_factor") == true ||
-                totpEnabled || backupEnabled || securityKeyEnabled || hasMulti2fa
+            val isSecondFactor = reason == "second_factor" ||
+                reason == "invalid_second_factor" ||
+                reason == "invalid_second_factor_method" ||
+                reason?.contains("second_factor", ignoreCase = true) == true ||
+                totpEnabled || backupEnabled || securityKeyEnabled || hasMulti2fa ||
+                (trimmedToken.isEmpty() && !error.isNullOrBlank() && (
+                    error.contains("双重身份验证") ||
+                        error.contains("两步") ||
+                        error.contains("二步") ||
+                        error.contains("second factor", ignoreCase = true)
+                ))
             if (isSecondFactor) {
                 if (trimmedToken.isEmpty()) {
                     diagnostics.log("账号已开启 2FA，等待输入两步验证码")
@@ -3336,11 +3676,11 @@ class TopicRepository(
                 markPostCompleted()
             }
             diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
+            if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
             if (result.status == 429) {
                 enterRateLimitCooldown("/u/email-login.json", result.retryAfterSeconds)
                 throw HttpStatusException(429, "发送登录邮件过于频繁，请稍后再试")
             }
-            if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
             if (result.status == 403) throw RiskControlException(403, "发送登录邮件触发风控 (403)")
             if (result.status == 0) throw NetworkTimeoutException()
             if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
@@ -3353,11 +3693,11 @@ class TopicRepository(
             loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
         }
         diagnostics.recordStatus(transport.name, result.status, "/session/csrf")
+        if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
         if (result.status == 429) {
             enterRateLimitCooldown("/session/csrf.json", result.retryAfterSeconds)
             throw HttpStatusException(429, "获取凭据过于频繁，请稍后再试")
         }
-        if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
         if (result.status == 403) throw RiskControlException(403, "获取登录凭证触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
         if (result.status !in 200..299) throw HttpStatusException(result.status, "无法获取 CSRF token")
@@ -3412,9 +3752,15 @@ class TopicRepository(
         val reason = body?.get("reason")?.jsonPrimitive?.contentOrNull
         val secondFactorRequired = body?.get("second_factor_required")?.jsonPrimitive?.booleanOrNull == true ||
             body?.get("totp_enabled")?.jsonPrimitive?.booleanOrNull == true ||
+            body?.get("backup_enabled")?.jsonPrimitive?.booleanOrNull == true ||
+            body?.get("security_key_enabled")?.jsonPrimitive?.booleanOrNull == true ||
+            reason == "second_factor" ||
             reason == "invalid_second_factor" ||
+            reason == "invalid_second_factor_method" ||
+            reason?.contains("second_factor", ignoreCase = true) == true ||
             (trimmed2fa.isEmpty() && serverError != null && (
-                serverError.contains("两步") ||
+                serverError.contains("双重身份验证") ||
+                    serverError.contains("两步") ||
                     serverError.contains("二步") ||
                     serverError.contains("验证") ||
                     serverError.contains("second factor", ignoreCase = true) ||
@@ -3497,19 +3843,25 @@ class TopicRepository(
         val known = if (awaitCategories) categories() else categoryCache.orEmpty()
         val usersById = response.users.associateBy { it.id }
         response.users.forEach { u -> AvatarCache.record(u.username, u.animatedAvatar) }
-        // 本地已读集合优先于服务端 unseen:纯净模式下压根没上报过,服务端当然还认为没读。
+        // 开启同步只合并成功回执；关闭同步才用本地浏览记录覆盖未读状态。
         val filteredTopics = response.topicList.topics.distinctBy { it.id }.filterNot { topic ->
-            excludeReadUnread && reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
+            excludeReadUnread && reading?.isUnreadExcluded(topic.id, topic.postsCount, topic.highestPostNumber) == true
         }
         val items = filteredTopics.map { topic ->
-            // Discourse 的 posters 顺序固定,第一个是原始发帖人。
-            val author = topic.posters.firstOrNull()?.userId?.let { usersById[it] }
-            val locallyRead = reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
+            // 对齐 fluxdo：优先取首个 Original Poster（兼容 user_id 映射顶层 users 表与 poster.user 内嵌对象两种形状），
+            // 缺失时再按其余 poster 或 lastPosterUsername 匹配，确保人员图标绝不因序列化形状差异而漏取。
+            val author = topic.posters.firstNotNullOfOrNull { p ->
+                (p.user ?: p.userId?.let { usersById[it] })?.also { u ->
+                    AvatarCache.record(u.username, u.animatedAvatar)
+                }
+            } ?: topic.lastPosterUsername?.let { uname ->
+                response.users.firstOrNull { it.username.equals(uname, ignoreCase = true) }
+            }
             val cachedLevel = sessionStore?.getTopicNotificationLevel(topic.id)
             val effectiveLevelCode = cachedLevel ?: topic.notificationLevel?.takeIf { it in 0..3 && it != 1 }
             val notificationLevel = effectiveLevelCode?.let { TopicNotificationLevel.fromCode(it) }
             TopicListItem(
-                topic = if (topic.unseen && locallyRead) topic.copy(unseen = false) else topic,
+                topic = reading?.mergeReadState(topic) ?: topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 authorName = author?.name,
                 avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64, username = author?.username),
@@ -3519,7 +3871,10 @@ class TopicRepository(
                 notificationLevel = notificationLevel,
             )
         }
-        return TopicPage(items = items, hasMore = response.topicList.moreTopicsUrl != null)
+        return TopicPage(
+            items = items,
+            hasMore = response.topicList.moreTopicsUrl != null && response.topicList.topics.isNotEmpty(),
+        )
     }
 
     private fun ensureRequestAllowed() {
@@ -3543,21 +3898,25 @@ class TopicRepository(
             !store.isClearanceChallenged(currentClearance)
     }
 
-    private suspend fun request(path: String, burst: Boolean = false, present: Boolean = true): String {
+    private suspend fun request(
+        path: String,
+        burst: Boolean = false,
+        present: Boolean = true,
+        retryAllowed: Boolean = true,
+        beforeDispatch: (() -> Unit)? = null,
+    ): String {
         try {
-            return pacedGet(path, burst, present, allow429Challenge = true)
+            return pacedGet(path, burst, present, allow429Challenge = retryAllowed, retryAllowed = retryAllowed, beforeDispatch = beforeDispatch)
         } catch (challenge: NeedsInteractiveVerification) {
+            if (!retryAllowed || !present) throw challenge
             // 对齐 v1.3.1 & P0-1/P0-3：撞盾先在隐藏 WebView 里按当前出口静默重签 cf_clearance（带锁内去重合并），成功再重试一次。
             // 换代理/切直连后凭据与出口不一致时，这一步让第一个被挑战的请求就把凭据换掉，用户无感。
             // 必须在串行闸门外做：静默过盾最长 30 秒，占着闸门会把所有 GET 堵死。
             if (!silentRevalidateForGet(path, challenge.failedClearanceFp)) {
-                if (challenge.isFrom429) {
-                    throw enterRateLimitCooldown(path, null, cfChallenge = true)
-                }
                 throw challenge
             }
             return try {
-                pacedGet(path, burst, present, allow429Challenge = false)
+                pacedGet(path, burst, present, allow429Challenge = false, beforeDispatch = beforeDispatch)
             } catch (retryChallenge: NeedsInteractiveVerification) {
                 // P0-4: CLEARED 后重放立撞 403 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
                 // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
@@ -3596,13 +3955,15 @@ class TopicRepository(
         burst: Boolean,
         present: Boolean,
         allow429Challenge: Boolean = true,
+        retryAllowed: Boolean = true,
+        beforeDispatch: (() -> Unit)? = null,
     ): String {
-        if (present) return dispatchGet(path, burst, present, allow429Challenge)
+        if (present) return dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch)
         return backgroundGetGate.withLock {
             val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
             if (wait > 0) delay(wait)
             try {
-                dispatchGet(path, burst, present, allow429Challenge)
+                dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch)
             } finally {
                 lastBackgroundGetAt = SystemClock.elapsedRealtime()
             }
@@ -3637,6 +3998,8 @@ class TopicRepository(
         burst: Boolean,
         present: Boolean,
         allow429Challenge: Boolean = true,
+        retryAllowed: Boolean = true,
+        beforeDispatch: (() -> Unit)? = null,
     ): String {
         ensureRequestAllowed()
         if (!present) throwIfRateLimitCoolingDown()
@@ -3645,50 +4008,25 @@ class TopicRepository(
             if (!present) throwIfRateLimitCoolingDown()
             var attempt = 0
             var staleReplayed = false
+            var revalidated = false
             while (true) {
                 acquireGetSlot { !present && isRateLimitCoolingDown() }
+                currentCoroutineContext().ensureActive()
                 if (!present) throwIfRateLimitCoolingDown()
                 // 前台请求发出后，后台计量池在静默窗口内让行，避免与用户操作贴脸叠加
                 if (present) ApiQuotaPool.markForeground()
                 val transport = transportProvider()
+                beforeDispatch?.invoke()
                 val result = try {
-                    transport.get(path, present = present)
+                    if (retryAllowed) transport.get(path, present = present)
+                    else transport.getWithoutRevalidate(path, present = present)
                 } finally {
                     // 时间戳已在 acquireGetSlot 记录
                 }
                 diagnostics.recordStatus(transport.name, result.status, path)
                 when {
-                    result.status == 429 -> {
-                        val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
-                        if (challenge429 && allow429Challenge) {
-                            if (!staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
-                                staleReplayed = true
-                                diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
-                                continue
-                            }
-                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
-                            notify403OrChallenged("request $path 429-challenge")
-                            throw NeedsInteractiveVerification(
-                                "请求 $path 被 Cloudflare 速率挑战拦截",
-                                failedClearanceFp = result.sentClearanceFp,
-                                isFrom429 = true,
-                            )
-                        }
-                        val cfChallenge = challenge429 || isCfChallengeBody(result.body)
-                        val cooldownEx = enterRateLimitCooldown(
-                            path, result.retryAfterSeconds, cfChallenge = cfChallenge,
-                        )
-                        val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
-                        if (present && !cfChallenge && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                            diagnostics.log("前台请求 429 自动等待 ${waitSec}s 后重放(${attempt + 1}/$MAX_RETRIES): $path")
-                            delay(waitSec * 1_000L)
-                            attempt++
-                        } else {
-                            throw cooldownEx
-                        }
-                    }
                     result.challenged -> {
-                        if (!staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
+                        if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
                             staleReplayed = true
                             diagnostics.log("检测到携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，跳过 WebView 直接换新值重放: $path")
                             continue
@@ -3700,6 +4038,21 @@ class TopicRepository(
                             failedClearanceFp = result.sentClearanceFp,
                         )
                     }
+                    result.status == 429 -> {
+                        val cooldownEx = enterRateLimitCooldown(
+                            path, result.retryAfterSeconds, cfChallenge = false,
+                        )
+                        val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
+                        if (retryAllowed && present && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                            val jitterMs = (200L..800L).random()
+                            val totalWaitMs = (waitSec * 1_000L) + jitterMs
+                            diagnostics.log("前台请求 429 自动等待 ${totalWaitMs}ms (含抖动 ${jitterMs}ms) 后重试(${attempt + 1}/$MAX_RETRIES): $path")
+                            delay(totalWaitMs)
+                            attempt++
+                        } else {
+                            throw cooldownEx
+                        }
+                    }
                     result.status == 403 -> {
                         notify403OrChallenged("request $path 403")
                         throw HttpStatusException(result.status, result.body.take(120))
@@ -3707,11 +4060,11 @@ class TopicRepository(
                     result.status in 200..299 -> return result.body
                     // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
                     result.status == 0 -> throw NetworkTimeoutException()
-                    result.status >= 500 && attempt < MAX_RETRIES -> {
+                    retryAllowed && result.status >= 500 && attempt < MAX_RETRIES -> {
                         delay(BACKOFF_BASE_MS shl attempt)
                         attempt++
                     }
-                    else -> throw HttpStatusException(result.status, result.body.take(120))
+                    else -> throw HttpStatusException(result.status, result.body.take(120), result.retryAfterSeconds)
                 }
             }
             @Suppress("UNREACHABLE_CODE")
@@ -3739,7 +4092,7 @@ class TopicRepository(
         private const val MAX_REPORTED_TOPICS_CACHE = 200
 
         // 3. Timings 阅读进度全进程共享上报跟踪与去重缓存（按 (userId, topicId) 隔离，LRU 淘汰）
-        val inFlightTimingsTopics = ConcurrentHashMap.newKeySet<Long>()
+        val inFlightTimingsTopics = ConcurrentHashMap<Long, Any>()
         private val reportedPostsLock = Any()
         private val reportedPostsMap = object : LinkedHashMap<Pair<Long, Long>, MutableSet<Int>>(128, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<Long, Long>, MutableSet<Int>>?): Boolean {
@@ -3775,6 +4128,7 @@ class TopicRepository(
 
         /** 后台静默 GET 的全进程串行闸门与上一次完成时间。 */
         val backgroundGetGate = Mutex()
+        private val topicPollGate = Mutex()
         @Volatile var lastBackgroundGetAt = 0L
 
         /** GET 静默过盾失败后的冷却截止时间（elapsedRealtime）。 */
@@ -3815,6 +4169,13 @@ class TopicRepository(
             return remaining
         }
 
+        fun clearRateLimitCooldown(sessionStore: SessionStore? = null) {
+            synchronized(rateLimitLock) {
+                rateLimitedUntil = 0L
+                sessionStore?.setRateLimitedUntil(0L)
+            }
+        }
+
         /** 429 响应体是 CF 质询页（Just a moment）而非 Discourse 的 JSON 限流提示。 */
         fun isCfChallengeBody(body: String): Boolean {
             val head = body.take(4_000)
@@ -3822,6 +4183,8 @@ class TopicRepository(
         }
         const val MAX_RETRIES = 2
         const val BACKOFF_BASE_MS = 1_000L
+        /** 登录前 CF 闸门复用启动后本就要刷新的通知读取请求。 */
+        const val LOGIN_CF_GATE_PATH = "/notifications.json?recent=true&limit=50&silent=true"
         /** 前台请求遇到 429 时允许静默自动等待重放的最大秒数（对齐 fluxdo）。 */
         const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
         /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
@@ -3838,7 +4201,6 @@ class TopicRepository(
         const val MAX_SCAN_ROUNDS = 5
 
         /** 阅读进度上报的时长边界(毫秒)。服务端会按批次封顶,客户端先规整一遍免得被整条丢弃。 */
-        const val MIN_READ_TIME_MS = 1_000L
         const val MAX_POST_TIME_MS = 60_000L
         const val MAX_TOPIC_TIME_MS = 30 * 60 * 1_000L
 

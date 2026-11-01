@@ -1,15 +1,16 @@
 {
-  "versionCode": 15,
-  "versionName": "1.4.0",
+  "versionCode": 17,
+  "versionName": "1.5.0",
   "forceUpdate": false,
   "minVersionCode": 1,
-  "title": "LINUX DO Android v1.4.0 正式版更新说明",
+  "title": "LINUX DO Android v1.5.0 正式版更新说明",
   "changelog": [
-    "1、视觉交互沉浸革新：全维度玻璃化风格、全屏毛玻璃底栏、个人主页背景图与动图头像高刷",
-    "2、多账号体系落地：支持多账号安全隔离、代次保护与本地 Context Swap 快捷无感切换",
-    "3、网络与调度全面加固：引入 ApiQuotaPool 独立计量池、读写双轨调度、429 全局冷却与代理 DoH 保持",
-    "4、楼层未读感知与细节体验：话题楼层未读蓝点、我的页社区分胶囊与搜索卡片流式排版优化"
+    "1、内置免代理直连网络栈，无需系统代理即可直接登录畅刷论坛",
+    "2、新增话题标签（Tags）聚合与精准检索功能，找帖更高效",
+    "3、优化信息流纯净度与滑动性能，精细化打磨列表与详情体验",
+    "4、修复简评真实等级展示、非列表页底部Bar手势返回平滑复位等多项细节"
   ],
-  "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.4.0/linuxdo-1.4.0-release.apk",
-  "apkSha256": "9006fa5794bffdea2b1da7a9031e5ed651cd7016dcdcdd30071711edb20bbcef"
+  "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.5.0/linuxdo-1.5.0-release.apk",
+  "apkSha256": "08347eff53e5b1e98bf874b41df1d9f6e31922c2dad7c77e21666838f476d744"
 }
+

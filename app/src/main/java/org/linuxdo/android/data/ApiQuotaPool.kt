@@ -2,6 +2,96 @@ package org.linuxdo.android.data
 
 import android.os.SystemClock
 
+internal enum class ExcerptFetchOutcome {
+    COMPLETE, EMPTY, TRANSIENT_FAILURE, BLOCKED, PERMANENT_FAILURE, DEFERRED;
+
+    companion object {
+        fun fromStatus(status: Int, challenged: Boolean = false): ExcerptFetchOutcome = when {
+            challenged || status in setOf(401, 403, 429) -> BLOCKED
+            status in setOf(0, 408, 500, 502, 503, 504) -> TRANSIENT_FAILURE
+            else -> PERMANENT_FAILURE
+        }
+    }
+}
+
+internal data class ExcerptFetchResult(
+    val outcome: ExcerptFetchOutcome,
+    val retryAfterMs: Long = 0L,
+)
+
+/** 进程级发送预算；每次重试与首次请求同样计数，局部让行不消耗额度。 */
+internal class ExcerptRetryPolicy(
+    private val requestLimit: Int = 15,
+    private val attemptLimit: Int = 2,
+    private val retryDelayMs: Long = 10_000L,
+) {
+    private data class Entry(var attempts: Int = 0, var readyAt: Long = 0L, var complete: Boolean = false)
+    private val entries = mutableMapOf<Pair<Long, Long>, Entry>()
+    private var issued = 0
+    private var readyAt = 0L
+    private var inFlight: Pair<Long, Long>? = null
+
+    @Synchronized
+    fun nextTopic(userId: Long, topicIds: List<Long>, now: Long): Long? {
+        if (issued >= requestLimit || inFlight != null || now < readyAt) return null
+        return topicIds.distinct().filter { eligible(userId, it) }
+            .filter { now >= (entries[userId to it]?.readyAt ?: 0L) }
+            .minByOrNull { entries[userId to it]?.attempts ?: 0 }
+    }
+
+    @Synchronized
+    fun waitMs(userId: Long, topicIds: List<Long>, now: Long): Long? {
+        if (issued >= requestLimit || inFlight != null) return null
+        val next = topicIds.filter { eligible(userId, it) }
+            .minOfOrNull { maxOf(readyAt, entries[userId to it]?.readyAt ?: 0L) } ?: return null
+        return (next - now).coerceAtLeast(0L)
+    }
+
+    @Synchronized
+    fun startAttempt(userId: Long, topicId: Long, now: Long): Boolean {
+        if (nextTopic(userId, listOf(topicId), now) == null) return false
+        val key = userId to topicId
+        entries.getOrPut(key) { Entry() }.attempts++
+        issued++
+        inFlight = key
+        return true
+    }
+
+    @Synchronized
+    fun finishAttempt(userId: Long, topicId: Long, result: ExcerptFetchResult?, now: Long, spacingMs: Long) {
+        val key = userId to topicId
+        if (inFlight != key) return
+        inFlight = null
+        val entry = entries.getValue(key)
+        val serverWait = result?.retryAfterMs?.coerceAtLeast(0L) ?: 0L
+        val blockedWait = if (result?.outcome == ExcerptFetchOutcome.BLOCKED) 60_000L else 0L
+        readyAt = maxOf(readyAt, deadline(now, maxOf(spacingMs.coerceAtLeast(3_000L), serverWait, blockedWait)))
+        // 取消不会在后台调度重试；若再次成为可见候选，仍受原次数和退避限制。
+        if (result == null || result.outcome == ExcerptFetchOutcome.TRANSIENT_FAILURE) {
+            entry.complete = entry.attempts >= attemptLimit
+            entry.readyAt = deadline(now, maxOf(retryDelayMs, serverWait))
+        } else {
+            entry.complete = true
+        }
+    }
+
+    @Synchronized
+    fun completeWithoutRequest(userId: Long, topicId: Long) {
+        entries.getOrPut(userId to topicId) { Entry() }.complete = true
+    }
+
+    @Synchronized
+    fun remainingBudget(): Int = (requestLimit - issued).coerceAtLeast(0)
+
+    private fun eligible(userId: Long, topicId: Long): Boolean {
+        val entry = entries[userId to topicId]
+        return topicId > 0L && entry?.complete != true && (entry?.attempts ?: 0) < attemptLimit
+    }
+
+    private fun deadline(now: Long, delayMs: Long): Long =
+        if (delayMs > Long.MAX_VALUE - now) Long.MAX_VALUE else now + delayMs
+}
+
 /**
  * 后台自动请求的独立计量池。
  *
@@ -26,10 +116,15 @@ enum class ApiQuotaPool(
     UNREAD_POLL("未读轮询", 15_000L, true, 30_000L),
 
     /** 列表顶部"有 N 条新话题"的静默探测。 */
-    INCOMING_PROBE("新话题探测", 15_000L, true, 40_000L),
+    INCOMING_PROBE("新话题探测", 10_000L, true, 40_000L),
+
+    /** 详情页单一长轮询；消息密集时也至少间隔三秒，复用全局限流。 */
+    TOPIC_EVENTS("话题订阅", 3_000L, true, 45_000L),
+    TOPIC_POSTS("新增回复", 3_000L, true, 45_000L),
+    TOPIC_SYNC("话题校准", 60_000L, true, 60_000L),
 
     /** 列表首楼摘要的静默预取。前台活跃时让行并保持最小间隔，避免与前台抢占额度触发 429。 */
-    EXCERPT_PREFETCH("摘要预取", 600L, true, 45_000L),
+    EXCERPT_PREFETCH("摘要预取", 3_000L, true, 45_000L),
     ;
 
     private var lastAcquiredAt = 0L
@@ -65,7 +160,8 @@ enum class ApiQuotaPool(
         val poolWait = synchronized(this) {
             maxOf(penaltyUntil - now, lastAcquiredAt + minIntervalMs - now)
         }
-        return maxOf(poolWait, TopicRepository.rateLimitRemainingMs(), 0L)
+        val foregroundWait = if (yieldToForeground) lastActivityAt() + FOREGROUND_QUIET_MS - now else 0L
+        return maxOf(poolWait, TopicRepository.rateLimitRemainingMs(), foregroundWait, 0L)
     }
 
     private fun penalize(globalCooldownMs: Long, cfChallenge: Boolean) {

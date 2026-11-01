@@ -27,10 +27,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
+import org.linuxdo.android.net.awaitImageRetrySlot
+import org.linuxdo.android.net.isTransientImageError
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
@@ -67,9 +72,9 @@ fun avatarShape(username: String?, avatarUrl: String? = null, cornerRadius: Dp =
  * 对齐 FluxDO 的 NativeAnimatedImageProvider 链路逻辑。
  */
 @Composable
-fun rememberAnimatedImageRequest(data: Any?): coil.request.ImageRequest? {
+fun rememberAnimatedImageRequest(data: Any?, retryToken: Int = 0): coil.request.ImageRequest? {
     val context = androidx.compose.ui.platform.LocalContext.current
-    return androidx.compose.runtime.remember(data) {
+    return androidx.compose.runtime.remember(data, retryToken) {
         if (data == null || (data is String && data.isBlank())) null
         else {
             val builder = coil.request.ImageRequest.Builder(context)
@@ -77,6 +82,9 @@ fun rememberAnimatedImageRequest(data: Any?): coil.request.ImageRequest? {
                 .crossfade(false)
                 .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
                 .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+            if (retryToken > 0) {
+                builder.setParameter("coil#retry_token", retryToken, memoryCacheKey = null)
+            }
             if (android.os.Build.VERSION.SDK_INT >= 28) {
                 builder.setParameter("coil#repeat_count", -1, memoryCacheKey = null)
             }
@@ -86,12 +94,11 @@ fun rememberAnimatedImageRequest(data: Any?): coil.request.ImageRequest? {
 }
 
 /**
- * 统一的用户头像组件：
- * 1. 优先加载动图/高优头像 avatarUrl（如 GIF 动画头像），对齐 fluxdo；
- * 2. 底层垫底静态 fallbackUrl，在动图解码或网络返回时不白屏、不露灰色底，彻底杜绝闪烁；
- * 3. 若动图加载失败或无动图，自动无缝降级加载静态头像 fallbackUrl；
- * 4. 若均无法加载或 URL 为空，优雅展示带用户名首字母的大写占位图，绝不出现空白方块；
- * 5. 自动应用站长 neo 方形角与普通用户圆形裁切。
+ * 统一的用户头像组件（全面对齐 fluxdo SmartAvatar + AnimatedAvatarStack）：
+ * 1. 静态模板小图（staticBaseUrl）单通道优先打底（几 KB 秒出），杜绝同卡挂载时双 AsyncImage 同时并发请求；
+ * 2. 动图（animatedOverlayUrl）仅在静态底图就绪或回退后作为 Overlay 叠加，动图首帧就绪后收起静态底图防透明 GIF 重影；
+ * 3. 底层常驻用户名首字母圆标：图片未就绪、排队或失败期间始终展示清晰的首字母徽章，彻底消除空白灰块；
+ * 4. 瞬时网络抖动或门禁冷却（429/timeout）时后台自动按槽位错峰重试，恢复后无感浮现。
  */
 @Composable
 fun UserAvatar(
@@ -102,15 +109,26 @@ fun UserAvatar(
     cornerRadius: Dp = 4.dp,
     contentScale: ContentScale = ContentScale.Crop,
 ) {
-    var failedPrimary by remember(avatarUrl) { mutableStateOf(false) }
-    var failedFallback by remember(fallbackUrl) { mutableStateOf(false) }
-    val effectiveUrl = if (failedPrimary || avatarUrl.isNullOrBlank()) fallbackUrl else avatarUrl
-    val shape = avatarShape(username, effectiveUrl ?: avatarUrl, cornerRadius)
+    val staticBaseUrl = fallbackUrl?.takeIf { it.isNotBlank() } ?: avatarUrl?.takeIf { it.isNotBlank() }
+    val animatedOverlayUrl = avatarUrl?.takeIf { it.isNotBlank() && it != staticBaseUrl }
+    val shape = avatarShape(username, avatarUrl ?: staticBaseUrl, cornerRadius)
 
-    // 记录当前已成功渲染或已知有效的图片 URL（按用户名隔离生命周期）。
-    // 只要有任何一帧呈现过图片，在新图片/新尺寸下载或解码期间，它就始终在底层稳固显示，绝不露出灰色背景！
-    var displayedUrl by remember(username?.takeIf { it.isNotBlank() } ?: avatarUrl) {
-        mutableStateOf(fallbackUrl?.takeIf { it.isNotBlank() } ?: avatarUrl?.takeIf { it.isNotBlank() })
+    var baseReady by remember(staticBaseUrl) { mutableStateOf(false) }
+    var baseFailed by remember(staticBaseUrl) { mutableStateOf(false) }
+    var basePendingRetry by remember(staticBaseUrl) { mutableStateOf(false) }
+    var baseRetryAttempt by remember(staticBaseUrl) { mutableIntStateOf(0) }
+    var baseRetryToken by remember(staticBaseUrl) { mutableIntStateOf(0) }
+
+    var animReady by remember(animatedOverlayUrl) { mutableStateOf(false) }
+    var animFailed by remember(animatedOverlayUrl) { mutableStateOf(false) }
+
+    if (basePendingRetry && !staticBaseUrl.isNullOrBlank()) {
+        LaunchedEffect(staticBaseUrl, baseRetryAttempt) {
+            awaitImageRetrySlot((baseRetryAttempt - 1).coerceAtLeast(0))
+            basePendingRetry = false
+            baseFailed = false
+            baseRetryToken++
+        }
     }
 
     Box(
@@ -119,43 +137,54 @@ fun UserAvatar(
             .background(IosTheme.colors.fieldBackground),
         contentAlignment = Alignment.Center,
     ) {
-        // 1. 底层静止/过渡头像垫底：在新图/新尺寸下载或解码期间保持显示，彻底杜绝变灰闪烁
-        if (!displayedUrl.isNullOrBlank()) {
-            val baseRequest = rememberAnimatedImageRequest(displayedUrl)
-            AsyncImage(
-                model = baseRequest ?: displayedUrl,
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = contentScale,
-            )
-        }
-
-        // 2. 顶层主图：当前目标图片（加载成功后平滑更新 displayedUrl）
-        if (!effectiveUrl.isNullOrBlank() && !failedFallback) {
-            val imageRequest = rememberAnimatedImageRequest(effectiveUrl)
-            AsyncImage(
-                model = imageRequest ?: effectiveUrl,
-                contentDescription = username,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = contentScale,
-                onSuccess = {
-                    displayedUrl = effectiveUrl
-                },
-                onError = {
-                    if (!failedPrimary && !fallbackUrl.isNullOrBlank() && fallbackUrl != avatarUrl) {
-                        failedPrimary = true
-                    } else {
-                        failedFallback = true
-                    }
-                },
-            )
-        } else if (displayedUrl.isNullOrBlank()) {
+        // 0. 首字母常驻兜底（对齐 fluxdo CircleAvatar）：未渲染出任何有效图片帧前始终展示，绝不露空白灰块
+        if (!baseReady && !animReady) {
             val initial = username?.trimStart('@')?.firstOrNull()?.uppercase() ?: "★"
             Text(
                 text = initial,
                 style = IosTheme.type.footnote,
                 fontWeight = FontWeight.Bold,
                 color = IosTheme.colors.secondaryLabel,
+            )
+        }
+
+        // 1. 静态模板小图打底层（动图首帧就绪后收起，避免透明 GIF 透出底图成双影）
+        if (!staticBaseUrl.isNullOrBlank() && !baseFailed && !animReady) {
+            val baseRequest = rememberAnimatedImageRequest(staticBaseUrl, baseRetryToken)
+            AsyncImage(
+                model = baseRequest ?: staticBaseUrl,
+                contentDescription = username,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+                onSuccess = {
+                    baseReady = true
+                },
+                onError = { state ->
+                    if (isTransientImageError(state.result.throwable) && baseRetryAttempt < IMAGE_AUTO_RETRY_LIMIT) {
+                        baseRetryAttempt++
+                        baseFailed = true
+                        basePendingRetry = true
+                    } else {
+                        baseFailed = true
+                    }
+                },
+            )
+        }
+
+        // 2. 动图 Overlay 层：仅在存在独立动图且静态底图已结束首轮请求后挂载，避免单卡双请求齐发
+        if (!animatedOverlayUrl.isNullOrBlank() && !animFailed && (baseReady || (baseFailed && !basePendingRetry))) {
+            val animRequest = rememberAnimatedImageRequest(animatedOverlayUrl)
+            AsyncImage(
+                model = animRequest ?: animatedOverlayUrl,
+                contentDescription = username,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+                onSuccess = {
+                    animReady = true
+                },
+                onError = {
+                    animFailed = true
+                },
             )
         }
     }

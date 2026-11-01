@@ -1,8 +1,25 @@
 package org.linuxdo.android.ui
 
 import android.app.Dialog
+import android.content.Context
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import org.linuxdo.android.data.InternalTopicLink
+import org.linuxdo.android.data.parseTopicLinkFromText
 import android.graphics.Color as AndroidColor
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
@@ -30,6 +47,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -55,6 +73,7 @@ import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -329,7 +348,7 @@ private fun ReadSyncVerifyBanner(
     }
 }
 
-/** 验证页加载层：加载中显示转圈，加载异常时提示检查网络或代理。 */
+/** 验证页加载层：加载中显示转圈，未取得验证凭据或页面异常时提供重试。 */
 @Composable
 private fun VerifyLoadingLayer(
     stalled: Boolean,
@@ -343,12 +362,12 @@ private fun VerifyLoadingLayer(
     ) {
         if (stalled) {
             Text(
-                text = "页面加载异常",
+                text = "验证未完成",
                 style = IosTheme.type.navTitle,
                 color = IosTheme.colors.label,
             )
             Text(
-                text = "请检查网络或代理后重试\nDoH 直连下验证页可能无法打开",
+                text = "未取得新的安全凭据，请检查网络后重试",
                 color = IosTheme.colors.secondaryLabel,
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -411,10 +430,10 @@ private fun NativeWebLoginDialog(
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
         }
         val title = AndroidTextView(context).apply {
-            text = "完成人机验证"
+            text = "安全验证"
             gravity = Gravity.CENTER_VERTICAL
             setTextColor(labelColor)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setPadding(dp(8), 0, 0, 0)
         }
@@ -453,8 +472,10 @@ private fun NativeWebLoginDialog(
             )
             setGravity(Gravity.BOTTOM)
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             attributes = attributes.apply { dimAmount = 0.5f }
         }
+        webView.requestFocus()
 
         onDispose {
             dismissedByComposition = true
@@ -478,8 +499,13 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val holder = rememberSaveableStateHolder()
     val stack = stacks.getValue(selected)
     val scrollToTopRequest = scrollRequests.getValue(selected).intValue
+    val feedStates by viewModel.feedStates.collectAsStateWithLifecycle()
     val details by viewModel.details.collectAsStateWithLifecycle()
     val categories by viewModel.categories.collectAsStateWithLifecycle()
+    val categorySubTab by viewModel.categorySubTab.collectAsStateWithLifecycle()
+    val tagsState by viewModel.tags.collectAsStateWithLifecycle()
+    val tagSearchQuery by viewModel.tagSearchQuery.collectAsStateWithLifecycle()
+    val tagTopics by viewModel.tagTopics.collectAsStateWithLifecycle()
     val categoryTopics by viewModel.categoryTopics.collectAsStateWithLifecycle()
     val userTopicStates by viewModel.userTopicStates.collectAsStateWithLifecycle()
     val search by viewModel.search.collectAsStateWithLifecycle()
@@ -519,6 +545,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val autoRefreshIncoming by viewModel.autoRefreshIncoming.collectAsStateWithLifecycle()
     val autoRefreshInterval by viewModel.autoRefreshInterval.collectAsStateWithLifecycle()
+    val autoReadClipboardEnabled by viewModel.autoReadClipboardEnabled.collectAsStateWithLifecycle()
+    val detectedClipboardTarget by viewModel.detectedClipboardTarget.collectAsStateWithLifecycle()
     val backgroundNotification by viewModel.backgroundNotification.collectAsStateWithLifecycle()
     val notificationPollInterval by viewModel.notificationPollInterval.collectAsStateWithLifecycle()
     val notificationScope by viewModel.notificationScope.collectAsStateWithLifecycle()
@@ -535,6 +563,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val dohLatencies by viewModel.dohLatencies.collectAsStateWithLifecycle()
     val dohSummaries by viewModel.dohSummaries.collectAsStateWithLifecycle()
     val isTestingAllDoh by viewModel.isTestingAllDoh.collectAsStateWithLifecycle()
+    val smartRouteMode by viewModel.smartRouteMode.collectAsStateWithLifecycle()
+    val smartDirectLatency by viewModel.smartDirectLatency.collectAsStateWithLifecycle()
+    val smartDohLatency by viewModel.smartDohLatency.collectAsStateWithLifecycle()
+    val smartRouteSummary by viewModel.smartRouteSummary.collectAsStateWithLifecycle()
+    val isSmartEvaluating by viewModel.isSmartEvaluating.collectAsStateWithLifecycle()
     val isSelfHealing by viewModel.isSelfHealing.collectAsStateWithLifecycle()
     val feedGraphicMode by viewModel.feedGraphicMode.collectAsStateWithLifecycle()
     val feedDisplayMode by viewModel.feedDisplayMode.collectAsStateWithLifecycle()
@@ -559,12 +592,66 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         viewModel.clearPendingNotificationTarget()
     }
 
+    LaunchedEffect(stack.current) {
+        val currentRoute = stack.current
+        val isList = currentRoute is Route.TopicList || currentRoute is Route.CategoryTopics || currentRoute is Route.UserTopics || currentRoute is Route.TagTopics
+        val isDetail = currentRoute is Route.TopicDetail || currentRoute is Route.Chat || currentRoute is Route.ChatRoom
+        if (!isList && !isDetail) {
+            viewModel.setBarsVisible(true)
+        }
+    }
+
     val context = LocalContext.current
+
+    LaunchedEffect(autoReadClipboardEnabled) {
+        if (autoReadClipboardEnabled) {
+            viewModel.checkClipboard(context)
+        }
+    }
+
+    DisposableEffect(lifecycle, autoReadClipboardEnabled) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && autoReadClipboardEnabled) {
+                viewModel.checkClipboard(context)
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
     val browsing = state.screen == Screen.List
     var detailOverlay by rememberSaveable { mutableStateOf(false) }
     var showConnectSheet by rememberSaveable { mutableStateOf(false) }
     var privateMessageRecipient by rememberSaveable { mutableStateOf<String?>(null) }
     var globalBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    val contentObscured = topicCreator.open || composer.open || detailOverlay ||
+        showConnectSheet || globalBrowserUrl != null || privateMessageRecipient != null || accountState.switching ||
+        userCard.loading || userCard.user != null || userCard.error != null
+    val visibleRoute = stack.current
+    val navigationLifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+    val listForeground = navigationLifecycleState.isAtLeast(Lifecycle.State.RESUMED) && !contentObscured
+    DisposableEffect(lifecycle, visibleRoute, browsing, contentObscured, state.homeFeed) {
+        fun updateProbeVisibility() {
+            val category = visibleRoute as? Route.CategoryTopics
+            val visible = browsing && !contentObscured &&
+                lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                (visibleRoute == Route.TopicList || category != null)
+            viewModel.setAutoProbeVisible(visible, category?.categoryId, category?.slug)
+            val previewVisible = browsing && !contentObscured &&
+                lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                (visibleRoute == Route.TopicList || category != null || visibleRoute is Route.TagTopics)
+            viewModel.setPreviewListVisible(previewVisible)
+        }
+        val observer = LifecycleEventObserver { _, _ -> updateProbeVisibility() }
+        lifecycle.addObserver(observer)
+        updateProbeVisibility()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            viewModel.setAutoProbeVisible(false)
+            viewModel.setPreviewListVisible(false)
+        }
+    }
     val openNotifications = {
         if (stack.current != Route.Notifications) stack.push(Route.Notifications)
         viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true)
@@ -577,13 +664,27 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                 key(selected) {
                     IosNavHost(stack, interactive = browsing && !topicCreator.open) { route ->
                         val active = browsing && stack.current == route
+                        // 首次详情响应可补齐历史位置，之后固定；0 代表新话题，不能被阅读回执改写。
+                        var entryResumeFloor by rememberSaveable(route) {
+                            mutableIntStateOf((route as? Route.TopicDetail)?.let {
+                                viewModel.resolveResumePostNumber(it.topicId, it.postNumber)
+                            } ?: -1)
+                        }
+                        var topicEntryLoaded by rememberSaveable(route) { mutableStateOf(false) }
+                        val entryDetail = (route as? Route.TopicDetail)?.let { details[it.topicId] }
+                        if (entryResumeFloor == -1 && topicEntryLoaded && entryDetail?.topic != null && !entryDetail.loading) {
+                            SideEffect { entryResumeFloor = entryDetail.topic.lastReadPostNumber?.takeIf { it > 1 } ?: 0 }
+                        }
+                        val resumePostNumber = entryResumeFloor.takeIf { it > 0 }
                         LaunchedEffect(route, active) {
                             if (active) when (route) {
-                                is Route.TopicDetail -> viewModel.loadTopic(
-                                    route.topicId,
-                                    postNumber = route.postNumber,
-                                    resumePostNumber = viewModel.resolveResumePostNumber(route.topicId, route.postNumber),
-                                )
+                                is Route.TopicDetail -> {
+                                    if (!topicEntryLoaded || viewModel.details.value[route.topicId]?.topic == null) {
+                                        topicEntryLoaded = true
+                                        viewModel.loadTopic(route.topicId, postNumber = route.postNumber,
+                                            resumePostNumber = resumePostNumber)
+                                    }
+                                }
                                 Route.CategoryList -> viewModel.loadCategories()
                                 is Route.CategoryTopics -> {
                                     if (!categories.loaded && !categories.loading) viewModel.loadCategories()
@@ -619,23 +720,17 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
                                 },
                                 onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
-                                onPrefetchExcerpts = { topics ->
-                                    val query = when (state.homeFeed) {
-                                        HomeFeedType.Latest -> "in:first order:latest"
-                                        HomeFeedType.Hot -> "in:first order:activity"
-                                        HomeFeedType.Unread -> "in:first order:activity"
-                                        HomeFeedType.Posted -> "in:first order:latest"
-                                    }
-                                    viewModel.prefetchTopicExcerpts(topics, query)
-                                },
+                                onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
                                 onScrollBusyChanged = viewModel::setTopicListScrollBusy,
                                 onBarsVisibilityChange = viewModel::setBottomBarVisible,
                                 barsVisible = isBottomBarVisible,
-                                active = active,
+                                active = active && listForeground,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = {},
                                 currentFeed = state.homeFeed,
+                                feedStates = feedStates,
                                 onFeedSelect = viewModel::switchHomeFeed,
+                                onPreloadFeed = viewModel::preloadHomeFeed,
                                 hasUnread = state.unreadCount > 0,
                                 onApplyIncoming = { viewModel.applyIncomingTopics(state.homeFeed) },
                                 onSetNotificationLevel = { topic, level ->
@@ -663,14 +758,47 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                 onNavigateToConnect = { showConnectSheet = true },
                                 onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToBookmarks = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserTopics(username, "我的收藏", isBookmark = true))
+                                        }
+                                    },
+                                    onNavigateToFollowing = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.FollowList(username))
+                                        }
+                                    },
+                                    onNavigateToLikes = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的点赞", filter = "1"))
+                                        }
+                                    },
+                                    onNavigateToReplies = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的回复", filter = "5"))
+                                        }
+                                    },
                             )
 
                             is Route.TopicDetail -> {
-                                val resumePostNumber = viewModel.resolveResumePostNumber(route.topicId, route.postNumber)
                                 val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
-                                val isForeground = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
-                                LaunchedEffect(route.topicId, isForeground) {
-                                    viewModel.setTopicActive(route.topicId, isForeground)
+                                val isForeground = active && !contentObscured && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                                DisposableEffect(lifecycle, route.topicId, active, contentObscured) {
+                                    fun updateReadingActivity() {
+                                        viewModel.setTopicActive(route.topicId, active && !contentObscured &&
+                                            lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                                    }
+                                    val observer = LifecycleEventObserver { _, _ -> updateReadingActivity() }
+                                    lifecycle.addObserver(observer)
+                                    updateReadingActivity()
+                                    onDispose {
+                                        lifecycle.removeObserver(observer)
+                                        viewModel.setTopicActive(route.topicId, false)
+                                    }
                                 }
                                 // 离开这篇帖子时结算一次阅读进度(仅在用户开启同步后才会真正发请求)。
                                 DisposableEffect(route.topicId) {
@@ -716,10 +844,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onOpenTopic = { id, title, postNumber ->
                                         stack.push(Route.TopicDetail(id, title, postNumber))
                                     },
-                                    active = active,
+                                    onJumpToFloor = { viewModel.jumpToFloor(route.topicId, it) },
+                                    active = isForeground,
                                     trailing = {},
                                     onToggleOrder = { viewModel.toggleCommentOrder(route.topicId) },
                                     onPostsVisible = { viewModel.onPostsVisible(route.topicId, it) },
+                                    onLiveViewport = { atEnd, scrolling -> viewModel.onTopicViewport(route.topicId, atEnd, scrolling) },
+                                    syncReadProgress = syncReadProgress,
+                                    onScrolled = { viewModel.onTopicScrolled(route.topicId) },
                                     onOverlayActive = { detailOverlay = it },
                                     onSetFilterUser = { viewModel.setTopicAuthorFilter(route.topicId, it) },
                                     onVotePoll = { postId, pollName, optionIds ->
@@ -755,7 +887,84 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     scrollToTopRequest = scrollToTopRequest,
                                     onSaveOrder = viewModel::saveCategoryOrder,
                                     onResetOrder = viewModel::resetCategoryOrder,
+                                    currentTab = categorySubTab,
+                                    onTabChange = viewModel::setCategorySubTab,
+                                    tagsState = tagsState,
+                                    tagSearchQuery = tagSearchQuery,
+                                    onTagSearchQueryChange = viewModel::updateTagSearchQuery,
+                                    onRetryTags = { viewModel.loadTags(retry = true) },
+                                    onOpenTag = { tag -> stack.push(Route.TagTopics(tag)) },
                                     trailing = {},
+                                )
+                            }
+
+                            is Route.TagTopics -> {
+                                val topicState = tagTopics[route.tag] ?: TopicListUiState()
+                                LaunchedEffect(route.tag) {
+                                    viewModel.loadTagTopics(route.tag)
+                                }
+                                TopicListScreen(
+                                    title = "# ${route.tag}",
+                                    state = topicState,
+                                    feedGraphicMode = feedGraphicMode,
+                                    feedDisplayMode = feedDisplayMode,
+                                    showTopicUnreadDot = showTopicUnreadDot,
+                                    topicUnreadDotPosition = topicUnreadDotPosition,
+                                    blockedUsernames = blockedUsernameSet,
+                                    onRefresh = { viewModel.loadTagTopics(route.tag, refresh = true) },
+                                    onLoadMore = { viewModel.loadTagTopics(route.tag, more = true) },
+                                    onOpenTopic = {
+                                        viewModel.recordTopicListOpen(it.id, it.postsCount)
+                                        stack.push(Route.TopicDetail(it.id, it.title))
+                                    },
+                                    onOpenUser = { username, primaryAvatarUrl, staticAvatarUrl, displayName ->
+                                        viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
+                                    },
+                                    onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
+                                    onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
+                                    onScrollBusyChanged = viewModel::setTopicListScrollBusy,
+                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
+                                    barsVisible = isBottomBarVisible,
+                                    onBack = { stack.pop() },
+                                    active = active && listForeground,
+                                    trailing = {},
+                                    onApplyIncoming = {},
+                                    onSetNotificationLevel = { topic, level ->
+                                        viewModel.setTopicNotificationLevel(topic.id, level)
+                                    },
+                                    sortOrder = topicSortOrder,
+                                    sortAscending = topicSortAscending,
+                                    onSortChange = { viewModel.setTopicSort(it) },
+                                    floatingBallEnabled = floatingBallEnabled,
+                                    floatingBallActions = floatingBallActions,
+                                    floatingBallXRatio = floatingBallXRatio,
+                                    floatingBallYRatio = floatingBallYRatio,
+                                    floatingBallOnRight = floatingBallOnRight,
+                                    onFloatingBallPositionChange = viewModel::updateFloatingBallPosition,
+                                    onNavigateToDrafts = { stack.push(Route.Drafts) },
+                                    onNavigateToSearch = { selected = MainTab.Search },
+                                    onNavigateToCategories = { selected = MainTab.Categories },
+                                    onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
+                                    onNavigateToConnect = { showConnectSheet = true },
+                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToBookmarks = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserTopics(username, "我的收藏", isBookmark = true))
+                                        }
+                                    },
+                                    onNavigateToFollowing = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.FollowList(username))
+                                        }
+                                    },
+                                    onNavigateToLikes = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的点赞", filter = "1"))
+                                        }
+                                    },
                                 )
                             }
 
@@ -769,14 +978,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                             .filter { categoryLevelOf(it) in 0..3 }
                                     } else {
                                         emptyList()
-                                    }
-                                }
-                                DisposableEffect(route.categoryId, route.slug, active) {
-                                    if (active) {
-                                        viewModel.setActiveCategory(route.categoryId, route.slug)
-                                    }
-                                    onDispose {
-                                        viewModel.setActiveCategory(null)
                                     }
                                 }
                                 TopicListScreen(
@@ -797,17 +998,12 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
                                     },
                                     onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
-                                    onPrefetchExcerpts = { topics ->
-                                        viewModel.prefetchTopicExcerpts(
-                                            topics,
-                                            "category:${route.slug} in:first order:latest",
-                                        )
-                                    },
+                                    onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
                                     onScrollBusyChanged = viewModel::setTopicListScrollBusy,
                                     onBarsVisibilityChange = viewModel::setBottomBarVisible,
                                     barsVisible = isBottomBarVisible,
                                     onBack = { stack.pop() },
-                                    active = active,
+                                    active = active && listForeground,
                                     trailing = {},
                                     onApplyIncoming = { viewModel.applyIncomingTopics(state.homeFeed, categoryId = route.categoryId) },
                                     categoryVariants = variants,
@@ -843,6 +1039,30 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToBookmarks = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserTopics(username, "我的收藏", isBookmark = true))
+                                        }
+                                    },
+                                    onNavigateToFollowing = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.FollowList(username))
+                                        }
+                                    },
+                                    onNavigateToLikes = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的点赞", filter = "1"))
+                                        }
+                                    },
+                                    onNavigateToReplies = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的回复", filter = "5"))
+                                        }
+                                    },
                                 )
                             }
 
@@ -973,6 +1193,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     active = roomActive,
                                     currentUsername = currentUsername,
                                     onLoad = viewModel::loadChatRoom,
+                                    onLoadPast = viewModel::loadMoreChatHistory,
                                     onSend = viewModel::sendChatMessage,
                                     onUploadAttachment = viewModel::uploadChatAttachment,
                                     onOpenUser = viewModel::openUserCard,
@@ -1047,6 +1268,30 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToBookmarks = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserTopics(username, "我的收藏", isBookmark = true))
+                                        }
+                                    },
+                                    onNavigateToFollowing = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.FollowList(username))
+                                        }
+                                    },
+                                    onNavigateToLikes = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的点赞", filter = "1"))
+                                        }
+                                    },
+                                    onNavigateToReplies = {
+                                        val username = state.username
+                                        if (!username.isNullOrBlank()) {
+                                            stack.push(Route.UserReplies(username, "我的回复", filter = "5"))
+                                        }
+                                    },
                                 )
                             }
 
@@ -1114,6 +1359,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onAutoRefreshIncoming = viewModel::setAutoRefreshIncoming,
                                 autoRefreshInterval = autoRefreshInterval,
                                 onAutoRefreshInterval = viewModel::setAutoRefreshInterval,
+                                autoReadClipboard = autoReadClipboardEnabled,
+                                onAutoReadClipboard = viewModel::setAutoReadClipboardEnabled,
                                 backgroundNotification = backgroundNotification,
                                 onBackgroundNotification = viewModel::setBackgroundNotification,
                                 notificationPollInterval = notificationPollInterval,
@@ -1142,6 +1389,12 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 isTestingAllDoh = isTestingAllDoh,
                                 onTestDohServer = viewModel::testDohServer,
                                 onTestAllDohServers = viewModel::testAllDohServers,
+                                smartRouteMode = smartRouteMode,
+                                smartDirectLatency = smartDirectLatency,
+                                smartDohLatency = smartDohLatency,
+                                smartRouteSummary = smartRouteSummary,
+                                isSmartEvaluating = isSmartEvaluating,
+                                onEvaluateSmartRoute = viewModel::evaluateSmartRoute,
                                 onAddCustomDohServer = viewModel::addCustomDohServer,
                                 onUpdateDohServer = viewModel::updateDohServer,
                                 onDeleteDohServer = viewModel::deleteDohServer,
@@ -1215,8 +1468,10 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             }
         }
         val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        val isDetailRoute = stack.current is Route.TopicDetail || stack.current is Route.ChatRoom
-        val shouldShowTabBar = isBottomBarVisible && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
+        val isDetailRoute = stack.current is Route.TopicDetail || stack.current is Route.Chat || stack.current is Route.ChatRoom
+        val isTopicListRoute = stack.current is Route.TopicList || stack.current is Route.CategoryTopics || stack.current is Route.UserTopics || stack.current is Route.TagTopics
+        val effectiveBottomBarVisible = isBottomBarVisible || !isTopicListRoute
+        val shouldShowTabBar = effectiveBottomBarVisible && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
         androidx.compose.animation.AnimatedVisibility(
             visible = shouldShowTabBar,
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -1225,7 +1480,12 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             exit = androidx.compose.animation.slideOutVertically(animationSpec = androidx.compose.animation.core.tween(220)) { it } +
                 androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(180)),
         ) {
-            TabBar(selected, homeFeedLabel = state.homeFeed.label, unreadCount = state.unreadCount) { tab ->
+            TabBar(
+                selected,
+                homeFeedLabel = state.homeFeed.label,
+                categoriesTabLabel = if (categorySubTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) "标签" else "分类",
+                unreadCount = state.unreadCount,
+            ) { tab ->
                 if (browsing) {
                     if (tab == selected) {
                         stacks.getValue(tab).popToRoot()
@@ -1235,6 +1495,46 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                         viewModel.setBottomBarVisible(true)
                     }
                 }
+            }
+        }
+
+        androidx.compose.animation.AnimatedVisibility(
+            visible = detectedClipboardTarget != null,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = if (shouldShowTabBar) 64.dp else 16.dp, start = 16.dp, end = 16.dp)
+                .zIndex(10f),
+            enter = androidx.compose.animation.slideInVertically(animationSpec = androidx.compose.animation.core.tween(240)) { it / 2 } +
+                androidx.compose.animation.fadeIn(animationSpec = androidx.compose.animation.core.tween(200)),
+            exit = androidx.compose.animation.slideOutVertically(animationSpec = androidx.compose.animation.core.tween(200)) { it / 2 } +
+                androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(160)),
+        ) {
+            val target = detectedClipboardTarget
+            if (target != null) {
+                ClipboardTopicDetectionCard(
+                    rawUrl = target.first,
+                    link = target.second,
+                    onView = {
+                        val consumed = viewModel.consumeClipboardTarget(context, target.first)
+                        val linkToOpen = consumed ?: target.second
+                        selected = MainTab.Latest
+                        val latestStack = stacks.getValue(MainTab.Latest)
+                        val currentRoute = latestStack.current
+                        if (currentRoute is Route.TopicDetail && currentRoute.topicId == linkToOpen.topicId) {
+                            viewModel.loadTopic(
+                                linkToOpen.topicId,
+                                postNumber = linkToOpen.postNumber,
+                                resumePostNumber = viewModel.resolveResumePostNumber(linkToOpen.topicId, linkToOpen.postNumber),
+                                fromNotification = true,
+                            )
+                        } else {
+                            latestStack.push(Route.TopicDetail(linkToOpen.topicId, "", linkToOpen.postNumber))
+                        }
+                    },
+                    onDismiss = {
+                        viewModel.dismissClipboardTarget(context, target.first)
+                    },
+                )
             }
         }
     }
@@ -1296,5 +1596,109 @@ private fun BootScreen() {
         contentAlignment = Alignment.Center,
     ) {
         IosActivityIndicator(diameter = 28.dp)
+    }
+}
+
+@Composable
+private fun ClipboardTopicDetectionCard(
+    rawUrl: String,
+    link: InternalTopicLink,
+    onView: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val accentColor = IosTheme.colors.accent
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .shadow(12.dp, RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(16.dp))
+            .background(IosTheme.colors.card)
+            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(accentColor.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(Modifier.size(20.dp)) {
+                    scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+                        val stroke = Stroke(2.0f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                        val l1 = Path().apply {
+                            moveTo(10f, 13f); lineTo(8f, 15f); cubicTo(6.5f, 16.5f, 6.5f, 19f, 8f, 20.5f); cubicTo(9.5f, 22f, 12f, 22f, 13.5f, 20.5f); lineTo(15.5f, 18.5f)
+                        }
+                        val l2 = Path().apply {
+                            moveTo(14f, 11f); lineTo(16f, 9f); cubicTo(17.5f, 7.5f, 17.5f, 5f, 16f, 3.5f); cubicTo(14.5f, 2f, 12f, 2f, 10.5f, 3.5f); lineTo(8.5f, 5.5f)
+                        }
+                        drawPath(l1, accentColor, style = stroke)
+                        drawPath(l2, accentColor, style = stroke)
+                        drawLine(accentColor, Offset(9.5f, 14.5f), Offset(14.5f, 9.5f), strokeWidth = 2.0f, cap = StrokeCap.Round)
+                    }
+                }
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(
+                    text = "检测到剪贴板帖子链接",
+                    style = IosTheme.type.footnote.copy(fontWeight = FontWeight.SemiBold, fontSize = 13.5.sp),
+                    color = IosTheme.colors.label,
+                    maxLines = 1,
+                )
+                Spacer(Modifier.height(2.dp))
+                val floorText = if (link.postNumber != null) " · #${link.postNumber}楼" else ""
+                Text(
+                    text = "话题 #${link.topicId}$floorText",
+                    style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                    color = IosTheme.colors.secondaryLabel,
+                    maxLines = 1,
+                )
+            }
+
+            Spacer(Modifier.width(8.dp))
+
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(IosTheme.colors.accent)
+                    .clickable(onClick = onView)
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "打开",
+                    color = Color.White,
+                    style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Bold, fontSize = 12.5.sp),
+                )
+            }
+
+            Spacer(Modifier.width(6.dp))
+
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable(onClick = onDismiss),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "✕",
+                    color = IosTheme.colors.secondaryLabel,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
     }
 }

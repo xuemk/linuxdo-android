@@ -4,6 +4,9 @@ import android.content.Context
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import org.linuxdo.android.net.gecko.CfDiagnosticMode
+import org.linuxdo.android.net.gecko.CfDiagnosticSession
+import org.linuxdo.android.net.gecko.CfDiagnosticStatus
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -33,7 +36,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.ui.window.Dialog
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -48,6 +53,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.zIndex
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -146,6 +158,8 @@ import android.view.Gravity
 import android.text.InputType
 import coil.request.ImageRequest
 import coil.imageLoader
+import coil.size.Precision
+import coil.size.Scale
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -2004,8 +2018,10 @@ fun SettingsScreen(
     onLogout: () -> Unit = {},
     autoRefreshIncoming: Boolean = true,
     onAutoRefreshIncoming: (Boolean) -> Unit = {},
-    autoRefreshInterval: AutoRefreshInterval = AutoRefreshInterval.REALTIME,
+    autoRefreshInterval: AutoRefreshInterval = AutoRefreshInterval.SEC_20,
     onAutoRefreshInterval: (AutoRefreshInterval) -> Unit = {},
+    autoReadClipboard: Boolean = true,
+    onAutoReadClipboard: (Boolean) -> Unit = {},
     backgroundNotification: Boolean = false,
     onBackgroundNotification: (Boolean) -> Unit = {},
     notificationPollInterval: NotificationPollInterval = NotificationPollInterval.OFF,
@@ -2034,13 +2050,19 @@ fun SettingsScreen(
     isTestingAllDoh: Boolean = false,
     onTestDohServer: (DohServer) -> Unit = {},
     onTestAllDohServers: () -> Unit = {},
+    smartRouteMode: org.linuxdo.android.net.NetworkRouteMode = org.linuxdo.android.net.NetworkRouteMode.DIRECT,
+    smartDirectLatency: Long? = null,
+    smartDohLatency: Long? = null,
+    smartRouteSummary: String = "",
+    isSmartEvaluating: Boolean = false,
+    onEvaluateSmartRoute: () -> Unit = {},
     onAddCustomDohServer: (url: String, name: String) -> Unit = { _, _ -> },
     onUpdateDohServer: (oldServer: DohServer, url: String, name: String) -> Unit = { _, _, _ -> },
     onDeleteDohServer: (DohServer) -> Unit = {},
     onResetDohServers: () -> Unit = {},
     feedGraphicMode: Boolean = true,
     onFeedGraphicMode: (Boolean) -> Unit = {},
-    feedDisplayMode: String = if (feedGraphicMode) "graphic" else "small_image",
+    feedDisplayMode: String = "no_excerpt",
     onFeedDisplayMode: (String) -> Unit = {},
     skinPreset: org.linuxdo.android.ui.design.SkinPreset = org.linuxdo.android.ui.design.SkinPreset.CLASSIC,
     onSkinPreset: (org.linuxdo.android.ui.design.SkinPreset) -> Unit = {},
@@ -2126,11 +2148,69 @@ fun SettingsScreen(
         }
     }
 
+    val settingsListState = rememberLazyListState()
+    val haptic = LocalHapticFeedback.current
+
+    // ── 悬浮球设置专用状态与拖拽重排逻辑 (参照 CategoryListScreen 分类拖拽方式) ──
+    val maxFloatingActions = FloatingAction.MAX_ACTIONS
+    val enabledFloatingActions = remember { mutableStateListOf<FloatingAction>() }
+    var draggedFloatingAction by remember { mutableStateOf<FloatingAction?>(null) }
+    var floatingBallDragOrigin by remember { mutableFloatStateOf(0f) }
+    var floatingBallDragDistance by remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(floatingBallActions) {
+        if (draggedFloatingAction == null) {
+            enabledFloatingActions.clear()
+            enabledFloatingActions.addAll(floatingBallActions.take(maxFloatingActions))
+        }
+    }
+
+    fun moveFloatingBallItem(fromIndex: Int, toIndex: Int) {
+        if (fromIndex == toIndex || fromIndex !in enabledFloatingActions.indices || toIndex !in enabledFloatingActions.indices) return
+        enabledFloatingActions.add(toIndex, enabledFloatingActions.removeAt(fromIndex))
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    fun moveDraggedFloatingBallItem() {
+        val active = draggedFloatingAction ?: return
+        val visible = settingsListState.layoutInfo.visibleItemsInfo
+        val activeItem = visible.firstOrNull { it.key == "enabled-${active.name}" } ?: return
+        val fromIndex = enabledFloatingActions.indexOf(active)
+        if (fromIndex < 0) return
+        val center = floatingBallDragOrigin + floatingBallDragDistance + activeItem.size / 2f
+        val target = visible.firstOrNull { item ->
+            val targetAction = enabledFloatingActions.firstOrNull { "enabled-${it.name}" == item.key }
+            val targetIndex = if (targetAction != null) enabledFloatingActions.indexOf(targetAction) else -1
+            targetIndex >= 0 && item.key != "enabled-${active.name}" &&
+                center in item.offset.toFloat()..(item.offset + item.size).toFloat() &&
+                ((targetIndex > fromIndex && center > item.offset + item.size / 2f) ||
+                    (targetIndex < fromIndex && center < item.offset + item.size / 2f))
+        }
+        val targetIndex = if (target != null) {
+            val targetAction = enabledFloatingActions.firstOrNull { "enabled-${it.name}" == target.key }
+            if (targetAction != null) enabledFloatingActions.indexOf(targetAction) else -1
+        } else {
+            // 首尾越界兜底：拖拽中心若已越过首项顶部或末项底部，直接吸附到首位或末位
+            val actionItems = visible.filter { v -> enabledFloatingActions.any { "enabled-${it.name}" == v.key } }
+            val firstCat = actionItems.firstOrNull()
+            val lastCat = actionItems.lastOrNull()
+            when {
+                firstCat != null && center < firstCat.offset && fromIndex > 0 -> 0
+                lastCat != null && center > lastCat.offset + lastCat.size && fromIndex < enabledFloatingActions.lastIndex -> enabledFloatingActions.lastIndex
+                else -> -1
+            }
+        }
+        if (targetIndex in enabledFloatingActions.indices && targetIndex != fromIndex) {
+            moveFloatingBallItem(fromIndex, targetIndex)
+        }
+    }
+
     IosLargeTitleScaffold(
         title = page?.title ?: "设置",
         onBack = onBack,
         showLargeTitle = false,
         backLabel = "",
+        listState = settingsListState,
     ) {
         // ── 首页只列品目入口，具体设置项点进子页再展开；版本信息与退出账号在列表末尾 ──
         if (page == null) item("entries-general") {
@@ -2148,6 +2228,7 @@ fun SettingsScreen(
                     badgeColor = Color(0xFFFFF4E5),
                     value = when (feedDisplayMode) {
                         "graphic" -> "图文模式"
+                        "no_excerpt" -> "无正文模式"
                         "text_only" -> "纯文模式"
                         else -> "小图模式"
                     },
@@ -2198,6 +2279,8 @@ fun SettingsScreen(
             SectionTitle("列表与阅读偏好")
             IosGroupCard {
                 // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
+                // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
+                if (false) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2214,6 +2297,7 @@ fun SettingsScreen(
                             Text("信息流展现样式", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Medium)
                             val desc = when (feedDisplayMode) {
                                 "graphic" -> "图文模式：微博风格大卡片，大图与三栏互动"
+                                "no_excerpt" -> "无正文模式：微博式上下排版，聚焦标题与缩略图"
                                 "text_only" -> "纯文模式：极客纯文字排版，无图超省流"
                                 else -> "小图模式：经典双列排版，右侧小图，紧凑舒适"
                             }
@@ -2228,7 +2312,7 @@ fun SettingsScreen(
 
                     Spacer(Modifier.height(10.dp))
 
-                    // 三胶囊分段选择器（素雅黑白高亮，修复纯文模式切换）
+                    // 四胶囊分段选择器（素雅黑白高亮，包含无正文模式）
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2238,6 +2322,7 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         listOf(
+                            "no_excerpt" to "无正文模式",
                             "graphic" to "图文模式",
                             "small_image" to "小图模式",
                             "text_only" to "纯文模式",
@@ -2260,11 +2345,12 @@ fun SettingsScreen(
                             ) {
                                 Text(
                                     text = label,
-                                    fontSize = 12.5.sp,
+                                    fontSize = 11.5.sp,
                                     fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
                                     color = if (isSelected) {
                                         if (IosTheme.colors.isDark) Color(0xFF181818) else Color.White
                                     } else IosTheme.colors.label,
+                                    maxLines = 1,
                                 )
                             }
                         }
@@ -2272,6 +2358,7 @@ fun SettingsScreen(
                 }
 
                 IosDivider()
+                }
 
                 // 2.1 树形查看话题
                 IosRow(onClick = { onTreeView(!treeView) }) {
@@ -2475,6 +2562,26 @@ fun SettingsScreen(
                     )
                 }
 
+                IosDivider()
+
+                // 2.35 ?????????
+                IosRow(onClick = { onAutoReadClipboard(!autoReadClipboard) }) {
+                    SettingIconBadge(bgColor = Color(0xFFFFF3E0)) {
+                        SettingClipboardIcon(tint = Color(0xFFFF9800))
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("读取剪贴板话题链接", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Normal)
+                        Text(
+                            "切回应用时检测剪贴板中的 linux.do 链接并提示直达",
+                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                    IosSwitch(checked = autoReadClipboard, onCheckedChange = onAutoReadClipboard)
+                }
+
                 if (syncReadProgress && readingStatus != null) {
                     IosDivider()
                     IosRow(onClick = { if (canRetryReading) onRetryReading() }) {
@@ -2486,244 +2593,292 @@ fun SettingsScreen(
         }
 
         // ── 2.5 辅助悬浮按钮设置 ──
-        if (page == SettingsPage.FloatingBall) item("group-floating-ball") {
-            SectionTitle("辅助功能")
-            IosGroupCard {
-                IosRow(onClick = { onFloatingBallEnabled(!floatingBallEnabled) }) {
-                    SettingIconBadge(bgColor = Color(0xFFF3E5F5)) {
-                        SettingFloatingBallIcon(tint = Color(0xFFAB47BC))
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("开启辅助悬浮球", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Normal)
-                        Text(
-                            "单功能直接点击直达，多功能伞型展开；可拖动吸附贴边并记录坐标",
-                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.padding(top = 3.dp),
+        if (page == SettingsPage.FloatingBall) {
+            item("floating-ball-section-title") {
+                SectionTitle("辅助功能")
+            }
+
+            item("floating-ball-toggle") {
+                IosGroupCard {
+                    IosRow(onClick = { onFloatingBallEnabled(!floatingBallEnabled) }) {
+                        SettingIconBadge(bgColor = Color(0xFFF3E5F5)) {
+                            SettingFloatingBallIcon(tint = Color(0xFFAB47BC))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("开启辅助悬浮球", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Normal)
+                            Text(
+                                "单功能直接点击直达，多功能伞型展开；可拖动吸附贴边并记录坐标",
+                                style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                        IosSwitch(
+                            checked = floatingBallEnabled,
+                            onCheckedChange = onFloatingBallEnabled,
                         )
                     }
-                    IosSwitch(
-                        checked = floatingBallEnabled,
-                        onCheckedChange = onFloatingBallEnabled,
-                    )
                 }
+            }
 
-                if (floatingBallEnabled) {
-                    IosDivider()
+            if (floatingBallEnabled) {
+                // 1. 已启用功能标题栏
+                item("floating-ball-enabled-header") {
+                    Spacer(Modifier.height(14.dp))
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            "功能配置与排序 (${floatingBallActions.size}/8)",
-                            style = IosTheme.type.footnote.copy(fontWeight = FontWeight.SemiBold),
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.weight(1f),
+                            "已启用功能 (${enabledFloatingActions.size}/$maxFloatingActions)",
+                            style = IosTheme.type.headline.copy(fontSize = 15.sp, fontWeight = FontWeight.Bold),
+                            color = IosTheme.colors.label,
                         )
-                        if (floatingBallActions != FloatingAction.DEFAULT_ACTIONS) {
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "长按 ☰ 拖动可自定义排序",
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                        )
+                        if (enabledFloatingActions.toList() != FloatingAction.DEFAULT_ACTIONS) {
+                            Spacer(Modifier.width(8.dp))
                             Text(
                                 "恢复默认",
-                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
                                 color = IosTheme.colors.accent,
-                                modifier = Modifier.clickable { onFloatingBallActions(FloatingAction.DEFAULT_ACTIONS) },
+                                modifier = Modifier.clickable {
+                                    enabledFloatingActions.clear()
+                                    enabledFloatingActions.addAll(FloatingAction.DEFAULT_ACTIONS)
+                                    onFloatingBallActions(FloatingAction.DEFAULT_ACTIONS)
+                                },
                             )
                         }
                     }
+                    Spacer(Modifier.height(4.dp))
+                }
 
-                    val allOptions = remember(floatingBallActions) {
-                        val enabled = floatingBallActions
-                        val disabled = FloatingAction.entries.filter { it !in enabled }
-                        enabled + disabled
-                    }
-
-                    allOptions.forEachIndexed { index, action ->
-                        val isActionEnabled = action in floatingBallActions
-                        val isFirstInEnabled = isActionEnabled && index == 0
-                        val isLastInEnabled = isActionEnabled && index == floatingBallActions.lastIndex
-
-                        IosDivider(startIndent = 16.dp)
+                // 2. 已启用功能各项 (参照 CategoryListScreen 分类卡片拖拽方式: 独立动画条目 + graphicsLayer 平滑位移 + 相交交换)
+                itemsIndexed(
+                    items = enabledFloatingActions,
+                    key = { _, action -> "enabled-${action.name}" }
+                ) { index, action ->
+                    val dragging = draggedFloatingAction == action
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = IosMetrics.screenPadding, vertical = 2.5.dp)
+                            .animateItem(placementSpec = if (dragging) null else tween(180))
+                            .zIndex(if (dragging) 2f else 0f)
+                            .graphicsLayer {
+                                val currentOffset = settingsListState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == "enabled-${action.name}" }?.offset
+                                translationY = if (dragging && currentOffset != null) floatingBallDragOrigin + floatingBallDragDistance - currentOffset else 0f
+                                scaleX = if (dragging) 1.025f else 1f
+                                scaleY = if (dragging) 1.025f else 1f
+                                shadowElevation = if (dragging) 10.dp.toPx() else 0f
+                            }
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (dragging) IosTheme.colors.card.copy(alpha = 0.96f) else IosTheme.colors.card)
+                            .pointerInput(action.name) {
+                                detectDragGesturesAfterLongPress(
+                                    onDragStart = {
+                                        val item = settingsListState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == "enabled-${action.name}" }
+                                        if (item != null) {
+                                            floatingBallDragOrigin = item.offset.toFloat()
+                                            floatingBallDragDistance = 0f
+                                            draggedFloatingAction = action
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        }
+                                    },
+                                    onDrag = { change, amount ->
+                                        if (draggedFloatingAction == action) {
+                                            change.consume()
+                                            floatingBallDragDistance += amount.y
+                                            moveDraggedFloatingBallItem()
+                                        }
+                                    },
+                                    onDragEnd = {
+                                        if (draggedFloatingAction != null) {
+                                            draggedFloatingAction = null
+                                            onFloatingBallActions(enabledFloatingActions.toList())
+                                        }
+                                    },
+                                    onDragCancel = {
+                                        draggedFloatingAction = null
+                                        enabledFloatingActions.clear()
+                                        enabledFloatingActions.addAll(floatingBallActions.take(maxFloatingActions))
+                                    }
+                                )
+                            }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            // 红色减号按钮 ⊖
                             Box(
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(24.dp)
                                     .clip(CircleShape)
-                                    .background(
-                                        when (action) {
-                                            FloatingAction.CreateTopic -> Color(0xFFFF5722).copy(alpha = 0.15f)
-                                            FloatingAction.Sort -> Color(0xFFFFB300).copy(alpha = 0.15f)
-                                            FloatingAction.Drafts -> Color(0xFFAB47BC).copy(alpha = 0.15f)
-                                            FloatingAction.Search -> Color(0xFF26A69A).copy(alpha = 0.15f)
-                                            FloatingAction.Categories -> Color(0xFF29B6F6).copy(alpha = 0.15f)
-                                            FloatingAction.History -> Color(0xFF7E57C2).copy(alpha = 0.15f)
-                                            FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f)
-                                            FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f)
-                                        }
-                                    ),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                val actionTint = when (action) {
-                                    FloatingAction.CreateTopic -> Color(0xFFFF5722)
-                                    FloatingAction.Sort -> Color(0xFFFF9800)
-                                    FloatingAction.Drafts -> Color(0xFF8E24AA)
-                                    FloatingAction.Search -> Color(0xFF00897B)
-                                    FloatingAction.Categories -> Color(0xFF0288D1)
-                                    FloatingAction.History -> Color(0xFF7E57C2)
-                                    FloatingAction.Connect -> Color(0xFF1E88E5)
-                                    FloatingAction.Chat -> Color(0xFFE91E63)
-                                }
-                                Canvas(Modifier.size(16.dp)) {
-                                    scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-                                        val stroke = Stroke(width = 2.1f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                                        when (action) {
-                                            FloatingAction.CreateTopic -> {
-                                                val p = Path().apply { moveTo(3f, 13f); lineTo(6f, 12f); lineTo(13f, 5f); lineTo(11f, 3f); lineTo(4f, 10f); close() }
-                                                drawPath(p, actionTint, style = Stroke(1.8f))
-                                            }
-                                            FloatingAction.Sort -> {
-                                                drawLine(actionTint, Offset(5f, 12f), Offset(5f, 4f), 1.8f)
-                                                val a1 = Path().apply { moveTo(3f, 6.5f); lineTo(5f, 4f); lineTo(7f, 6.5f) }
-                                                drawPath(a1, actionTint, style = Stroke(1.8f))
-                                                drawLine(actionTint, Offset(11f, 4f), Offset(11f, 12f), 1.8f)
-                                                val a2 = Path().apply { moveTo(9f, 9.5f); lineTo(11f, 12f); lineTo(13f, 9.5f) }
-                                                drawPath(a2, actionTint, style = Stroke(1.8f))
-                                            }
-                                            FloatingAction.Drafts -> {
-                                                val f = Path().apply { moveTo(2f, 4f); lineTo(6f, 4f); lineTo(8f, 6f); lineTo(14f, 6f); lineTo(14f, 13f); lineTo(2f, 13f); close() }
-                                                drawPath(f, actionTint, style = Stroke(1.6f))
-                                            }
-                                            FloatingAction.Search -> {
-                                                drawCircle(actionTint, 4f, Offset(7f, 7f), style = Stroke(1.8f))
-                                                drawLine(actionTint, Offset(10f, 10f), Offset(13.5f, 13.5f), 2f)
-                                            }
-                                            FloatingAction.Categories -> {
-                                                drawRoundRect(actionTint, Offset(3f, 3f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
-                                                drawRoundRect(actionTint, Offset(9f, 3f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
-                                                drawRoundRect(actionTint, Offset(3f, 9f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
-                                                drawRoundRect(actionTint, Offset(9f, 9f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
-                                            }
-                                            FloatingAction.History -> {
-                                                drawArc(
-                                                    color = actionTint,
-                                                    startAngle = 40f,
-                                                    sweepAngle = 280f,
-                                                    useCenter = false,
-                                                    topLeft = Offset(4f, 4f),
-                                                    size = Size(16f, 16f),
-                                                    style = stroke,
-                                                )
-                                                val arrow = Path().apply {
-                                                    moveTo(9.5f, 2.5f)
-                                                    lineTo(4f, 4.5f)
-                                                    lineTo(5.5f, 10f)
-                                                }
-                                                drawPath(arrow, actionTint, style = stroke)
-                                                drawLine(actionTint, Offset(12f, 12f), Offset(12f, 7.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
-                                                drawLine(actionTint, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.1f, cap = StrokeCap.Round)
-                                            }
-                                            FloatingAction.Connect -> {
-                                                val l1 = Path().apply {
-                                                    moveTo(10f, 13f); lineTo(8f, 15f)
-                                                    cubicTo(6.5f, 16.5f, 6.5f, 19f, 8f, 20.5f)
-                                                    cubicTo(9.5f, 22f, 12f, 22f, 13.5f, 20.5f)
-                                                    lineTo(15.5f, 18.5f)
-                                                }
-                                                val l2 = Path().apply {
-                                                    moveTo(14f, 11f); lineTo(16f, 9f)
-                                                    cubicTo(17.5f, 7.5f, 17.5f, 5f, 16f, 3.5f)
-                                                    cubicTo(14.5f, 2f, 12f, 2f, 10.5f, 3.5f)
-                                                    lineTo(8.5f, 5.5f)
-                                                }
-                                                drawPath(l1, actionTint, style = stroke)
-                                                drawPath(l2, actionTint, style = stroke)
-                                                drawLine(actionTint, Offset(9.5f, 14.5f), Offset(14.5f, 9.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
-                                            }
-                                            FloatingAction.Chat -> {
-                                                val bubble = Path().apply {
-                                                    moveTo(4.5f, 6f); cubicTo(4.5f, 4.5f, 5.5f, 4f, 7f, 4f); lineTo(17f, 4f)
-                                                    cubicTo(18.5f, 4f, 19.5f, 4.5f, 19.5f, 6f); lineTo(19.5f, 14f)
-                                                    cubicTo(19.5f, 15.5f, 18.5f, 16f, 17f, 16f); lineTo(9.5f, 16f)
-                                                    lineTo(5.5f, 19.5f); lineTo(5.5f, 16f); lineTo(4.5f, 16f); close()
-                                                }
-                                                drawPath(bubble, actionTint, style = stroke)
-                                                drawCircle(actionTint, 1.1f, Offset(8.5f, 10f))
-                                                drawCircle(actionTint, 1.1f, Offset(12f, 10f))
-                                                drawCircle(actionTint, 1.1f, Offset(15.5f, 10f))
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(action.title, style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.Medium))
-                                Text(action.description, style = IosTheme.type.caption.copy(fontSize = 12.sp), color = IosTheme.colors.secondaryLabel)
-                            }
-
-                            if (isActionEnabled) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        "↑",
-                                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Bold),
-                                        color = if (!isFirstInEnabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .clickable(enabled = !isFirstInEnabled) {
-                                                val list = floatingBallActions.toMutableList()
-                                                val idx = list.indexOf(action)
-                                                if (idx > 0) {
-                                                    val temp = list[idx]
-                                                    list[idx] = list[idx - 1]
-                                                    list[idx - 1] = temp
-                                                    onFloatingBallActions(list)
-                                                }
-                                            }
-                                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                                    )
-                                    Text(
-                                        "↓",
-                                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Bold),
-                                        color = if (!isLastInEnabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .clickable(enabled = !isLastInEnabled) {
-                                                val list = floatingBallActions.toMutableList()
-                                                val idx = list.indexOf(action)
-                                                if (idx in 0 until list.lastIndex) {
-                                                    val temp = list[idx]
-                                                    list[idx] = list[idx + 1]
-                                                    list[idx + 1] = temp
-                                                    onFloatingBallActions(list)
-                                                }
-                                            }
-                                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                                    )
-                                }
-                                Spacer(Modifier.width(4.dp))
-                            }
-
-                            IosSwitch(
-                                checked = isActionEnabled,
-                                onCheckedChange = { checked ->
-                                    if (checked) {
-                                        if (action !in floatingBallActions) {
-                                            onFloatingBallActions((floatingBallActions + action).take(8))
-                                        }
-                                    } else {
-                                        if (floatingBallActions.size > 1) {
-                                            onFloatingBallActions(floatingBallActions - action)
+                                    .background(Color(0xFFE53935))
+                                    .clickable {
+                                        if (enabledFloatingActions.size > 1) {
+                                            enabledFloatingActions.remove(action)
+                                            onFloatingBallActions(enabledFloatingActions.toList())
                                         } else {
                                             Toast.makeText(context, "悬浮球至少需要保留 1 项功能", Toast.LENGTH_SHORT).show()
                                         }
-                                    }
-                                },
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(width = 10.dp, height = 2.5.dp)
+                                        .background(Color.White, RoundedCornerShape(1.dp))
+                                )
+                            }
+
+                            Spacer(Modifier.width(12.dp))
+
+                            // 功能专属矢量图标徽章
+                            FloatingActionSettingBadge(action = action)
+
+                            Spacer(Modifier.width(12.dp))
+
+                            // 标题与副标题
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    action.title,
+                                    style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
+                                    color = IosTheme.colors.label,
+                                )
+                                Text(
+                                    action.description,
+                                    style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                    color = IosTheme.colors.secondaryLabel,
+                                )
+                            }
+
+                            // 拖拽手柄 ☰ (三条杠)
+                            Box(
+                                modifier = Modifier.size(width = 34.dp, height = 36.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                DragHandleIcon(tint = if (dragging) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel)
+                            }
+                        }
+                    }
+                }
+
+                // 3. 未启用功能标题栏
+                item("floating-ball-disabled-header") {
+                    val isFull = enabledFloatingActions.size >= maxFloatingActions
+                    Spacer(Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "未启用功能 (点击 ⊕ 添加)",
+                            style = IosTheme.type.headline.copy(fontSize = 15.sp, fontWeight = FontWeight.Bold),
+                            color = IosTheme.colors.label,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        if (isFull) {
+                            Text(
+                                "已达到上限 $maxFloatingActions/$maxFloatingActions",
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                color = IosTheme.colors.secondaryLabel,
                             )
+                        } else {
+                            Text(
+                                "还可添加 ${maxFloatingActions - enabledFloatingActions.size} 项",
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+                                color = Color(0xFF43A047),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+
+                // 4. 未启用功能卡片
+                item("floating-ball-disabled-card") {
+                    val disabledActions = FloatingAction.entries.filter { it !in enabledFloatingActions }
+                    val isFull = enabledFloatingActions.size >= maxFloatingActions
+                    IosGroupCard {
+                        disabledActions.forEachIndexed { index, action ->
+                            if (index > 0) {
+                                IosDivider(startIndent = 58.dp)
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        if (!isFull) {
+                                            enabledFloatingActions.add(action)
+                                            onFloatingBallActions(enabledFloatingActions.toList())
+                                        } else {
+                                            Toast.makeText(context, "已达到上限 $maxFloatingActions/$maxFloatingActions，请先移除上方功能", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                // 绿色加号按钮 ⊕ (达到上限置灰)
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (!isFull) Color(0xFF4CAF50).copy(alpha = 0.12f) else Color(0xFFEEEEEE)
+                                        )
+                                        .border(
+                                            width = 1.2.dp,
+                                            color = if (!isFull) Color(0xFF4CAF50).copy(alpha = 0.6f) else Color(0xFFBDBDBD),
+                                            shape = CircleShape
+                                        ),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    val plusColor = if (!isFull) Color(0xFF43A047) else Color(0xFFBDBDBD)
+                                    Box(
+                                        modifier = Modifier
+                                            .size(width = 10.dp, height = 2.dp)
+                                            .background(plusColor, RoundedCornerShape(1.dp))
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .size(width = 2.dp, height = 10.dp)
+                                            .background(plusColor, RoundedCornerShape(1.dp))
+                                    )
+                                }
+
+                                Spacer(Modifier.width(12.dp))
+
+                                // 功能专属矢量图标徽章
+                                FloatingActionSettingBadge(action = action)
+
+                                Spacer(Modifier.width(12.dp))
+
+                                // 标题与副标题
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        action.title,
+                                        style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
+                                        color = IosTheme.colors.label,
+                                    )
+                                    Text(
+                                        action.description,
+                                        style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                        color = IosTheme.colors.secondaryLabel,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -3027,7 +3182,7 @@ fun SettingsScreen(
                             fontWeight = FontWeight.SemiBold,
                         )
                         Text(
-                            if (dohEnabled) "已开启 · 仅解析 linux.do，其余直透系统 DNS" else "关闭 · 使用系统默认 DNS",
+                            if (dohEnabled) "已开启 · 智能双轨调度 (Anycast直连/DoH解析+ECH)" else "关闭 · 强制本地直连 (Anycast) + 内置ECH",
                             style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                             color = IosTheme.colors.secondaryLabel,
                             modifier = Modifier.padding(top = 3.dp),
@@ -3085,6 +3240,122 @@ fun SettingsScreen(
                             )
                         }
                         IosSwitch(checked = dohForceOverProxy, onCheckedChange = onDohForceOverProxy)
+                    }
+
+                    IosDivider()
+
+                    // 智能双轨调度状态卡片
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "智能双轨调度",
+                                        style = IosTheme.type.body.copy(fontSize = 14.5.sp),
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = IosTheme.colors.label,
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    val isDirect = smartRouteMode == org.linuxdo.android.net.NetworkRouteMode.DIRECT
+                                    val badgeBg = if (isDirect) Color(0xFFE8F5E9) else Color(0xFFE3F2FD)
+                                    val badgeTextColor = if (isDirect) Color(0xFF2E7D32) else Color(0xFF1565C0)
+                                    Box(
+                                        modifier = Modifier
+                                            .background(badgeBg, RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = smartRouteMode.shortLabel,
+                                            style = IosTheme.type.footnote.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                                            color = badgeTextColor,
+                                        )
+                                    }
+                                }
+                                Text(
+                                    "真实 TLS+ECH 握手延迟智能仲裁，防频繁切换风控",
+                                    style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                                    color = IosTheme.colors.secondaryLabel,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .clickable(enabled = !isSmartEvaluating, onClick = onEvaluateSmartRoute)
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (isSmartEvaluating) {
+                                    IosActivityIndicator(diameter = 14.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                }
+                                Text(
+                                    if (isSmartEvaluating) "探测中..." else "测速评估",
+                                    style = IosTheme.type.footnote.copy(fontSize = 13.sp),
+                                    color = if (isSmartEvaluating) IosTheme.colors.secondaryLabel else IosTheme.colors.accent,
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(IosTheme.colors.fieldBackground, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceAround,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    "本地直连 (Anycast)",
+                                    style = IosTheme.type.footnote.copy(fontSize = 11.sp),
+                                    color = IosTheme.colors.secondaryLabel,
+                                )
+                                Text(
+                                    text = if (smartDirectLatency != null) "${smartDirectLatency} ms" else if (isSmartEvaluating) "测速中..." else "--",
+                                    style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold),
+                                    color = if (smartDirectLatency != null && smartDirectLatency < 100) Color(0xFF2E7D32) else IosTheme.colors.label,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .width(1.dp)
+                                    .height(24.dp)
+                                    .background(IosTheme.colors.separator)
+                            )
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    "DoH 动态解析",
+                                    style = IosTheme.type.footnote.copy(fontSize = 11.sp),
+                                    color = IosTheme.colors.secondaryLabel,
+                                )
+                                Text(
+                                    text = if (smartDohLatency != null) "${smartDohLatency} ms" else if (isSmartEvaluating) "测速中..." else "--",
+                                    style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold),
+                                    color = if (smartDohLatency != null && smartDohLatency < 150) Color(0xFF1565C0) else IosTheme.colors.label,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
+                            }
+                        }
+
+                        if (smartRouteSummary.isNotBlank()) {
+                            Text(
+                                text = "仲裁状态：$smartRouteSummary",
+                                style = IosTheme.type.footnote.copy(fontSize = 11.5.sp),
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 6.dp, start = 2.dp),
+                            )
+                        }
                     }
 
                     IosDivider()
@@ -4405,6 +4676,32 @@ private fun LogoutConfirmDialog(
 }
 
 @Composable
+private fun SettingClipboardIcon(tint: Color) {
+    Canvas(Modifier.size(18.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(1.8f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(5f, 4f),
+                size = androidx.compose.ui.geometry.Size(14f, 17f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.5f, 2.5f),
+                style = stroke
+            )
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(9f, 2.5f),
+                size = androidx.compose.ui.geometry.Size(6f, 3.5f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.2f, 1.2f),
+                style = stroke
+            )
+            drawLine(tint, Offset(8f, 10f), Offset(16f, 10f), strokeWidth = 1.6f, cap = StrokeCap.Round)
+            drawLine(tint, Offset(8f, 13.5f), Offset(16f, 13.5f), strokeWidth = 1.6f, cap = StrokeCap.Round)
+            drawLine(tint, Offset(8f, 17f), Offset(13f, 17f), strokeWidth = 1.6f, cap = StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
 private fun SettingLogoutIcon(tint: Color) {
     Canvas(Modifier.size(18.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
@@ -4832,9 +5129,46 @@ fun DiagnosticsScreen(state: UiState, viewModel: MainViewModel, onBack: () -> Un
     }
     var zeroDohPocReport by remember { mutableStateOf<String?>(null) }
     var zeroDohPocRunning by remember { mutableStateOf(false) }
+    var cfDiagnosticMode by remember { mutableStateOf<CfDiagnosticMode?>(null) }
+    var cfDiagnosticReports by remember { mutableStateOf<Map<CfDiagnosticMode, String>>(emptyMap()) }
     val zeroDohPocScope = androidx.compose.runtime.rememberCoroutineScope()
+    val crashReport = remember { viewModel.diagnostics.readCrashLog() }
+    var showCrashDialog by remember { mutableStateOf(false) }
+    var crashDismissed by remember { mutableStateOf(false) }
 
     IosLargeTitleScaffold(title = "开发者选项", onBack = onBack) {
+        if (!crashReport.isNullOrBlank() && !crashDismissed) {
+            item(key = "crash-report-card") {
+                SectionTitle("异常记录")
+                IosGroupCard {
+                    IosRow {
+                        SettingIconBadge(bgColor = Color(0xFFFFE5E5)) {
+                            Text("💥", fontSize = 14.sp)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("检测到崩溃日志记录", style = IosTheme.type.body, fontWeight = FontWeight.SemiBold, color = Color(0xFFD32F2F))
+                            Text(
+                                "已将未捕获异常完整堆栈落盘至 crash.log",
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        Text(
+                            text = "查看",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.accent,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { showCrashDialog = true }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
+                }
+            }
+        }
         item(key = "developer-switch") {
             SectionTitle("开发者模式")
             IosGroupCard {
@@ -4889,6 +5223,37 @@ fun DiagnosticsScreen(state: UiState, viewModel: MainViewModel, onBack: () -> Un
                     if (index < NetworkPath.entries.lastIndex) IosDivider()
                 }
             }
+        }
+
+        item(key = "cf-diagnostics") {
+            SectionTitle("Cloudflare 验证测试")
+            IosGroupCard {
+                CfDiagnosticMode.entries.forEachIndexed { index, mode ->
+                    IosRow(onClick = { cfDiagnosticMode = mode }) {
+                        Column(Modifier.weight(1f)) {
+                            Text(mode.title, style = IosTheme.type.body, color = IosTheme.colors.accent)
+                            Text(
+                                cfDiagnosticReports[mode] ?: if (mode == CfDiagnosticMode.FLOW) {
+                                    "本地模拟遇盾、点击、失败和重试"
+                                } else {
+                                    "加载官方交互测试控件；请先关闭手机和宿主代理"
+                                },
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
+                        Text("测试 ›", style = IosTheme.type.subheadline, color = IosTheme.colors.accent)
+                    }
+                    if (index == 0) IosDivider()
+                }
+            }
+            Text(
+                "测试使用独立会话。流程模拟通过、测试控件通过，均不等于 linux.do 真实站点认证通过。详细结果记录在下方日志。",
+                style = IosTheme.type.caption,
+                color = IosTheme.colors.secondaryLabel,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
         }
 
         item(key = "zero-doh-lab") {
@@ -5073,6 +5438,81 @@ fun DiagnosticsScreen(state: UiState, viewModel: MainViewModel, onBack: () -> Un
         item(key = "log-tail") { Spacer(Modifier.height(32.dp)) }
     }
 
+    cfDiagnosticMode?.let { mode ->
+        CfDiagnosticDialog(
+            mode = mode,
+            onClose = { cfDiagnosticMode = null },
+            onStatus = { update ->
+                cfDiagnosticReports = cfDiagnosticReports + (mode to update.message)
+                viewModel.diagnostics.log("[${mode.title}] ${update.message.replace('\n', ' ')}")
+            },
+        )
+    }
+
+    if (showCrashDialog && crashReport != null) {
+        Dialog(onDismissRequest = { showCrashDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 290.dp, max = 360.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(IosTheme.colors.card)
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text("崩溃日志详情", style = IosTheme.type.headline, fontWeight = FontWeight.Bold, color = Color(0xFFD32F2F))
+                Text(
+                    crashReport,
+                    style = IosTheme.type.caption.copy(fontFamily = FontFamily.Monospace, fontSize = 9.5.sp),
+                    modifier = Modifier
+                        .heightIn(max = 380.dp)
+                        .verticalScroll(rememberScrollState()),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "清空日志",
+                        style = IosTheme.type.footnote,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier
+                            .clickable {
+                                viewModel.diagnostics.clearCrashLog()
+                                crashDismissed = true
+                                showCrashDialog = false
+                                Toast.makeText(context, "崩溃日志已清空", Toast.LENGTH_SHORT).show()
+                            }
+                            .padding(4.dp)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            "复制全部",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.accent,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .clickable {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Crash Report", crashReport))
+                                    Toast.makeText(context, "崩溃堆栈已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                                }
+                                .padding(4.dp)
+                        )
+                        Text(
+                            "关闭",
+                            style = IosTheme.type.subheadline,
+                            color = IosTheme.colors.label,
+                            modifier = Modifier
+                                .clickable { showCrashDialog = false }
+                                .padding(4.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     zeroDohPocReport?.let { report ->
         Dialog(onDismissRequest = { zeroDohPocReport = null }) {
             Column(
@@ -5107,6 +5547,99 @@ fun DiagnosticsScreen(state: UiState, viewModel: MainViewModel, onBack: () -> Un
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun CfDiagnosticDialog(
+    mode: CfDiagnosticMode,
+    onClose: () -> Unit,
+    onStatus: (CfDiagnosticStatus) -> Unit,
+) {
+    val context = LocalContext.current
+    val dark = IosTheme.colors.isDark
+    val latestClose = androidx.compose.runtime.rememberUpdatedState(onClose)
+    val latestStatus = androidx.compose.runtime.rememberUpdatedState(onStatus)
+    DisposableEffect(context, mode, dark) {
+        val density = context.resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+        val match = android.view.ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        val surface = if (dark) android.graphics.Color.rgb(28, 28, 30) else android.graphics.Color.WHITE
+        val label = if (dark) android.graphics.Color.rgb(245, 245, 247) else android.graphics.Color.rgb(28, 28, 30)
+        val dialog = android.app.Dialog(context)
+        var disposed = false
+        var running: CfDiagnosticSession? = null
+        val root = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(surface)
+        }
+        val title = android.widget.TextView(context).apply {
+            text = mode.title
+            textSize = 18f
+            setTextColor(label)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(dp(16), dp(16), dp(16), dp(8))
+        }
+        val status = android.widget.TextView(context).apply {
+            textSize = 14f
+            setTextColor(label)
+            setPadding(dp(16), 0, dp(16), dp(8))
+        }
+        val controls = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            setPadding(dp(12), 0, dp(12), dp(8))
+        }
+        val retry = android.widget.Button(context).apply { text = "重试" }
+        val close = android.widget.Button(context).apply { text = "关闭" }
+        controls.addView(retry, android.widget.LinearLayout.LayoutParams(0, wrap, 1f))
+        controls.addView(close, android.widget.LinearLayout.LayoutParams(0, wrap, 1f))
+        val host = android.widget.FrameLayout(context)
+        root.addView(title, android.widget.LinearLayout.LayoutParams(match, wrap))
+        root.addView(status, android.widget.LinearLayout.LayoutParams(match, wrap))
+        root.addView(controls, android.widget.LinearLayout.LayoutParams(match, wrap))
+        root.addView(host, android.widget.LinearLayout.LayoutParams(match, 0, 1f))
+
+        fun startTest() {
+            running?.close(reportCancellation = false)
+            host.removeAllViews()
+            val test = CfDiagnosticSession(context, mode, dark) { update ->
+                if (!disposed) {
+                    status.text = update.message
+                    status.setTextColor(if (update.success) android.graphics.Color.rgb(48, 166, 86) else label)
+                    latestStatus.value(update)
+                }
+            }
+            running = test
+            host.addView(test.view, android.widget.FrameLayout.LayoutParams(match, match))
+            test.start()
+        }
+
+        retry.setOnClickListener { startTest() }
+        close.setOnClickListener { dialog.dismiss() }
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dialog.setContentView(root)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
+        dialog.setOnDismissListener {
+            running?.close()
+            if (!disposed) latestClose.value()
+        }
+        dialog.show()
+        dialog.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(surface))
+            setLayout(match, (context.resources.displayMetrics.heightPixels * 0.92f).toInt())
+            setGravity(android.view.Gravity.BOTTOM)
+            clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        }
+        startTest()
+        onDispose {
+            disposed = true
+            dialog.setOnDismissListener(null)
+            running?.close(reportCancellation = false)
+            host.removeAllViews()
+            dialog.dismiss()
         }
     }
 }
@@ -5735,6 +6268,8 @@ internal class CreatorMediaSpan(
 
     private var cachedBitmap: Bitmap? = null
     private var isBitmapLoading = false
+    private var loadFailed = false
+    private var retryCount = 0
     private val density = context.resources.displayMetrics.density
 
     val cardHeight = if (media.isImage) 180f * density else 56f * density
@@ -5749,11 +6284,32 @@ internal class CreatorMediaSpan(
         loadBitmapAsync()
     }
 
-    private fun loadBitmapAsync() {
-        if (!media.isImage || cachedBitmap != null || isBitmapLoading) return
+    private fun loadBitmapAsync(force: Boolean = false) {
+        if (!media.isImage || cachedBitmap != null) return
+        if (isBitmapLoading && !force) return
+        if (loadFailed && !force && retryCount >= 2) return
+
         isBitmapLoading = true
+        loadFailed = false
+
+        val cardW = ((view.width - view.paddingLeft - view.paddingRight)
+            .takeIf { it > 100 } ?: context.resources.displayMetrics.widthPixels)
+            .coerceIn(100, 1080)
+        val cardH = cardHeight.toInt().coerceIn(100, 720)
+
+        // 优先使用 previewUrl，若失败且有远端上传 URL 则自动降级重试远端
+        val targetUrl = if (retryCount > 0 && !media.uploaded.url.isNullOrBlank()) {
+            val u = media.uploaded.url
+            if (u.startsWith("http")) u else org.linuxdo.android.Config.BASE_URL + "/" + u.removePrefix("/")
+        } else {
+            media.previewUrl
+        }
+
         val request = ImageRequest.Builder(context)
-            .data(media.previewUrl)
+            .data(targetUrl)
+            .size(cardW, cardH)
+            .precision(Precision.INEXACT)
+            .scale(Scale.FILL)
             .allowHardware(false)
             .target(
                 onSuccess = { drawable ->
@@ -5767,10 +6323,20 @@ internal class CreatorMediaSpan(
                         bmp
                     }
                     isBitmapLoading = false
+                    loadFailed = false
                     view.postInvalidate()
                 },
                 onError = {
                     isBitmapLoading = false
+                    loadFailed = true
+                    retryCount++
+                    // 若首次本地 URI 失败且远端有 URL，自动触发一次降级远端拉取
+                    val remoteUrl = media.uploaded.url
+                    if (retryCount == 1 && !remoteUrl.isNullOrBlank() && targetUrl != remoteUrl) {
+                        view.post { loadBitmapAsync(force = true) }
+                    } else {
+                        view.postInvalidate()
+                    }
                 }
             )
             .build()
@@ -5861,9 +6427,15 @@ internal class CreatorMediaSpan(
                     textSize = 14f * density
                     textAlign = Paint.Align.CENTER
                 }
-                val tipText = if (isBitmapLoading) "🖼️ 正在载入图片…" else "🖼️ ${media.name}"
+                val tipText = when {
+                    isBitmapLoading -> "🖼️ 正在载入图片…"
+                    loadFailed -> "🖼️ ${media.name}（点击放大）"
+                    else -> "🖼️ ${media.name}"
+                }
                 canvas.drawText(tipText, lastDrawBounds.centerX(), lastDrawBounds.centerY() + 5f * density, tipPaint)
-                loadBitmapAsync()
+                if (!isBitmapLoading && !loadFailed) {
+                    loadBitmapAsync()
+                }
             }
 
             val barHeight = 28f * density
@@ -5927,6 +6499,9 @@ internal class CreatorMediaSpan(
             return true
         } else if (lastDrawBounds.contains(eventX, eventY)) {
             if (media.isImage) {
+                if (cachedBitmap == null && loadFailed) {
+                    loadBitmapAsync(force = true)
+                }
                 onPreview(media)
             }
             return true
@@ -8059,3 +8634,159 @@ private fun BadgeDetailDialog(
 }
 
 
+
+/** 辅助悬浮球设置界面的拖拽排序三条杠手柄图标。 */
+@Composable
+private fun DragHandleIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(width = 18.dp, height = 14.dp)) {
+        val strokeWidth = 1.9.dp.toPx()
+        val spacing = 4.8.dp.toPx()
+        val startX = 1.dp.toPx()
+        val endX = size.width - 1.dp.toPx()
+        for (i in 0..2) {
+            val y = i * spacing + strokeWidth / 2f + 1.dp.toPx()
+            drawLine(
+                color = tint,
+                start = Offset(startX, y),
+                end = Offset(endX, y),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round,
+            )
+        }
+    }
+}
+
+/** 辅助悬浮球设置界面的纯矢量手绘功能图标徽章。 */
+@Composable
+private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifier = Modifier) {
+    val (bgColor, actionTint) = when (action) {
+        FloatingAction.CreateTopic -> Color(0xFFFF5722).copy(alpha = 0.15f) to Color(0xFFFF5722)
+        FloatingAction.Bookmarks -> Color(0xFFFAAD14).copy(alpha = 0.15f) to Color(0xFFFAAD14)
+        FloatingAction.Following -> Color(0xFF2979FF).copy(alpha = 0.15f) to Color(0xFF2979FF)
+        FloatingAction.Likes -> Color(0xFFFF4D4F).copy(alpha = 0.15f) to Color(0xFFFF4D4F)
+        FloatingAction.Replies -> Color(0xFF00BFA5).copy(alpha = 0.15f) to Color(0xFF00BFA5)
+        FloatingAction.Sort -> Color(0xFFFFB300).copy(alpha = 0.15f) to Color(0xFFFF9800)
+        FloatingAction.Drafts -> Color(0xFFAB47BC).copy(alpha = 0.15f) to Color(0xFF8E24AA)
+        FloatingAction.Search -> Color(0xFF26A69A).copy(alpha = 0.15f) to Color(0xFF00897B)
+        FloatingAction.Categories -> Color(0xFF29B6F6).copy(alpha = 0.15f) to Color(0xFF0288D1)
+        FloatingAction.History -> Color(0xFF7E57C2).copy(alpha = 0.15f) to Color(0xFF7E57C2)
+        FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f) to Color(0xFF1E88E5)
+        FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f) to Color(0xFFE91E63)
+    }
+
+    Box(
+        modifier = modifier
+            .size(34.dp)
+            .clip(CircleShape)
+            .background(bgColor),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(17.dp)) {
+            scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+                val stroke = Stroke(width = 2.1f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                when (action) {
+                    FloatingAction.CreateTopic -> {
+                        val p = Path().apply { moveTo(3f, 13f); lineTo(6f, 12f); lineTo(13f, 5f); lineTo(11f, 3f); lineTo(4f, 10f); close() }
+                        drawPath(p, actionTint, style = Stroke(1.8f))
+                    }
+                    FloatingAction.Bookmarks -> {
+                        val bm = Path().apply {
+                            moveTo(6.5f, 4.5f); lineTo(17.5f, 4.5f); lineTo(17.5f, 19.5f); lineTo(12f, 15.5f); lineTo(6.5f, 19.5f); close()
+                        }
+                        drawPath(bm, actionTint, style = stroke)
+                        drawLine(actionTint, Offset(9.5f, 9.5f), Offset(14.5f, 9.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    }
+                    FloatingAction.Following -> {
+                        drawCircle(actionTint, 3.2f, Offset(9f, 7.5f), style = stroke)
+                        val shoulder = Path().apply {
+                            moveTo(3.5f, 19.5f); cubicTo(3.5f, 15f, 6.5f, 13.5f, 9f, 13.5f); cubicTo(11.5f, 13.5f, 14.5f, 15f, 14.5f, 19.5f)
+                        }
+                        drawPath(shoulder, actionTint, style = stroke)
+                        drawLine(actionTint, Offset(18.5f, 8f), Offset(18.5f, 14f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                        drawLine(actionTint, Offset(15.5f, 11f), Offset(21.5f, 11f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    }
+                    FloatingAction.Likes -> {
+                        val thumb = Path().apply {
+                            moveTo(4.5f, 12f); lineTo(4.5f, 19.5f); lineTo(7.5f, 19.5f); lineTo(7.5f, 12f); close()
+                        }
+                        drawPath(thumb, actionTint, style = stroke)
+                        val palm = Path().apply {
+                            moveTo(7.5f, 13f); lineTo(10.5f, 11f); lineTo(12.5f, 4.5f)
+                            cubicTo(13.2f, 3.5f, 14.5f, 3.5f, 15f, 4.5f)
+                            cubicTo(15.2f, 5.5f, 14.2f, 8f, 13.5f, 10.5f)
+                            lineTo(17.5f, 10.5f)
+                            cubicTo(19f, 10.5f, 19.5f, 11.5f, 19.5f, 12.8f)
+                            lineTo(19f, 17f)
+                            cubicTo(18.8f, 18.2f, 17.8f, 19.5f, 16.5f, 19.5f)
+                            lineTo(7.5f, 19.5f)
+                        }
+                        drawPath(palm, actionTint, style = stroke)
+                    }
+                    FloatingAction.Replies -> {
+                        val reply = Path().apply {
+                            moveTo(18.5f, 18f); cubicTo(18.5f, 11.5f, 14.5f, 8.5f, 9.5f, 8.5f)
+                        }
+                        drawPath(reply, actionTint, style = stroke)
+                        val arrowHead = Path().apply {
+                            moveTo(13.5f, 5f); lineTo(9f, 8.5f); lineTo(13.5f, 12f)
+                        }
+                        drawPath(arrowHead, actionTint, style = stroke)
+                        drawLine(actionTint, Offset(5f, 19.5f), Offset(19f, 19.5f), strokeWidth = 1.9f, cap = StrokeCap.Round)
+                    }
+                    FloatingAction.Sort -> {
+                        drawLine(actionTint, Offset(5f, 12f), Offset(5f, 4f), 1.8f)
+                        val a1 = Path().apply { moveTo(3f, 6.5f); lineTo(5f, 4f); lineTo(7f, 6.5f) }
+                        drawPath(a1, actionTint, style = Stroke(1.8f))
+                        drawLine(actionTint, Offset(11f, 4f), Offset(11f, 12f), 1.8f)
+                        val a2 = Path().apply { moveTo(9f, 9.5f); lineTo(11f, 12f); lineTo(13f, 9.5f) }
+                        drawPath(a2, actionTint, style = Stroke(1.8f))
+                    }
+                    FloatingAction.Drafts -> {
+                        val f = Path().apply { moveTo(2f, 4f); lineTo(6f, 4f); lineTo(8f, 6f); lineTo(14f, 6f); lineTo(14f, 13f); lineTo(2f, 13f); close() }
+                        drawPath(f, actionTint, style = Stroke(1.6f))
+                    }
+                    FloatingAction.Search -> {
+                        drawCircle(actionTint, 4f, Offset(7f, 7f), style = Stroke(1.8f))
+                        drawLine(actionTint, Offset(10f, 10f), Offset(13.5f, 13.5f), 2f)
+                    }
+                    FloatingAction.Categories -> {
+                        drawRoundRect(actionTint, Offset(3f, 3f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
+                        drawRoundRect(actionTint, Offset(9f, 3f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
+                        drawRoundRect(actionTint, Offset(3f, 9f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
+                        drawRoundRect(actionTint, Offset(9f, 9f), Size(4.2f, 4.2f), CornerRadius(1f, 1f), style = Stroke(1.6f))
+                    }
+                    FloatingAction.History -> {
+                        drawArc(color = actionTint, startAngle = 40f, sweepAngle = 280f, useCenter = false, topLeft = Offset(4f, 4f), size = Size(16f, 16f), style = stroke)
+                        val arrow = Path().apply { moveTo(9.5f, 2.5f); lineTo(4f, 4.5f); lineTo(5.5f, 10f) }
+                        drawPath(arrow, actionTint, style = stroke)
+                        drawLine(actionTint, Offset(12f, 12f), Offset(12f, 7.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                        drawLine(actionTint, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    }
+                    FloatingAction.Connect -> {
+                        val l1 = Path().apply {
+                            moveTo(10f, 13f); lineTo(8f, 15f); cubicTo(6.5f, 16.5f, 6.5f, 19f, 8f, 20.5f); cubicTo(9.5f, 22f, 12f, 22f, 13.5f, 20.5f); lineTo(15.5f, 18.5f)
+                        }
+                        val l2 = Path().apply {
+                            moveTo(14f, 11f); lineTo(16f, 9f); cubicTo(17.5f, 7.5f, 17.5f, 5f, 16f, 3.5f); cubicTo(14.5f, 2f, 12f, 2f, 10.5f, 3.5f); lineTo(8.5f, 5.5f)
+                        }
+                        drawPath(l1, actionTint, style = stroke)
+                        drawPath(l2, actionTint, style = stroke)
+                        drawLine(actionTint, Offset(9.5f, 14.5f), Offset(14.5f, 9.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    }
+                    FloatingAction.Chat -> {
+                        val bubble = Path().apply {
+                            moveTo(4.5f, 6f); cubicTo(4.5f, 4.5f, 5.5f, 4f, 7f, 4f); lineTo(17f, 4f)
+                            cubicTo(18.5f, 4f, 19.5f, 4.5f, 19.5f, 6f); lineTo(19.5f, 14f)
+                            cubicTo(19.5f, 15.5f, 18.5f, 16f, 17f, 16f); lineTo(9.5f, 16f)
+                            lineTo(5.5f, 19.5f); lineTo(5.5f, 16f); lineTo(4.5f, 16f); close()
+                        }
+                        drawPath(bubble, actionTint, style = stroke)
+                        drawCircle(actionTint, 1.1f, Offset(8.5f, 10f))
+                        drawCircle(actionTint, 1.1f, Offset(12f, 10f))
+                        drawCircle(actionTint, 1.1f, Offset(15.5f, 10f))
+                    }
+                }
+            }
+        }
+    }
+}

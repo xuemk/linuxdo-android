@@ -557,21 +557,8 @@ internal fun CompactUserIdentityHeader(
                     color = IosTheme.colors.secondaryLabel,
                     maxLines = 1,
                 )
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(if (isDark) Color(0xFF1E3A5F) else Color(0xFFE1F0FF))
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = "L${user.trustLevel ?: 1} 活跃用户",
-                        style = androidx.compose.ui.text.TextStyle(
-                            fontSize = 11.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (isDark) Color(0xFF60A5FA) else Color(0xFF0284C7),
-                        ),
-                    )
+                user.trustLevel?.let { level ->
+                    LevelBadge(level)
                 }
             }
         }

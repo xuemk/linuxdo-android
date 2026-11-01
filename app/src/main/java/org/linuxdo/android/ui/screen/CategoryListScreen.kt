@@ -1,10 +1,14 @@
 package org.linuxdo.android.ui.screen
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -12,8 +16,12 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.rememberScrollState
@@ -30,6 +38,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -39,7 +49,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -48,9 +60,14 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.onSizeChanged
+import kotlin.math.abs
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -158,6 +175,13 @@ fun CategoryListScreen(
     scrollToTopRequest: Int = 0,
     onSaveOrder: (List<Long>) -> Unit = {},
     onResetOrder: () -> Unit = {},
+    currentTab: org.linuxdo.android.ui.CategorySectionTab = org.linuxdo.android.ui.CategorySectionTab.CATEGORIES,
+    onTabChange: (org.linuxdo.android.ui.CategorySectionTab) -> Unit = {},
+    tagsState: org.linuxdo.android.ui.TagsUiState = org.linuxdo.android.ui.TagsUiState(),
+    tagSearchQuery: String = "",
+    onTagSearchQueryChange: (String) -> Unit = {},
+    onRetryTags: () -> Unit = {},
+    onOpenTag: (String) -> Unit = {},
     trailing: @Composable () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
@@ -297,17 +321,190 @@ fun CategoryListScreen(
         }
     }
 
+    LaunchedEffect(currentTab) {
+        if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS && !tagsState.loaded && !tagsState.loading) {
+            onRetryTags()
+        }
+    }
+
+    val filteredTags = remember(tagsState.tags, tagsState.searchedTags, tagSearchQuery) {
+        if (tagSearchQuery.isBlank()) {
+            tagsState.tags.sortedWith(
+                compareByDescending<org.linuxdo.android.data.DiscourseTag> { it.effectiveCount }
+                    .thenBy { it.displayName.lowercase() }
+            )
+        } else {
+            val q = tagSearchQuery.trim().lowercase()
+            val merged = linkedMapOf<String, org.linuxdo.android.data.DiscourseTag>()
+            for (tag in tagsState.tags) {
+                if (tag.displayName.lowercase().contains(q) ||
+                    tag.name.lowercase().contains(q) ||
+                    tag.text.lowercase().contains(q) ||
+                    tag.id.lowercase().contains(q)
+                ) {
+                    val key = tag.displayName.trim()
+                    if (key.isNotEmpty()) {
+                        merged[key] = tag.copy(count = tag.effectiveCount)
+                    }
+                }
+            }
+            for (tag in tagsState.searchedTags) {
+                if (tag.displayName.lowercase().contains(q) ||
+                    tag.name.lowercase().contains(q) ||
+                    tag.text.lowercase().contains(q) ||
+                    tag.id.lowercase().contains(q)
+                ) {
+                    val key = tag.displayName.trim()
+                    if (key.isNotEmpty()) {
+                        val existing = merged[key]
+                        if (existing == null) {
+                            merged[key] = tag.copy(count = tag.effectiveCount)
+                        } else if (tag.effectiveCount > existing.count) {
+                            merged[key] = existing.copy(count = tag.effectiveCount)
+                        }
+                    }
+                }
+            }
+            merged.values.sortedWith(
+                compareByDescending<org.linuxdo.android.data.DiscourseTag> { it.effectiveCount }
+                    .thenBy { it.displayName.lowercase() }
+            )
+        }
+    }
+
+    val latestCurrentTab by rememberUpdatedState(currentTab)
+    val latestOnTabChange by rememberUpdatedState(onTabChange)
+    val latestDraggedId by rememberUpdatedState(draggedId)
+    val tabSwipeEdgeMarginPx = with(LocalDensity.current) { 32.dp.toPx() }
+    val tabSwipeThresholdPx = with(LocalDensity.current) { 48.dp.toPx() }
+
+    val segmentTitle: @Composable () -> Unit = {
+        Box(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(IosTheme.colors.fieldBackground)
+                    .padding(2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val isDark = IosTheme.colors.isDark
+                val activeCardBg = if (isDark) Color(0xFF32353E) else Color.White
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) activeCardBg else Color.Transparent)
+                        .clickable { onTabChange(org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) }
+                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        text = "分类",
+                        style = IosTheme.type.footnote,
+                        fontWeight = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) activeCardBg else Color.Transparent)
+                        .clickable { onTabChange(org.linuxdo.android.ui.CategorySectionTab.TAGS) }
+                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        text = "标签",
+                        style = IosTheme.type.footnote,
+                        fontWeight = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                    )
+                }
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(tabSwipeEdgeMarginPx, tabSwipeThresholdPx) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    if (latestDraggedId != null ||
+                        down.position.x < tabSwipeEdgeMarginPx ||
+                        (size.width > 0 && down.position.x > size.width - tabSwipeEdgeMarginPx)
+                    ) {
+                        return@awaitEachGesture
+                    }
+                    var dragMode = 0 // 0: 未定, 1: 水平切标签, 2: 垂直滚动或其他手势
+                    var totalPan = Offset.Zero
+                    var horizontalDrag = 0f
+                    val touchSlop = viewConfiguration.touchSlop
+
+                    do {
+                        val event = awaitPointerEvent()
+                        if (latestDraggedId != null) {
+                            dragMode = 2
+                            break
+                        }
+                        val activePointers = event.changes.filter { it.pressed }
+                        if (activePointers.isEmpty()) break
+                        if (activePointers.size > 1) {
+                            dragMode = 2
+                            break
+                        }
+                        val change = activePointers.first()
+                        if (change.isConsumed && dragMode == 0) {
+                            dragMode = 2
+                            break
+                        }
+                        val delta = change.positionChange()
+                        when (dragMode) {
+                            1 -> {
+                                horizontalDrag += delta.x
+                                change.consume()
+                            }
+                            0 -> {
+                                totalPan += delta
+                                if (totalPan.getDistance() > touchSlop) {
+                                    if (abs(totalPan.x) > abs(totalPan.y) * 1.35f) {
+                                        dragMode = 1
+                                        horizontalDrag = totalPan.x
+                                        change.consume()
+                                    } else {
+                                        dragMode = 2
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    } while (event.changes.any { it.pressed })
+
+                    if (dragMode == 1 && abs(horizontalDrag) >= tabSwipeThresholdPx) {
+                        val tabs = org.linuxdo.android.ui.CategorySectionTab.entries
+                        val nextIndex = if (horizontalDrag < 0f) {
+                            (latestCurrentTab.ordinal + 1) % tabs.size
+                        } else {
+                            (latestCurrentTab.ordinal - 1 + tabs.size) % tabs.size
+                        }
+                        latestOnTabChange(tabs[nextIndex])
+                    }
+                }
+            }
+    ) {
     IosLargeTitleScaffold(
-        title = "分类",
+        title = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) "标签" else "分类",
         showLargeTitle = false,
         listState = listState,
         compactTop = false,
         scrollToTopRequest = scrollToTopRequest,
-        trailing = combinedTrailing,
+        trailing = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) combinedTrailing else trailing,
+        customCollapsedTitle = segmentTitle,
     ) {
-        if (state.loading) item("loading") { IosLoadingBox() }
-        state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
-        if (state.loaded && state.items.isEmpty()) item("empty") { EmptyNotice() }
+        if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) {
+            if (state.loading) item("loading") { IosLoadingBox() }
+            state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
+            if (state.loaded && state.items.isEmpty()) item("empty") { EmptyNotice() }
 
         // ── 自定义版块（固定在分类第一位，仅在用户配置后展示） ──
         if (customSection != null) {
@@ -441,6 +638,101 @@ fun CategoryListScreen(
                 }
             }
         }
+        } else {
+            // ── 标签页面（仅在标签页面展示搜索筛选框） ──
+            item("tags-search-bar") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = IosMetrics.screenPadding, vertical = 8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.fieldBackground)
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SearchLoupeIcon(
+                            tint = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        BasicTextField(
+                            value = tagSearchQuery,
+                            onValueChange = onTagSearchQueryChange,
+                            singleLine = true,
+                            textStyle = IosTheme.type.body.copy(
+                                color = IosTheme.colors.label,
+                                fontSize = 14.sp
+                            ),
+                            cursorBrush = SolidColor(IosTheme.colors.accent),
+                            decorationBox = { field ->
+                                Box {
+                                    if (tagSearchQuery.isEmpty()) {
+                                        Text(
+                                            text = if (tagsState.tags.isNotEmpty()) "搜索标签 (共 ${tagsState.tags.size} 个)..." else "搜索标签...",
+                                            style = IosTheme.type.body.copy(fontSize = 14.sp),
+                                            color = IosTheme.colors.secondaryLabel,
+                                        )
+                                    }
+                                    field()
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (tagSearchQuery.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .background(IosTheme.colors.secondaryLabel.copy(alpha = 0.2f))
+                                    .clickable { onTagSearchQueryChange("") },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text("✕", fontSize = 10.sp, color = IosTheme.colors.secondaryLabel)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (tagsState.loading && tagsState.tags.isEmpty()) {
+                item("tags-loading") { IosLoadingBox() }
+            }
+            tagsState.error?.takeIf { tagsState.tags.isEmpty() }?.let { message ->
+                item("tags-error") { ErrorNotice(message, onRetryTags) }
+            }
+
+            if (tagsState.loaded && filteredTags.isEmpty()) {
+                item("tags-empty") {
+                    EmptyNotice()
+                }
+            } else {
+                items(
+                    items = filteredTags.chunked(2),
+                    key = { chunk -> "tags-chunk:" + chunk.joinToString(",") { it.displayName } }
+                ) { pair ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = IosMetrics.screenPadding, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        pair.forEach { tag ->
+                            Box(modifier = Modifier.weight(1f)) {
+                                TagCard(tag = tag, onClick = { onOpenTag(tag.name.ifBlank { tag.displayName }) })
+                            }
+                        }
+                        if (pair.size == 1) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
     }
 
     if (showCustomSectionDialog) {
@@ -1564,6 +1856,68 @@ private fun BadgeArrowIcon(color: Color, bold: Boolean = false) {
                 style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round),
             )
         }
+    }
+}
+
+/** 搜索放大镜图标 */
+@Composable
+private fun SearchLoupeIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 2f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            drawCircle(tint, radius = 6.5f, center = Offset(10.5f, 10.5f), style = stroke)
+            drawLine(tint, Offset(15.5f, 15.5f), Offset(21f, 21f), strokeWidth = 2.2f, cap = StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
+private fun TagCard(
+    tag: org.linuxdo.android.data.DiscourseTag,
+    onClick: () -> Unit,
+) {
+    val isDark = IosTheme.colors.isDark
+    val shape = RoundedCornerShape(10.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(IosTheme.colors.card)
+            .border(
+                0.5.dp,
+                if (isDark) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.06f),
+                shape
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "#",
+            style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Bold, fontSize = 14.sp),
+            color = IosTheme.colors.accent,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = tag.displayName,
+            style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium, fontSize = 13.5.sp),
+            color = IosTheme.colors.label,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        val displayCount = tag.effectiveCount
+        Spacer(Modifier.width(6.dp))
+        val countStr = when {
+            displayCount >= 10000 -> String.format(java.util.Locale.US, "%.1fw", displayCount / 10000.0)
+            displayCount >= 1000 -> String.format(java.util.Locale.US, "%.1fk", displayCount / 1000.0)
+            else -> "$displayCount"
+        }
+        Text(
+            text = countStr,
+            style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+            color = IosTheme.colors.secondaryLabel,
+        )
     }
 }
 

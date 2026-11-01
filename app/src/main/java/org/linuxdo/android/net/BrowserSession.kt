@@ -56,6 +56,16 @@ import org.linuxdo.android.Config
 import org.linuxdo.android.data.Diagnostics
 import org.linuxdo.android.data.SessionStore
 import org.linuxdo.android.data.TopicRepository
+import org.linuxdo.android.net.gecko.GeckoAuthBridge
+import org.linuxdo.android.net.gecko.GeckoManager
+import org.mozilla.geckoview.GeckoView
+import kotlinx.coroutines.SupervisorJob
+import okhttp3.Cookie
+import okhttp3.FormBody
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * 全应用唯一的 WebView 会话:
@@ -68,7 +78,10 @@ class BrowserSession(
     val userAgent: String,
     private val store: SessionStore,
     private val diagnostics: Diagnostics,
+    private val httpClientProvider: (() -> OkHttpClient)? = null,
+    private val isProxyOrVpnActiveProvider: (() -> Boolean)? = null,
 ) {
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var webViewInstance: WebView? = null
     private var authWebView: WebView? = null
     private var pendingAuthHtml: String? = null
@@ -120,6 +133,8 @@ class BrowserSession(
     private var cachedPassword: String = ""
     /** 非空表示当前内联页处于"发送登录邮件"模式，值为目标邮箱。 */
     private var cachedEmailSend: String? = null
+    /** 非空表示当前内联页处于"邮件链接/验证码登录兑换"模式，值为提取出的 token。 */
+    private var cachedEmailLoginToken: String? = null
     /** 非空表示认证 WebView 正在整页打开邮件登录链接（Fluxdo 同款兑换方式）。 */
     private var pendingEmailLink: String? = null
     private var emailLinkCompleting: Boolean = false
@@ -154,6 +169,93 @@ class BrowserSession(
     private var attachedActivityContext: Context? = null
     private var cfDialog: Dialog? = null
     private var cfWebView: WebView? = null
+    private var cfGeckoView: org.mozilla.geckoview.GeckoView? = null
+    private var cfGeckoSession: org.mozilla.geckoview.GeckoSession? = null
+    private var authGeckoView: org.mozilla.geckoview.GeckoView? = null
+    private var authGeckoSession: org.mozilla.geckoview.GeckoSession? = null
+    private var mainGeckoView: org.mozilla.geckoview.GeckoView? = null
+    private var mainGeckoSession: org.mozilla.geckoview.GeckoSession? = null
+    private var isGeckoVerifyActive: Boolean = false
+    private val geckoBridges = mutableMapOf<View, GeckoAuthBridge>()
+    private var authGeckoInitJob: Job? = null
+    private var cfGeckoInitJob: Job? = null
+    private var authGeckoCookiesPrepared = false
+    private var authGeckoPreparing = false
+
+    private fun currentAuthView(): View? = authGeckoView ?: authWebView
+
+    private fun currentCfView(): View? = cfGeckoView ?: cfWebView
+
+    private fun evaluateBrowserScript(view: View, script: String, callback: ((String?) -> Unit)? = null) {
+        if (view is WebView) {
+            view.evaluateJavascript(script) { callback?.invoke(it) }
+        } else {
+            val bridge = geckoBridges[view]
+            if (bridge == null) callback?.invoke(null)
+            else bridge.evaluateJavascript(script) { callback?.invoke(it) }
+        }
+    }
+
+    private fun stopBrowserLoading(view: View) {
+        if (view is WebView) view.stopLoading()
+        else (view as? GeckoView)?.session?.stop()
+    }
+
+    private suspend fun syncBrowserCookies(view: View): Map<String, String> {
+        val bridge = geckoBridges[view] ?: return store.syncFromWebView()
+        val generation = store.sessionGeneration
+        val previousCookies = store.syncFromWebView()
+        val snapshot = bridge.readCookies()
+        val cookies = (0 until snapshot.length()).mapNotNull { index ->
+            val cookie = snapshot.getJSONObject(index)
+            val domain = cookie.optString("domain").removePrefix(".")
+            if (domain != Config.HOST) return@mapNotNull null
+            Cookie.Builder().apply {
+                name(cookie.getString("name"))
+                value(cookie.getString("value"))
+                if (cookie.optBoolean("hostOnly")) hostOnlyDomain(domain) else domain(domain)
+                path(cookie.optString("path", "/"))
+                if (cookie.optBoolean("secure")) secure()
+                if (cookie.optBoolean("httpOnly")) httpOnly()
+                if (cookie.has("expirationDate")) expiresAt((cookie.getDouble("expirationDate") * 1000).toLong())
+            }.build()
+        }
+        store.applyResponseCookies(cookies, requestGeneration = generation, sentCookies = previousCookies)
+        return store.syncFromWebView()
+    }
+
+    private fun refreshBrowserCookies(view: View, onComplete: () -> Unit) {
+        scope.launch(Dispatchers.Main) {
+            try {
+                syncBrowserCookies(view)
+                onComplete()
+            } catch (_: CancellationException) {
+            } catch (error: Exception) {
+                diagnostics.log("浏览器 Cookie 同步失败: ${error.message}")
+                if (isInCfMode && currentCfView() === view) scheduleCfCompletionProbe(view)
+            }
+        }
+    }
+
+    private fun onGeckoAuthCallback(view: View, name: String, payload: String) {
+        if (name == "onAuthAborted" && geckoBridges.containsKey(view)) {
+            Bridge().onAuthAborted(payload)
+            return
+        }
+        if (currentAuthView() !== view && currentCfView() !== view) return
+        val bridge = Bridge()
+        when (name) {
+            "onAuthResult" -> refreshBrowserCookies(view) { bridge.onAuthResult(payload) }
+            "onHcaptchaPass" -> bridge.onHcaptchaPass(payload)
+            "onAuthAborted" -> bridge.onAuthAborted(payload)
+            "onDiagnostic" -> {
+                if (payload == "Gecko认证桥就绪") Log.d("GeckoAuthBridge", "认证页面与 Native 双向回调已验证")
+                bridge.onDiagnostic(payload)
+            }
+            "onChallengeOriginReached" -> if (currentCfView() === view) awaitFreshClearanceThen(view, payload)
+            "onChallengeNavigating" -> if (currentCfView() === view) view.alpha = 0f
+        }
+    }
 
     private enum class AuthSubmitResult {
         RESPONSE,
@@ -165,7 +267,7 @@ class BrowserSession(
         authSubmissionGeneration += 1L
         val submissionId = currentSubmissionId
         val completion = authSubmitCompletion
-        val view = authWebView
+        val view = currentAuthView()
         val hasActiveSubmission = submissionId != null && completion != null && !completion.isCompleted
         if (submissionId != null && completion != null && !completion.isCompleted) {
             cancelledSubmissionId = submissionId
@@ -200,15 +302,17 @@ class BrowserSession(
         pendingAuthHtml = null
         authHtmlInjected = false
         cachedEmailSend = null
+        cachedEmailLoginToken = null
         dismissCfDialog()
         onAuthCallback = null
         pendingEmailLink = null
         emailLinkCompleting = false
         if (!hasActiveSubmission) {
-            authWebView?.let { authView ->
-                authView.evaluateJavascript("if (typeof window.__linuxdoAbortLogin === 'function') window.__linuxdoAbortLogin();", null)
-                authView.stopLoading()
-                authView.loadUrl("about:blank")
+            currentAuthView()?.let { authView ->
+                evaluateBrowserScript(authView, "if (typeof window.__linuxdoAbortLogin === 'function') window.__linuxdoAbortLogin();")
+                stopBrowserLoading(authView)
+                if (authView is WebView) authView.loadUrl("about:blank")
+                else (authView as? GeckoView)?.session?.loadUri("about:blank")
             }
         }
     }
@@ -229,7 +333,7 @@ class BrowserSession(
         cachedSecondFactor = secondFactorToken
         cachedSecondFactorMethod = secondFactorMethod
         isInCfMode = false
-        val view = authWebView ?: return false
+        val view = currentAuthView() ?: return false
         view.post {
             executeWebLogin(view, null, cachedSecondFactor, cachedSecondFactorMethod)
         }
@@ -305,8 +409,6 @@ class BrowserSession(
 
         @JavascriptInterface
         fun onAuthResult(jsonStr: String) {
-            Log.d(TAG, "onAuthResult: $jsonStr")
-            diagnostics.log("收到安全验证登录结果: $jsonStr")
             var resultSubmissionId = ""
             try {
                 val obj = JSONObject(jsonStr)
@@ -319,6 +421,7 @@ class BrowserSession(
                 }
                 val phase = obj.optString("phase")
                 val status = obj.optInt("status")
+                diagnostics.log("安全验证响应: phase=$phase HTTP=$status")
                 val body = obj.optString("body")
                 val retryAfterStr = obj.optString("retryAfter")
                 val retryAfterSeconds = HttpHeaderUtils.parseRetryAfter(retryAfterStr)
@@ -346,17 +449,16 @@ class BrowserSession(
                         retryingLoginWithHcaptchaToken = false
                         pendingHcaptchaToken = null
                         val resObj = try { JSONObject(body) } catch (_: Exception) { null }
-                        val reason = resObj?.optString("reason")
-                        val error = resObj?.optString("error")
+                        val error = resObj?.optString("error")?.takeIf { it.isNotBlank() }
+                            ?: resObj?.optString("errors")?.takeIf { it.isNotBlank() && it != "[]" && it != "null" }
                         val user = resObj?.optJSONObject("user")?.optString("username")
 
-                        if (reason == "second_factor" || reason == "invalid_second_factor") {
+                        val has2faToken = !cachedSecondFactor.isNullOrBlank()
+                        val is2FA = isSecondFactorResponse(resObj, has2faToken)
+
+                        if (is2FA) {
                             awaitingSecondFactorLogin = true
-                            val msg = if (reason == "invalid_second_factor") {
-                                error?.takeIf { it.isNotBlank() } ?: "二次验证码错误，请重新输入"
-                            } else {
-                                "需要进行二次验证 (2FA)"
-                            }
+                            val msg = extractSecondFactorMessage(resObj, has2faToken)
                             cb(false, msg, true)
                         } else if (!error.isNullOrBlank() && user.isNullOrBlank()) {
                             awaitingSecondFactorLogin = false
@@ -388,13 +490,13 @@ class BrowserSession(
                     }
                     "hcaptcha" -> {
                         hcaptchaTempReady = false
-                        if (retryingLoginWithHcaptchaToken || cachedEmailSend != null) {
+                        if (retryingLoginWithHcaptchaToken || cachedEmailSend != null || cachedEmailLoginToken != null) {
                             // 令牌可能在用户完成 CF 的过程中到期；回退到可见 hCaptcha，
                             // 不能把已经通过的 CF 也当作失败。
                             retryingLoginWithHcaptchaToken = false
                             pendingHcaptchaToken = null
                             diagnostics.log("hCaptcha 令牌已过期，重新展示图形验证")
-                            authWebView?.post {
+                            currentAuthView()?.post {
                                 loadCaptchaLogin(
                                     login = cachedLogin,
                                     password = cachedPassword,
@@ -403,6 +505,7 @@ class BrowserSession(
                                     isDark = isDarkCached,
                                     resetCfRetry = false,
                                     emailSendTo = cachedEmailSend,
+                                    emailLoginToken = cachedEmailLoginToken,
                                     onResult = cb,
                                 )
                             }
@@ -444,18 +547,18 @@ class BrowserSession(
         @JavascriptInterface
         fun onHcaptchaPass(token: String) {
             if (token.isBlank()) return
-            val view = authWebView ?: return
+            val view = currentAuthView() ?: return
             view.postDelayed(
                 {
-                    if (authWebView !== view || onAuthCallback == null) return@postDelayed
+                    if (currentAuthView() !== view || onAuthCallback == null) return@postDelayed
+                    diagnostics.log("hCaptcha 验证通过，在原浏览器会话中提交登录")
                     pendingHcaptchaToken = token
                     hcaptchaTempReady = false
                     retryingLoginWithHcaptchaToken = false
-                    // 对齐 Fluxdo：回灌时排除会话凭据。Fluxdo 所有 CF 相关同步都带
-                    // excludeCookieNames: authCookieNames，理由是"避免旧会话回写" ——
-                    // 一枚失效的旧 _t 被灌回去，Discourse 就会在已有会话状态下处理登录。
-                    store.restoreMissingToWebView(exclude = setOf(Config.SESSION_COOKIE))
-                    CookieManager.getInstance().flush()
+                    if (view is WebView) {
+                        store.restoreMissingToWebView(exclude = setOf(Config.SESSION_COOKIE))
+                        CookieManager.getInstance().flush()
+                    }
                     executeWebLogin(view, token, cachedSecondFactor, cachedSecondFactorMethod)
                 },
                 HCAPTCHA_CALLBACK_SETTLE_DELAY_MS,
@@ -475,30 +578,28 @@ class BrowserSession(
      * hCaptcha token / h_captcha_temp_id 继续提交 session。Android 也必须保持这个边界。
      */
     private fun launchCfChallenge() {
+        val loginView = currentAuthView() ?: return
         isInCfMode = true
         cfProbeScheduled = false
         cfCompletionProbing = false
         cfQuietRounds = 0
-        val loginView = authWebView ?: return
-        loginView.post {
-            if (!isInCfMode) return@post
-            cfClearanceBeforeChallenge = currentCfClearance()
-            val cleared = store.clearCookie(CF_CLEARANCE_COOKIE)
-            CookieManager.getInstance().flush()
-            if (cleared) {
-                diagnostics.log(
-                    "已清除旧 cf_clearance ${clearanceFingerprint(cfClearanceBeforeChallenge)}，" +
-                        "打开独立 Cloudflare 验证窗口",
-                )
-            } else {
-                // 删不掉时 CF 会拿旧凭据直接放行回源(不出盾),整轮验证就会空转。
-                // 把它记成显式告警,避免又把"落到 404 页"误读成验证成功。
-                diagnostics.log(
-                    "旧 cf_clearance 删除失败，仍残留 ${currentCfClearance()?.length ?: 0} 字符；" +
-                        "Cloudflare 可能直接放行而不出盾",
-                )
+        scope.launch(Dispatchers.Main) {
+            try {
+                if (!isInCfMode || currentAuthView() !== loginView) return@launch
+                syncBrowserCookies(loginView)
+                cfClearanceBeforeChallenge = currentCfClearance()
+                geckoBridges[loginView]?.clearCfClearance()
+                store.clearCookie(CF_CLEARANCE_COOKIE)
+                CookieManager.getInstance().flush()
+                if (!isInCfMode || currentAuthView() !== loginView) return@launch
+                diagnostics.log("保留原 hCaptcha 会话，打开独立 Cloudflare 验证窗口")
+                showCfChallengeDialog()
+            } catch (_: CancellationException) {
+            } catch (error: Exception) {
+                isInCfMode = false
+                diagnostics.log("CF 验证会话初始化失败: ${error.message}")
+                onAuthCallback?.invoke(false, "无法初始化安全验证，请重试", false)
             }
-            showCfChallengeDialog()
         }
     }
 
@@ -510,78 +611,21 @@ class BrowserSession(
             return
         }
 
-        val challengeView = WebView(MutableContextWrapper(appContext)).also { view ->
-            (view.context as MutableContextWrapper).baseContext = context
-            configureWebView(view)
-            view.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                    Log.d(TAG, "CF onPageStarted: $url")
-                    if (view != null && isChallengePathUrl(url.orEmpty())) {
-                        installOriginFallbackMask(view)
-                    }
-                }
+        diagnostics.log("正在使用 Mozilla GeckoView (Firefox Necko+NSS / DoH+ECH) 打开 Cloudflare 安全验证窗口...")
 
-                override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    super.onPageCommitVisible(view, url)
-                    if (view != null && isChallengePathUrl(url.orEmpty())) {
-                        installOriginFallbackMask(view)
-                    }
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    CookieManager.getInstance().flush()
-                    Log.d(TAG, "CF onPageFinished: $url")
-                    val currentUrl = url.orEmpty()
-                    if (view == null) return
-                    if (isChallengePathUrl(currentUrl)) {
-                        installOriginFallbackMask(view)
-                    }
-                    if (isBareChallengeUrl(currentUrl)) {
-                        // 对齐 Fluxdo：检查页面是否已到达源站 404（CF 放行回源）
-                        view.evaluateJavascript(ORIGIN_NOT_FOUND_PROBE_JS) { result ->
-                            if (decodeJsValue(result) == "true") {
-                                view.alpha = 0f
-                                awaitFreshClearanceThen(view, "源站 404 页面(DOM 特征)")
-                                return@evaluateJavascript
-                            }
-                            detectCfChallengeCompletion(view, currentUrl)
-                        }
-                    } else {
-                        detectCfChallengeCompletion(view, currentUrl)
-                    }
-                }
-
-                override fun onReceivedHttpError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    errorResponse: WebResourceResponse?,
-                ) {
-                    val url = request?.url?.toString().orEmpty()
-                    val status = errorResponse?.statusCode ?: 0
-                    diagnostics.log("CF WebView HTTP 错误 [$status]: $url" + cfMitigatedSuffix(errorResponse))
-                    if (request?.isForMainFrame != true || view == null) return
-                    if (status == 404 && isBareChallengeUrl(url) && !isCfMitigatedChallenge(errorResponse)) {
-                        // 对齐 Fluxdo：/challenge 是站点专用的 CF 验证入口。
-                        // 未通过时 CF 接管并返回 challenge；通过后请求落到源站，源站没有该页面返回 404。
-                        // 但 404 只能说明"这次请求没被 CF 接管",不等于本轮验证签发了新 clearance ——
-                        // 旧 clearance 残留时 CF 同样会直接放行回源。所以这里先遮住 404 再确认新凭据。
-                        view.alpha = 0f
-                        installOriginFallbackMask(view)
-                        awaitFreshClearanceThen(view, "主框架 /challenge 返回源站 404")
-                        return
-                    }
-                    scheduleCfCompletionProbe(view, 250L)
-                }
-
-                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                    if (request?.isForMainFrame == true) {
-                        diagnostics.log("CF WebView 资源错误 [${error?.errorCode ?: 0}]: ${request.url}")
-                    }
-                }
-            }
-            view.webChromeClient = createLoggingChromeClient("CF")
-            view.addJavascriptInterface(Bridge(), BRIDGE_NAME)
-        }
+        val geckoView = org.linuxdo.android.net.gecko.GeckoManager.createGeckoView(context)
+        val geckoSession = org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+            context = context,
+            onLocationChanged = { url ->
+                diagnostics.log("CF GeckoView 导航至: $url")
+            },
+            onPageFinished = { url ->
+                diagnostics.log("CF GeckoView 页面加载完成: $url")
+                detectCfChallengeCompletion(geckoView, url)
+            },
+            onPageError = { _, _ -> geckoView.alpha = 1f },
+        )
+        geckoView.setSession(geckoSession)
 
         val density = context.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -648,7 +692,7 @@ class BrowserSession(
             visibility = View.GONE
         }
         val warnMsg = TextView(context).apply {
-            text = "验证服务连接受阻（可能受直连或 DoH 影响），若一直白屏建议检查代理设置"
+            text = "验证尚未完成，请完成页面验证或点击刷新重试"
             setTextColor(warnText)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setLineSpacing(0f, 1.2f)
@@ -658,15 +702,14 @@ class BrowserSession(
             setTextColor(warnBtn)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setOnClickListener {
-                challengeView.alpha = 1f
-                challengeView.reload()
+                geckoSession.reload()
             }
         }
         timeoutBanner.addView(warnMsg, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         timeoutBanner.addView(retryBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)))
         root.addView(timeoutBanner, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        root.addView(challengeView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(geckoView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         val dialog = Dialog(context).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -675,17 +718,23 @@ class BrowserSession(
             close.setOnClickListener { dismiss() }
             setOnDismissListener {
                 if (cfDialog === this && isInCfMode) {
-                    val dismissedView = cfWebView
+                    val dismissedSession = cfGeckoSession
+                    val dismissedView = cfGeckoView
                     cfDialog = null
-                    cfWebView = null
+                    cfGeckoView = null
+                    cfGeckoSession = null
                     isInCfMode = false
-                    dismissedView?.destroy()
+                    cfGeckoInitJob?.cancel()
+                    dismissedView?.let { geckoBridges.remove(it)?.close() }
+                    dismissedSession?.close()
+                    dismissedView?.releaseSession()
                     onAuthCallback?.invoke(false, "Cloudflare 验证已取消，请重试", false)
                 }
             }
         }
         cfDialog = dialog
-        cfWebView = challengeView
+        cfGeckoView = geckoView
+        cfGeckoSession = geckoSession
         dialog.show()
         dialog.window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
@@ -695,68 +744,141 @@ class BrowserSession(
             )
             setGravity(Gravity.BOTTOM)
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             attributes = attributes.apply { dimAmount = 0.5f }
         }
-        challengeView.postDelayed({
+        geckoView.requestFocus()
+        geckoView.postDelayed({
             if (isInCfMode && cfDialog?.isShowing == true && !isFreshCfClearance(currentCfClearance())) {
                 timeoutBanner.visibility = View.VISIBLE
             }
-        }, 4_000L)
-        challengeView.loadUrl("${Config.BASE_URL}/challenge")
-        scheduleCfCompletionProbe(challengeView)
+        }, 5_000L)
+        cfGeckoInitJob = scope.launch(Dispatchers.Main) {
+            try {
+                val bridge = GeckoAuthBridge.create(
+                    context,
+                    geckoSession,
+                    onReady = { onCfGeckoReady(geckoView) },
+                    onCallback = { name, payload -> onGeckoAuthCallback(geckoView, name, payload) },
+                )
+                if (!isInCfMode || cfGeckoView !== geckoView) {
+                    bridge.close()
+                    return@launch
+                }
+                geckoBridges[geckoView] = bridge
+                geckoSession.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+            } catch (_: CancellationException) {
+            } catch (error: Exception) {
+                diagnostics.log("CF 认证桥初始化失败: ${error.message}")
+                if (cfGeckoView === geckoView) {
+                    isInCfMode = false
+                    dismissCfDialog()
+                    onAuthCallback?.invoke(false, "安全验证组件初始化失败，请重试", false)
+                }
+            }
+        }
     }
 
-    private fun detectCfChallengeCompletion(challengeView: WebView, url: String?) {
+    private fun onCfGeckoReady(view: GeckoView) {
+        if (!isInCfMode || cfGeckoView !== view) return
+        installOriginFallbackMask(view)
+        evaluateBrowserScript(view, ORIGIN_NOT_FOUND_PROBE_JS) { raw ->
+            if (!isInCfMode || cfGeckoView !== view) return@evaluateBrowserScript
+            if (decodeJsValue(raw) == "true") {
+                awaitFreshClearanceThen(view, "已到达源站，等待新的安全凭据")
+            } else {
+                view.alpha = 1f
+                hideOriginFallbackMask(view)
+                scheduleCfCompletionProbe(view)
+            }
+        }
+    }
+
+    private fun scheduleCfGeckoProbe(context: Context, delayMs: Long = 800L) {
+        if (!isGeckoVerifyActive) return
+        scope.launch(Dispatchers.IO) {
+            delay(delayMs)
+            if (!isGeckoVerifyActive) return@launch
+            checkCfGeckoCompletion(context)
+            if (isGeckoVerifyActive) {
+                scheduleCfGeckoProbe(context, delayMs)
+            }
+        }
+    }
+
+    private fun checkCfGeckoCompletion(context: Context) {
+        if (!isGeckoVerifyActive) return
+        scope.launch(Dispatchers.IO) {
+            val cookies = org.linuxdo.android.net.gecko.GeckoManager.extractCookiesFromDb(context)
+            val clearance = cookies[CF_CLEARANCE_COOKIE]
+            val hasFreshClearance = !clearance.isNullOrBlank() && isFreshCfClearance(clearance)
+
+            if (hasFreshClearance) {
+                if (hasFreshClearance) {
+                    diagnostics.log("GeckoView (Firefox NSS) 成功验证通过 Cloudflare！取得新签发 cf_clearance: ${clearanceFingerprint(clearance)}")
+                }
+                withContext(Dispatchers.Main) {
+                    if (!isGeckoVerifyActive) return@withContext
+                    if (!clearance.isNullOrBlank()) {
+                        CookieManager.getInstance().setCookie(Config.BASE_URL, "$CF_CLEARANCE_COOKIE=$clearance; Path=/; Domain=.linux.do; Secure; HttpOnly; SameSite=None")
+                    }
+                    CookieManager.getInstance().flush()
+                    store.syncFromWebView()
+
+                    if (isGeckoVerifyActive) {
+                        isGeckoVerifyActive = false
+                        store.completeVerification()
+                    }
+
+                }
+            }
+        }
+    }
+
+    private fun detectCfChallengeCompletion(challengeView: View, url: String?) {
         if (!isInCfMode) return
         diagnostics.log("Cloudflare 页面已完成一次加载: ${url.orEmpty()}")
         scheduleCfCompletionProbe(challengeView, 250L)
     }
 
     /** CF 成功时不保证会再触发导航回调，因此持续观察新的 cf_clearance Cookie。 */
-    private fun scheduleCfCompletionProbe(challengeView: WebView, delayMs: Long = CF_PROBE_INTERVAL_MS) {
+    private fun scheduleCfCompletionProbe(challengeView: View, delayMs: Long = CF_PROBE_INTERVAL_MS) {
         if (
             !isInCfMode ||
             cfProbeScheduled ||
             cfCompletionProbing ||
-            cfWebView !== challengeView ||
+            currentCfView() !== challengeView ||
             cfDialog?.isShowing != true
         ) return
         cfProbeScheduled = true
         challengeView.postDelayed(
             {
                 cfProbeScheduled = false
-                if (!isInCfMode || cfWebView !== challengeView || cfDialog?.isShowing != true) return@postDelayed
+                if (!isInCfMode || currentCfView() !== challengeView || cfDialog?.isShowing != true) return@postDelayed
                 if (cfCompletionProbing) return@postDelayed
-
-                val freshClearance = currentCfClearance()
-                if (!isFreshCfClearance(freshClearance)) {
-                    scheduleCfCompletionProbe(challengeView)
-                    return@postDelayed
-                }
-                // 新 clearance 出现不等于挑战已经做完。Cloudflare 的 JS challenge 跑在
-                // 页面加载之后,期间就可能先落一枚 clearance;此时收口会拿到一枚半成品凭据,
-                // 紧接着的 csrf 必然再被 cf-mitigated=challenge 拒掉 —— 实测三次失败
-                // 全是"页面加载完 2~3 秒就判定完成"这个形态。对齐 Fluxdo 的
-                // hasActiveCfChallenge:必须等页面上的挑战标记消失才算真的过了。
-                challengeView.evaluateJavascript(ACTIVE_CHALLENGE_PROBE_JS) { raw ->
-                    if (!isInCfMode || cfWebView !== challengeView || cfDialog?.isShowing != true) {
-                        return@evaluateJavascript
-                    }
-                    if (decodeJsValue(raw) == "true") {
-                        cfQuietRounds = 0
-                        diagnostics.log(
-                            "已出现新 cf_clearance ${clearanceFingerprint(freshClearance)}，但页面仍在验证中，继续等待",
-                        )
+                refreshBrowserCookies(challengeView) {
+                    if (!isInCfMode || currentCfView() !== challengeView || cfCompletionProbing) return@refreshBrowserCookies
+                    val freshClearance = currentCfClearance()
+                    if (!isFreshCfClearance(freshClearance)) {
                         scheduleCfCompletionProbe(challengeView)
-                        return@evaluateJavascript
+                        return@refreshBrowserCookies
                     }
-                    // CF 完成后会导航回 /challenge，导航那一瞬间页面是空的,
-                    // 挑战标记同样查不到。连续两轮静默才收口,把这个空窗挡掉。
-                    cfQuietRounds++
-                    if (cfQuietRounds >= CF_QUIET_ROUNDS_REQUIRED) {
-                        completeCfChallenge(challengeView, "新 cf_clearance 且页面连续 $cfQuietRounds 轮无挑战标记")
-                    } else {
-                        scheduleCfCompletionProbe(challengeView)
+                    evaluateBrowserScript(challengeView, ACTIVE_CHALLENGE_PROBE_JS) { raw ->
+                        if (!isInCfMode || currentCfView() !== challengeView || cfDialog?.isShowing != true) {
+                            return@evaluateBrowserScript
+                        }
+                        // 沿用 master：新凭据出现后仍需连续确认挑战已结束。
+                        if (decodeJsValue(raw) != "false") {
+                            cfQuietRounds = 0
+                            scheduleCfCompletionProbe(challengeView)
+                            return@evaluateBrowserScript
+                        }
+                        cfQuietRounds++
+                        if (cfQuietRounds >= CF_QUIET_ROUNDS_REQUIRED) {
+                            completeCfChallenge(challengeView, "新 cf_clearance 且页面连续 $cfQuietRounds 轮无挑战标记")
+                        } else {
+                            scheduleCfCompletionProbe(challengeView)
+                        }
                     }
                 }
             },
@@ -772,47 +894,49 @@ class BrowserSession(
      * 必然再撞一次 403,最后以"Cloudflare 验证已失效"收场。改为先确认新 clearance
      * 真的出现;等不到就如实报失败,而不是让用户再看一遍同样的错误。
      */
-    private fun awaitFreshClearanceThen(view: WebView, reason: String) {
+    private fun awaitFreshClearanceThen(view: View, reason: String) {
         if (!isInCfMode || cfCompletionProbing) return
         cfCompletionProbing = true
         cfProbeScheduled = false
         diagnostics.log("$reason，开始确认是否签发了新 cf_clearance")
         val deadline = SystemClock.elapsedRealtime() + CF_COMPLETION_PROBE_TIMEOUT_MS
 
-        fun poll() {
-            if (!isInCfMode || cfWebView !== view || cfDialog?.isShowing != true) {
-                cfCompletionProbing = false
-                return
+        scope.launch(Dispatchers.Main) {
+            delay(CF_COOKIE_SETTLE_DELAY_MS)
+            while (isInCfMode && currentCfView() === view && cfDialog?.isShowing == true) {
+                try {
+                    syncBrowserCookies(view)
+                } catch (_: CancellationException) {
+                    return@launch
+                } catch (error: Exception) {
+                    diagnostics.log("等待 CF 凭据同步: ${error.message}")
+                }
+                if (!isInCfMode || currentCfView() !== view) return@launch
+                if (isFreshCfClearance(currentCfClearance())) {
+                    cfCompletionProbing = false
+                    completeCfChallenge(view, reason)
+                    return@launch
+                }
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    cfCompletionProbing = false
+                    isInCfMode = false
+                    diagnostics.log("$reason，但未签发新 cf_clearance，验证未完成")
+                    dismissCfDialog()
+                    onAuthCallback?.invoke(false, "Cloudflare 未签发新的验证凭据，请重试", false)
+                    return@launch
+                }
+                delay(CF_PROBE_INTERVAL_MS)
             }
-            CookieManager.getInstance().flush()
-            if (isFreshCfClearance(currentCfClearance())) {
-                cfCompletionProbing = false
-                completeCfChallenge(view, reason)
-                return
-            }
-            if (SystemClock.elapsedRealtime() >= deadline) {
-                cfCompletionProbing = false
-                isInCfMode = false
-                diagnostics.log(
-                    "$reason，但 ${CF_COMPLETION_PROBE_TIMEOUT_MS}ms 内未出现新 cf_clearance，判定本轮验证未完成",
-                )
-                dismissCfDialog()
-                onAuthCallback?.invoke(false, "Cloudflare 未签发新的验证凭据，请重试", false)
-                return
-            }
-            view.postDelayed({ poll() }, CF_PROBE_INTERVAL_MS)
         }
-
-        view.postDelayed({ poll() }, CF_COOKIE_SETTLE_DELAY_MS)
     }
 
     /**
      * 与 Fluxdo 一致：新 clearance 出现即收口。不要在这里再请求 /session/csrf，
      * 否则验证后的短暂限流会把成功的 CF 流程误判为失败。
      */
-    private fun completeCfChallenge(probeView: WebView, reason: String) {
+    private fun completeCfChallenge(probeView: View, reason: String) {
         if (!isInCfMode) return
-        val loginView = authWebView ?: return
+        val loginView = currentAuthView() ?: return
         diagnostics.log(
             "Cloudflare 验证完成($reason)，clearance=${clearanceFingerprint(currentCfClearance())}，" +
                 "关闭验证窗口并恢复原认证请求",
@@ -826,7 +950,7 @@ class BrowserSession(
         // 对齐 Fluxdo：底层网络栈沉淀后直接重放，绝不手动回灌以破坏原生 Cookie
         loginView.postDelayed(
             {
-                if (authWebView !== loginView || onAuthCallback == null) return@postDelayed
+                if (currentAuthView() !== loginView || onAuthCallback == null) return@postDelayed
                 CookieManager.getInstance().flush()
                 resumePendingWebLogin(loginView)
             },
@@ -872,16 +996,16 @@ class BrowserSession(
      * 一旦 CF 挑战完成触发页面卸载（beforeunload/pagehide），或 DOM 出现源站 404 特征，
      * 立即在当前 JS 帧塞入全屏纯色遮罩并通知原生层隐藏 WebView。
      */
-    private fun installOriginFallbackMask(view: WebView) {
+    private fun installOriginFallbackMask(view: View) {
         val nightMode = (appContext.resources.configuration.uiMode and
             android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         val maskColor = if (isDarkCached || nightMode) "#1c1c1e" else "#f2f2f7"
-        view.evaluateJavascript(buildOriginFallbackMaskScript(maskColor), null)
+        evaluateBrowserScript(view, buildOriginFallbackMaskScript(maskColor))
     }
 
-    private fun hideOriginFallbackMask(view: WebView) {
-        view.evaluateJavascript("if (typeof window.__linuxdoHideCfMask === 'function') window.__linuxdoHideCfMask();", null)
+    private fun hideOriginFallbackMask(view: View) {
+        evaluateBrowserScript(view, "if (typeof window.__linuxdoHideCfMask === 'function') window.__linuxdoHideCfMask();")
     }
 
     /** 带 `cf-mitigated: challenge` 的响应是 CF 自己接管的挑战，不能算放行。 */
@@ -899,7 +1023,7 @@ class BrowserSession(
         return if (interesting.isEmpty()) "" else " [$interesting]"
     }
 
-    private fun resumePendingWebLogin(loginView: WebView) {
+    private fun resumePendingWebLogin(loginView: View) {
         when {
             awaitingSecondFactorLogin && !cachedSecondFactor.isNullOrBlank() -> {
                 executeWebLogin(loginView, null, cachedSecondFactor, cachedSecondFactorMethod)
@@ -923,6 +1047,7 @@ class BrowserSession(
                     isDark = isDarkCached,
                     resetCfRetry = false,
                     emailSendTo = cachedEmailSend,
+                    emailLoginToken = cachedEmailLoginToken,
                     onResult = onAuthCallback ?: { _, _, _ -> },
                 )
             }
@@ -930,10 +1055,10 @@ class BrowserSession(
     }
 
     private fun executeWebLogin(
-        view: WebView,
+        view: View,
         hcaptchaToken: String?,
-        secondFactorToken: String?,
-        secondFactorMethod: Int,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
     ) {
         val submissionCallback = onAuthCallback ?: return
         val submissionId = UUID.randomUUID().toString()
@@ -943,7 +1068,7 @@ class BrowserSession(
         val secondFactorMethodJson = JSONObject.quote(secondFactorMethod.toString())
         val submissionIdJson = JSONObject.quote(submissionId)
         val previousJob = authSubmitJob
-        authSubmitJob = CoroutineScope(Dispatchers.Main).launch {
+        authSubmitJob = scope.launch(Dispatchers.Main) {
             previousJob?.join()
             if (submissionGeneration != authSubmissionGeneration) return@launch
             TopicRepository.postGate.withLock {
@@ -956,7 +1081,7 @@ class BrowserSession(
                 val completion = CompletableDeferred<AuthSubmitResult>()
                 authSubmitCompletion = completion
                 try {
-                    view.evaluateJavascript(
+                    evaluateBrowserScript(view,
                         """
                             (function () {
                               if (typeof window.__linuxdoRunLogin !== 'function') return false;
@@ -968,7 +1093,7 @@ class BrowserSession(
                             })();
                         """.trimIndent(),
                     ) { raw ->
-                        if (decodeJsValue(raw) == "true") return@evaluateJavascript
+                        if (decodeJsValue(raw) == "true") return@evaluateBrowserScript
                         retryingLoginWithHcaptchaToken = false
                         diagnostics.log("网页登录脚本已丢失，重新展示图形验证")
                         if (currentSubmissionId == submissionId) {
@@ -982,6 +1107,8 @@ class BrowserSession(
                                 secondFactorMethod = cachedSecondFactorMethod,
                                 isDark = isDarkCached,
                                 resetCfRetry = false,
+                                emailSendTo = cachedEmailSend,
+                                emailLoginToken = cachedEmailLoginToken,
                                 onResult = submissionCallback,
                             )
                         }
@@ -1011,9 +1138,389 @@ class BrowserSession(
         }
     }
 
+    private fun executeNativeLogin(
+        hcaptchaToken: String?,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+    ) {
+        val client = httpClientProvider?.invoke()
+        if (client == null) {
+            diagnostics.log("Native 登录失败: HTTP 客户端未就绪")
+            onAuthCallback?.invoke(false, "网络通道未就绪，请稍后重试", false)
+            return
+        }
+
+        val submissionCallback = onAuthCallback ?: return
+        val isEmailMode = !cachedEmailSend.isNullOrBlank()
+        val isEmailTokenMode = !cachedEmailLoginToken.isNullOrBlank()
+
+        authWebView?.post {
+            authWebView?.evaluateJavascript(
+                "(function(){ if (typeof window.__linuxdoShowSubmitting === 'function') window.__linuxdoShowSubmitting(); })()",
+                null,
+            )
+        }
+
+        val previousJob = authSubmitJob
+        authSubmitJob = scope.launch(Dispatchers.IO) {
+            previousJob?.join()
+            TopicRepository.postGate.withLock {
+                if (TopicRepository.isRateLimitCoolingDown()) {
+                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                    withContext(Dispatchers.Main) {
+                        submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                    }
+                    return@withLock
+                }
+                TopicRepository.throttlePost(burst = true)
+                try {
+                    // 1. 获取 CSRF Token
+                    diagnostics.log("Native 登录第 1 步: 请求 /session/csrf...")
+                    val csrfReq = Request.Builder()
+                        .url("${Config.BASE_URL}/session/csrf")
+                        .header("X-Requested-With", "XMLHttpRequest")
+                        .header("Accept", "application/json")
+                        .build()
+
+                    var csrfToken: String? = null
+                    client.newCall(csrfReq).execute().use { resp ->
+                        val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                        if (cookies.isNotEmpty()) {
+                            withContext(Dispatchers.Main) {
+                                store.applyResponseCookies(cookies)
+                                CookieManager.getInstance().flush()
+                            }
+                        }
+                        if (resp.code == 429) {
+                            val retryAfter = HttpHeaderUtils.parseRetryAfter(resp.header("Retry-After"))
+                            TopicRepository.enterRateLimitCooldown("/session/csrf", retryAfter, sessionStore = store)
+                        }
+                        if (!resp.isSuccessful) {
+                            diagnostics.log("CSRF 请求失败: HTTP ${resp.code}")
+                            withContext(Dispatchers.Main) {
+                                if (resp.code == 403) {
+                                    val isCf = resp.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+                                    if (isCf && !cfRetryUsed) {
+                                        cfRetryUsed = true
+                                        diagnostics.log("CSRF 遇到 Cloudflare 盾 (403)，正在安全弹窗内启动 /challenge 验证...")
+                                        launchCfChallenge()
+                                    } else {
+                                        submissionCallback(false, "安全防护拦截 (HTTP 403)，请重试或开启网络加速", false)
+                                    }
+                                } else if (resp.code == 429) {
+                                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                                } else {
+                                    submissionCallback(false, "CSRF 获取失败: HTTP ${resp.code}", false)
+                                }
+                            }
+                            return@launch
+                        }
+                        val body = resp.body?.string().orEmpty()
+                        csrfToken = try {
+                            JSONObject(body).optString("csrf")
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+
+                    if (csrfToken.isNullOrBlank()) {
+                        diagnostics.log("CSRF Token 解析为空")
+                        withContext(Dispatchers.Main) {
+                            submissionCallback(false, "CSRF Token 解析失败", false)
+                        }
+                        return@launch
+                    }
+                    diagnostics.log("Native 登录: 获取 CSRF 成功")
+
+                    // 2. 兑换 hCaptcha token (若有)
+                    if (!hcaptchaToken.isNullOrBlank()) {
+                        diagnostics.log("Native 登录第 2 步: 兑换 hCaptcha token...")
+                        val endpoints = listOf("/captcha/hcaptcha/create.json", "/hcaptcha/create.json")
+                        var hOk = false
+                        var lastCode = 0
+                        var isCfEncountered = false
+
+                        for (ep in endpoints) {
+                            val hBody = FormBody.Builder()
+                                .add("token", hcaptchaToken)
+                                .build()
+                            val hReq = Request.Builder()
+                                .url("${Config.BASE_URL}$ep")
+                                .post(hBody)
+                                .header("X-CSRF-Token", csrfToken)
+                                .header("X-Requested-With", "XMLHttpRequest")
+                                .header("Accept", "application/json")
+                                .build()
+
+                            client.newCall(hReq).execute().use { resp ->
+                                lastCode = resp.code
+                                val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                                if (cookies.isNotEmpty()) {
+                                    withContext(Dispatchers.Main) {
+                                        store.applyResponseCookies(cookies)
+                                        CookieManager.getInstance().flush()
+                                    }
+                                }
+                                if (resp.code == 429) {
+                                    val retryAfter = HttpHeaderUtils.parseRetryAfter(resp.header("Retry-After"))
+                                    TopicRepository.enterRateLimitCooldown(ep, retryAfter, sessionStore = store)
+                                }
+                                if (resp.isSuccessful) {
+                                    hOk = true
+                                } else if (resp.code == 403) {
+                                    val isCf = resp.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+                                    if (isCf) isCfEncountered = true
+                                }
+                            }
+                            if (hOk || lastCode != 404) break
+                        }
+
+                        if (!hOk) {
+                            diagnostics.log("hCaptcha Token 兑换失败: HTTP $lastCode")
+                            withContext(Dispatchers.Main) {
+                                if (isCfEncountered && !cfRetryUsed) {
+                                    cfRetryUsed = true
+                                    diagnostics.log("hCaptcha 兑换遇到 Cloudflare 盾 (403)，正在安全弹窗内启动 /challenge 验证...")
+                                    launchCfChallenge()
+                                } else if (lastCode == 429) {
+                                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                                } else {
+                                    submissionCallback(false, "人机验证令牌兑换失败 (HTTP $lastCode)，请重试", false)
+                                }
+                            }
+                            return@launch
+                        }
+                        diagnostics.log("Native 登录: hCaptcha Token 兑换成功")
+                    }
+
+                    // 3. 提交登录 /session.json 或 发送邮件 /u/email-login.json
+                    if (isEmailMode) {
+                        val email = cachedEmailSend.orEmpty()
+                        diagnostics.log("Native 登录第 3 步: 提交发送登录邮件 $email (/u/email-login.json)...")
+                        val jsonPayload = JSONObject().put("login", email).toString()
+                        val emailReq = Request.Builder()
+                            .url("${Config.BASE_URL}/u/email-login.json")
+                            .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                            .header("X-CSRF-Token", csrfToken)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .header("Referer", "${Config.BASE_URL}/login")
+                            .header("Accept", "application/json")
+                            .build()
+
+                        client.newCall(emailReq).execute().use { resp ->
+                            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                            if (cookies.isNotEmpty()) {
+                                withContext(Dispatchers.Main) {
+                                    store.applyResponseCookies(cookies)
+                                    CookieManager.getInstance().flush()
+                                }
+                            }
+                            if (resp.code == 429) {
+                                val retryAfter = HttpHeaderUtils.parseRetryAfter(resp.header("Retry-After"))
+                                TopicRepository.enterRateLimitCooldown("/u/email-login.json", retryAfter, sessionStore = store)
+                            }
+                            val bodyStr = resp.body?.string().orEmpty()
+                            diagnostics.log("邮箱登录响应 HTTP ${resp.code}: ${bodyStr.take(200)}")
+
+                            val resObj = try { JSONObject(bodyStr) } catch (_: Exception) { null }
+                            val success = resp.isSuccessful && (resObj?.optString("success") == "OK")
+                            val msg = if (success) {
+                                "登录邮件已发送至 $email，请查收邮件并点击其中的链接登录"
+                            } else {
+                                val err = resObj?.optString("errors") ?: resObj?.optString("error")
+                                err?.takeIf { it.isNotBlank() } ?: "发送失败: HTTP ${resp.code}"
+                            }
+                            withContext(Dispatchers.Main) {
+                                if (!success && resp.code == 403) {
+                                    val isCf = resp.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true ||
+                                        bodyStr.contains("challenge-platform", ignoreCase = true) ||
+                                        bodyStr.contains("just a moment", ignoreCase = true)
+                                    if (isCf && !cfRetryUsed) {
+                                        cfRetryUsed = true
+                                        diagnostics.log("邮箱登录遇到 Cloudflare 盾 (403)，正在安全弹窗内启动 /challenge 验证...")
+                                        launchCfChallenge()
+                                    } else {
+                                        submissionCallback(false, "安全防护拦截 (HTTP 403)，请重试或开启网络加速", false)
+                                    }
+                                } else if (!success && resp.code == 429) {
+                                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                                } else {
+                                    submissionCallback(success, msg, false)
+                                }
+                            }
+                        }
+                    } else if (isEmailTokenMode) {
+                        val token = cachedEmailLoginToken.orEmpty().trim()
+                        val path = "/session/email-login/${Uri.encode(token)}"
+                        diagnostics.log("Native 登录第 3 步: 提交邮件登录令牌兑换 $path...")
+                        val payloadObj = JSONObject()
+                        if (!secondFactorToken.isNullOrBlank()) {
+                            payloadObj.put("second_factor_token", secondFactorToken.trim())
+                            payloadObj.put("second_factor_method", secondFactorMethod)
+                        }
+                        val tokenReq = Request.Builder()
+                            .url("${Config.BASE_URL}$path")
+                            .post(payloadObj.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                            .header("X-CSRF-Token", csrfToken)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .header("Referer", "${Config.BASE_URL}$path")
+                            .header("Accept", "application/json")
+                            .build()
+
+                        client.newCall(tokenReq).execute().use { resp ->
+                            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                            if (cookies.isNotEmpty()) {
+                                withContext(Dispatchers.Main) {
+                                    store.applyResponseCookies(cookies)
+                                    CookieManager.getInstance().flush()
+                                }
+                            }
+                            if (resp.code == 429) {
+                                val retryAfter = HttpHeaderUtils.parseRetryAfter(resp.header("Retry-After"))
+                                TopicRepository.enterRateLimitCooldown(path, retryAfter, sessionStore = store)
+                            }
+                            val bodyStr = resp.body?.string().orEmpty()
+                            diagnostics.log("邮件令牌兑换响应 HTTP ${resp.code}: ${bodyStr.take(200)}")
+
+                            val resObj = try { JSONObject(bodyStr) } catch (_: Exception) { null }
+                            val error = resObj?.optString("error")?.takeIf { it.isNotBlank() }
+                                ?: resObj?.optString("errors")?.takeIf { it.isNotBlank() }
+                            val has2faToken = !secondFactorToken.isNullOrBlank()
+                            val secondFactorRequired = isSecondFactorResponse(resObj, has2faToken)
+
+                            withContext(Dispatchers.Main) {
+                                if (secondFactorRequired) {
+                                    awaitingSecondFactorLogin = true
+                                    val msg = extractSecondFactorMessage(resObj, has2faToken)
+                                    submissionCallback(false, msg, true)
+                                } else if (!error.isNullOrBlank()) {
+                                    awaitingSecondFactorLogin = false
+                                    submissionCallback(false, error, false)
+                                } else if (resp.isSuccessful) {
+                                    awaitingSecondFactorLogin = false
+                                    CookieManager.getInstance().flush()
+                                    diagnostics.log("Native 邮件令牌兑换登录成功！")
+                                    submissionCallback(true, null, false)
+                                } else {
+                                    awaitingSecondFactorLogin = false
+                                    if (resp.code == 403) {
+                                        val isCf = resp.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true ||
+                                            bodyStr.contains("challenge-platform", ignoreCase = true) ||
+                                            bodyStr.contains("just a moment", ignoreCase = true)
+                                        if (isCf && !cfRetryUsed) {
+                                            cfRetryUsed = true
+                                            diagnostics.log("邮件令牌兑换遇到 Cloudflare 盾 (403)，正在安全弹窗内启动 /challenge 验证...")
+                                            launchCfChallenge()
+                                        } else {
+                                            submissionCallback(false, "安全防护拦截 (HTTP 403)，请重试或开启网络加速", false)
+                                        }
+                                    } else if (resp.code == 429) {
+                                        val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                                        submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                                    } else {
+                                        submissionCallback(false, "登录链接无效或已过期 (HTTP ${resp.code})", false)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        diagnostics.log("Native 登录第 3 步: 提交登录凭据 session.json...")
+                        val sessionBodyBuilder = FormBody.Builder()
+                            .add("login", cachedLogin)
+                            .add("password", cachedPassword)
+
+                        if (!secondFactorToken.isNullOrBlank()) {
+                            sessionBodyBuilder
+                                .add("second_factor_token", secondFactorToken)
+                                .add("second_factor_method", secondFactorMethod.toString())
+                        }
+
+                        val sessionReq = Request.Builder()
+                            .url("${Config.BASE_URL}/session.json")
+                            .post(sessionBodyBuilder.build())
+                            .header("X-CSRF-Token", csrfToken)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .header("Referer", "${Config.BASE_URL}/login")
+                            .header("Accept", "application/json")
+                            .build()
+
+                        client.newCall(sessionReq).execute().use { resp ->
+                            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                            if (cookies.isNotEmpty()) {
+                                withContext(Dispatchers.Main) {
+                                    store.applyResponseCookies(cookies)
+                                    CookieManager.getInstance().flush()
+                                }
+                            }
+                            if (resp.code == 429) {
+                                val retryAfter = HttpHeaderUtils.parseRetryAfter(resp.header("Retry-After"))
+                                TopicRepository.enterRateLimitCooldown("/session.json", retryAfter, sessionStore = store)
+                            }
+
+                            val bodyStr = resp.body?.string().orEmpty()
+                            diagnostics.log("登录响应 HTTP ${resp.code}: ${bodyStr.take(200)}")
+
+                            val resObj = try { JSONObject(bodyStr) } catch (_: Exception) { null }
+                            val error = resObj?.optString("error")
+                            val user = resObj?.optJSONObject("user")?.optString("username")
+
+                            val has2faToken = !secondFactorToken.isNullOrBlank()
+                            val is2FA = isSecondFactorResponse(resObj, has2faToken)
+
+                            withContext(Dispatchers.Main) {
+                                if (is2FA) {
+                                    awaitingSecondFactorLogin = true
+                                    val msg = extractSecondFactorMessage(resObj, has2faToken)
+                                    submissionCallback(false, msg, true)
+                                } else if (!error.isNullOrBlank() && user.isNullOrBlank()) {
+                                    awaitingSecondFactorLogin = false
+                                    submissionCallback(false, error, false)
+                                } else if (resp.isSuccessful || !user.isNullOrBlank()) {
+                                    awaitingSecondFactorLogin = false
+                                    CookieManager.getInstance().flush()
+                                    diagnostics.log("Native 登录成功！用户: ${user ?: cachedLogin}")
+                                    submissionCallback(true, null, false)
+                                } else {
+                                    awaitingSecondFactorLogin = false
+                                    if (resp.code == 403) {
+                                        val isCf = resp.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true ||
+                                            bodyStr.contains("challenge-platform", ignoreCase = true) ||
+                                            bodyStr.contains("just a moment", ignoreCase = true)
+                                        if (isCf && !cfRetryUsed) {
+                                            cfRetryUsed = true
+                                            diagnostics.log("Native 登录遇到 Cloudflare 盾 (403)，正在安全弹窗内启动 /challenge 验证...")
+                                            launchCfChallenge()
+                                        } else {
+                                            submissionCallback(false, "登录安全防护校验拦截 (HTTP 403)，可开启网络加速完成登录", false)
+                                        }
+                                    } else if (resp.code == 429) {
+                                        val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                                        submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                                    } else {
+                                        submissionCallback(false, "登录失败: HTTP ${resp.code}", false)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    diagnostics.log("Native 登录异常: ${e.message}")
+                    withContext(Dispatchers.Main) {
+                        submissionCallback(false, "登录网络异常: ${e.message ?: "连接失败"}", false)
+                    }
+                } finally {
+                    TopicRepository.markPostCompleted()
+                }
+            }
+        }
+    }
+
     private fun abortActiveAuthSubmission(
         submissionId: String,
-        view: WebView,
+        view: View,
         completion: CompletableDeferred<AuthSubmitResult>,
     ) {
         if (authAbortSubmissionId == submissionId && authAbortJob?.isActive == true) return
@@ -1022,11 +1529,15 @@ class BrowserSession(
         authAbortSubmissionId = submissionId
         authAbortAcknowledgement = acknowledgement
         if (authWebView === view) authWebView = null
+        if (authGeckoView === view) {
+            authGeckoView = null
+            authGeckoSession = null
+        }
         pendingAuthHtml = null
         authHtmlInjected = false
         val submissionIdJson = JSONObject.quote(submissionId)
         runCatching {
-            view.evaluateJavascript(
+            evaluateBrowserScript(view,
                 """
                     (function () {
                       if (typeof window.__linuxdoAbortLogin !== 'function') return false;
@@ -1035,13 +1546,13 @@ class BrowserSession(
                 """.trimIndent(),
             ) { raw ->
                 if (decodeJsValue(raw) != "true") acknowledgement.complete(Unit)
-                runCatching { view.stopLoading() }
+                runCatching { stopBrowserLoading(view) }
             }
         }.onFailure { acknowledgement.complete(Unit) }
 
         authAbortJob = CoroutineScope(Dispatchers.Main).launch {
             withTimeoutOrNull(AUTH_ABORT_ACK_TIMEOUT_MS) { acknowledgement.await() }
-            destroyAuthWebView(view)
+            destroyAuthBrowser(view)
             if (currentSubmissionId == submissionId) {
                 currentSubmissionId = null
                 currentSubmissionCallback = null
@@ -1057,25 +1568,44 @@ class BrowserSession(
         }
     }
 
-    private fun destroyAuthWebView(view: WebView) {
+    private fun destroyAuthBrowser(view: View) {
         if (authWebView === view) authWebView = null
+        if (authGeckoView === view) {
+            authGeckoView = null
+            authGeckoSession = null
+        }
+        geckoBridges.remove(view)?.close()
         runCatching { (view.context as? MutableContextWrapper)?.baseContext = appContext }
-        runCatching { view.stopLoading() }
-        runCatching { view.removeJavascriptInterface(BRIDGE_NAME) }
-        runCatching { view.destroy() }
+        runCatching { stopBrowserLoading(view) }
+        if (view is WebView) {
+            runCatching { view.removeJavascriptInterface(BRIDGE_NAME) }
+            runCatching { view.destroy() }
+        } else if (view is GeckoView) {
+            val session = view.session
+            view.releaseSession()
+            session?.close()
+        }
     }
 
     private fun dismissCfDialog() {
         val dialog = cfDialog ?: return
         val view = cfWebView
+        val gView = cfGeckoView
+        val gSession = cfGeckoSession
         cfDialog = null
         cfWebView = null
+        cfGeckoView = null
+        cfGeckoSession = null
         cfProbeScheduled = false
         cfCompletionProbing = false
         cfQuietRounds = 0
+        cfGeckoInitJob?.cancel()
+        gView?.let { geckoBridges.remove(it)?.close() }
         dialog.setOnDismissListener(null)
         dialog.dismiss()
         view?.destroy()
+        gSession?.close()
+        gView?.releaseSession()
     }
 
     /**
@@ -1096,14 +1626,22 @@ class BrowserSession(
         resetCfRetry: Boolean = true,
         /** 非空时切换为"发送登录邮件"模式：同一套 hCaptcha/CF 机制，提交的是 /u/email-login.json。 */
         emailSendTo: String? = null,
+        /** 非空时切换为"邮件链接/验证码兑换"模式：提交 POST /session/email-login/:token。 */
+        emailLoginToken: String? = null,
         onResult: (success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit,
     ) {
+        if (TopicRepository.isRateLimitCoolingDown()) {
+            val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+            onResult(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+            return
+        }
         onAuthCallback = onResult
         cachedLogin = login
         cachedPassword = password
         cachedSecondFactor = secondFactorToken
         cachedSecondFactorMethod = secondFactorMethod
         cachedEmailSend = emailSendTo
+        cachedEmailLoginToken = emailLoginToken
         isDarkCached = isDark
         isInCfMode = false
         hcaptchaTempReady = false
@@ -1117,6 +1655,7 @@ class BrowserSession(
         val uJson = JSONObject.quote(login)
         val pJson = JSONObject.quote(password)
         val emailJson = JSONObject.quote(emailSendTo.orEmpty())
+        val emailLoginTokenJson = JSONObject.quote(emailLoginToken.orEmpty())
         val emailMode = !emailSendTo.isNullOrBlank()
         val sfJson = if (!secondFactorToken.isNullOrBlank()) JSONObject.quote(secondFactorToken) else "null"
         val sfMethodJson = JSONObject.quote(secondFactorMethod.toString())
@@ -1134,7 +1673,9 @@ class BrowserSession(
               <style>
                 * { box-sizing: border-box; }
                 html, body {
-                  margin: 0; padding: 0; width: 100%; height: 100%; background: transparent;
+                  margin: 0; padding: 0; width: 100%; height: 100%;
+                  background: ${if (isDark) "#1c1c1e" else "#ffffff"};
+                  color-scheme: $hTheme;
                   overflow-x: hidden;
                   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                   -webkit-text-size-adjust: 100%;
@@ -1153,7 +1694,7 @@ class BrowserSession(
                   font-size: 14px; line-height: 1.5; color: $tipColor; margin: 0; max-width: 300px;
                   text-align: center; font-weight: 500;
                 }
-                .h-captcha { min-height: 78px; margin-top: 4px; }
+                .h-captcha { min-height: 78px; margin-top: 4px; pointer-events: auto; touch-action: manipulation; }
                 .spinner {
                   width: 30px; height: 30px; border: 3px solid rgba(0, 122, 255, 0.25);
                   border-radius: 50%; border-top-color: $statusColor;
@@ -1232,6 +1773,7 @@ class BrowserSession(
                   var signal = currentAbortController.signal;
                   var identifier = $uJson;
                   var password = $pJson;
+                  var emailLoginToken = $emailLoginTokenJson;
                   var secondFactor = arguments.length > 2 ? secondFactorOverride : $sfJson;
                   var secondFactorMethod = arguments.length > 3 ? secondFactorMethodOverride : $sfMethodJson;
 
@@ -1352,16 +1894,28 @@ class BrowserSession(
                       }
                     }
 
-                    // 3. 提交登录 session.json
+                    // 3. 在同一浏览器会话中提交账号密码或邮件令牌。
                     var form = 'login=' + encodeURIComponent(identifier) + '&password=' + encodeURIComponent(password);
                     if (secondFactor) {
                       form += '&second_factor_token=' + encodeURIComponent(secondFactor) + '&second_factor_method=' + encodeURIComponent(secondFactorMethod);
                     }
-                    var s = await fetch('/session.json', {
+                    var loginPath = '/session.json';
+                    var loginContentType = 'application/x-www-form-urlencoded';
+                    if (emailLoginToken) {
+                      loginPath = '/session/email-login/' + encodeURIComponent(emailLoginToken);
+                      loginContentType = 'application/json; charset=utf-8';
+                      var tokenPayload = {};
+                      if (secondFactor) {
+                        tokenPayload.second_factor_token = secondFactor;
+                        tokenPayload.second_factor_method = Number(secondFactorMethod);
+                      }
+                      form = JSON.stringify(tokenPayload);
+                    }
+                    var s = await fetch(loginPath, {
                       method: 'POST',
                       credentials: 'include',
                       headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Content-Type': loginContentType,
                         'X-CSRF-Token': csrf,
                         'X-Requested-With': 'XMLHttpRequest',
                         'Accept': 'application/json'
@@ -1604,7 +2158,7 @@ class BrowserSession(
         // 切换期间 View.post 回调被旧父容器丢弃的问题。
         pendingAuthHtml = html
         pendingEmailLink = null
-        authWebView?.let { loadAuthHtml(it, html) }
+        currentAuthView()?.let { loadAuthHtml(it, html) }
     }
 
     /**
@@ -1619,6 +2173,11 @@ class BrowserSession(
         isDark: Boolean = false,
         onResult: (success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit,
     ) {
+        if (TopicRepository.isRateLimitCoolingDown()) {
+            val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+            onResult(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+            return
+        }
         onAuthCallback = onResult
         cachedEmailSend = null
         isDarkCached = isDark
@@ -1628,9 +2187,14 @@ class BrowserSession(
         pendingEmailLink = url
         emailLinkCompleting = true
         emailLinkRechecksRemaining = EMAIL_LINK_RECHECK_TIMES
-        diagnostics.log("改用 WebView 整页打开邮件登录链接: $url")
+        diagnostics.log("在认证浏览器中打开邮件登录链接")
         authWebView?.let { view ->
             view.loadUrl(url)
+        }
+        authGeckoView?.let { view ->
+            authGeckoCookiesPrepared = false
+            loadAuthHtml(view, "")
+            pendingAuthHtml = null
         }
     }
 
@@ -1641,8 +2205,17 @@ class BrowserSession(
      * 触发时 Cookie 往往还没被内核写进 CookieManager。这里先与 WebView 同步一次，
      * 没拿到就短间隔复查若干轮，而不是一次判死。
      */
-    private fun checkEmailLinkLogin(view: WebView, url: String?) {
+    private fun checkEmailLinkLogin(view: View, url: String?) {
         if (!emailLinkCompleting || pendingEmailLink == null) return
+        if (view is GeckoView) {
+            refreshBrowserCookies(view) { checkEmailLinkResult(view, url) }
+        } else {
+            checkEmailLinkResult(view, url)
+        }
+    }
+
+    private fun checkEmailLinkResult(view: View, url: String?) {
+        if (!emailLinkCompleting || pendingEmailLink == null || currentAuthView() !== view) return
         CookieManager.getInstance().flush()
         val hasSession = runCatching { store.syncFromWebView().containsKey(Config.SESSION_COOKIE) }
             .getOrDefault(false)
@@ -1657,7 +2230,7 @@ class BrowserSession(
             emailLinkRechecksRemaining--
             view.postDelayed(
                 {
-                    if (emailLinkCompleting && authWebView === view) {
+                    if (emailLinkCompleting && currentAuthView() === view) {
                         checkEmailLinkLogin(view, url)
                     }
                 },
@@ -1666,7 +2239,7 @@ class BrowserSession(
             return
         }
         emailLinkCompleting = false
-        diagnostics.log("邮件链接页面已停止跳转但仍无会话 Cookie: ${url.orEmpty()}")
+        diagnostics.log("邮件链接页面已停止跳转但仍无会话 Cookie")
         onAuthCallback?.invoke(false, "登录链接未能完成登录，请重新获取验证码后重试", false)
     }
 
@@ -1678,7 +2251,7 @@ class BrowserSession(
             loadWithOverviewMode = true
             useWideViewPort = true
             setSupportMultipleWindows(false)
-            userAgentString = userAgent
+            userAgentString = store.userAgentOrNull() ?: userAgent
         }
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -1699,18 +2272,28 @@ class BrowserSession(
      * 用户先过盾再见九宫格 —— 与 Fluxdo 先 CF 后 hCaptcha 的主路径同形,
      * 且不必改动登录入口。
      */
-    private fun loadAuthHtml(view: WebView, html: String) {
+    private fun loadAuthHtml(view: View, html: String) {
         pendingAuthHtml = html
         authHtmlInjected = false
-        diagnostics.log("独立登录 WebView 正在对 $AUTH_BOOTSTRAP_PATH 做第一方导航,随后注入内联 hCaptcha 页面")
-        view.setBackgroundColor(Color.TRANSPARENT)
-        view.loadUrl("${Config.BASE_URL}$AUTH_BOOTSTRAP_PATH")
+        diagnostics.log("认证浏览器正在对 $AUTH_BOOTSTRAP_PATH 做第一方导航，随后加载原有 hCaptcha 页面")
+        if (view is WebView) {
+            view.setBackgroundColor(Color.TRANSPARENT)
+            view.loadUrl("${Config.BASE_URL}$AUTH_BOOTSTRAP_PATH")
+        } else if (view is GeckoView && geckoBridges.containsKey(view)) {
+            view.alpha = 0f // 导航前先透明，避免 /robots.txt 文本闪现
+            view.session?.loadUri("${Config.BASE_URL}$AUTH_BOOTSTRAP_PATH")
+        }
     }
 
     /** 退回旧的 data URL 方式。bootstrap 导航失败时宁可降级,也不能让登录整体不可用。 */
-    private fun loadAuthHtmlInline(view: WebView, reason: String) {
+    private fun loadAuthHtmlInline(view: View, reason: String) {
         val html = pendingAuthHtml ?: return
         if (authHtmlInjected) return
+        if (view !is WebView) {
+            diagnostics.log("Gecko 认证同源上下文不可用: $reason")
+            onAuthCallback?.invoke(false, "认证页面加载失败，请重试", false)
+            return
+        }
         authHtmlInjected = true
         diagnostics.log("bootstrap 导航不可用($reason),回退到 data URL 方式加载内联登录页")
         view.setBackgroundColor(Color.TRANSPARENT)
@@ -1724,13 +2307,15 @@ class BrowserSession(
      * document.cookie 与宿主侧 CookieManager 的对照能区分"根本没有 clearance"
      * 和"有 clearance 但页面上下文带不上"这两种完全不同的根因。
      */
-    private fun maybeInjectAuthHtml(view: WebView, url: String?) {
+    private fun maybeInjectAuthHtml(view: View, url: String?) {
         val html = pendingAuthHtml ?: return
         if (authHtmlInjected) return
-        if (!url.orEmpty().startsWith(Config.BASE_URL)) return
+        val target = Uri.parse(url.orEmpty())
+        if (target.scheme != "https" || target.host != Config.HOST) return
+        if (view is GeckoView && (!authGeckoCookiesPrepared || !geckoBridges.containsKey(view))) return
 
-        view.evaluateJavascript(AUTH_CONTEXT_PROBE_JS) { raw ->
-            if (authWebView !== view || authHtmlInjected) return@evaluateJavascript
+        evaluateBrowserScript(view, AUTH_CONTEXT_PROBE_JS) { raw ->
+            if (currentAuthView() !== view || authHtmlInjected) return@evaluateBrowserScript
             val probe = runCatching { JSONObject(decodeJsValue(raw)) }.getOrNull()
             val origin = probe?.optString("origin").orEmpty()
             val cookie = probe?.optString("cookie").orEmpty()
@@ -1748,16 +2333,38 @@ class BrowserSession(
             when {
                 // 盾就在这个窗口里,此刻注入会把挑战页冲掉。按兵不动,
                 // 等 CF 自己放行后重新导航回 bootstrap 页,下一次 onPageFinished 再注入。
-                isChallenge -> diagnostics.log("bootstrap 导航遇到 Cloudflare 挑战,等待用户在登录窗口内完成验证")
+                isChallenge -> {
+                    diagnostics.log("bootstrap 导航遇到 Cloudflare 挑战,等待用户在登录窗口内完成验证")
+                    view.post { view.alpha = 1f }
+                }
                 origin == Config.BASE_URL -> {
                     authHtmlInjected = true
                     diagnostics.log("已取得站点第一方上下文,注入内联 hCaptcha 登录页")
-                    view.evaluateJavascript(
+                    evaluateBrowserScript(view,
                         "(function(){document.open();document.write(${JSONObject.quote(html)});document.close();})();",
-                        null,
-                    )
+                    ) {
+                        view.post { view.alpha = 1f }
+                        if (view is GeckoView && currentAuthView() === view) {
+                            evaluateBrowserScript(view, """
+                                (function () {
+                                  if (!window.__ldb || typeof window.__ldb.onDiagnostic !== 'function' ||
+                                      typeof window.__linuxdoRunLogin !== 'function') return false;
+                                  window.__ldb.onDiagnostic('Gecko认证桥就绪');
+                                  return true;
+                                })();
+                            """.trimIndent()) { result ->
+                                if (currentAuthView() === view && decodeJsValue(result) != "true") {
+                                    diagnostics.log("Gecko 认证页面脚本未就绪")
+                                    onAuthCallback?.invoke(false, "认证页面初始化失败，请重试", false)
+                                }
+                            }
+                        }
+                    }
                 }
-                else -> loadAuthHtmlInline(view, "origin=$origin")
+                else -> {
+                    view.post { view.alpha = 1f }
+                    loadAuthHtmlInline(view, "origin=$origin")
+                }
             }
         }
     }
@@ -1774,102 +2381,113 @@ class BrowserSession(
 
 
     /**
-     * 与 Fluxdo 的登录对话框一致：每次认证使用独立的可见 WebView，
-     * 不复用全局后台 WebView 的页面、连接与导航状态。
+     * 认证/登录视图：使用独立的可见 GeckoView (Firefox Necko+NSS，支持 DoH+ECH)，
+     * 复用 master 的同源 bootstrap、内联 hCaptcha 和登录脚本。
      */
-    fun attachAuth(activityContext: Context): WebView {
-        check(Looper.myLooper() == Looper.getMainLooper()) { "WebView 只能在主线程访问" }
+    fun attachAuth(activityContext: Context): View {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "只能在主线程访问" }
         attachedActivityContext = activityContext
-        authWebView?.let { view ->
-            (view.context as? MutableContextWrapper)?.baseContext = activityContext
+        authGeckoView?.let { view ->
             (view.parent as? ViewGroup)?.removeView(view)
             return view
         }
 
-        val view = WebView(MutableContextWrapper(appContext))
-        (view.context as MutableContextWrapper).baseContext = activityContext
-        configureWebView(view)
-        view.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val urlString = request?.url?.toString().orEmpty()
-                if (urlString.startsWith("discourse://auth_redirect")) {
-                    try {
-                        val intent = Intent(Intent.ACTION_VIEW, request?.url).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                        }
-                        activityContext.startActivity(intent)
-                        return true
-                    } catch (e: Exception) {
-                        diagnostics.log("拦截 discourse 网页授权跳转失败: ${e.message}")
+        val geckoView = org.linuxdo.android.net.gecko.GeckoManager.createGeckoView(activityContext).apply {
+            alpha = 0f // 初始完全透明，避免在加载 /robots.txt bootstrap 期间闪烁纯文本源码
+        }
+        val geckoSession = org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+            context = activityContext,
+            onLocationChanged = { url ->
+                diagnostics.log("Auth GeckoView 导航至: ${GeckoManager.diagnosticUrl(url)}")
+            },
+            onPageFinished = { url ->
+                diagnostics.log("Auth GeckoView 页面完成: ${GeckoManager.diagnosticUrl(url)}")
+                if (authGeckoView === geckoView) {
+                    maybeInjectAuthHtml(geckoView, url)
+                    if (authGeckoCookiesPrepared && pendingEmailLink != null && !url.endsWith(AUTH_BOOTSTRAP_PATH)) {
+                        checkEmailLinkLogin(geckoView, url)
                     }
                 }
-                return super.shouldOverrideUrlLoading(view, request)
-            }
-
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                Log.d(TAG, "登录 onPageStarted: $url")
-                // 重新发起 bootstrap 导航(含 CF 放行后的回跳)时解锁注入,
-                // 否则过完盾回到 bootstrap 页就永远等不到注入了。
-                if (url.orEmpty().startsWith("${Config.BASE_URL}$AUTH_BOOTSTRAP_PATH")) {
-                    authHtmlInjected = false
+            },
+            onPageError = { _, _ -> geckoView.post { geckoView.alpha = 1f } },
+        )
+        geckoView.setSession(geckoSession)
+        authGeckoView = geckoView
+        authGeckoSession = geckoSession
+        authGeckoCookiesPrepared = false
+        authGeckoPreparing = false
+        authGeckoInitJob = scope.launch(Dispatchers.Main) {
+            try {
+                val browserUserAgent = withTimeoutOrNull(10_000L) {
+                    suspendCancellableCoroutine<String?> { continuation ->
+                        geckoSession.userAgent.accept(
+                            { value -> if (continuation.isActive) continuation.resume(value) },
+                            { _ -> if (continuation.isActive) continuation.resume(null) },
+                        )
+                    }
+                }?.takeIf { it.isNotBlank() } ?: error("无法读取认证浏览器标识")
+                if (authGeckoView !== geckoView) return@launch
+                if (store.userAgentOrNull() != browserUserAgent) {
+                    store.saveUserAgent(browserUserAgent)
+                    webViewInstance?.settings?.userAgentString = browserUserAgent
+                    authWebView?.settings?.userAgentString = browserUserAgent
+                    diagnostics.log("接口与认证浏览器的 User-Agent 已同步")
                 }
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                CookieManager.getInstance().flush()
-                Log.d(TAG, "登录 onPageFinished: $url")
-                view?.let { maybeInjectAuthHtml(it, url) }
-                view?.let { checkEmailLinkLogin(it, url) }
-            }
-
-            override fun onReceivedHttpError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                errorResponse: WebResourceResponse?,
-            ) {
-                val status = errorResponse?.statusCode ?: 0
-                diagnostics.log(
-                    "登录 WebView HTTP 错误 [$status]: ${request?.url}" +
-                        cfMitigatedSuffix(errorResponse),
+                Log.d("GeckoAuthBridge", "认证会话 User-Agent 已对齐")
+                val bridge = GeckoAuthBridge.create(
+                    activityContext,
+                    geckoSession,
+                    onReady = { url -> onAuthGeckoReady(geckoView, url) },
+                    onCallback = { name, payload -> onGeckoAuthCallback(geckoView, name, payload) },
                 )
-                if (status == 429 && request?.isForMainFrame == true) {
-                    val retryAfter = HttpHeaderUtils.parseRetryAfter(errorResponse?.responseHeaders?.get("Retry-After"))
-                    TopicRepository.enterRateLimitCooldown(request.url.toString(), retryAfter, store)
+                if (authGeckoView !== geckoView) {
+                    bridge.close()
+                    return@launch
                 }
-            }
-
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                diagnostics.log(
-                    "登录 WebView 资源错误 [${error?.errorCode ?: 0}: ${error?.description}]: ${request?.url}",
-                )
-                // 只有主框架的 bootstrap 导航失败才降级,子资源错误(图片/脚本)不算。
-                if (request?.isForMainFrame == true && view != null && !authHtmlInjected) {
-                    loadAuthHtmlInline(view, "导航错误 ${error?.errorCode ?: 0}")
-                }
+                geckoBridges[geckoView] = bridge
+                diagnostics.log("Gecko 认证桥已初始化，开始同源 bootstrap → hCaptcha 登录链路")
+                geckoSession.loadUri("${Config.BASE_URL}$AUTH_BOOTSTRAP_PATH")
+            } catch (_: CancellationException) {
+            } catch (error: Exception) {
+                diagnostics.log("Gecko 认证桥初始化失败: ${error.message}")
+                if (authGeckoView === geckoView) onAuthCallback?.invoke(false, "认证组件初始化失败，请重试", false)
             }
         }
-        view.webChromeClient = createLoggingChromeClient("登录")
-        view.addJavascriptInterface(Bridge(), BRIDGE_NAME)
-        authWebView = view
-        val link = pendingEmailLink
-        if (link != null) {
-            // 链接兑换：直接整页导航，等 onPageFinished 判定 _t 是否落地。
-            emailLinkCompleting = true
-            view.loadUrl(link)
-        } else {
-            pendingAuthHtml?.let { loadAuthHtml(view, it) }
-        }
-        return view
+        return geckoView
     }
 
-    /**
-     * 2FA 输入页会暂时卸下认证 WebView，但保留它的 h_captcha_temp_id；
-     * 其他收场路径则彻底销毁，下一次登录从全新的 WebView 开始。
-     */
-    fun detachAuth(view: WebView) {
-        (view.context as? MutableContextWrapper)?.baseContext = appContext
-        if (authWebView !== view) return
+    private fun onAuthGeckoReady(view: GeckoView, url: String) {
+        if (authGeckoView !== view) return
+        val bridge = geckoBridges[view] ?: return
+        if (authGeckoCookiesPrepared) {
+            maybeInjectAuthHtml(view, url)
+            if (pendingEmailLink != null && !url.endsWith(AUTH_BOOTSTRAP_PATH)) checkEmailLinkLogin(view, url)
+            return
+        }
+        if (authGeckoPreparing) return
+        authGeckoPreparing = true
+        scope.launch(Dispatchers.Main) {
+            try {
+                bridge.prepareAuthCookies(store.syncFromWebView())
+                if (authGeckoView !== view) return@launch
+                authGeckoCookiesPrepared = true
+                val link = pendingEmailLink
+                if (link != null) view.session?.loadUri(link)
+                else maybeInjectAuthHtml(view, url)
+            } catch (_: CancellationException) {
+            } catch (error: Exception) {
+                diagnostics.log("Gecko 认证会话准备失败: ${error.message}")
+                if (authGeckoView === view) onAuthCallback?.invoke(false, "认证会话准备失败，请重试", false)
+            } finally {
+                if (authGeckoView === view) authGeckoPreparing = false
+            }
+        }
+    }
+
+    fun detachAuth(view: View) {
+        if (authGeckoView !== view) return
         if (awaitingSecondFactorLogin) return
+        authGeckoInitJob?.cancel()
         val submissionId = currentSubmissionId
         val completion = authSubmitCompletion
         if (submissionId != null && completion != null && !completion.isCompleted) {
@@ -1879,7 +2497,11 @@ class BrowserSession(
         }
         pendingAuthHtml = null
         authHtmlInjected = false
-        destroyAuthWebView(view)
+        destroyAuthBrowser(view)
+    }
+
+    fun loadUrlInAuthGecko(url: String) {
+        authGeckoSession?.loadUri(url)
     }
 
     private fun createLoggingChromeClient(scope: String): WebChromeClient = object : WebChromeClient() {
@@ -2054,18 +2676,48 @@ class BrowserSession(
         return webView
     }
 
-    /** 挂到界面时把 Context 换成 Activity,键盘/弹窗才正常;必要时先从旧父容器摘下。 */
-    fun attach(activityContext: Context): WebView {
-        val webView = webView()
+    /** 全屏验证页挂载 GeckoView，享受 DoH+ECH 原生免梯直连与 Turnstile 验证 */
+    fun attach(activityContext: Context): View {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "只能在主线程访问" }
         attachedActivityContext = activityContext
-        (webView.context as? MutableContextWrapper)?.baseContext = activityContext
-        (webView.parent as? ViewGroup)?.removeView(webView)
-        return webView
+
+        mainGeckoView?.let { view ->
+            (view.parent as? ViewGroup)?.removeView(view)
+            return view
+        }
+
+        val geckoView = org.linuxdo.android.net.gecko.GeckoManager.createGeckoView(activityContext)
+        val geckoSession = org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+            context = activityContext,
+            onLocationChanged = { url ->
+                diagnostics.log("Verify GeckoView 导航至: $url")
+                checkCfGeckoCompletion(activityContext)
+            },
+            onPageFinished = { url ->
+                diagnostics.log("Verify GeckoView 页面加载完成: $url")
+                checkCfGeckoCompletion(activityContext)
+            }
+        )
+        geckoView.setSession(geckoSession)
+        mainGeckoView = geckoView
+        mainGeckoSession = geckoSession
+        isGeckoVerifyActive = true
+
+        scope.launch(Dispatchers.IO) {
+            org.linuxdo.android.net.gecko.GeckoManager.clearCfClearanceFromDb(activityContext)
+        }
+        geckoSession.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+        scheduleCfGeckoProbe(activityContext)
+        return geckoView
     }
 
-    /** 从界面卸下时还原为 Application Context,避免泄漏 Activity。 */
+    /** 从界面卸下时释放 Session，重置验证状态。 */
     fun detach() {
-        (webViewInstance?.context as? MutableContextWrapper)?.baseContext = appContext
+        isGeckoVerifyActive = false
+        mainGeckoSession?.close()
+        mainGeckoView?.releaseSession()
+        mainGeckoSession = null
+        mainGeckoView = null
     }
 
     suspend fun openUrl(url: String) = withContext(Dispatchers.Main) {
@@ -2429,53 +3081,47 @@ class BrowserSession(
 
     /** 调用方必须已持有 [solveMutex]。 */
     private suspend fun acquireCfClearanceLocked(reason: String, timeoutMs: Long = Config.CHALLENGE_TIMEOUT_MS): Boolean {
-        diagnostics.log("静默补签 cf_clearance 开始: $reason")
+        diagnostics.log("静默补签 cf_clearance 开始: $reason (使用 GeckoSession DoH+ECH)")
         val startedAt = SystemClock.elapsedRealtime()
-        hasMainFrameError = false
-        challengeOriginReached = false
-        openUrl("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+        val context = attachedActivityContext ?: appContext
+
+        scope.launch(Dispatchers.IO) {
+            org.linuxdo.android.net.gecko.GeckoManager.clearCfClearanceFromDb(context)
+        }.join()
+
+        val headlessSession = withContext(Dispatchers.Main) {
+            org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+                context = context,
+                onLocationChanged = { url -> diagnostics.log("Headless GeckoSession 导航: $url") },
+                onPageFinished = { url -> diagnostics.log("Headless GeckoSession 完成: $url") }
+            ).also { it.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH") }
+        }
+
         val deadline = startedAt + timeoutMs
-        var unreachableSince = -1L
-        var sawChallenge = false
         var outcome = SilentOutcome.TIMEOUT
         try {
             while (SystemClock.elapsedRealtime() < deadline) {
                 delay(POLL_INTERVAL_MS)
-                val clearance = withContext(Dispatchers.Main) {
-                    CookieManager.getInstance().flush()
-                    currentCfClearance()
-                }
-                val activeChallenge = evalString(ACTIVE_CHALLENGE_PROBE_JS) == "true"
-                if (activeChallenge) {
-                    sawChallenge = true
-                }
-                if (!challengeOriginReached && !activeChallenge && evalString(ORIGIN_NOT_FOUND_PROBE_JS) == "true") {
-                    challengeOriginReached = true
-                }
-                if (challengeOriginReached || (clearance != null && !activeChallenge)) {
-                    // 等 Chromium 把同轮签发的其余 Cookie 落盘再同步
-                    delay(CF_COOKIE_SETTLE_DELAY_MS)
+                val cookies = org.linuxdo.android.net.gecko.GeckoManager.extractCookiesFromDb(context)
+                val clearance = cookies[CF_CLEARANCE_COOKIE]
+                if (!clearance.isNullOrBlank() && isFreshCfClearance(clearance)) {
+                    diagnostics.log("Headless GeckoSession 静默补签成功取得 cf_clearance: ${clearanceFingerprint(clearance)}")
                     withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().setCookie(Config.BASE_URL, "$CF_CLEARANCE_COOKIE=$clearance; Path=/; Domain=.linux.do; Secure; HttpOnly; SameSite=None")
                         CookieManager.getInstance().flush()
                         store.syncFromWebView()
                     }
                     outcome = SilentOutcome.CLEARED
                     break
                 }
-                if (hasMainFrameError) {
-                    if (unreachableSince < 0) unreachableSince = SystemClock.elapsedRealtime()
-                    if (SystemClock.elapsedRealtime() - unreachableSince > UNREACHABLE_GRACE_MS) {
-                        outcome = SilentOutcome.UNREACHABLE
-                        break
-                    }
-                }
             }
         } catch (cancelled: CancellationException) {
             diagnostics.log("[诊断] 静默补签 cf_clearance 被取消(+${SystemClock.elapsedRealtime() - startedAt}ms)")
             throw cancelled
-        }
-        if (outcome == SilentOutcome.TIMEOUT && sawChallenge) {
-            outcome = SilentOutcome.CHALLENGE
+        } finally {
+            withContext(Dispatchers.Main) {
+                headlessSession.close()
+            }
         }
         lastSilentOutcome = outcome
         val cleared = outcome == SilentOutcome.CLEARED
@@ -2519,85 +3165,8 @@ class BrowserSession(
         if (failedClearanceFp != "-") {
             store.noteClearanceChallenged(failedClearanceFp)
         }
-        // 手里根本没有 cf_clearance 时，重载首页不会签发凭据（首页一般不被挑战），重试照样撞盾
-        if (currentClearance.isNullOrBlank()) return@withLock acquireCfClearanceLocked(reason)
-        diagnostics.log("静默重验证开始: $reason (failedFp=$failedClearanceFp, currentFp=$currentFp)")
-        val startedAt = SystemClock.elapsedRealtime()
-        logEnvironmentOnce()
-        logCookieInventory("重验证前")
-        hasMainFrameError = false
-        openUrl("${Config.BASE_URL}/")
-        val deadline = SystemClock.elapsedRealtime() + Config.CHALLENGE_TIMEOUT_MS
-        var cleared = false
-        var challengeStartTime = -1L
-        var lastProbeState = ""
-        var round = 0
-        var unreachableSince = -1L
-        var outcome = SilentOutcome.TIMEOUT
-        try {
-        while (SystemClock.elapsedRealtime() < deadline) {
-            val probe = runProbe(timeoutMs = 4_000L)
-            round++
-            val probeState = "probe=${probe?.status ?: "TIMEOUT"}${probe?.error?.takeIf { it.isNotBlank() }?.let { "(${it.take(60)})" }.orEmpty()}" +
-                " url=${currentUrl()?.let { runCatching { Uri.parse(it).let { u -> "${u.scheme}://${u.host}${u.path}" } }.getOrNull() } ?: "-"}" +
-                " title=${currentTitle().take(30)} mainFrameError=$hasMainFrameError finished=$finishedCount"
-            if (probeState != lastProbeState) {
-                diagnostics.log("[诊断] 重验证第${round}轮 +${SystemClock.elapsedRealtime() - startedAt}ms $probeState")
-                lastProbeState = probeState
-            }
-            if (!hasMainFrameError && probe?.status != "WRONG_ORIGIN") {
-                unreachableSince = -1L
-            }
-            if (probe?.status == "CLEARED") {
-                CookieManager.getInstance().flush()
-                withContext(Dispatchers.Main) { store.syncFromWebView() }
-                diagnostics.log("静默重验证成功(探活通路畅通, hasCsrf=${probe.csrf.isNotBlank()})")
-                cleared = true
-                break
-            } else if (probe?.status == "CF_CHALLENGE") {
-                // 对齐 v1.3.1：挑战页留足 CHALLENGE_TIMEOUT_MS 让 CF 的 JS/非交互挑战自动跑完。
-                // 多数 "Just a moment" 几秒到十几秒内会自己通过，提前放弃等于把本可静默续上的盾变成手工验证。
-                if (challengeStartTime < 0) {
-                    challengeStartTime = SystemClock.elapsedRealtime()
-                    diagnostics.log("静默重验证: 遇到 Cloudflare 挑战页，等待其自动完成")
-                }
-                outcome = SilentOutcome.CHALLENGE
-            } else if (hasMainFrameError || probe?.status == "WRONG_ORIGIN") {
-                // 主框架连不上（DoH 直连下 WebView 不走 ECH 通道）时停在 chrome-error 页，
-                // 等多久都不会好转；宽限数秒排除重定向中间态后立即判定不可达，不再空等满 30 秒。
-                if (unreachableSince < 0) unreachableSince = SystemClock.elapsedRealtime()
-                if (SystemClock.elapsedRealtime() - unreachableSince > UNREACHABLE_GRACE_MS) {
-                    diagnostics.log("静默重验证: WebView 无法连通站点(主框架错误)，提前结束")
-                    outcome = SilentOutcome.UNREACHABLE
-                    break
-                }
-            } else if (isPageCleared()) {
-                CookieManager.getInstance().flush()
-                withContext(Dispatchers.Main) { store.syncFromWebView() }
-                diagnostics.log("静默重验证成功(DOM 特征就绪)")
-                cleared = true
-                break
-            }
-            delay(POLL_INTERVAL_MS)
-        }
-        } catch (cancelled: CancellationException) {
-            diagnostics.log("[诊断] 静默重验证被取消(+${SystemClock.elapsedRealtime() - startedAt}ms, 第${round}轮, ${cancelled.message.orEmpty().take(40)})")
-            throw cancelled
-        }
-        withContext(Dispatchers.Main) { store.syncFromWebView() }
-        if (cleared) {
-            outcome = SilentOutcome.CLEARED
-            lastClearedAtElapsed = SystemClock.elapsedRealtime()
-        } else if (outcome == SilentOutcome.CHALLENGE) {
-            // 等满仍停在挑战页：确实需要人工交互（如 Turnstile 勾选）
-            diagnostics.log("静默等待超时仍为 Cloudflare 挑战，需前台交互验证")
-            store.requireVerification()
-        }
-        lastSilentOutcome = outcome
-        diagnostics.log(if (cleared) "静默重验证成功" else "静默重验证未通过(${outcome.name})")
-        diagnostics.log("[诊断] 静默重验证结束 cleared=$cleared 耗时=${SystemClock.elapsedRealtime() - startedAt}ms 轮数=$round 末态: $lastProbeState")
-        logCookieInventory("重验证后")
-        cleared
+        // 在免梯环境下，系统 WebView 无法走 ECH，统一委派给 GeckoSession 静默补签
+        return@withLock acquireCfClearanceLocked(reason)
     }
 
     /** 403 诊断：主站与 credit 子站的 CF/会话 Cookie 作用域与指纹。 */
@@ -2927,5 +3496,48 @@ class BrowserSession(
               }
             })();
         """.trimIndent()
+
+        /**
+         * 判断 Discourse 登录响应是否要求提供/重试二步验证（2FA）。
+         * 对齐 Fluxdo 与 Discourse 3.1+ 契约：
+         * 1. reason 为 second_factor、invalid_second_factor、invalid_second_factor_method 或包含 second_factor；
+         * 2. totp_enabled / backup_enabled / security_key_enabled / second_factor_required 标志位为 true；
+         * 3. 首次未带 2FA 时，错误文案包含"双重身份验证"（如"所选双重身份验证方法无效。"）、"两步"、"二步"等。
+         */
+        fun isSecondFactorResponse(resObj: JSONObject?, hasSecondFactorToken: Boolean): Boolean {
+            if (resObj == null) return false
+            val reason = resObj.optString("reason")
+            val error = resObj.optString("error").takeIf { it.isNotBlank() }
+                ?: resObj.optString("errors").takeIf { it.isNotBlank() }
+            val totpEnabled = resObj.optBoolean("totp_enabled")
+            val backupEnabled = resObj.optBoolean("backup_enabled")
+            val securityKeyEnabled = resObj.optBoolean("security_key_enabled")
+            val secondFactorRequired = resObj.optBoolean("second_factor_required")
+            val hasMulti2fa = resObj.has("multiple_second_factor_methods")
+
+            val isReason2fa = reason == "second_factor" ||
+                reason == "invalid_second_factor" ||
+                reason == "invalid_second_factor_method" ||
+                reason.contains("second_factor", ignoreCase = true)
+            val isFlag2fa = totpEnabled || backupEnabled || securityKeyEnabled || secondFactorRequired || hasMulti2fa
+            val isError2fa = !hasSecondFactorToken && !error.isNullOrBlank() && (
+                error.contains("双重身份验证") ||
+                    error.contains("两步") ||
+                    error.contains("二步") ||
+                    error.contains("second factor", ignoreCase = true) ||
+                    error.contains("authentication code", ignoreCase = true)
+            )
+            return isReason2fa || isFlag2fa || isError2fa
+        }
+
+        fun extractSecondFactorMessage(resObj: JSONObject?, hasSecondFactorToken: Boolean): String {
+            val error = resObj?.optString("error")?.takeIf { it.isNotBlank() }
+                ?: resObj?.optString("errors")?.takeIf { it.isNotBlank() }
+            return if (hasSecondFactorToken) {
+                error ?: "二次验证码错误或已过期，请重新输入"
+            } else {
+                "需要进行二次验证 (2FA)"
+            }
+        }
     }
 }

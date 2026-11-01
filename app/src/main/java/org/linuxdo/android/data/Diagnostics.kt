@@ -1,7 +1,11 @@
 package org.linuxdo.android.data
 
+import android.content.Context
+import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -98,6 +102,80 @@ class Diagnostics(private val logFile: File) {
         log("需要交互验证: $reason")
     }
 
+    val crashFile: File get() = File(logFile.parentFile, "crash.log")
+
+    fun hasCrashLog(): Boolean = runCatching { crashFile.exists() && crashFile.length() > 0 }.getOrDefault(false)
+
+    fun readCrashLog(): String? = synchronized(lock) {
+        runCatching {
+            if (crashFile.exists()) crashFile.readText(Charsets.UTF_8) else null
+        }.getOrNull()
+    }
+
+    fun clearCrashLog() = synchronized(lock) {
+        runCatching {
+            if (crashFile.exists()) {
+                crashFile.delete()
+            }
+        }
+    }
+
+    /** 记录未捕获异常崩溃堆栈，强制同步刷盘 */
+    fun recordCrash(thread: Thread, throwable: Throwable, context: Context? = null) {
+        synchronized(lock) {
+            runCatching {
+                val timeStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+                val stackTrace = Log.getStackTraceString(throwable)
+                val runtime = Runtime.getRuntime()
+                val freeMb = runtime.freeMemory() / (1024 * 1024f)
+                val totalMb = runtime.totalMemory() / (1024 * 1024f)
+                val maxMb = runtime.maxMemory() / (1024 * 1024f)
+                val pkgInfo = context?.let {
+                    runCatching { it.packageManager.getPackageInfo(it.packageName, 0) }.getOrNull()
+                }
+                val verName = pkgInfo?.versionName ?: "unknown"
+                val verCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    pkgInfo?.longVersionCode ?: 0L
+                } else {
+                    @Suppress("DEPRECATION")
+                    pkgInfo?.versionCode?.toLong() ?: 0L
+                }
+
+                val crashHeader = buildString {
+                    appendLine("💥💥💥 ==================== CRASH REPORT ====================")
+                    appendLine("Time: $timeStr")
+                    appendLine("App Version: v$verName ($verCode)")
+                    appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})")
+                    appendLine("Thread: ${thread.name} (id=${thread.id})")
+                    appendLine("Memory: Free=%.1fMB, Total=%.1fMB, Max=%.1fMB".format(Locale.US, freeMb, totalMb, maxMb))
+                    appendLine("Exception: ${throwable.javaClass.name}: ${throwable.message}")
+                    appendLine("-------------------- STACKTRACE --------------------")
+                    appendLine(stackTrace.trimEnd())
+                    appendLine("============================================================")
+                }
+
+                // 1. 同步写入专属 crash.log 文件，追加并刷盘
+                crashFile.parentFile?.mkdirs()
+                FileOutputStream(crashFile, true).use { fos ->
+                    fos.write((crashHeader + "\n\n").toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    fos.fd.sync()
+                }
+
+                // 如果 crash.log 过大(>256KB)，截取并保留最后 128KB
+                if (crashFile.length() > MAX_CRASH_FILE_BYTES) {
+                    val content = crashFile.readText(Charsets.UTF_8)
+                    val trimmed = content.takeLast(128 * 1024)
+                    crashFile.writeText(trimmed, Charsets.UTF_8)
+                }
+
+                // 2. 将崩溃概要写入当前的 diagnostics.log 文件
+                val diagLine = "${timeFormat.format(Date())} 💥 [CRASH] ${thread.name}: ${throwable.javaClass.simpleName}: ${throwable.message}"
+                logFile.appendText(diagLine + "\n", Charsets.UTF_8)
+            }
+        }
+    }
+
     private fun loadTail(): List<String> = runCatching {
         if (logFile.exists()) logFile.readLines(Charsets.UTF_8).takeLast(MAX_MEMORY_LINES) else emptyList()
     }.getOrDefault(emptyList())
@@ -111,5 +189,6 @@ class Diagnostics(private val logFile: File) {
         const val MAX_MEMORY_LINES = 300
         const val KEEP_FILE_LINES = 2_000
         const val MAX_FILE_BYTES = 512 * 1024L
+        const val MAX_CRASH_FILE_BYTES = 256 * 1024L
     }
 }

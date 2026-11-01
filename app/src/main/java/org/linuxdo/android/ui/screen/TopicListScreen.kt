@@ -17,10 +17,13 @@ import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
@@ -52,6 +55,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -61,6 +65,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
@@ -75,6 +80,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -83,8 +89,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -175,7 +186,9 @@ fun TopicListScreen(
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
     currentFeed: HomeFeedType? = null,
+    feedStates: Map<HomeFeedType, TopicListUiState> = emptyMap(),
     onFeedSelect: ((HomeFeedType) -> Unit)? = null,
+    onPreloadFeed: ((HomeFeedType) -> Unit)? = null,
     hasUnread: Boolean = false,
     categoryVariants: List<Category> = emptyList(),
     currentCategoryId: Int? = null,
@@ -200,11 +213,15 @@ fun TopicListScreen(
     onNavigateToHistory: (() -> Unit)? = null,
     onNavigateToConnect: (() -> Unit)? = null,
     onNavigateToChat: (() -> Unit)? = null,
+    onNavigateToBookmarks: (() -> Unit)? = null,
+    onNavigateToFollowing: (() -> Unit)? = null,
+    onNavigateToLikes: (() -> Unit)? = null,
+    onNavigateToReplies: (() -> Unit)? = null,
     feedGraphicMode: Boolean = true,
-    feedDisplayMode: String = if (feedGraphicMode) "graphic" else "small_image",
+    feedDisplayMode: String = "no_excerpt",
     showTopicUnreadDot: Boolean = true,
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
-    onPrefetchExcerpt: ((Long) -> Unit)? = null,
+    onPrefetchExcerpt: ((Any, List<Long>, () -> Set<Long>) -> Unit)? = null,
     onPrefetchExcerpts: ((List<Topic>) -> Unit)? = null,
     onScrollBusyChanged: ((Any, Boolean) -> Unit)? = null,
     onBarsVisibilityChange: ((Boolean) -> Unit)? = null,
@@ -214,8 +231,20 @@ fun TopicListScreen(
     val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
     val categoryListStates = remember { mutableMapOf<Int, LazyListState>() }
     val defaultListState = rememberLazyListState()
+    var pendingSettledFeed by remember { mutableStateOf<HomeFeedType?>(null) }
+    LaunchedEffect(currentFeed) {
+        if (currentFeed != null && currentFeed == pendingSettledFeed) {
+            pendingSettledFeed = null
+        }
+    }
+    val effectiveFeed = pendingSettledFeed ?: currentFeed
+    val effectiveState = if (effectiveFeed != null && effectiveFeed != currentFeed) {
+        feedStates[effectiveFeed] ?: state
+    } else {
+        state
+    }
     val listState = when {
-        currentFeed != null -> feedListStates.getOrPut(currentFeed) { LazyListState() }
+        effectiveFeed != null -> feedListStates.getOrPut(effectiveFeed) { LazyListState() }
         currentCategoryId != null -> categoryListStates.getOrPut(currentCategoryId) { LazyListState() }
         else -> defaultListState
     }
@@ -246,6 +275,13 @@ fun TopicListScreen(
         if (!active) return@LaunchedEffect
         if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20) {
             onBarsVisibilityChange?.invoke(true)
+        }
+    }
+    DisposableEffect(active) {
+        onDispose {
+            if (!active || onBack != null) {
+                onBarsVisibilityChange?.invoke(true)
+            }
         }
     }
     val pullState = rememberPullToRefreshState()
@@ -305,34 +341,342 @@ fun TopicListScreen(
     }
 
 
-    val filteredItems = remember(state.items, blockedUsernames) {
-        if (blockedUsernames.isEmpty()) state.items
-        else state.items.filterNot { it.authorUsername?.lowercase() in blockedUsernames }
+    val filteredItems = remember(effectiveState.items, blockedUsernames) {
+        if (blockedUsernames.isEmpty()) effectiveState.items
+        else effectiveState.items.filterNot { it.authorUsername?.lowercase() in blockedUsernames }
     }
 
     val (pinnedGroups, plainItems) = remember(filteredItems) { pinnedPrefixGroups(filteredItems) }
+    val previewKeyPrefix = effectiveFeed?.name ?: currentCategoryId ?: "topic"
+    val previewTopicsByKey = remember(plainItems, previewKeyPrefix) {
+        plainItems.associate { "${previewKeyPrefix}_${it.topic.id}" to it.topic }
+    }
+    val visiblePreviewTopics by remember(listState, previewTopicsByKey) {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val center = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
+            layout.visibleItemsInfo
+                .filter { it.offset < layout.viewportEndOffset && it.offset + it.size > layout.viewportStartOffset }
+                .sortedBy { kotlin.math.abs(it.offset + it.size / 2 - center) }
+                .mapNotNull { item -> (item.key as? String)?.let(previewTopicsByKey::get) }
+        }
+    }
+    val currentVisibleTopics by rememberUpdatedState(visiblePreviewTopics)
+    val currentPrefetchExcerpt by rememberUpdatedState(onPrefetchExcerpt)
+    LaunchedEffect(active, listState, listState.isScrollInProgress, feedDisplayMode, state.refreshing, state.initialLoading, filteredItems) {
+        try {
+            currentPrefetchExcerpt?.invoke(scrollBusySource, emptyList()) { emptySet() }
+            if (!active || listState.isScrollInProgress || feedDisplayMode == "no_excerpt" ||
+                state.refreshing || state.initialLoading
+            ) return@LaunchedEffect
+            delay(400L)
+            // 一次停顿只拍下这一屏的候选，正文回填引起的布局变化不会追加更多卡片。
+            val candidates = currentVisibleTopics.filter { getTopicRealExcerpt(it) == null }.take(6).map { it.id }
+            currentPrefetchExcerpt?.invoke(scrollBusySource, candidates) {
+                currentVisibleTopics.map { it.id }.toSet()
+            }
+            awaitCancellation()
+        } finally {
+            currentPrefetchExcerpt?.invoke(scrollBusySource, emptyList()) { emptySet() }
+        }
+    }
 
-    LaunchedEffect(active, filteredItems) {
-        if (active && filteredItems.isNotEmpty()) {
+    LaunchedEffect(active, filteredItems, feedDisplayMode) {
+        if (active && feedDisplayMode != "no_excerpt" && filteredItems.isNotEmpty()) {
             onPrefetchExcerpts?.invoke(filteredItems.map { it.topic })
         }
     }
 
+    var containerWidthPx by remember { mutableFloatStateOf(0f) }
+    val feedDragOffsetPx = remember { Animatable(0f) }
+    var manualTargetFeed by remember { mutableStateOf<HomeFeedType?>(null) }
+
+    val latestEffectiveFeed by rememberUpdatedState(effectiveFeed)
+    val latestOnFeedSelect by rememberUpdatedState(onFeedSelect)
+    val latestOnPreloadFeed by rememberUpdatedState(onPreloadFeed)
+    val latestContainerWidthPx by rememberUpdatedState(containerWidthPx)
+    val feedSwipeEdgeMarginPx = with(LocalDensity.current) { 32.dp.toPx() }
+    val feedSwipeThresholdPx = with(LocalDensity.current) { 48.dp.toPx() }
+
+    val incomingFeed: HomeFeedType? = if (effectiveFeed != null && feedDragOffsetPx.value != 0f) {
+        if (manualTargetFeed != null && manualTargetFeed != effectiveFeed) {
+            manualTargetFeed
+        } else {
+            val feeds = HomeFeedType.entries
+            if (feedDragOffsetPx.value < 0f) {
+                feeds[(effectiveFeed.ordinal + 1) % feeds.size]
+            } else {
+                feeds[(effectiveFeed.ordinal - 1 + feeds.size) % feeds.size]
+            }
+        }
+    } else null
+
+    LaunchedEffect(incomingFeed) {
+        if (incomingFeed != null) {
+            onPreloadFeed?.invoke(incomingFeed)
+        }
+    }
+
+    val transitionProgress = if (containerWidthPx > 0f && incomingFeed != null) {
+        (abs(feedDragOffsetPx.value) / containerWidthPx).coerceIn(0f, 1f)
+    } else 0f
+
+    val secondaryListState = incomingFeed?.let { feedListStates.getOrPut(it) { LazyListState() } }
+    val incomingFeedState = incomingFeed?.let { feedStates[it] ?: TopicListUiState(initialLoading = true) }
+    val incomingFilteredItems = remember(incomingFeedState?.items, blockedUsernames) {
+        val raw = incomingFeedState?.items.orEmpty()
+        if (blockedUsernames.isEmpty()) raw
+        else raw.filterNot { it.authorUsername?.lowercase() in blockedUsernames }
+    }
+    val (incomingPinnedGroups, incomingPlainItems) = remember(incomingFilteredItems) {
+        pinnedPrefixGroups(incomingFilteredItems)
+    }
+
+    val animateSelectFeed: (HomeFeedType) -> Unit = { targetFeed ->
+        val cur = latestEffectiveFeed
+        val width = latestContainerWidthPx
+        val select = latestOnFeedSelect
+        if (cur == null || targetFeed == cur || width <= 0f || select == null) {
+            select?.invoke(targetFeed)
+        } else {
+            latestOnPreloadFeed?.invoke(targetFeed)
+            val dir = if (targetFeed.ordinal > cur.ordinal) -1f else 1f
+            scope.launch {
+                manualTargetFeed = targetFeed
+                feedDragOffsetPx.snapTo(0f)
+                feedDragOffsetPx.animateTo(
+                    targetValue = dir * width,
+                    animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
+                )
+                pendingSettledFeed = targetFeed
+                manualTargetFeed = null
+                select(targetFeed)
+                feedDragOffsetPx.snapTo(0f)
+            }
+        }
+    }
+
+    val homeFeedSwipeModifier = if (currentFeed != null && onFeedSelect != null) {
+        Modifier.pointerInput(feedSwipeEdgeMarginPx, feedSwipeThresholdPx) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                if (down.position.x < feedSwipeEdgeMarginPx ||
+                    (size.width > 0 && down.position.x > size.width - feedSwipeEdgeMarginPx)
+                ) {
+                    return@awaitEachGesture
+                }
+                var dragMode = 0 // 0: 未定, 1: 水平切标签, 2: 垂直滚动或其他手势
+                var totalPan = Offset.Zero
+                var horizontalDrag = 0f
+                val touchSlop = viewConfiguration.touchSlop
+
+                do {
+                    val event = awaitPointerEvent()
+                    val activePointers = event.changes.filter { it.pressed }
+                    if (activePointers.isEmpty()) break
+                    if (activePointers.size > 1) {
+                        dragMode = 2
+                        break
+                    }
+                    val change = activePointers.first()
+                    if (change.isConsumed && dragMode == 0) {
+                        dragMode = 2
+                        break
+                    }
+                    val delta = change.positionChange()
+                    when (dragMode) {
+                        1 -> {
+                            horizontalDrag += delta.x
+                            val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
+                            val clamped = horizontalDrag.coerceIn(-maxW, maxW)
+                            scope.launch { feedDragOffsetPx.snapTo(clamped) }
+                            change.consume()
+                        }
+                        0 -> {
+                            totalPan += delta
+                            if (totalPan.getDistance() > touchSlop) {
+                                if (abs(totalPan.x) > abs(totalPan.y) * 1.35f) {
+                                    dragMode = 1
+                                    manualTargetFeed = null
+                                    horizontalDrag = totalPan.x
+                                    val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
+                                    val clamped = horizontalDrag.coerceIn(-maxW, maxW)
+                                    scope.launch { feedDragOffsetPx.snapTo(clamped) }
+                                    change.consume()
+                                } else {
+                                    dragMode = 2
+                                    break
+                                }
+                            }
+                        }
+                    }
+                } while (event.changes.any { it.pressed })
+
+                if (dragMode == 1) {
+                    val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
+                    val currentOffset = feedDragOffsetPx.value
+                    val threshold = if (maxW > 0f) maxOf(feedSwipeThresholdPx, maxW * 0.16f) else feedSwipeThresholdPx
+                    val feed = latestEffectiveFeed
+                    val select = latestOnFeedSelect
+                    if (feed != null && select != null && maxW > 0f && abs(currentOffset) >= threshold) {
+                        val feeds = HomeFeedType.entries
+                        val nextIndex = if (currentOffset < 0f) {
+                            (feed.ordinal + 1) % feeds.size
+                        } else {
+                            (feed.ordinal - 1 + feeds.size) % feeds.size
+                        }
+                        val targetFeed = feeds[nextIndex]
+                        val targetX = if (currentOffset < 0f) -maxW else maxW
+                        val remaining = (1f - abs(currentOffset) / maxW).coerceIn(0.15f, 1f)
+                        val durationMs = (220f * remaining).toInt().coerceIn(85, 220)
+                        scope.launch {
+                            feedDragOffsetPx.animateTo(
+                                targetValue = targetX,
+                                animationSpec = tween(durationMillis = durationMs, easing = FastOutSlowInEasing),
+                            )
+                            pendingSettledFeed = targetFeed
+                            manualTargetFeed = null
+                            select(targetFeed)
+                            feedDragOffsetPx.snapTo(0f)
+                        }
+                    } else {
+                        scope.launch {
+                            feedDragOffsetPx.animateTo(
+                                targetValue = 0f,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                    stiffness = Spring.StiffnessMediumLow,
+                                ),
+                            )
+                            manualTargetFeed = null
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        Modifier
+    }
+
+    fun LazyListScope.renderFeedItems(
+        pageState: TopicListUiState,
+        pagePinnedGroups: List<List<TopicListItem>>,
+        pagePlainItems: List<TopicListItem>,
+        keyPrefix: String,
+    ) {
+        pageState.error?.let { message ->
+            item(key = "${keyPrefix}_error") { ErrorNotice(message, onRefresh) }
+        }
+        if (pageState.initialLoading && pageState.items.isEmpty()) {
+            item(key = "${keyPrefix}_loading") { IosLoadingBox() }
+        }
+        if (!pageState.initialLoading && pageState.items.isEmpty() && pageState.error == null) {
+            item(key = "${keyPrefix}_empty") { EmptyNotice() }
+        }
+
+        itemsIndexed(
+            items = pagePinnedGroups,
+            key = { _, group -> "${keyPrefix}_pinned_${group.first().topic.id}" },
+        ) { _, group ->
+            val isGraphic = feedDisplayMode == "graphic"
+            val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
+            Column(modifier = Modifier.fillMaxWidth()) {
+                PinnedGroupCard(
+                    items = group,
+                    isHighlighted = group.any { it.topic.id in pageState.highlightedTopicIds },
+                    onOpenTopic = onOpenTopic,
+                    onSetNotificationLevel = onSetNotificationLevel,
+                    onCopyLink = copyTopicLink,
+                    onBookmark = bookmarkTopicAction,
+                    onFlag = flagTopicAction,
+                    showTopicUnreadDot = showTopicUnreadDot,
+                    topicUnreadDotPosition = topicUnreadDotPosition,
+                )
+                if (isCardStyle) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(3.dp)
+                            .background(IosTheme.colors.groupedBackground)
+                    )
+                } else {
+                    IosDivider(startIndent = IosMetrics.screenPadding)
+                }
+            }
+        }
+
+        itemsIndexed(
+            items = pagePlainItems,
+            key = { _, item -> "${keyPrefix}_${item.topic.id}" },
+            contentType = { _, item ->
+                when {
+                    feedDisplayMode == "graphic" -> "topic-graphic"
+                    feedDisplayMode == "no_excerpt" -> "topic-no-excerpt"
+                    item.topic.thumbnailUrlForList() != null -> "topic-with-thumbnail"
+                    else -> "topic-text"
+                }
+            },
+        ) { index, item ->
+            val isHighlighted = item.topic.id in pageState.highlightedTopicIds
+            val isGraphic = feedDisplayMode == "graphic"
+            val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
+            Column(modifier = Modifier.fillMaxWidth()) {
+                TopicRow(
+                    item = item,
+                    isHighlighted = isHighlighted,
+                    revealed = revealedTopicId == item.topic.id,
+                    onReveal = { opened -> revealedTopicId = item.topic.id.takeIf { opened } },
+                    onSetNotificationLevel = if (onSetNotificationLevel != null) { level ->
+                        onSetNotificationLevel(item.topic, level)
+                    } else null,
+                    onCopyLink = { copyTopicLink(item.topic) },
+                    onBookmark = bookmarkTopicAction?.let { fn -> { fn(item.topic) } },
+                    onFlag = flagTopicAction?.let { fn -> { fn(item.topic) } },
+                    onOpenUser = onOpenUser,
+                    onClick = { onOpenTopic(item.topic) },
+                    feedGraphicMode = isGraphic,
+                    feedDisplayMode = feedDisplayMode,
+                    showTopicUnreadDot = showTopicUnreadDot,
+                    topicUnreadDotPosition = topicUnreadDotPosition,
+                )
+                if (index < pagePlainItems.lastIndex) {
+                    if (isCardStyle) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                                .background(IosTheme.colors.groupedBackground)
+                        )
+                    } else {
+                        IosDivider(startIndent = IosMetrics.screenPadding)
+                    }
+                }
+            }
+        }
+
+        if (pageState.loadingMore) {
+            item(key = "${keyPrefix}_load_more") { IosLoadingBox() }
+        }
+    }
+
     PullToRefreshBox(
-        isRefreshing = state.refreshing,
+        isRefreshing = effectiveState.refreshing,
         onRefresh = onRefresh,
         state = pullState,
-        modifier = modifier.nestedScroll(nestedScrollConnection),
+        modifier = modifier
+            .onSizeChanged { containerWidthPx = it.width.toFloat() }
+            .then(homeFeedSwipeModifier)
+            .nestedScroll(nestedScrollConnection),
         indicator = {
             val fraction = pullState.distanceFraction
             // 初始加载时列表中央已有加载指示，这里再叠一个下拉转圈就成了两个圈。
-            if (!state.initialLoading && (state.refreshing || fraction > 0f)) {
+            if (!effectiveState.initialLoading && (effectiveState.refreshing || fraction > 0f)) {
                 Box(
                     Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = IosMetrics.navBarHeight + 10.dp)
                         .graphicsLayer {
-                            alpha = if (state.refreshing) 1f else min(1f, fraction * 1.4f)
+                            alpha = if (effectiveState.refreshing) 1f else min(1f, fraction * 1.4f)
                         },
                 ) {
                     IosActivityIndicator(diameter = 22.dp)
@@ -349,12 +693,32 @@ fun TopicListScreen(
             barsVisible = barsVisible,
             scrollToTopRequest = scrollToTopRequest,
             trailing = trailing,
+            pageOffsetXProvider = if (effectiveFeed != null) ({ feedDragOffsetPx.value }) else null,
+            secondaryListState = secondaryListState,
+            secondaryPageOffsetXProvider = if (incomingFeed != null) {
+                {
+                    val offset = feedDragOffsetPx.value
+                    if (offset < 0f) containerWidthPx + offset else -containerWidthPx + offset
+                }
+            } else null,
+            secondaryContent = if (incomingFeed != null && incomingFeedState != null) {
+                {
+                    renderFeedItems(
+                        pageState = incomingFeedState,
+                        pagePinnedGroups = incomingPinnedGroups,
+                        pagePlainItems = incomingPlainItems,
+                        keyPrefix = incomingFeed.name,
+                    )
+                }
+            } else null,
             customLargeTitle = when {
-                currentFeed != null && onFeedSelect != null -> {
+                effectiveFeed != null && onFeedSelect != null -> {
                     {
                         HomeFeedTitleBar(
-                            currentFeed = currentFeed,
-                            onFeedSelect = onFeedSelect,
+                            currentFeed = effectiveFeed,
+                            targetFeed = incomingFeed,
+                            transitionProgress = transitionProgress,
+                            onFeedSelect = animateSelectFeed,
                             trailing = trailing,
                         )
                     }
@@ -373,11 +737,13 @@ fun TopicListScreen(
                 else -> null
             },
             customCollapsedTitle = when {
-                currentFeed != null && onFeedSelect != null -> {
+                effectiveFeed != null && onFeedSelect != null -> {
                     {
                         HomeFeedCollapsedBar(
-                            currentFeed = currentFeed,
-                            onFeedSelect = onFeedSelect,
+                            currentFeed = effectiveFeed,
+                            targetFeed = incomingFeed,
+                            transitionProgress = transitionProgress,
+                            onFeedSelect = animateSelectFeed,
                         )
                     }
                 }
@@ -395,8 +761,24 @@ fun TopicListScreen(
                 else -> null
             },
             floatingOverlay = {
+                var bannerAlphaTarget by remember { mutableFloatStateOf(1f) }
+                LaunchedEffect(listState.isScrollInProgress, effectiveState.incomingTopicIds.isEmpty()) {
+                    if (listState.isScrollInProgress || effectiveState.incomingTopicIds.isEmpty()) {
+                        bannerAlphaTarget = 1f
+                    } else {
+                        delay(2000L)
+                        bannerAlphaTarget = FLOATING_BALL_IDLE_ALPHA
+                    }
+                }
+                val bannerAlpha by animateFloatAsState(
+                    targetValue = bannerAlphaTarget,
+                    animationSpec = tween(durationMillis = 300),
+                    label = "incomingBannerAlpha",
+                )
+                var lastApplyIncomingClickTime by remember { mutableLongStateOf(0L) }
+
                 AnimatedVisibility(
-                    visible = state.incomingTopicIds.isNotEmpty(),
+                    visible = effectiveState.incomingTopicIds.isNotEmpty(),
                     enter = fadeIn(tween(200)) + slideInVertically(tween(250)) { -it },
                     exit = fadeOut(tween(150)) + slideOutVertically(tween(200)) { -it },
                     modifier = Modifier
@@ -404,11 +786,16 @@ fun TopicListScreen(
                         .padding(top = if (onBack == null) 58.dp else IosMetrics.navBarHeight + 8.dp),
                 ) {
                     IncomingTopicsBanner(
-                        count = state.incomingTopicIds.size,
+                        count = effectiveState.incomingTopicIds.size,
                         onClick = {
-                            onApplyIncoming?.invoke()
-                            scope.launch { listState.animateScrollToItem(0) }
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            if (now - lastApplyIncomingClickTime > 400L) {
+                                lastApplyIncomingClickTime = now
+                                onApplyIncoming?.invoke()
+                                scope.launch { listState.animateScrollToItem(0) }
+                            }
                         },
+                        modifier = Modifier.graphicsLayer { alpha = bannerAlpha },
                     )
                 }
                 if (floatingBallEnabled && floatingBallActions.isNotEmpty()) {
@@ -422,6 +809,10 @@ fun TopicListScreen(
                         onActionClick = { action ->
                             when (action) {
                                 FloatingAction.CreateTopic -> onCreateTopic?.invoke()
+                                FloatingAction.Bookmarks -> onNavigateToBookmarks?.invoke()
+                                FloatingAction.Following -> onNavigateToFollowing?.invoke()
+                                FloatingAction.Likes -> onNavigateToLikes?.invoke()
+                                FloatingAction.Replies -> onNavigateToReplies?.invoke()
                                 FloatingAction.Sort -> showSortDialog = true
                                 FloatingAction.Drafts -> onNavigateToDrafts?.invoke()
                                 FloatingAction.Search -> onNavigateToSearch?.invoke()
@@ -481,89 +872,13 @@ fun TopicListScreen(
                 }
             },
         ) {
-            state.error?.let { message ->
-                item(key = "error") { ErrorNotice(message, onRefresh) }
-            }
-            if (state.initialLoading && state.items.isEmpty()) {
-                item(key = "loading") { IosLoadingBox() }
-            }
-            if (!state.initialLoading && state.items.isEmpty() && state.error == null) {
-                item(key = "empty") { EmptyNotice() }
-            }
-
-            val keyPrefix = currentFeed?.name ?: currentCategoryId ?: "topic"
-
-            itemsIndexed(
-                items = pinnedGroups,
-                key = { _, group -> "${keyPrefix}_pinned_${group.first().topic.id}" },
-            ) { _, group ->
-                Column {
-                    PinnedGroupCard(
-                        items = group,
-                        isHighlighted = group.any { it.topic.id in state.highlightedTopicIds },
-                        onOpenTopic = onOpenTopic,
-                        onSetNotificationLevel = onSetNotificationLevel,
-                        onCopyLink = copyTopicLink,
-                        onBookmark = bookmarkTopicAction,
-                        onFlag = flagTopicAction,
-                        showTopicUnreadDot = showTopicUnreadDot,
-                        topicUnreadDotPosition = topicUnreadDotPosition,
-                    )
-                    IosDivider(startIndent = IosMetrics.screenPadding)
-                }
-            }
-
-            itemsIndexed(
-                items = plainItems,
-                key = { _, item -> "${keyPrefix}_${item.topic.id}" },
-                contentType = { _, item ->
-                    when {
-                        feedDisplayMode == "graphic" -> "topic-graphic"
-                        item.topic.thumbnailUrlForList() != null -> "topic-with-thumbnail"
-                        else -> "topic-text"
-                    }
-                },
-            ) { index, item ->
-                val isHighlighted = item.topic.id in state.highlightedTopicIds
-                val isGraphic = feedDisplayMode == "graphic"
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    TopicRow(
-                        item = item,
-                        isHighlighted = isHighlighted,
-                        revealed = revealedTopicId == item.topic.id,
-                        onReveal = { opened -> revealedTopicId = item.topic.id.takeIf { opened } },
-                        onSetNotificationLevel = if (onSetNotificationLevel != null) { level ->
-                            onSetNotificationLevel(item.topic, level)
-                        } else null,
-                        onCopyLink = { copyTopicLink(item.topic) },
-                        onBookmark = bookmarkTopicAction?.let { fn -> { fn(item.topic) } },
-                        onFlag = flagTopicAction?.let { fn -> { fn(item.topic) } },
-                        onOpenUser = onOpenUser,
-                        onClick = { onOpenTopic(item.topic) },
-                        feedGraphicMode = isGraphic,
-                        feedDisplayMode = feedDisplayMode,
-                        onPrefetchExcerpt = onPrefetchExcerpt,
-                        showTopicUnreadDot = showTopicUnreadDot,
-                        topicUnreadDotPosition = topicUnreadDotPosition,
-                    )
-                    if (index < plainItems.lastIndex) {
-                        if (isGraphic) {
-                            Box(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .background(IosTheme.colors.groupedBackground)
-                            )
-                        } else {
-                            IosDivider(startIndent = IosMetrics.screenPadding)
-                        }
-                    }
-                }
-            }
-
-            if (state.loadingMore) {
-                item(key = "load-more") { IosLoadingBox() }
-            }
+            val keyPrefix = effectiveFeed?.name ?: currentCategoryId?.toString() ?: "topic"
+            renderFeedItems(
+                pageState = effectiveState,
+                pagePinnedGroups = pinnedGroups,
+                pagePlainItems = plainItems,
+                keyPrefix = keyPrefix,
+            )
         }
     }
 
@@ -608,14 +923,15 @@ private fun CreateTopicFab(onClick: () -> Unit) {
     val bgBase = IosTheme.colors.card.copy(alpha = 0.95f)
     val bgTint = tintColor.copy(alpha = 0.12f)
     val borderColor = tintColor.copy(alpha = 0.28f)
+    val fabShape = RoundedCornerShape(16.dp)
     Box(
         Modifier
-            .size(46.dp)
-            .shadow(elevation = 3.dp, shape = CircleShape, clip = false)
-            .clip(CircleShape)
+            .size(48.dp)
+            .shadow(elevation = 3.dp, shape = fabShape, clip = false)
+            .clip(fabShape)
             .background(bgBase)
             .background(bgTint)
-            .border(1.dp, borderColor, CircleShape)
+            .border(1.dp, borderColor, fabShape)
             .clickable(onClick = onClick)
             .semantics { contentDescription = "创建新话题" },
         contentAlignment = Alignment.Center,
@@ -1154,11 +1470,79 @@ fun PinnedGroupCard(
  * 彻底过滤掉开头自动生成的图片属性、文件名、分辨率与体积信息（如 "image1540×734 54.4 KB"、"截图... 120KB" 等），
  * 直接将真实正文字符串呈现给用户。
  */
+internal val EMOJI_SHORTCODE_MAP = mapOf(
+    "laughing" to "😆", "satisfied" to "😆", "smile" to "😄", "smiley" to "😃", "grinning" to "😀",
+    "grin" to "😁", "joy" to "😂", "rofl" to "🤣", "sweat_smile" to "😅", "wink" to "😉",
+    "blush" to "😊", "innocent" to "😇", "slight_smile" to "🙂", "upside_down_face" to "🙃",
+    "yum" to "😋", "relieved" to "😌", "heart_eyes" to "😍", "kissing_heart" to "😘",
+    "kissing" to "😗", "stuck_out_tongue_winking_eye" to "😜", "stuck_out_tongue_closed_eyes" to "😝",
+    "stuck_out_tongue" to "😛", "money_mouth_face" to "🤑", "hugs" to "🤗", "hug" to "🤗",
+    "shush" to "🤫", "thinking" to "🤔", "zipper_mouth_face" to "🤐", "face_with_raised_eyebrow" to "🤨",
+    "neutral_face" to "😐", "expressionless" to "😑", "no_mouth" to "😶", "smirk" to "😏",
+    "unamused" to "😒", "rolling_eyes" to "🙄", "grimacing" to "😬", "lying_face" to "🤥",
+    "sleepy" to "😪", "drooling_face" to "🤤", "sleeping" to "😴", "mask" to "😷",
+    "face_with_thermometer" to "🤒", "head_bandage" to "🤕", "nauseated_face" to "🤢",
+    "vomiting_face" to "🤮", "sneezing_face" to "🤧", "hot_face" to "🥵", "cold_face" to "🥶",
+    "woozy_face" to "🥴", "dizzy_face" to "😵", "exploding_head" to "🤯", "sunglasses" to "😎",
+    "nerd_face" to "🤓", "monocle_face" to "🧐", "confused" to "😕", "worried" to "😟",
+    "slight_frown" to "🙁", "frowning_face" to "☹️", "open_mouth" to "😮", "hushed" to "😯",
+    "astonished" to "😲", "flushed" to "😳", "pleading_face" to "🥺", "frowning" to "😦",
+    "anguished" to "😧", "fearful" to "😨", "cold_sweat" to "😰", "disappointed_relieved" to "😥",
+    "cry" to "😢", "sob" to "😭", "scream" to "😱", "confounded" to "😖", "persevere" to "😣",
+    "disappointed" to "😞", "sweat" to "😓", "weary" to "😩", "tired_face" to "😫",
+    "yawning_face" to "🥱", "triumph" to "😤", "rage" to "😡", "pout" to "😡", "angry" to "😠",
+    "cursing_face" to "🤬", "smiling_imp" to "😈", "imp" to "👿", "skull" to "💀", "poop" to "💩",
+    "clown_face" to "🤡", "ghost" to "👻", "alien" to "👽", "wave" to "👋", "ok_hand" to "👌",
+    "victory" to "✌️", "v" to "✌️", "+1" to "👍", "thumbsup" to "👍", "-1" to "👎", "thumbsdown" to "👎",
+    "clap" to "👏", "pray" to "🙏", "muscle" to "💪", "eyes" to "👀", "heart" to "❤️", "broken_heart" to "💔",
+    "fire" to "🔥", "100" to "💯", "tada" to "🎉", "sparkles" to "✨", "star" to "⭐", "rocket" to "🚀",
+    "salute" to "🫡", "saluting_face" to "🫡", "party" to "🥳", "partying_face" to "🥳",
+    "melting_face" to "🫠", "face_holding_back_tears" to "🥹", "handshake" to "🤝",
+    "dog" to "🐶", "cat" to "🐱", "beer" to "🍺", "beers" to "🍻", "coffee" to "☕", "tea" to "🍵",
+    "check" to "✅", "white_check_mark" to "✅", "x" to "❌", "cross_mark" to "❌",
+    "sun" to "☀️", "sunny" to "☀️", "moon" to "🌙", "rose" to "🌹", "warning" to "⚠️",
+    "pin" to "📌", "pushpin" to "📌", "red_heart" to "❤️", "sparkling_heart" to "💖",
+    "two_hearts" to "💕", "gift" to "🎁", "bulb" to "💡", "memo" to "📝", "pencil" to "📝"
+)
+
+internal val CLOSED_EMOJI_PATTERN = Regex("""(?<![a-zA-Z0-9]):([a-zA-Z0-9_\-+]+):""")
+internal val UNCLOSED_EMOJI_PATTERN = Regex("""(?<![a-zA-Z0-9]):([a-zA-Z0-9_\-+]{2,30})(?=[,\s，。！!？?；;]|\Z)""")
+
+/**
+ * 智能渲染或过滤 Discourse 表情代码（如 :laughing:, :joy:, :heart:, :+1: 以及截断的 :laughing 等）：
+ * - [keepUnknown] 为 true 时（如聊天场景），无法识别的代码保留原貌；为 false 时（如摘要场景）剔除，避免显示生硬难看的冒号字符。
+ */
+fun renderEmojiShortcodes(text: String?, keepUnknown: Boolean = false): String? {
+    if (text.isNullOrBlank()) return text
+    var res = CLOSED_EMOJI_PATTERN.replace(text) { matchResult ->
+        val code = matchResult.groupValues[1].lowercase()
+        EMOJI_SHORTCODE_MAP[code] ?: if (keepUnknown) matchResult.value else ""
+    }
+    res = UNCLOSED_EMOJI_PATTERN.replace(res) { matchResult ->
+        val code = matchResult.groupValues[1].lowercase()
+        EMOJI_SHORTCODE_MAP[code] ?: if (keepUnknown) matchResult.value else ""
+    }
+    return res
+}
+
+/** 兼容旧接口：默认过滤无法识别的代码 */
+fun renderOrFilterEmojiShortcodes(text: String?): String? = renderEmojiShortcodes(text, keepUnknown = false)
+
+/**
+ * 清洗摘要文本。
+ * 深度过滤掉各种图片占位符、相机相册自动生成的文件名、十六进制哈希、分辨率大小以及无意义的元信息；
+ * 并将 :laughing: 等表情代码自动转为真实 Emoji（未识别的表情代码自动过滤消除），保留真实有意义正文。
+ */
 internal fun cleanExcerpt(rawHtmlOrText: String?): String? {
     if (rawHtmlOrText.isNullOrBlank()) return null
     val parsed = try {
         val doc = Jsoup.parseBodyFragment(rawHtmlOrText)
-        doc.select(".lightbox-wrapper, .lightbox, .meta, .informations, .filename, img, svg, video, audio").remove()
+        doc.select(".lightbox-wrapper, .lightbox, .meta, .informations, .filename, img:not(.emoji), svg, video, audio").remove()
+        doc.select("img.emoji").forEach { img ->
+            val alt = img.attr("alt")
+            val converted = renderOrFilterEmojiShortcodes(alt).orEmpty()
+            img.replaceWith(org.jsoup.nodes.TextNode(converted))
+        }
         doc.text().trim()
     } catch (_: Exception) {
         rawHtmlOrText.trim()
@@ -1167,23 +1551,57 @@ internal fun cleanExcerpt(rawHtmlOrText: String?): String? {
     if (parsed.isEmpty()) return null
 
     var cleaned = parsed
-    val imageMetaPattern = Regex(
-        """^(?:(?:image|img|图片|截图|截屏|屏幕截图|微信截图|QQ截图|photo|screenshot|IMG_\d+|Screenshot[^\s]*|Pasted\s+image[^\s]*)\s*(?:\d{2,5}\s*[×xX*]\s*\d{2,5})?\s*(?:[\d.]+\s*(?:KB|MB|GB|B|千字节|兆字节))?|(?:[\w\-_.]+\.(?:png|jpe?g|gif|webp|bmp))\s*(?:\d{2,5}\s*[×xX*]\s*\d{2,5})?\s*(?:[\d.]+\s*(?:KB|MB|GB|B))?)\s*[,，:：、\s]*""",
-        RegexOption.IGNORE_CASE
-    )
-    val sizeOnlyPattern = Regex(
-        """^(?:\[(?:图片|image|图)\]|\d{2,5}\s*[×xX*]\s*\d{2,5}\s*(?:[\d.]+\s*(?:KB|MB|GB|B))?)\s*""",
-        RegexOption.IGNORE_CASE
+
+    // 1. 先进行 Emoji Shortcode 渲染与过滤（如 :laughing: -> 😆，未知代码过滤）
+    cleaned = renderOrFilterEmojiShortcodes(cleaned).orEmpty()
+
+    // 2. 清理占位符：[image], [图片], [图], [photo], [attachment], [video], [audio] 等（包括首部、中间、尾部）
+    cleaned = cleaned.replace(
+        Regex("""\[(?:image|img|图片|贴图|图|photo|attachment|video|audio)\]""", RegexOption.IGNORE_CASE),
+        " "
     )
 
-    var previous: String
-    do {
-        previous = cleaned
-        cleaned = cleaned.replace(imageMetaPattern, "").trim()
-        cleaned = cleaned.replace(sizeOnlyPattern, "").trim()
-    } while (cleaned != previous && cleaned.isNotEmpty())
+    // 3. 清理常见相机、相册、截图默认命名前缀及完整文件名：
+    // 如 IMG_5509, PXL_20230501, Screenshot_2023..., 微信截图_..., mmexport1234..., wx_camera_...
+    cleaned = cleaned.replace(
+        Regex("""\b(?:IMG_\d+|PXL_\d+|Screenshot[^\s]*|截屏[^\s]*|微信截图[^\s]*|QQ截图[^\s]*|mmexport\d+|wx_camera_\d+|Pasted\s+image[^\s]*)\b""", RegexOption.IGNORE_CASE),
+        " "
+    )
 
-    return cleaned.takeIf { it.isNotBlank() }
+    // 4. 清理 16~64 位的纯十六进制哈希字符串（如 MD5: E577F8EF97E51E7BAD93488ED6435DCA）与标准 UUID
+    cleaned = cleaned.replace(Regex("""\b[0-9a-fA-F]{16,64}\b"""), " ")
+    cleaned = cleaned.replace(Regex("""\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"""), " ")
+
+    // 5. 清理图片扩展名文件：xxx.png, xxx.jpg, xxx.jpeg, xxx.webp 等
+    cleaned = cleaned.replace(
+        Regex("""\b[\w\-_.]+\.(?:png|jpe?g|gif|webp|bmp|svg)\b""", RegexOption.IGNORE_CASE),
+        " "
+    )
+
+    // 6. 清理分辨率与体积元信息：image1540×734, 1920x1080, 54.4 KB, 1.2MB 等
+    cleaned = cleaned.replace(
+        Regex("""\b(?:image|img|photo|贴图)?\s*\d{2,5}\s*[×xX*]\s*\d{2,5}\b""", RegexOption.IGNORE_CASE),
+        " "
+    )
+    cleaned = cleaned.replace(
+        Regex("""\b[\d.]+\s*(?:KB|MB|GB|B|千字节|字节)\b""", RegexOption.IGNORE_CASE),
+        " "
+    )
+    cleaned = cleaned.replace(
+        Regex("""\b(?:image|img|photo|贴图)\s*\d*\b""", RegexOption.IGNORE_CASE),
+        " "
+    )
+
+    // 7. 规整空白与清理多余残留标点
+    cleaned = cleaned.replace(Regex("""\s+"""), " ").trim()
+    cleaned = cleaned.trim(',', '，', ':', '：', '|', '丨', '/', '\\', '、', '-', '—', ' ')
+
+    // 8. 必须包含字符、数字或大于 127 的符号（如中文、Emoji 等），否则认定无有效正文
+    if (cleaned.isBlank() || cleaned.none { it.isLetterOrDigit() || it.code > 127 }) {
+        return null
+    }
+
+    return cleaned
 }
 
 /**
@@ -1280,10 +1698,9 @@ fun TopicRow(
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onClick: () -> Unit,
     feedGraphicMode: Boolean = true,
-    feedDisplayMode: String = if (feedGraphicMode) "graphic" else "small_image",
+    feedDisplayMode: String = "no_excerpt",
     showTopicUnreadDot: Boolean = true,
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
-    onPrefetchExcerpt: ((Long) -> Unit)? = null,
 ) {
     var showLevelMenu by remember { mutableStateOf(false) }
     val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
@@ -1298,25 +1715,12 @@ fun TopicRow(
         topic.thumbnailUrlForList(targetWidth = 320) ?: coverImageUrl
     }
     val originalImageUrl = remember(topic.id, topic.imageUrl) { topic.originalImageUrl() }
-    val drawerWidth = with(LocalDensity.current) { 240.dp.toPx() }
-    var dragging by remember(topic.id) { mutableStateOf(false) }
-    var dragOffset by remember(topic.id) { mutableFloatStateOf(0f) }
-    val currentRevealed by rememberUpdatedState(revealed)
-    val offset by animateFloatAsState(
-        targetValue = if (dragging) dragOffset else if (revealed) -drawerWidth else 0f,
-        animationSpec = if (dragging) snap() else tween(180), label = "topic-swipe",
-    )
     val rowBackground = topicRowBackground(isHighlighted)
     val needle = query?.trim().orEmpty()
     val accent = IosTheme.colors.accent
 
     // 观察响应式真实正文（一旦预取成功或点开详情，立即自动重组刷新）
-    val realExcerpt = getTopicRealExcerpt(topic)
-    LaunchedEffect(topic.id, realExcerpt) {
-        if (realExcerpt == null && onPrefetchExcerpt != null) {
-            onPrefetchExcerpt(topic.id)
-        }
-    }
+    val realExcerpt = if (feedDisplayMode == "no_excerpt") null else getTopicRealExcerpt(topic)
 
     val excerpt = remember(realExcerpt, needle, accent) {
         val raw = realExcerpt
@@ -1337,53 +1741,183 @@ fun TopicRow(
         }
     }
     Box(Modifier.fillMaxWidth().clipToBounds()) {
-        if (onSetNotificationLevel != null && (revealed || dragging || offset < 0f)) {
-            Row(Modifier.matchParentSize(), horizontalArrangement = Arrangement.End) {
-                TopicNotificationLevel.entries.forEach { level ->
-                    Box(Modifier.width(60.dp).fillMaxHeight()
-                        .background(notificationLevelColor(level))
-                        .clickable(enabled = !item.notificationLevelUpdating) {
-                            onReveal(false)
-                            onSetNotificationLevel(level)
-                        }, contentAlignment = Alignment.Center) {
-                        Text(level.badgeLabel, style = IosTheme.type.footnote, color = Color.White)
-                    }
-                }
-            }
-        }
         val isGraphic = feedDisplayMode == "graphic"
+        val isNoExcerpt = feedDisplayMode == "no_excerpt"
+        val isCardStyle = isGraphic || isNoExcerpt
         Column(
             Modifier
                 .fillMaxWidth()
-                .graphicsLayer { translationX = offset }
-                .background(if (isHighlighted) IosTheme.colors.card.copy(alpha = 0.85f) else if (isGraphic) IosTheme.colors.card else rowBackground)
-                .then(if (onSetNotificationLevel == null) Modifier else Modifier.pointerInput(topic.id, drawerWidth, item.notificationLevelUpdating) {
-                    if (!item.notificationLevelUpdating) detectHorizontalDragGestures(
-                        onDragStart = {
-                            dragOffset = if (currentRevealed) -drawerWidth else 0f
-                            dragging = true
-                            onReveal(true)
-                        },
-                        onHorizontalDrag = { change, distance ->
-                            change.consume()
-                            dragOffset = (dragOffset + distance).coerceIn(-drawerWidth, 0f)
-                        },
-                        onDragEnd = { dragging = false; onReveal(dragOffset < -drawerWidth / 3f) },
-                        onDragCancel = { dragging = false; onReveal(false) },
-                    )
-                })
+                .background(if (isHighlighted) IosTheme.colors.card.copy(alpha = 0.85f) else if (isCardStyle) IosTheme.colors.card else rowBackground)
                 .combinedClickable(
-                    onClick = { if (revealed) onReveal(false) else onClick() },
+                    onClick = onClick,
                     onLongClick = if (hasAnyLongPress && !item.notificationLevelUpdating) {
-                        { onReveal(false); showLevelMenu = true }
+                        { showLevelMenu = true }
                     } else null,
                 )
                 .padding(
-                    horizontal = if (isGraphic) 16.dp else IosMetrics.screenPadding,
-                    vertical = if (isGraphic) 14.dp else 10.dp,
+                    horizontal = if (isCardStyle) 16.dp else IosMetrics.screenPadding,
+                    vertical = if (isCardStyle) 12.dp else 10.dp,
                 ),
         ) {
-            if (isGraphic) {
+            if (isNoExcerpt) {
+                // ── 无正文模式（微博样式）：从上到下：用户图标 -> 标题 -> 缩略图 ──
+                // 1. 用户图标与作者信息行（微博风格双行头部）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box {
+                        UserAvatar(
+                            avatarUrl = item.avatarUrl,
+                            fallbackUrl = item.staticAvatarUrl,
+                            username = item.authorUsername,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                    item.authorUsername?.let { u ->
+                                        onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                    }
+                                },
+                            cornerRadius = 16.dp,
+                        )
+                        if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && topic.unseen) {
+                            Box(
+                                Modifier
+                                    .size(7.5.dp)
+                                    .align(Alignment.TopEnd)
+                                    .offset(x = 1.dp, y = (-1).dp)
+                                    .clip(CircleShape)
+                                    .background(IosTheme.colors.card)
+                                    .padding(1.dp)
+                                    .clip(CircleShape)
+                                    .background(IosTheme.colors.accent)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = item.displayName.ifBlank { "匿名" },
+                            style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.Medium),
+                            color = IosTheme.colors.label,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                item.authorUsername?.let { u ->
+                                    onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                }
+                            },
+                        )
+                        item.trustLevel?.takeIf { it > 0 }?.let { level ->
+                            Spacer(Modifier.width(5.dp))
+                            LevelBadge(level)
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
+                            TopicNotificationLevelTag(level)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        item.category?.let { CategoryTag(it) }
+                    }
+                }
+
+                NotificationLevelMenu(
+                    expanded = showLevelMenu && hasAnyLongPress,
+                    currentLevel = item.notificationLevel,
+                    updating = item.notificationLevelUpdating,
+                    onDismiss = { showLevelMenu = false },
+                    onPick = onSetNotificationLevel,
+                    onCopyLink = onCopyLink,
+                    onBookmark = onBookmark,
+                    onFlag = onFlag,
+                )
+
+                // 2. 标题（紧随作者行，精致克制主标题，契合主流App信息流）
+                Spacer(Modifier.height(7.5.dp))
+                Text(
+                    text = titleWithBadges(
+                        topic = topic,
+                        accent = IosTheme.colors.accent,
+                        query = query,
+                        includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
+                    ),
+                    style = IosTheme.type.body.copy(
+                        fontSize = 14.6.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 20.8.sp,
+                        letterSpacing = 0.1.sp,
+                    ),
+                    color = IosTheme.colors.label,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    inlineContent = unseenDotContent(IosTheme.colors.accent),
+                )
+
+                // 3. 缩略图（如果有配图，上下微留白舒展，不团在一起）
+                val coverUrl = largeThumbnailUrl ?: smallThumbnailUrl
+                if (coverUrl != null) {
+                    Spacer(Modifier.height(11.dp))
+                    TopicThumbnailImage(
+                        thumbnailUrl = coverUrl,
+                        fallbackUrl = originalImageUrl,
+                        widthPx = 960,
+                        heightPx = 540,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.2f), RoundedCornerShape(14.dp))
+                            .background(IosTheme.colors.fieldBackground),
+                    )
+                    Spacer(Modifier.height(12.dp))
+                } else {
+                    Spacer(Modifier.height(11.dp))
+                }
+
+                // 4. 底部三等分互动栏（评论 / 浏览 / 活跃时间，舒展透气）
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceAround,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 1. 评论 (细线气泡)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ReplyGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            formatCount(topic.totalReplies),
+                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontFeatureSettings = "tnum"),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                    // 2. 浏览 (细线眼睛图标)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ViewGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            formatCount(topic.views),
+                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontFeatureSettings = "tnum"),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                    // 3. 活跃时间 (细线时钟)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ClockGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
+                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                }
+            } else if (isGraphic) {
                 // ── 图文模式：标题置顶（知乎级粗体大标题，首字平齐无毛刺） ──
                 Text(
                     text = titleWithBadges(
@@ -1392,7 +1926,12 @@ fun TopicRow(
                         query = query,
                         includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
                     ),
-                    style = IosTheme.type.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold, lineHeight = 23.5.sp),
+                    style = IosTheme.type.body.copy(
+                        fontSize = 15.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 22.sp,
+                        letterSpacing = 0.15.sp,
+                    ),
                     color = IosTheme.colors.label,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -1527,7 +2066,8 @@ fun TopicRow(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(160.dp)
-                            .clip(RoundedCornerShape(10.dp))
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.2f), RoundedCornerShape(14.dp))
                             .background(IosTheme.colors.fieldBackground),
                     )
                 }
@@ -1580,7 +2120,12 @@ fun TopicRow(
                         query = query,
                         includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
                     ),
-                    style = IosTheme.type.body.copy(fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, lineHeight = 22.sp),
+                    style = IosTheme.type.body.copy(
+                        fontSize = 15.2.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 21.5.sp,
+                        letterSpacing = 0.15.sp,
+                    ),
                     color = IosTheme.colors.label,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -1796,7 +2341,7 @@ internal val RAINBOW = listOf(
 @Composable
 fun LevelBadge(level: Int, modifier: Modifier = Modifier) {
     val isDark = IosTheme.colors.isDark
-    val shape = RoundedCornerShape(4.dp)
+    val shape = RoundedCornerShape(6.dp)
     val palette = when {
         level >= 4 -> LevelPalette(
             background = Brush.horizontalGradient(
@@ -2028,13 +2573,16 @@ internal fun formatCount(value: Int): String {
 internal fun CategoryTag(category: Category, prominent: Boolean = false) {
     val catColor = parseCategoryColor(category.color) ?: IosTheme.colors.accent
     val isDark = IosTheme.colors.isDark
-    val pillBg = catColor.copy(alpha = if (isDark) 0.20f else 0.10f)
+    val chipShape = RoundedCornerShape(8.dp)
+    val borderColor = catColor.copy(alpha = if (isDark) 0.35f else 0.22f)
+    val pillBg = catColor.copy(alpha = if (isDark) 0.16f else 0.08f)
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
-            .clip(RoundedCornerShape(4.dp))
+            .clip(chipShape)
+            .border(width = 0.75.dp, color = borderColor, shape = chipShape)
             .background(pillBg)
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+            .padding(horizontal = 7.dp, vertical = 2.5.dp),
     ) {
         Box(
             Modifier
@@ -2042,10 +2590,10 @@ internal fun CategoryTag(category: Category, prominent: Boolean = false) {
                 .clip(CircleShape)
                 .background(catColor),
         )
-        Spacer(Modifier.width(4.dp))
+        Spacer(Modifier.width(4.5.dp))
         Text(
             text = category.name,
-            style = if (prominent) IosTheme.type.body.copy(fontSize = 12.5.sp, fontWeight = FontWeight.Medium) else IosTheme.type.footnote.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+            style = if (prominent) IosTheme.type.body.copy(fontSize = 12.5.sp, fontWeight = FontWeight.Medium) else IosTheme.type.footnote.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Medium),
             color = catColor,
             maxLines = 1,
         )
@@ -2102,11 +2650,17 @@ fun parseCategoryColor(hex: String?): Color? {
 @Composable
 private fun HomeFeedTitleBar(
     currentFeed: HomeFeedType,
+    targetFeed: HomeFeedType?,
+    transitionProgress: Float,
     onFeedSelect: (HomeFeedType) -> Unit,
     trailing: @Composable () -> Unit,
 ) {
     val activeColor = IosTheme.colors.label
+    val inactiveColor = IosTheme.colors.secondaryLabel
     val indicatorColor = IosTheme.colors.accent
+    val feeds = HomeFeedType.entries
+    val tabCenters = remember { FloatArray(feeds.size) }
+    val p = transitionProgress.coerceIn(0f, 1f)
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -2117,34 +2671,53 @@ private fun HomeFeedTitleBar(
         Row(
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(22.dp),
+            modifier = Modifier.drawWithContent {
+                drawContent()
+                val curIdx = currentFeed.ordinal
+                val curCenter = tabCenters[curIdx]
+                if (curCenter > 0f) {
+                    val dstIdx = (targetFeed ?: currentFeed).ordinal
+                    val dstCenter = tabCenters[dstIdx].takeIf { it > 0f } ?: curCenter
+                    val center = curCenter + (dstCenter - curCenter) * p
+                    val baseWidth = 18.dp.toPx()
+                    val stretch = min(abs(dstCenter - curCenter) * 0.35f, 16.dp.toPx()) *
+                        sin(p * Math.PI.toFloat())
+                    val indicatorWidth = baseWidth + stretch
+                    val indicatorHeight = 3.dp.toPx()
+                    val topY = size.height - 2.dp.toPx() - indicatorHeight
+                    drawRoundRect(
+                        color = indicatorColor,
+                        topLeft = Offset(center - indicatorWidth / 2f, topY),
+                        size = Size(indicatorWidth, indicatorHeight),
+                        cornerRadius = CornerRadius(indicatorHeight / 2f, indicatorHeight / 2f),
+                    )
+                }
+            },
         ) {
-            HomeFeedType.entries.forEach { feed ->
-                val selected = feed == currentFeed
+            feeds.forEachIndexed { index, feed ->
+                val weight = when {
+                    targetFeed != null && targetFeed != currentFeed && feed == currentFeed -> 1f - p
+                    targetFeed != null && targetFeed != currentFeed && feed == targetFeed -> p
+                    feed == currentFeed -> 1f
+                    else -> 0f
+                }
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
+                        .onGloballyPositioned { coords ->
+                            tabCenters[index] = coords.positionInParent().x + coords.size.width / 2f
+                        }
                         .clip(RoundedCornerShape(6.dp))
                         .clickable { onFeedSelect(feed) }
                         .padding(horizontal = 4.dp, vertical = 2.dp),
                 ) {
                     Text(
                         text = feed.label,
-                        fontSize = if (selected) 17.5.sp else 15.sp,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selected) activeColor else IosTheme.colors.secondaryLabel,
+                        fontSize = (15f + 2.5f * weight).sp,
+                        fontWeight = if (weight >= 0.5f) FontWeight.Bold else FontWeight.Normal,
+                        color = lerp(inactiveColor, activeColor, weight),
                     )
-                    Spacer(Modifier.height(4.dp))
-                    if (selected) {
-                        Box(
-                            modifier = Modifier
-                                .width(18.dp)
-                                .height(3.dp)
-                                .clip(RoundedCornerShape(1.5.dp))
-                                .background(indicatorColor),
-                        )
-                    } else {
-                        Spacer(Modifier.height(3.dp))
-                    }
+                    Spacer(Modifier.height(7.dp))
                 }
             }
         }
@@ -2154,10 +2727,16 @@ private fun HomeFeedTitleBar(
 @Composable
 private fun HomeFeedCollapsedBar(
     currentFeed: HomeFeedType,
+    targetFeed: HomeFeedType?,
+    transitionProgress: Float,
     onFeedSelect: (HomeFeedType) -> Unit,
 ) {
     val activeColor = IosTheme.colors.label
+    val inactiveColor = IosTheme.colors.secondaryLabel
     val indicatorColor = IosTheme.colors.accent
+    val feeds = HomeFeedType.entries
+    val tabCenters = remember { FloatArray(feeds.size) }
+    val p = transitionProgress.coerceIn(0f, 1f)
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = Alignment.Center,
@@ -2165,34 +2744,53 @@ private fun HomeFeedCollapsedBar(
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(20.dp),
+            modifier = Modifier.drawWithContent {
+                drawContent()
+                val curIdx = currentFeed.ordinal
+                val curCenter = tabCenters[curIdx]
+                if (curCenter > 0f) {
+                    val dstIdx = (targetFeed ?: currentFeed).ordinal
+                    val dstCenter = tabCenters[dstIdx].takeIf { it > 0f } ?: curCenter
+                    val center = curCenter + (dstCenter - curCenter) * p
+                    val baseWidth = 16.dp.toPx()
+                    val stretch = min(abs(dstCenter - curCenter) * 0.35f, 14.dp.toPx()) *
+                        sin(p * Math.PI.toFloat())
+                    val indicatorWidth = baseWidth + stretch
+                    val indicatorHeight = 2.5.dp.toPx()
+                    val topY = size.height - 2.dp.toPx() - indicatorHeight
+                    drawRoundRect(
+                        color = indicatorColor,
+                        topLeft = Offset(center - indicatorWidth / 2f, topY),
+                        size = Size(indicatorWidth, indicatorHeight),
+                        cornerRadius = CornerRadius(indicatorHeight / 2f, indicatorHeight / 2f),
+                    )
+                }
+            },
         ) {
-            HomeFeedType.entries.forEach { feed ->
-                val selected = feed == currentFeed
+            feeds.forEachIndexed { index, feed ->
+                val weight = when {
+                    targetFeed != null && targetFeed != currentFeed && feed == currentFeed -> 1f - p
+                    targetFeed != null && targetFeed != currentFeed && feed == targetFeed -> p
+                    feed == currentFeed -> 1f
+                    else -> 0f
+                }
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
+                        .onGloballyPositioned { coords ->
+                            tabCenters[index] = coords.positionInParent().x + coords.size.width / 2f
+                        }
                         .clip(RoundedCornerShape(6.dp))
                         .clickable { onFeedSelect(feed) }
                         .padding(horizontal = 4.dp, vertical = 2.dp),
                 ) {
                     Text(
                         text = feed.label,
-                        fontSize = if (selected) 15.5.sp else 14.sp,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selected) activeColor else IosTheme.colors.secondaryLabel,
+                        fontSize = (14f + 1.5f * weight).sp,
+                        fontWeight = if (weight >= 0.5f) FontWeight.Bold else FontWeight.Normal,
+                        color = lerp(inactiveColor, activeColor, weight),
                     )
-                    Spacer(Modifier.height(2.dp))
-                    if (selected) {
-                        Box(
-                            modifier = Modifier
-                                .width(16.dp)
-                                .height(2.5.dp)
-                                .clip(RoundedCornerShape(1.25.dp))
-                                .background(indicatorColor),
-                        )
-                    } else {
-                        Spacer(Modifier.height(2.5.dp))
-                    }
+                    Spacer(Modifier.height(4.5.dp))
                 }
             }
         }
@@ -2402,9 +3000,10 @@ private fun DropdownChevronGlyph(
 fun IncomingTopicsBanner(
     count: Int,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .padding(horizontal = 20.dp, vertical = 4.dp)
             .shadow(
                 elevation = 8.dp,
@@ -2444,12 +3043,21 @@ fun TopicNotificationLevelTag(
 ) {
     if (level == TopicNotificationLevel.Regular) return
     val color = notificationLevelColor(level)
-    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(7.dp).background(color, CircleShape))
-        Spacer(Modifier.width(5.dp))
+    val isDark = IosTheme.colors.isDark
+    val chipShape = RoundedCornerShape(8.dp)
+    Row(
+        modifier = modifier
+            .clip(chipShape)
+            .border(0.75.dp, color.copy(alpha = if (isDark) 0.35f else 0.22f), chipShape)
+            .background(color.copy(alpha = if (isDark) 0.16f else 0.08f))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(5.dp).background(color, CircleShape))
+        Spacer(Modifier.width(4.5.dp))
         Text(
             text = level.badgeLabel,
-            style = IosTheme.type.footnote,
+            style = IosTheme.type.footnote.copy(fontSize = 11.5.sp),
             color = color,
             fontWeight = FontWeight.Medium,
             maxLines = 1,
@@ -2621,6 +3229,8 @@ private fun TopicFlagDialog(
     }
 }
 
+private const val FLOATING_BALL_IDLE_ALPHA = 0.18f
+
 /**
  * 辅助悬浮按钮设计方案（单功能直达 / 多功能伞型自适应展开，支持自由拖拽与边缘吸附记忆）。
  */
@@ -2685,7 +3295,7 @@ private fun FloatingAssistiveBall(
 
         // 静止淡出透明度：未交互时近乎透明（0.18f），触碰、拖拽或展开时平滑升为 1.0f，绝不遮挡阅读
         val idleAlpha by animateFloatAsState(
-            targetValue = if (isExpanded || isDragging) 1f else 0.18f,
+            targetValue = if (isExpanded || isDragging) 1f else FLOATING_BALL_IDLE_ALPHA,
             animationSpec = tween(220),
             label = "fabIdleAlpha",
         )
@@ -2762,10 +3372,15 @@ private fun FloatingAssistiveBall(
 
         // 4. 展开的子按钮群（四象限智能朝向：右上向左下，右下向左上，左上向右下，左下向右上）
         if (!isSingle && expandProgress > 0.01f) {
-            val subRadiusPx = with(density) { 142.dp.toPx() } * expandProgress
+            val count = actions.size
+            val subRadiusDp = when {
+                count >= 8 -> 168.dp
+                count >= 6 -> 154.dp
+                else -> 142.dp
+            }
+            val subRadiusPx = with(density) { subRadiusDp.toPx() } * expandProgress
             val subBallSize = 42.dp
             val subBallSizePx = with(density) { subBallSize.toPx() }
-            val count = actions.size
 
             val startAngle = if (isRightSide) {
                 if (needExpandDownward) 184.0 else 84.0
@@ -2959,6 +3574,10 @@ private fun FloatingAssistiveBall(
 /** 辅助悬浮按钮各功能的柔和雅致专属配色（低饱和度，对齐系统级设计图）。 */
 private fun floatingActionColor(action: FloatingAction): Color = when (action) {
     FloatingAction.CreateTopic -> Color(0xFFF06A55) // 暖珊瑚西柚橙
+    FloatingAction.Bookmarks -> Color(0xFFFAAD14)   // 典雅琥珀金
+    FloatingAction.Following -> Color(0xFF2979FF)   // 皇家明亮蓝
+    FloatingAction.Likes -> Color(0xFFFF4D4F)       // 活力点赞红
+    FloatingAction.Replies -> Color(0xFF00BFA5)     // 翠湖薄荷青
     FloatingAction.Sort -> Color(0xFF2196F3)        // 纯净主题天蓝
     FloatingAction.Drafts -> Color(0xFF8C9BB0)      // 雅致灰紫蓝
     FloatingAction.Search -> Color(0xFF68A398)      // 柔和灰海青
@@ -2992,6 +3611,70 @@ private fun FloatingActionIcon(
                     drawPath(pen, tint, style = stroke)
                     drawLine(tint, Offset(13.5f, 7f), Offset(17f, 10.5f), strokeWidth = 1.9f, cap = StrokeCap.Round)
                     drawLine(tint, Offset(12.5f, 20f), Offset(20f, 20f), strokeWidth = 1.9f, cap = StrokeCap.Round)
+                }
+                FloatingAction.Bookmarks -> {
+                    // 燕尾书签 🔖
+                    val bookmark = Path().apply {
+                        moveTo(6.5f, 4.5f)
+                        lineTo(17.5f, 4.5f)
+                        lineTo(17.5f, 19.5f)
+                        lineTo(12f, 15.5f)
+                        lineTo(6.5f, 19.5f)
+                        close()
+                    }
+                    drawPath(bookmark, tint, style = stroke)
+                    drawLine(tint, Offset(9.5f, 9.5f), Offset(14.5f, 9.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                }
+                FloatingAction.Following -> {
+                    // 关注用户群组人像 👤⁺
+                    drawCircle(tint, 3.2f, Offset(9f, 7.5f), style = stroke)
+                    val shoulder = Path().apply {
+                        moveTo(3.5f, 19.5f)
+                        cubicTo(3.5f, 15f, 6.5f, 13.5f, 9f, 13.5f)
+                        cubicTo(11.5f, 13.5f, 14.5f, 15f, 14.5f, 19.5f)
+                    }
+                    drawPath(shoulder, tint, style = stroke)
+                    drawLine(tint, Offset(18.5f, 8f), Offset(18.5f, 14f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    drawLine(tint, Offset(15.5f, 11f), Offset(21.5f, 11f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                }
+                FloatingAction.Likes -> {
+                    // 竖大拇指点赞 👍
+                    val thumb = Path().apply {
+                        moveTo(4.5f, 12f)
+                        lineTo(4.5f, 19.5f)
+                        lineTo(7.5f, 19.5f)
+                        lineTo(7.5f, 12f)
+                        close()
+                    }
+                    drawPath(thumb, tint, style = stroke)
+                    val palm = Path().apply {
+                        moveTo(7.5f, 13f)
+                        lineTo(10.5f, 11f)
+                        lineTo(12.5f, 4.5f)
+                        cubicTo(13.2f, 3.5f, 14.5f, 3.5f, 15f, 4.5f)
+                        cubicTo(15.2f, 5.5f, 14.2f, 8f, 13.5f, 10.5f)
+                        lineTo(17.5f, 10.5f)
+                        cubicTo(19f, 10.5f, 19.5f, 11.5f, 19.5f, 12.8f)
+                        lineTo(19f, 17f)
+                        cubicTo(18.8f, 18.2f, 17.8f, 19.5f, 16.5f, 19.5f)
+                        lineTo(7.5f, 19.5f)
+                    }
+                    drawPath(palm, tint, style = stroke)
+                }
+                FloatingAction.Replies -> {
+                    // 弯曲回折回复 ↩️
+                    val reply = Path().apply {
+                        moveTo(18.5f, 18f)
+                        cubicTo(18.5f, 11.5f, 14.5f, 8.5f, 9.5f, 8.5f)
+                    }
+                    drawPath(reply, tint, style = stroke)
+                    val arrowHead = Path().apply {
+                        moveTo(13.5f, 5f)
+                        lineTo(9f, 8.5f)
+                        lineTo(13.5f, 12f)
+                    }
+                    drawPath(arrowHead, tint, style = stroke)
+                    drawLine(tint, Offset(5f, 19.5f), Offset(19f, 19.5f), strokeWidth = 1.9f, cap = StrokeCap.Round)
                 }
                 FloatingAction.Sort -> {
                     // 垂直双向箭头 ⇅

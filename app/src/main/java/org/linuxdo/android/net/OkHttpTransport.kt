@@ -98,7 +98,9 @@ class OkHttpTransport(
         withContext(Dispatchers.Main) { store.syncFromWebView() }
         val targetUrl = if (path.startsWith("http://") || path.startsWith("https://")) path else Config.BASE_URL + path
         val isConnect = targetUrl.contains("connect.linux.do")
-        val acceptHeader = if (isConnect) {
+        val acceptHeader = if (path.startsWith("/raw/")) {
+            "text/plain"
+        } else if (isConnect) {
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
         } else if (path.endsWith(".json") || !path.startsWith("http")) {
             "application/json"

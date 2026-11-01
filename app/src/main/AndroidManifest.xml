@@ -102,6 +102,13 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="discourse" android:host="auth_redirect" />
             </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="linux.do" android:pathPrefix="/t" />
+                <data android:scheme="http" android:host="linux.do" android:pathPrefix="/t" />
+            </intent-filter>
         </activity>
     </application>
 

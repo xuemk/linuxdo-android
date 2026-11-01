@@ -10,6 +10,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.onSizeChanged
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.drop
+import kotlin.math.abs
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,6 +39,17 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -108,11 +127,22 @@ import androidx.compose.ui.unit.LayoutDirection
 import android.graphics.drawable.ColorDrawable
 import android.view.WindowManager
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -167,6 +197,8 @@ import org.linuxdo.android.data.TreePost
 import org.linuxdo.android.data.DEFAULT_SUB_REPLY_LIMIT
 import org.linuxdo.android.data.threadRows
 import org.linuxdo.android.data.postAncestorIds
+import org.linuxdo.android.data.InternalTopicLink
+import org.linuxdo.android.data.parseInternalTopicUrl
 import org.linuxdo.android.ui.IosTextAction
 import org.linuxdo.android.ui.ComposerTarget
 import org.linuxdo.android.ui.ComposerUiState
@@ -205,6 +237,19 @@ private data class AuthorFilterItem(
     val isOp: Boolean,
     val postCount: Int,
 )
+
+private data class ReadingFloorIndicator(
+    val rootFloor: Int,
+    val subFloor: Int? = null,
+    val total: Int,
+) {
+    val displayLabel: String
+        get() = if (subFloor != null && subFloor != rootFloor) {
+            "$rootFloor·$subFloor / $total"
+        } else {
+            "$rootFloor / $total"
+        }
+}
 
 private class CopyInterceptingTextToolbar(
     private val delegate: androidx.compose.ui.platform.TextToolbar,
@@ -252,7 +297,7 @@ private data class BoostTarget(
     val username: String,
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun TopicDetailScreen(
     title: String,
@@ -284,12 +329,16 @@ fun TopicDetailScreen(
     onRefresh: () -> Unit = {},
     onToggleOrder: () -> Unit = {},
     onOpenTopic: (Long, String, Int?) -> Unit = { _, _, _ -> },
+    onJumpToFloor: (Int) -> Unit = {},
     active: Boolean = true,
     signedIn: Boolean = false,
     showUnreadDot: Boolean = true,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     initialPostNumber: Int? = null,
     onPostsVisible: (List<Int>) -> Unit = {},
+    onLiveViewport: (Boolean, Boolean) -> Unit = { _, _ -> },
+    syncReadProgress: Boolean = true,
+    onScrolled: () -> Unit = {},
     onOverlayActive: (Boolean) -> Unit = {},
     onSetNotificationLevel: (TopicNotificationLevel) -> Unit = {},
     onToggleBookmark: (Post) -> Unit = {},
@@ -308,11 +357,15 @@ fun TopicDetailScreen(
     val scope = rememberCoroutineScope()
     val textToolbar = LocalTextToolbar.current
     var selectionResetKey by remember { mutableIntStateOf(0) }
-    var picture by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var pictureGallery by remember { mutableStateOf<Pair<List<ImageViewerItem>, Int>?>(null) }
     var collapsed by rememberSaveable { mutableStateOf(emptyList<Long>()) }
     var expanded by rememberSaveable { mutableStateOf(emptyList<Long>()) }
-    var located by rememberSaveable(initialPostNumber, state.locateVersion) { mutableStateOf(initialPostNumber == null) }
+    val locateTarget = state.locatePostNumber ?: initialPostNumber
+    val explicitLocateVersion = if (state.locatePostNumber != null) state.locateVersion else 0
+    var located by rememberSaveable(locateTarget, explicitLocateVersion) { mutableStateOf(locateTarget == null) }
     var highlightedPost by remember { mutableStateOf<Long?>(null) }
+    var showJumpBar by remember { mutableStateOf(false) }
+    var pendingTargetFloor by rememberSaveable { mutableStateOf<Int?>(null) }
     var manageTarget by remember { mutableStateOf<Post?>(null) }
     var deleteTarget by remember { mutableStateOf<Post?>(null) }
     var boostTarget by remember { mutableStateOf<BoostTarget?>(null) }
@@ -349,8 +402,8 @@ fun TopicDetailScreen(
         clipboardManager.setText(AnnotatedString(url))
         noticeToast = "链接已复制到剪贴板"
     }
-    val overlayActive = composer.open || boostTarget != null || picture != null ||
-        manageTarget != null || deleteTarget != null || state.flagDialogPost != null
+    val overlayActive = composer.open || boostTarget != null || pictureGallery != null ||
+        manageTarget != null || deleteTarget != null || state.flagDialogPost != null || browserUrl != null
     LaunchedEffect(overlayActive) {
         onOverlayActive(overlayActive)
     }
@@ -420,15 +473,19 @@ fun TopicDetailScreen(
         }
     }
     val nearEnd by remember { derivedStateOf {
-        (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 3
+        (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 6
     } }
     LaunchedEffect(active, nearEnd, state.loading, state.consumedIds.size, state.error, located) {
         if (active && located && nearEnd && !state.loading && state.error == null &&
-            state.posts.isNotEmpty() && state.remaining.isNotEmpty()) onLoadMore()
+            state.posts.isNotEmpty() && state.remaining.any { it !in state.realtimePostIds }) onLoadMore()
     }
-    // 真实屏幕可见楼层提取（依据 Discourse screen-track.js 规范，仅上报在屏幕上可见的楼层号）
+    // 真实屏幕可见楼层提取（对齐 Fluxdo 与 Discourse screen-track.js：只要帖子与视口有交集即计入可见）
     val visiblePostNumbers by remember(rows) { derivedStateOf {
-        val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
+        val layout = list.layoutInfo
+        val visibleIds = layout.visibleItemsInfo.filter { item ->
+            val overlap = minOf(item.offset + item.size, layout.viewportEndOffset) - maxOf(item.offset, layout.viewportStartOffset)
+            overlap > 0
+        }.mapNotNull { it.key as? Long }.toSet()
         rows.filter { it.post.id in visibleIds }.map { it.post.postNumber }
     } }
     val currentPostNumber by remember(rows, visiblePostNumbers) { derivedStateOf {
@@ -438,22 +495,65 @@ fun TopicDetailScreen(
     val firstPostVisible by remember(list, firstPostId) {
         derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { it.key == firstPostId } }
     }
-    LaunchedEffect(visiblePostNumbers) {
-        if (visiblePostNumbers.isNotEmpty()) {
-            onPostsVisible(visiblePostNumbers)
-        }
+    LaunchedEffect(visiblePostNumbers, active) {
+        onPostsVisible(if (active) visiblePostNumbers else emptyList())
     }
-    // 本次打开期间已看过的楼层:仅本地内存,与阅读进度上报解耦,不产生任何请求。
+    val currentOnScrolled by rememberUpdatedState(onScrolled)
+    LaunchedEffect(topicId, active) {
+        if (active) snapshotFlow { list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset }
+            .drop(1).collect { currentOnScrolled() }
+    }
+    // 关闭同步时按本地停留淡出；开启同步时只接受上报成功回执或服务端已读字段。
     var sessionReadPosts by remember(topicId) { mutableStateOf(emptySet<Int>()) }
-    LaunchedEffect(visiblePostNumbers, active, showUnreadDot) {
-        if (!active || !showUnreadDot) return@LaunchedEffect
+    LaunchedEffect(visiblePostNumbers, active, showUnreadDot, syncReadProgress) {
+        if (!active || !showUnreadDot || syncReadProgress) return@LaunchedEffect
         val pending = visiblePostNumbers.filter { it !in sessionReadPosts }
         if (pending.isEmpty()) return@LaunchedEffect
         // 停留一小会儿才算读过,避免飞速滑过时蓝点一闪而没、用户根本没看清。
         delay(UNREAD_DOT_DWELL_MS)
         sessionReadPosts = sessionReadPosts + pending
     }
-    val totalPosts = state.topic?.postStream?.stream?.size ?: 0
+    val totalPosts = maxOf(state.topic?.postsCount ?: 0, state.topic?.postStream?.stream?.size ?: 0)
+    val maxRootFloor = remember(rows, treeView) {
+        if (treeView) rows.filter { it.depth == 0 }.maxOfOrNull { it.post.postNumber } else null
+    }
+    val effectiveFloorTotal = remember(totalPosts, maxRootFloor, state.remaining.isEmpty(), treeView) {
+        if (treeView && state.remaining.isEmpty() && maxRootFloor != null && maxRootFloor > 0) {
+            maxRootFloor
+        } else {
+            totalPosts
+        }
+    }
+    val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView) {
+        derivedStateOf {
+            val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
+            val visibleRows = rows.filter { it.post.id in visibleIds }
+            if (visibleRows.isEmpty()) {
+                val first = rows.firstOrNull()?.post?.postNumber ?: 1
+                ReadingFloorIndicator(rootFloor = first, subFloor = null, total = effectiveFloorTotal)
+            } else {
+                val activeRow = visibleRows.last()
+                val rootPost = if (activeRow.depth == 0) {
+                    activeRow.post
+                } else {
+                    rows.firstOrNull { it.post.id == activeRow.rootPostId }?.post ?: activeRow.post
+                }
+                val rootFloor = rootPost.postNumber
+                if (treeView) {
+                    // 楼中楼模式: 严格只展示主楼层数，不显示子回复层号
+                    ReadingFloorIndicator(rootFloor = rootFloor, subFloor = null, total = effectiveFloorTotal)
+                } else {
+                    val sub = if (activeRow.post.postNumber != rootFloor) activeRow.post.postNumber else null
+                    ReadingFloorIndicator(rootFloor = rootFloor, subFloor = sub, total = effectiveFloorTotal)
+                }
+            }
+        }
+    }
+    LaunchedEffect(list.isScrollInProgress) {
+        if (list.isScrollInProgress && showJumpBar) {
+            showJumpBar = false
+        }
+    }
     val firstPostLoaded = state.posts.any { it.postNumber == 1 }
     val showTopError = !located || state.failedLoad == DetailLoad.Previous
     val canReply = state.topic?.canReply == true
@@ -495,6 +595,24 @@ fun TopicDetailScreen(
         return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
     }
 
+    val latestEdgeVisible = if (state.descending) list.firstVisibleItemIndex <= lazyIndexOf(headRows.size)
+        else !list.canScrollForward
+    LaunchedEffect(active, latestEdgeVisible, list.isScrollInProgress, state.filterUserId) {
+        onLiveViewport(active && latestEdgeVisible && state.filterUserId == null, list.isScrollInProgress)
+    }
+    // 在同一轮布局前按原楼层 key 与像素偏移恢复锚点；树状回复和倒序插入也不跳位置。
+    var anchoredRealtimeVersion by remember { mutableIntStateOf(state.realtimeVersion) }
+    if (anchoredRealtimeVersion != state.realtimeVersion) {
+        val firstIndex = list.firstVisibleItemIndex
+        val anchorId = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }?.key as? Long
+        val anchorRow = rows.indexOfFirst { it.post.id == anchorId }
+        val offset = list.firstVisibleItemScrollOffset
+        SideEffect {
+            anchoredRealtimeVersion = state.realtimeVersion
+            if (anchorRow >= 0 && !list.isScrollInProgress) list.requestScrollToItem(lazyIndexOf(anchorRow), offset)
+        }
+    }
+
     LaunchedEffect(pendingTocJump, rows) {
         val target = pendingTocJump ?: return@LaunchedEffect
         val index = rows.indexOfFirst { it.post.id == target.postId }
@@ -528,6 +646,54 @@ fun TopicDetailScreen(
         }
     }
 
+    val performJumpToFloor: (Int) -> Unit = performJumpToFloor@{ targetFloor ->
+        val clamped = targetFloor.coerceIn(1, effectiveFloorTotal)
+        if (treeView) {
+            // 楼中楼模式: 目标只对齐到主楼(depth == 0)
+            val rootRows = rows.filter { it.depth == 0 }
+            val directHit = rootRows.firstOrNull { it.post.postNumber == clamped }
+            if (directHit != null) {
+                scope.launch {
+                    val targetIdx = rows.indexOfFirst { it.post.id == directHit.post.id }
+                    if (targetIdx >= 0) {
+                        list.animateScrollToItem(lazyIndexOf(targetIdx))
+                        highlightedPost = directHit.post.id
+                    }
+                }
+                return@performJumpToFloor
+            }
+            val localPost = state.posts.firstOrNull { it.postNumber == clamped }
+            if (localPost != null) {
+                // 如果命中且是子回复，对齐到离目标楼层最近的一级主楼
+                val matchedLocal = rootRows.minByOrNull { kotlin.math.abs(it.post.postNumber - clamped) }
+                val effectiveTarget = matchedLocal?.post ?: localPost
+                scope.launch {
+                    val targetIdx = rows.indexOfFirst { it.post.id == effectiveTarget.id }
+                    if (targetIdx >= 0) {
+                        list.animateScrollToItem(lazyIndexOf(targetIdx))
+                        highlightedPost = effectiveTarget.id
+                    }
+                }
+                return@performJumpToFloor
+            }
+        } else {
+            val localTarget = state.posts.firstOrNull { it.postNumber == clamped }
+            if (localTarget != null) {
+                scope.launch {
+                    val targetIdx = rows.indexOfFirst { it.post.postNumber == clamped }
+                    if (targetIdx >= 0) {
+                        list.animateScrollToItem(lazyIndexOf(targetIdx))
+                        highlightedPost = localTarget.id
+                    }
+                }
+                return@performJumpToFloor
+            }
+        }
+        // 远端抢占式跳转: 移除 !state.loading 阻断，即刻响应用户操作
+        pendingTargetFloor = clamped
+        onJumpToFloor(clamped)
+    }
+
     // 切换正/倒序后把视口带回评论区头部,否则用户会停在原先的滚动偏移上、看不出顺序变了。
     var lastDescending by remember { mutableStateOf(state.descending) }
     LaunchedEffect(state.descending, state.loading, rows) {
@@ -539,40 +705,53 @@ fun TopicDetailScreen(
         list.scrollToItem(1 + topErrorCount + headRows.size)
     }
 
-    LaunchedEffect(active, initialPostNumber, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty(), state.locateVersion) {
-        if (active && !located && !state.loading && state.error == null && initialPostNumber != null) {
+    LaunchedEffect(active, locateTarget, pendingTargetFloor, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty(), explicitLocateVersion) {
+        val targetLocateNumber = pendingTargetFloor ?: locateTarget
+        val needLocate = (!located && locateTarget != null) || pendingTargetFloor != null
+        if (active && needLocate && !state.loading && state.error == null && targetLocateNumber != null) {
             // 目标楼层可能已被删除(抽楼)或超出当前加载范围。此时不能直接 return，
             // 否则 located 永远为 false，会连带锁死倒序切换等依赖它的逻辑。
             // 降级为「第一个不小于目标楼层的可见楼层」，再不行就按帖子顺序找最近的一层。
-            val target = state.posts.firstOrNull { it.postNumber == initialPostNumber }
-                ?: state.posts.firstOrNull { it.postNumber >= initialPostNumber }
-                ?: state.posts.minByOrNull { kotlin.math.abs(it.postNumber - initialPostNumber) }
-                ?: run { located = true; return@LaunchedEffect }
-            val anchorPostNumber = target.postNumber
-            if (treeView) {
-                val ancestors = postAncestorIds(state.posts, anchorPostNumber)
-                val needUncollapse = collapsed.any { it in ancestors }
-                val needExpand = ancestors.any { it !in expanded }
-                if (needUncollapse || needExpand) {
-                    if (needUncollapse) collapsed = collapsed.filterNot { it in ancestors }
-                    if (needExpand) expanded = (expanded + ancestors).distinct()
-                    // 关键修复：不再 return，等待两帧让 rows 因 collapsed/expanded 变化而重新计算
-                    withFrameNanos { }
-                    withFrameNanos { }
-                }
-            }
-            // 展开或无需展开，继续执行滚动定位（不论是否展开过父楼层）
-            val index = rows.indexOfFirst { it.post.postNumber == anchorPostNumber }
-            if (index >= 0) {
-                list.scrollToItem(lazyIndexOf(index))
-                withFrameNanos { }
-                if (list.layoutInfo.visibleItemsInfo.none { it.key == target.id }) {
+            val target = state.posts.firstOrNull { it.postNumber == targetLocateNumber }
+                ?: state.posts.firstOrNull { it.postNumber >= targetLocateNumber }
+                ?: state.posts.minByOrNull { kotlin.math.abs(it.postNumber - targetLocateNumber) }
+                ?: run { located = true; pendingTargetFloor = null; return@LaunchedEffect }
+            val isUserJump = pendingTargetFloor != null
+            if (treeView && isUserJump) {
+                // 楼中楼模式下的用户手动跳转: 严格对齐到主楼(depth == 0), 绝不跳进子回复层
+                val rootTargetRow = rows.filter { it.depth == 0 }.minByOrNull { kotlin.math.abs(it.post.postNumber - target.postNumber) }
+                val effectivePost = rootTargetRow?.post ?: target
+                val index = rows.indexOfFirst { it.post.id == effectivePost.id }
+                if (index >= 0) {
                     list.scrollToItem(lazyIndexOf(index))
+                    highlightedPost = effectivePost.id
                 }
-                highlightedPost = target.id
+            } else {
+                val anchorPostNumber = target.postNumber
+                if (treeView) {
+                    val ancestors = postAncestorIds(state.posts, anchorPostNumber)
+                    val needUncollapse = collapsed.any { it in ancestors }
+                    val needExpand = ancestors.any { it !in expanded }
+                    if (needUncollapse || needExpand) {
+                        if (needUncollapse) collapsed = collapsed.filterNot { it in ancestors }
+                        if (needExpand) expanded = (expanded + ancestors).distinct()
+                        withFrameNanos { }
+                        withFrameNanos { }
+                    }
+                }
+                val index = rows.indexOfFirst { it.post.postNumber == anchorPostNumber }
+                if (index >= 0) {
+                    list.scrollToItem(lazyIndexOf(index))
+                    withFrameNanos { }
+                    if (list.layoutInfo.visibleItemsInfo.none { it.key == target.id }) {
+                        list.scrollToItem(lazyIndexOf(index))
+                    }
+                    if (isUserJump) highlightedPost = target.id
+                }
             }
             // 无论是否滚动成功都终结定位，避免状态悬挂。
             located = true
+            pendingTargetFloor = null
         }
     }
 
@@ -621,28 +800,9 @@ fun TopicDetailScreen(
         }
     }
 
-    // 发完回复一步到位直接定格在新楼层并高亮（与 Web 端渲染完直达底部体验一致，不做长距离逐层滚动动画）。
-    LaunchedEffect(state.createdPostId, state.posts, rows, treeView) {
-        val created = state.createdPostId ?: return@LaunchedEffect
-        val createdPost = state.posts.firstOrNull { it.id == created }
-        if (treeView && createdPost != null) {
-            val ancestors = postAncestorIds(state.posts, createdPost.postNumber)
-            val needUncollapse = collapsed.any { it in ancestors }
-            val needExpand = ancestors.any { it !in expanded }
-            if (needUncollapse || needExpand) {
-                if (needUncollapse) collapsed = collapsed.filterNot { it in ancestors }
-                if (needExpand) expanded = (expanded + ancestors).distinct()
-                return@LaunchedEffect
-            }
-        }
-        val index = rows.indexOfFirst { it.post.id == created }
-        if (index < 0) return@LaunchedEffect
-        highlightedPost = created
-        try {
-            list.scrollToItem(lazyIndexOf(index))
-        } finally {
-            onCreatedPostShown()
-        }
+    // 发布后的状态收尾不改变视口，也不自动高亮新回复。
+    LaunchedEffect(state.createdPostId) {
+        if (state.createdPostId != null) onCreatedPostShown()
     }
 
     @Composable
@@ -650,7 +810,8 @@ fun TopicDetailScreen(
         val post = row.post
         val isTopicAuthor = topicAuthorUsername != null && post.username == topicAuthorUsername
         val unreadDotVisible = showUnreadDot && signedIn && !post.yours && !post.read &&
-            post.postNumber !in sessionReadPosts
+            post.postNumber !in state.confirmedReadPostNumbers &&
+            (syncReadProgress || post.postNumber !in sessionReadPosts)
         if (!treeView || row.depth == 0) {
             val hasExpandedSubtree = treeView && row.subtreeSize > 0 && post.id !in collapsed
             val unloadedTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
@@ -664,7 +825,7 @@ fun TopicDetailScreen(
                     showReplyToHint = !treeView,
                     unreadDotVisible = unreadDotVisible,
                     unreadDotPosition = unreadDotPosition,
-                    onPicture = { orig, thumb -> picture = orig to thumb },
+                    onPicture = { list, idx -> pictureGallery = list to idx },
                     onUnknownTag = onUnknownTag,
                     reactions = state.topic?.validReactions.orEmpty(),
                     emojiUrls = state.emojiUrls,
@@ -758,7 +919,7 @@ fun TopicDetailScreen(
                         isTopicAuthor = isTopicAuthor,
                         unreadDotVisible = unreadDotVisible,
                         unreadDotPosition = unreadDotPosition,
-                        onPicture = { orig, thumb -> picture = orig to thumb },
+                        onPicture = { list, idx -> pictureGallery = list to idx },
                         onUnknownTag = onUnknownTag,
                         reactions = state.topic?.validReactions.orEmpty(),
                         emojiUrls = state.emojiUrls,
@@ -988,21 +1149,28 @@ fun TopicDetailScreen(
                                             if (tocEntries.isNotEmpty()) {
                                                 Row(
                                                     modifier = Modifier
-                                                        .clip(RoundedCornerShape(12.dp))
+                                                        .height(26.dp)
+                                                        .clip(RoundedCornerShape(8.dp))
                                                         .background(if (showToc) Color(0xFFEDE9FE) else Color(0xFFF5F3FF))
-                                                        .then(if (showToc) Modifier.border(1.2.dp, Color(0xFF7E57C2), RoundedCornerShape(12.dp)) else Modifier)
+                                                        .then(
+                                                            Modifier.border(
+                                                                if (showToc) 1.2.dp else 0.75.dp,
+                                                                if (showToc) Color(0xFF7E57C2) else Color(0xFFDDD6FE),
+                                                                RoundedCornerShape(8.dp)
+                                                            )
+                                                        )
                                                         .clickable {
                                                             showToc = !showToc
                                                             authorMenuExpanded = false
                                                         }
-                                                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                                                        .padding(horizontal = 8.dp),
                                                     verticalAlignment = Alignment.CenterVertically,
                                                     horizontalArrangement = Arrangement.spacedBy(3.dp),
                                                 ) {
                                                     Text("📖", fontSize = 11.sp)
                                                     Text(
                                                         text = if (showToc) "目录 ▴" else "目录 ▾",
-                                                        style = IosTheme.type.footnote,
+                                                        style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
                                                         color = Color(0xFF7E57C2),
                                                         fontWeight = FontWeight.SemiBold,
                                                         maxLines = 1,
@@ -1014,65 +1182,28 @@ fun TopicDetailScreen(
                                             // 解密药丸
                                             Row(
                                                 modifier = Modifier
-                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .height(26.dp)
+                                                    .clip(RoundedCornerShape(8.dp))
                                                     .background(if (scannedCryptoResults.isNotEmpty()) IosTheme.colors.accent.copy(alpha = 0.12f) else Color(0xFFFFF1F0))
+                                                    .border(
+                                                        0.75.dp,
+                                                        if (scannedCryptoResults.isNotEmpty()) IosTheme.colors.accent.copy(alpha = 0.35f) else Color(0xFFFFCDD2),
+                                                        RoundedCornerShape(8.dp)
+                                                    )
                                                     .clickable { showDecryptSheet = true }
-                                                    .padding(horizontal = 9.dp, vertical = 5.dp),
+                                                    .padding(horizontal = 8.dp),
                                                 verticalAlignment = Alignment.CenterVertically,
                                                 horizontalArrangement = Arrangement.spacedBy(3.dp),
                                             ) {
                                                 Text("🔑", fontSize = 11.sp)
                                                 Text(
                                                     text = if (scannedCryptoResults.isNotEmpty()) "解密 (${scannedCryptoResults.size})" else "解密",
-                                                    style = IosTheme.type.footnote,
+                                                    style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
                                                     color = if (scannedCryptoResults.isNotEmpty()) IosTheme.colors.accent else Color(0xFFE53935),
                                                     fontWeight = FontWeight.Medium,
                                                     maxLines = 1,
                                                     softWrap = false,
                                                 )
-                                            }
-
-                                            // 筛选药丸 (展开态与筛选态高亮)
-                                            if (authorFilterItems.isNotEmpty()) {
-                                                val isFiltered = state.filterUserId != null
-                                                val pillBg = when {
-                                                    authorMenuExpanded -> Color(0xFFE0F2FE)
-                                                    isFiltered -> IosTheme.colors.accent.copy(alpha = 0.12f)
-                                                    IosTheme.colors.isDark -> Color(0xFF2C2C2E)
-                                                    else -> IosTheme.colors.fieldBackground
-                                                }
-                                                val pillTextColor = when {
-                                                    authorMenuExpanded || isFiltered -> Color(0xFF0284C7)
-                                                    IosTheme.colors.isDark -> Color(0xFFE5E5EA)
-                                                    else -> IosTheme.colors.label
-                                                }
-                                                Row(
-                                                    modifier = Modifier
-                                                        .clip(RoundedCornerShape(12.dp))
-                                                        .background(pillBg)
-                                                        .then(if (authorMenuExpanded) Modifier.border(1.5.dp, Color(0xFF0284C7), RoundedCornerShape(12.dp)) else Modifier)
-                                                        .clickable {
-                                                            authorMenuExpanded = !authorMenuExpanded
-                                                            showToc = false
-                                                        }
-                                                        .padding(horizontal = 9.dp, vertical = 5.dp),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
-                                                ) {
-                                                    val selectedName = authorFilterItems.firstOrNull { it.userId == state.filterUserId }?.username
-                                                    Text(
-                                                        text = when {
-                                                            selectedName != null -> "只看 $selectedName ${if (authorMenuExpanded) "▴" else "▾"}"
-                                                            authorMenuExpanded -> "筛选 ▴"
-                                                            else -> "筛选 ▾"
-                                                        },
-                                                        style = IosTheme.type.footnote,
-                                                        color = pillTextColor,
-                                                        fontWeight = if (authorMenuExpanded || isFiltered) FontWeight.SemiBold else FontWeight.Medium,
-                                                        maxLines = 1,
-                                                        softWrap = false,
-                                                    )
-                                                }
                                             }
 
                                             // 关注/通知级别药丸
@@ -1089,12 +1220,25 @@ fun TopicDetailScreen(
                                 item("top-error") { ErrorNotice(message, onRetry) }
                             }
                             items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
-                            if (showOrderBar) item("order-bar") {
+                            if (showOrderBar) stickyHeader(key = "order-bar") {
+                                val isPinned by remember {
+                                    derivedStateOf {
+                                        list.firstVisibleItemIndex >= 1 + topErrorCount + headRows.size
+                                    }
+                                }
                                 CommentOrderBar(
                                     total = replyTotal,
                                     descending = state.descending,
                                     busy = state.loading || state.refreshing,
                                     onToggle = onToggleOrder,
+                                    authorFilterItems = authorFilterItems,
+                                    filterUserId = state.filterUserId,
+                                    authorMenuExpanded = authorMenuExpanded,
+                                    onAuthorMenuClick = {
+                                        authorMenuExpanded = !authorMenuExpanded
+                                        showToc = false
+                                    },
+                                    isPinned = isPinned,
                                 )
                             }
                             if (showPreviousGap) item("load-previous") {
@@ -1127,15 +1271,52 @@ fun TopicDetailScreen(
                                 }
                             }
                         }
+                        // 全屏透明遮罩: 当跳楼浮卡展开时，点击任意外部区域收起浮卡
+                        if (showJumpBar) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) { showJumpBar = false }
+                            )
+                        }
+
+                        // 快速跳楼浮卡: 悬浮在左下角胶囊上方
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = showJumpBar,
+                            enter = fadeIn() + slideInVertically { it / 2 },
+                            exit = fadeOut() + slideOutVertically { it / 2 },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 68.dp)
+                                .imePadding()
+                        ) {
+                            JumpFloorCard(
+                                currentFloor = readingFloorIndicator.rootFloor,
+                                total = effectiveFloorTotal,
+                                displayFloorText = readingFloorIndicator.displayLabel,
+                                onJumpTo = { targetFloor ->
+                                    performJumpToFloor(targetFloor)
+                                },
+                                onClose = { showJumpBar = false },
+                            )
+                        }
+
                         // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
-                        if (currentPostNumber != null && currentPostNumber!! > 20 && totalPosts > 20 && !firstPostVisible) {
+                        // 支持点击左侧回到 1 楼、点击右侧打开跳楼卡片、长按任意区域触感震动并打开跳楼卡片。
+                        if (effectiveFloorTotal > 3 && !firstPostVisible) {
                             ReadingProgressPill(
-                                current = currentPostNumber ?: 1,
-                                total = totalPosts,
+                                indicator = readingFloorIndicator,
                                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
-                            ) {
-                                if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
-                            }
+                                onScrollToTop = {
+                                    if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                                },
+                                onOpenJumpBar = {
+                                    showJumpBar = !showJumpBar
+                                },
+                            )
                         }
                         if (canReply) {
                             Box(Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 16.dp)) {
@@ -1221,7 +1402,7 @@ fun TopicDetailScreen(
             }
         }
     }
-    picture?.let { (orig, thumb) -> ImageViewer(orig, thumb) { picture = null } }
+    pictureGallery?.let { (imgs, idx) -> ImageViewer(images = imgs, initialIndex = idx) { pictureGallery = null } }
     browserUrl?.let { url ->
         InAppBrowserSheet(url = url, onDismiss = { browserUrl = null })
     }
@@ -1569,23 +1750,93 @@ fun TopicDetailScreen(
 }
 
 /**
- * 评论区头部栏:左侧总回复数,右侧 iOS 分段控件样式的「正序 / 倒序」胶囊。
- * 固定跟在 1 楼下方 —— 顺序只作用于评论,主贴不参与翻转。
+ * 评论区头部栏:左侧总回复数与筛选药丸(贴吧模式),右侧 iOS 分段控件样式的「正序 / 倒序」胶囊。
+ * 固定跟在 1 楼下方 —— 向上滑动触顶时吸顶冻结,方便用户随时切换筛选或翻转排序;非顶部取消冻结。
  */
 @Composable
-private fun CommentOrderBar(total: Int, descending: Boolean, busy: Boolean, onToggle: () -> Unit) {
-    Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
+private fun CommentOrderBar(
+    total: Int,
+    descending: Boolean,
+    busy: Boolean,
+    onToggle: () -> Unit,
+    authorFilterItems: List<AuthorFilterItem> = emptyList(),
+    filterUserId: Long? = null,
+    authorMenuExpanded: Boolean = false,
+    onAuthorMenuClick: () -> Unit = {},
+    isPinned: Boolean = false,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .then(
+                if (isPinned) Modifier.shadow(elevation = 2.dp, clip = false) else Modifier
+            )
+            .background(IosTheme.colors.card)
+    ) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // 1. 全部回复标签
             Text(
                 text = if (total > 0) "全部回复 $total" else "全部回复",
                 style = IosTheme.type.subheadline,
                 fontWeight = FontWeight.SemiBold,
                 color = IosTheme.colors.label,
             )
+
+            // 2. 筛选药丸（放在全部回复后面，参照贴吧模式）
+            if (authorFilterItems.isNotEmpty()) {
+                Spacer(Modifier.width(8.dp))
+                val isFiltered = filterUserId != null
+                val pillBg = when {
+                    authorMenuExpanded -> Color(0xFFE0F2FE)
+                    isFiltered -> IosTheme.colors.accent.copy(alpha = 0.12f)
+                    IosTheme.colors.isDark -> Color(0xFF2C2C2E)
+                    else -> IosTheme.colors.fieldBackground
+                }
+                val pillTextColor = when {
+                    authorMenuExpanded || isFiltered -> Color(0xFF0284C7)
+                    IosTheme.colors.isDark -> Color(0xFFE5E5EA)
+                    else -> IosTheme.colors.label
+                }
+                val selectedName = authorFilterItems.firstOrNull { it.userId == filterUserId }?.username
+                val isDark = IosTheme.colors.isDark
+                val filterShape = RoundedCornerShape(8.dp)
+                val filterBorder = if (authorMenuExpanded) Color(0xFF0284C7) else (if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6))
+                Row(
+                    modifier = Modifier
+                        .widthIn(max = 140.dp)
+                        .height(26.dp)
+                        .clip(filterShape)
+                        .background(pillBg)
+                        .border(if (authorMenuExpanded) 1.2.dp else 0.75.dp, filterBorder, filterShape)
+                        .clickable(onClick = onAuthorMenuClick)
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    Text(
+                        text = when {
+                            selectedName != null -> "只看 $selectedName ${if (authorMenuExpanded) "▴" else "▾"}"
+                            authorMenuExpanded -> "筛选 ▴"
+                            else -> "筛选 ▾"
+                        },
+                        style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
+                        color = pillTextColor,
+                        fontWeight = if (authorMenuExpanded || isFiltered) FontWeight.SemiBold else FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        softWrap = false,
+                    )
+                }
+            }
+
             Spacer(Modifier.weight(1f))
+
+            // 3. 正序 / 倒序
             Row(
                 Modifier
                     .clip(RoundedCornerShape(8.dp))
@@ -1618,46 +1869,6 @@ private fun OrderSegment(label: String, selected: Boolean, enabled: Boolean, onC
     }
 }
 
-private data class InternalTopicLink(
-    val topicId: Long,
-    val postNumber: Int? = null,
-)
-/**
- * 解析站内（linux.do）帖子链接，支持：
- * - `https://linux.do/t/{slug}/{topicId}`
- * - `https://linux.do/t/{slug}/{topicId}/{postNumber}`
- * - `https://linux.do/t/{topicId}`
- * - `https://linux.do/t/{topicId}/{postNumber}`
- */
-private fun parseInternalTopicUrl(url: String): InternalTopicLink? = runCatching {
-    val uri = Uri.parse(url)
-    val host = uri.host?.lowercase() ?: return null
-    if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return null
-    val segments = uri.pathSegments ?: return null
-    if (segments.size < 2 || segments[0] != "t") return null
-    val secondAsId = segments[1].toLongOrNull()
-    when {
-        secondAsId == null -> {
-            val topicId = segments.getOrNull(2)?.toLongOrNull() ?: return null
-            val postNum = segments.getOrNull(3)?.toIntOrNull()?.takeIf { it > 1 }
-            InternalTopicLink(topicId = topicId, postNumber = postNum)
-        }
-        segments.size == 2 -> InternalTopicLink(topicId = secondAsId, postNumber = null)
-        segments.size >= 4 -> {
-            val topicId = segments[2].toLongOrNull() ?: return null
-            val postNum = segments[3].toIntOrNull()?.takeIf { it > 1 }
-            InternalTopicLink(topicId = topicId, postNumber = postNum)
-        }
-        else -> {
-            val thirdAsLong = segments[2].toLongOrNull() ?: return null
-            if (thirdAsLong > secondAsId && thirdAsLong >= 1000L) {
-                InternalTopicLink(topicId = thirdAsLong, postNumber = null)
-            } else {
-                InternalTopicLink(topicId = secondAsId, postNumber = thirdAsLong.toInt().takeIf { it > 1 })
-            }
-        }
-    }
-}.getOrNull()
 
 /**
  * Discourse 风格的前序未加载楼层折叠条 + 骨架屏（Skeleton Placeholder）。
@@ -1828,14 +2039,15 @@ private fun ReplyFab(enabled: Boolean, onClick: () -> Unit) {
     val bgBase = IosTheme.colors.card.copy(alpha = 0.95f)
     val bgTint = tintColor.copy(alpha = if (enabled) 0.12f else 0.05f)
     val borderColor = tintColor.copy(alpha = if (enabled) 0.28f else 0.12f)
+    val fabShape = RoundedCornerShape(16.dp)
     Box(
         Modifier
             .size(46.dp)
-            .shadow(elevation = 3.dp, shape = CircleShape, clip = false)
-            .clip(CircleShape)
+            .shadow(elevation = 3.dp, shape = fabShape, clip = false)
+            .clip(fabShape)
             .background(bgBase)
             .background(bgTint)
-            .border(1.dp, borderColor, CircleShape)
+            .border(1.dp, borderColor, fabShape)
             .clickable(enabled = enabled, onClick = onClick)
             .semantics { contentDescription = "回复这个话题" },
         contentAlignment = Alignment.Center,
@@ -1853,27 +2065,308 @@ private fun ReplyFab(enabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-/** 右下角的阅读进度。兼作"回到 1 楼"的按钮,省掉一个额外悬浮控件。 */
+/**
+ * 左下角的阅读进度胶囊。
+ * 双热区设计 + 长按支持:
+ * 1. 点击左侧: 平滑回顶(回到 1 楼)
+ * 2. 点击右侧: 打开快速跳楼卡片
+ * 3. 长按任意区域: 触感震动并打开快速跳楼卡片
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ReadingProgressPill(current: Int, total: Int, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun ReadingProgressPill(
+    indicator: ReadingFloorIndicator,
+    modifier: Modifier = Modifier,
+    onScrollToTop: () -> Unit,
+    onOpenJumpBar: () -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
     val arrowColor = IosTheme.colors.accent
     Row(
-        modifier
+        modifier = modifier
+            .shadow(elevation = 3.dp, shape = RoundedCornerShape(50))
             .clip(RoundedCornerShape(50))
             .background(IosTheme.colors.card.copy(alpha = 0.95f))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.5f), RoundedCornerShape(50)),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Canvas(Modifier.size(13.dp)) {
-            scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-                drawLine(arrowColor, Offset(12f, 21f), Offset(12f, 5f), 2f)
-                drawLine(arrowColor, Offset(12f, 4f), Offset(5f, 11f), 2f)
-                drawLine(arrowColor, Offset(12f, 4f), Offset(19f, 11f), 2f)
+        // 左半区: 回顶
+        Box(
+            modifier = Modifier
+                .combinedClickable(
+                    onClick = onScrollToTop,
+                    onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onOpenJumpBar()
+                    }
+                )
+                .padding(start = 11.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.size(13.dp)) {
+                scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+                    drawLine(arrowColor, Offset(12f, 21f), Offset(12f, 5f), 2f)
+                    drawLine(arrowColor, Offset(12f, 4f), Offset(5f, 11f), 2f)
+                    drawLine(arrowColor, Offset(12f, 4f), Offset(19f, 11f), 2f)
+                }
             }
         }
-        Text("$current / $total", style = IosTheme.type.caption,
-            color = IosTheme.colors.secondaryLabel, modifier = Modifier.padding(start = 5.dp))
+
+        // 分割线
+        Box(
+            modifier = Modifier
+                .width(0.8.dp)
+                .height(11.dp)
+                .background(IosTheme.colors.separator.copy(alpha = 0.6f))
+        )
+
+        // 右半区: 楼层展示 + 跳楼触发
+        Box(
+            modifier = Modifier
+                .combinedClickable(
+                    onClick = onOpenJumpBar,
+                    onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onOpenJumpBar()
+                    }
+                )
+                .padding(start = 6.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = indicator.displayLabel,
+                style = IosTheme.type.caption,
+                color = IosTheme.colors.secondaryLabel,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+/**
+ * 快速跳楼寻址浮卡。
+ * 纯离线演算 + 单飞防抖:
+ * 1. 拖动 Slider 过程中只更新本地预览状态与触感微震, 零网络请求(防止 CF 429 风控);
+ * 2. 松手(onValueChangeFinished)或点击确认时发起跳转;
+ * 3. 支持首楼、末楼一键直达及精准数字输入。
+ */
+@Composable
+private fun JumpFloorCard(
+    currentFloor: Int,
+    total: Int,
+    displayFloorText: String,
+    modifier: Modifier = Modifier,
+    onJumpTo: (Int) -> Unit,
+    onClose: () -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    var sliderValue by remember(currentFloor, total) { mutableStateOf(currentFloor.coerceIn(1, total.coerceAtLeast(1)).toFloat()) }
+    var lastVibratedFloor by remember { mutableStateOf(currentFloor) }
+    var inputFloorText by remember { mutableStateOf("") }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp)
+            .shadow(12.dp, RoundedCornerShape(20.dp)),
+        shape = RoundedCornerShape(20.dp),
+        color = IosTheme.colors.card.copy(alpha = 0.98f),
+        border = BorderStroke(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.6f)),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // 顶栏: 标题 + 当前楼层指示 + 关闭按钮
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "楼层直达",
+                        style = IosTheme.type.subheadline,
+                        fontWeight = FontWeight.Bold,
+                        color = IosTheme.colors.label,
+                    )
+                    Text(
+                        text = "当前 $displayFloorText",
+                        style = IosTheme.type.caption,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(IosTheme.colors.fieldBackground)
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable(onClick = onClose),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("✕", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                }
+            }
+
+            // 中栏: 首楼快捷 + 精准数字输入框 + 末楼快捷
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // 首楼快捷
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (sliderValue.toInt() == 1) IosTheme.colors.accent.copy(alpha = 0.15f) else IosTheme.colors.fieldBackground)
+                        .clickable {
+                            onJumpTo(1)
+                            onClose()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "首楼 #1",
+                        style = IosTheme.type.caption,
+                        color = if (sliderValue.toInt() == 1) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                // 精准数字输入框
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(34.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("#", style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(4.dp))
+                    BasicTextField(
+                        value = inputFloorText,
+                        onValueChange = { newText ->
+                            if (newText.all { it.isDigit() } && newText.length <= 6) {
+                                inputFloorText = newText
+                            }
+                        },
+                        textStyle = IosTheme.type.footnote.copy(color = IosTheme.colors.label),
+                        singleLine = true,
+                        cursorBrush = SolidColor(IosTheme.colors.accent),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(
+                            onGo = {
+                                val target = inputFloorText.toIntOrNull()
+                                if (target != null && target in 1..total) {
+                                    onJumpTo(target)
+                                    onClose()
+                                }
+                            }
+                        ),
+                        decorationBox = { innerTextField ->
+                            if (inputFloorText.isEmpty()) {
+                                Text("目标楼层", style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                            }
+                            innerTextField()
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (inputFloorText.isNotEmpty()) {
+                        val target = inputFloorText.toIntOrNull()
+                        val valid = target != null && target in 1..total
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(if (valid) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel.copy(alpha = 0.3f))
+                                .clickable(enabled = valid) {
+                                    if (target != null) {
+                                        onJumpTo(target)
+                                        onClose()
+                                    }
+                                }
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("前往", style = IosTheme.type.caption, color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                // 末楼快捷
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (sliderValue.toInt() == total) IosTheme.colors.accent.copy(alpha = 0.15f) else IosTheme.colors.fieldBackground)
+                        .clickable {
+                            onJumpTo(total)
+                            onClose()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "末楼 #$total",
+                        style = IosTheme.type.caption,
+                        color = if (sliderValue.toInt() == total) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            // 底栏: 平滑滑轨 (松手才触发跳转, 零网络风暴)
+            if (total > 1) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("滑动寻址", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        Text(
+                            text = "已选 #${sliderValue.toInt()} / $total",
+                            style = IosTheme.type.footnote,
+                            color = IosTheme.colors.accent,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    Slider(
+                        value = sliderValue,
+                        onValueChange = { newVal ->
+                            sliderValue = newVal
+                            val newFloor = newVal.toInt()
+                            if (newFloor != lastVibratedFloor) {
+                                lastVibratedFloor = newFloor
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            }
+                        },
+                        onValueChangeFinished = {
+                            onJumpTo(sliderValue.toInt())
+                            onClose()
+                        },
+                        valueRange = 1f..total.toFloat(),
+                        colors = SliderDefaults.colors(
+                            thumbColor = IosTheme.colors.accent,
+                            activeTrackColor = IosTheme.colors.accent,
+                            inactiveTrackColor = IosTheme.colors.separator.copy(alpha = 0.3f),
+                        ),
+                        modifier = Modifier.fillMaxWidth().height(28.dp)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -2893,7 +3386,7 @@ private fun PostRow(
     showReplyToHint: Boolean = true,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
-    onPicture: (String, String) -> Unit,
+    onPicture: (List<ImageViewerItem>, Int) -> Unit,
     onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -3073,7 +3566,7 @@ private fun SubReplyRow(
     isTopicAuthor: Boolean,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
-    onPicture: (String, String) -> Unit,
+    onPicture: (List<ImageViewerItem>, Int) -> Unit,
     onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -3556,7 +4049,7 @@ private fun PostActions(
     } }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun BoostActionSheet(
     boost: Boost,
@@ -3597,20 +4090,49 @@ private fun BoostActionSheet(
                 .navigationBarsPadding(),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            val identity = remember(author) {
+            val context = LocalContext.current
+            val repository = remember(context) { (context.applicationContext as? org.linuxdo.android.App)?.container?.topicRepository }
+            val accountManager = remember(context) { (context.applicationContext as? org.linuxdo.android.App)?.container?.accountManager }
+
+            val cleanUsername = remember(author?.username) {
+                author?.username.orEmpty().trim().removePrefix("@")
+            }
+
+            val initialIdentity = remember(cleanUsername, author) {
+                val cached = if (cleanUsername.isNotBlank()) repository?.getCachedUserCard(cleanUsername) else null
+                val myAccount = if (cleanUsername.isNotBlank()) {
+                    accountManager?.accounts()?.firstOrNull { it.username.equals(cleanUsername, ignoreCase = true) }
+                } else null
                 UserCardData(
-                    id = author?.id ?: 0L,
-                    username = author?.username.orEmpty().ifBlank { "unknown" },
-                    name = author?.name?.takeIf { it.isNotBlank() } ?: "简评作者",
-                    avatarTemplate = author?.avatarTemplate,
-                    animatedAvatar = author?.animatedAvatar,
-                    trustLevel = author?.trustLevel,
+                    id = author?.id ?: cached?.id ?: 0L,
+                    username = cleanUsername.ifBlank { "unknown" },
+                    name = author?.name?.takeIf { it.isNotBlank() } ?: cached?.name?.takeIf { it.isNotBlank() } ?: "简评作者",
+                    avatarTemplate = author?.avatarTemplate ?: cached?.avatarTemplate,
+                    animatedAvatar = author?.animatedAvatar ?: cached?.animatedAvatar ?: AvatarCache.get(cleanUsername),
+                    trustLevel = author?.trustLevel ?: cached?.trustLevel ?: myAccount?.trustLevel,
                 )
             }
+
+            var identity by remember(boost.id, cleanUsername) { mutableStateOf(initialIdentity) }
+
+            LaunchedEffect(boost.id, cleanUsername) {
+                if (cleanUsername.isNotBlank() && repository != null && identity.trustLevel == null) {
+                    val freshCard = runCatching { repository.fetchUserCard(cleanUsername) }.getOrNull()
+                    if (freshCard != null) {
+                        identity = identity.copy(
+                            trustLevel = freshCard.trustLevel,
+                            name = freshCard.cleanDisplayName.takeIf { it.isNotBlank() } ?: identity.name,
+                            avatarTemplate = freshCard.avatarTemplate ?: identity.avatarTemplate,
+                            animatedAvatar = freshCard.animatedAvatar ?: identity.animatedAvatar,
+                        )
+                    }
+                }
+            }
+
             CompactUserIdentityHeader(
                 user = identity,
-                modifier = Modifier.clickable(enabled = !author?.username.isNullOrBlank()) {
-                    author?.username?.let(onOpenAuthor)
+                modifier = Modifier.clickable(enabled = cleanUsername.isNotBlank()) {
+                    onOpenAuthor(cleanUsername)
                 },
             )
             Text(
@@ -4403,10 +4925,35 @@ private fun TiebaPostActionButton(
     }
 }
 
+data class ImageViewerItem(
+    val url: String,
+    val previewUrl: String? = null,
+    val description: String? = null,
+)
+
+fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
+    val result = mutableListOf<ImageViewerItem>()
+    fun traverse(list: List<CookedBlock>) {
+        for (b in list) {
+            when (b) {
+                is CookedBlock.Picture -> {
+                    result.add(ImageViewerItem(url = b.originalUrl, previewUrl = b.url, description = b.description))
+                }
+                is CookedBlock.Quote -> traverse(b.blocks)
+                is CookedBlock.ListBlock -> b.entries.forEach { traverse(it) }
+                else -> {}
+            }
+        }
+    }
+    traverse(blocks)
+    return result
+}
+
 @Composable
 private fun CookedContent(
     blocks: List<CookedBlock>,
-    onPicture: (String, String) -> Unit,
+    onPicture: (List<ImageViewerItem>, Int) -> Unit,
+    postImages: List<ImageViewerItem> = remember(blocks) { extractPostImages(blocks) },
     compact: Boolean = false,
     subReply: Boolean = false,
     pollPost: Post? = null,
@@ -4431,13 +4978,16 @@ private fun CookedContent(
                     }
                 }
                 is CookedBlock.Quote -> Row(
-                    Modifier.fillMaxWidth().background(
-                        if (subReply) IosTheme.colors.card else IosTheme.colors.fieldBackground,
-                    ),
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(
+                            if (subReply) IosTheme.colors.card else IosTheme.colors.fieldBackground,
+                        ),
                 ) {
-                    Box(Modifier.width(3.dp).height(28.dp).background(IosTheme.colors.separator))
+                    Box(Modifier.width(3.dp).height(28.dp).background(IosTheme.colors.accent.copy(alpha = 0.6f)))
                     Box(Modifier.weight(1f).padding(10.dp)) {
-                        CookedContent(block.blocks, onPicture, compact = compact, subReply = subReply, pollPost = pollPost)
+                        CookedContent(block.blocks, onPicture, postImages = postImages, compact = compact, subReply = subReply, pollPost = pollPost)
                     }
                 }
                 is CookedBlock.Picture -> {
@@ -4449,19 +4999,22 @@ private fun CookedContent(
                             Modifier
                                 .fillMaxWidth()
                                 .aspectRatio(rawRatio.coerceAtMost(4f))
-                                .clip(RoundedCornerShape(8.dp))
+                                .clip(RoundedCornerShape(14.dp))
+                                .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         } else {
                             // 竖屏长截图（如手机截图）：固定高度上限并按比例自适应宽度（左对齐，与网页端一致），既锁死高度防滚动抖动，又绝不越界遮挡文字
                             Modifier
                                 .height(maxPortraitHeight)
                                 .aspectRatio(rawRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
-                                .clip(RoundedCornerShape(8.dp))
+                                .clip(RoundedCornerShape(14.dp))
+                                .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         }
                     } else {
                         Modifier
                             .fillMaxWidth()
                             .heightIn(min = 80.dp, max = maxPortraitHeight)
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                     }
                     var currentUrl by remember(block.url) { mutableStateOf(block.url) }
                     var isError by remember(block.url) { mutableStateOf(false) }
@@ -4487,6 +5040,14 @@ private fun CookedContent(
                             .build()
                     }
 
+                    val clickedIndex = remember(postImages, block.originalUrl) {
+                        val idx = postImages.indexOfFirst { it.url == block.originalUrl }
+                        if (idx >= 0) idx else 0
+                    }
+                    val imageList = if (postImages.isNotEmpty()) postImages else listOf(
+                        ImageViewerItem(url = block.originalUrl, previewUrl = currentUrl, description = block.description)
+                    )
+
                     Box(
                         modifier = ratioModifier.background(IosTheme.colors.fieldBackground),
                         contentAlignment = Alignment.Center,
@@ -4500,7 +5061,7 @@ private fun CookedContent(
                             contentScale = ContentScale.Fit,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .clickable { onPicture(block.originalUrl, currentUrl) },
+                                .clickable { onPicture(imageList, clickedIndex) },
                             onLoading = {
                                 isLoading = true
                                 isError = false
@@ -4549,7 +5110,7 @@ private fun CookedContent(
                                         style = IosTheme.type.caption,
                                         color = Color(0xFF007AFF),
                                         modifier = Modifier.clickable {
-                                            onPicture(block.originalUrl, currentUrl)
+                                            onPicture(imageList, clickedIndex)
                                         },
                                     )
                                 }
@@ -4566,7 +5127,7 @@ private fun CookedContent(
                             modifier = Modifier.widthIn(min = 22.dp),
                         )
                         Box(Modifier.weight(1f)) {
-                            CookedContent(entry, onPicture, compact = compact, subReply = subReply, pollPost = pollPost)
+                            CookedContent(entry, onPicture, postImages = postImages, compact = compact, subReply = subReply, pollPost = pollPost)
                         }
                     }
                 }
@@ -5118,7 +5679,7 @@ private fun decodeCandidates(source: String): List<Pair<String, String>> {
     return results.distinctBy { it.second }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun DecryptBottomSheet(
     selectedText: String? = null,
@@ -5414,29 +5975,32 @@ private fun DecryptBottomSheet(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ImageViewer(
-    url: String,
-    previewUrl: String? = null,
+    images: List<ImageViewerItem>,
+    initialIndex: Int = 0,
     onDismiss: () -> Unit,
 ) {
+    if (images.isEmpty()) {
+        onDismiss()
+        return
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var zoom by remember(url) { mutableFloatStateOf(1f) }
-    var offset by remember(url) { mutableStateOf(Offset.Zero) }
-    var saving by remember(url) { mutableStateOf(false) }
-    var reloadTrigger by remember(url) { mutableIntStateOf(0) }
-    var showSpinner by remember(url, reloadTrigger) { mutableStateOf(false) }
-    LaunchedEffect(url, reloadTrigger) {
-        delay(200)
-        showSpinner = true
+    val pagerState = rememberPagerState(
+        initialPage = initialIndex.coerceIn(0, images.size - 1),
+        pageCount = { images.size }
+    )
+    val dismissOffsetY = remember { Animatable(0f) }
+    var isCurrentZoomed by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+
+    // 页面切走时，重置当前缩放状态为 false，保证新页面可以正常横滑
+    LaunchedEffect(pagerState.currentPage) {
+        isCurrentZoomed = false
     }
-    val originalRequest = remember(url, context, reloadTrigger) {
-        ImageRequest.Builder(context)
-            .data(url)
-            .crossfade(200)
-            .build()
-    }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -5465,166 +6029,417 @@ fun ImageViewer(
             enter = fadeIn(animationSpec = tween(120)),
             exit = fadeOut(animationSpec = tween(100)),
         ) {
+            val maxDismissDragPx = with(LocalDensity.current) { 320.dp.toPx() }
+            val dismissProgress = (dismissOffsetY.value / maxDismissDragPx).coerceIn(0f, 1f)
+            val bgAlpha = (1f - dismissProgress * 0.85f).coerceIn(0f, 1f)
+            val uiAlpha = (1f - dismissProgress * 1.5f).coerceIn(0f, 1f)
+
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
+                    .background(Color.Black.copy(alpha = bgAlpha)),
             ) {
+                // 核心修复点：将图片实际显示范围限定在 statusBars 和 navigationBars 之间（避让虚拟按键/手势条）
+                // 彻底杜绝 1x 比例下长截图、竖图被底部的系统导航栏遮挡！
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .zIndex(0f)
-                        .clipToBounds()
-                        .pointerInput(url) {
-                            detectTapGestures(
-                                onDoubleTap = {
-                                    if (zoom > 1.05f) {
-                                        zoom = 1f
-                                        offset = Offset.Zero
-                                    } else {
-                                        zoom = 2.5f
-                                    }
-                                },
-                            )
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .graphicsLayer {
+                            translationY = dismissOffsetY.value
                         }
-                        .pointerInput(url) {
-                            detectTransformGestures { _, pan, scale, _ ->
-                                val nextZoom = (zoom * scale).coerceIn(1f, 6f)
-                                zoom = nextZoom
-                                offset = if (nextZoom > 1f) {
-                                    offset + pan
-                                } else {
-                                    Offset(0f, (offset.y + pan.y).coerceAtLeast(0f))
-                                }
-                                if (nextZoom == 1f && offset.y > 100.dp.toPx()) onDismiss()
-                            }
-                        },
                 ) {
+                    HorizontalPager(
+                        state = pagerState,
+                        userScrollEnabled = !isCurrentZoomed,
+                        modifier = Modifier.fillMaxSize(),
+                    ) { page ->
+                        val item = images[page]
+                        val isPageActive = pagerState.currentPage == page
+                        ImageViewerPage(
+                            item = item,
+                            isActive = isPageActive,
+                            onZoomChanged = { zoomed ->
+                                if (isPageActive) {
+                                    isCurrentZoomed = zoomed
+                                }
+                            },
+                            dismissOffsetY = dismissOffsetY,
+                            onDismiss = onDismiss,
+                        )
+                    }
+                }
+
+                // 顶部居中多图页码指示器（仅在同一楼层有多张图时展示，微信同款简约胶囊）
+                if (images.size > 1) {
                     Box(
                         Modifier
-                            .fillMaxSize()
-                            .graphicsLayer {
-                                scaleX = zoom
-                                scaleY = zoom
-                                translationX = offset.x
-                                translationY = offset.y
-                            },
-                        contentAlignment = Alignment.Center,
+                            .align(Alignment.TopCenter)
+                            .zIndex(10f)
+                            .statusBarsPadding()
+                            .padding(top = 16.dp)
+                            .graphicsLayer { alpha = uiAlpha },
                     ) {
-                        // 1. 底层常驻预览图：优先从内存/磁盘缓存秒显，作为无缝垫底底图，大图加载全过程及切换时永不卸载，杜绝闪屏
-                        if (!previewUrl.isNullOrBlank()) {
-                            AsyncImage(
-                                model = ImageRequest.Builder(context)
-                                    .data(previewUrl)
-                                    .build(),
-                                contentDescription = null,
-                                contentScale = ContentScale.Fit,
-                                modifier = Modifier.fillMaxSize(),
+                        Text(
+                            text = "${pagerState.currentPage + 1} / ${images.size}",
+                            color = Color.White,
+                            style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Medium),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.Black.copy(alpha = 0.45f))
+                                .border(0.6.dp, Color.White.copy(alpha = 0.2f), RoundedCornerShape(50))
+                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+
+                // 顶部右侧：保存与关闭
+                Row(
+                    Modifier
+                        .align(Alignment.TopEnd)
+                        .zIndex(10f)
+                        .statusBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .graphicsLayer { alpha = uiAlpha },
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val currentItem = images.getOrNull(pagerState.currentPage) ?: images.first()
+                    Text(
+                        text = if (saving) "保存中…" else "保存",
+                        color = Color.White,
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.38f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable(enabled = !saving) {
+                                saving = true
+                                scope.launch {
+                                    var msg = saveMediaToPublicStorage(
+                                        context = context,
+                                        url = currentItem.url,
+                                        suggestedName = null,
+                                        asImage = true,
+                                    )
+                                    // 若大图下载保存失败，且存在预览图，自动降级保存当前已缓存的预览图
+                                    if (msg.startsWith("保存失败") && !currentItem.previewUrl.isNullOrBlank() && currentItem.previewUrl != currentItem.url) {
+                                        msg = saveMediaToPublicStorage(
+                                            context = context,
+                                            url = currentItem.previewUrl,
+                                            suggestedName = null,
+                                            asImage = true,
+                                        )
+                                    }
+                                    saving = false
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                    Text(
+                        text = "关闭",
+                        color = Color.White,
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.38f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable(onClick = onDismiss)
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ImageViewer(
+    url: String,
+    previewUrl: String? = null,
+    onDismiss: () -> Unit,
+) = ImageViewer(
+    images = listOf(ImageViewerItem(url = url, previewUrl = previewUrl)),
+    initialIndex = 0,
+    onDismiss = onDismiss,
+)
+
+@Composable
+private fun ImageViewerPage(
+    item: ImageViewerItem,
+    isActive: Boolean,
+    onZoomChanged: (Boolean) -> Unit,
+    dismissOffsetY: Animatable<Float, AnimationVector1D>,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var zoom by remember(item.url) { mutableFloatStateOf(1f) }
+    var panOffset by remember(item.url) { mutableStateOf(Offset.Zero) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var animJob by remember(item.url) { mutableStateOf<Job?>(null) }
+    var reloadTrigger by remember(item.url) { mutableIntStateOf(0) }
+    var showSpinner by remember(item.url, reloadTrigger) { mutableStateOf(false) }
+
+    LaunchedEffect(isActive) {
+        if (!isActive) {
+            animJob?.cancel()
+            zoom = 1f
+            panOffset = Offset.Zero
+            onZoomChanged(false)
+        }
+    }
+
+    LaunchedEffect(zoom) {
+        onZoomChanged(zoom > 1.05f)
+    }
+
+    LaunchedEffect(item.url, reloadTrigger) {
+        delay(200)
+        showSpinner = true
+    }
+
+    val originalRequest = remember(item.url, context, reloadTrigger) {
+        ImageRequest.Builder(context)
+            .data(item.url)
+            .crossfade(200)
+            .build()
+    }
+
+    val dismissThreshold = with(LocalDensity.current) { 90.dp.toPx() }
+
+    fun animateResetTo(targetZoom: Float, targetPan: Offset) {
+        animJob?.cancel()
+        animJob = scope.launch {
+            val startZoom = zoom
+            val startPan = panOffset
+            animate(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+            ) { fraction, _ ->
+                zoom = startZoom + (targetZoom - startZoom) * fraction
+                panOffset = Offset(
+                    x = startPan.x + (targetPan.x - startPan.x) * fraction,
+                    y = startPan.y + (targetPan.y - startPan.y) * fraction,
+                )
+            }
+            zoom = targetZoom
+            panOffset = targetPan
+        }
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .onSizeChanged { containerSize = it }
+            .clipToBounds()
+            .pointerInput(item.url, containerSize) {
+                detectTapGestures(
+                    onDoubleTap = { tapOffset ->
+                        if (zoom > 1.05f) {
+                            animateResetTo(1f, Offset.Zero)
+                        } else {
+                            val center = Offset(containerSize.width / 2f, containerSize.height / 2f)
+                            val targetZoom = 2.5f
+                            val targetPan = (center - tapOffset) * (targetZoom - 1f)
+                            val maxPanX = if (containerSize.width > 0) ((targetZoom - 1f) * containerSize.width / 2f).coerceAtLeast(0f) else 0f
+                            val maxPanY = if (containerSize.height > 0) ((targetZoom - 1f) * containerSize.height / 2f).coerceAtLeast(0f) else 0f
+                            animateResetTo(
+                                targetZoom = targetZoom,
+                                targetPan = Offset(
+                                    x = targetPan.x.coerceIn(-maxPanX, maxPanX),
+                                    y = targetPan.y.coerceIn(-maxPanY, maxPanY),
+                                ),
                             )
                         }
+                    },
+                )
+            }
+            .pointerInput(item.url, containerSize) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    animJob?.cancel()
 
-                        // 2. 表层高清原图：加载成功后以 200ms crossfade 平滑覆盖在预览图之上
-                        SubcomposeAsyncImage(
-                            model = originalRequest,
-                            contentDescription = "图片预览",
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize(),
-                        ) {
-                            val state = painter.state
-                            when (state) {
-                                is AsyncImagePainter.State.Loading -> {
-                                    if (showSpinner) {
-                                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                            IosActivityIndicator(
-                                                diameter = 34.dp,
-                                                color = Color.White.copy(alpha = 0.85f),
-                                            )
-                                        }
+                    var dragMode = if (zoom > 1.05f) 3 else 0 // 0: Undetermined, 1: Dismiss, 2: Pager, 3: Pan/Transform
+                    var totalPan = Offset.Zero
+                    val touchSlop = viewConfiguration.touchSlop
+
+                    do {
+                        val event = awaitPointerEvent()
+                        val activePointers = event.changes.filter { it.pressed }
+                        if (activePointers.isEmpty()) break
+
+                        if (activePointers.size >= 2) {
+                            dragMode = 3
+                            if (dismissOffsetY.value > 0f) {
+                                scope.launch { dismissOffsetY.snapTo(0f) }
+                            }
+
+                            val zoomChange = event.calculateZoom()
+                            val panChange = event.calculatePan()
+                            val centroid = event.calculateCentroid(useCurrent = false)
+                            val center = Offset(containerSize.width / 2f, containerSize.height / 2f)
+
+                            val oldZoom = zoom
+                            val nextZoom = (zoom * zoomChange).coerceIn(0.7f, 6f)
+                            val effectiveScale = if (oldZoom > 0f) nextZoom / oldZoom else 1f
+                            val centroidOffset = centroid - center
+                            val panAdjustment = (centroidOffset - panOffset) * (1f - effectiveScale)
+                            val nextPan = panOffset + panChange + panAdjustment
+
+                            zoom = nextZoom
+                            val maxPanX = if (containerSize.width > 0) ((nextZoom - 1f) * containerSize.width / 2f).coerceAtLeast(0f) else 0f
+                            val maxPanY = if (containerSize.height > 0) ((nextZoom - 1f) * containerSize.height / 2f).coerceAtLeast(0f) else 0f
+                            panOffset = Offset(
+                                x = nextPan.x.coerceIn(-maxPanX * 1.35f, maxPanX * 1.35f),
+                                y = nextPan.y.coerceIn(-maxPanY * 1.35f, maxPanY * 1.35f),
+                            )
+
+                            event.changes.forEach { it.consume() }
+                        } else if (activePointers.size == 1) {
+                            val change = activePointers.first()
+                            val delta = change.positionChange()
+
+                            if (zoom > 1.05f) {
+                                dragMode = 3
+                                val maxPanX = if (containerSize.width > 0) ((zoom - 1f) * containerSize.width / 2f).coerceAtLeast(0f) else 0f
+                                val maxPanY = if (containerSize.height > 0) ((zoom - 1f) * containerSize.height / 2f).coerceAtLeast(0f) else 0f
+                                panOffset = Offset(
+                                    x = (panOffset.x + delta.x).coerceIn(-maxPanX * 1.15f, maxPanX * 1.15f),
+                                    y = (panOffset.y + delta.y).coerceIn(-maxPanY * 1.15f, maxPanY * 1.15f),
+                                )
+                                change.consume()
+                            } else {
+                                when (dragMode) {
+                                    1 -> {
+                                        change.consume()
+                                        val nextDismiss = (dismissOffsetY.value + delta.y).coerceAtLeast(0f)
+                                        scope.launch { dismissOffsetY.snapTo(nextDismiss) }
                                     }
-                                }
-                                is AsyncImagePainter.State.Error -> {
-                                    // 仅在完全没有预览图垫底（即界面全黑、空无一物）时，才在中央显示重试卡片
-                                    // 若已有 previewUrl 成功垫底，保持静默展示当前预览图，绝不弹窗打断与遮挡用户视线
-                                    if (previewUrl.isNullOrBlank()) {
-                                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                            Column(
-                                                horizontalAlignment = Alignment.CenterHorizontally,
-                                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                                                modifier = Modifier
-                                                    .clip(RoundedCornerShape(10.dp))
-                                                    .background(Color.Black.copy(alpha = 0.72f))
-                                                    .border(0.6.dp, Color.White.copy(alpha = 0.2f), RoundedCornerShape(10.dp))
-                                                    .padding(horizontal = 20.dp, vertical = 12.dp)
-                                                    .clickable { reloadTrigger++ },
-                                            ) {
-                                                Text("大图加载失败", color = Color.White, style = IosTheme.type.subheadline)
-                                                Text("点击重新加载", color = Color(0xFF64B5F6), style = IosTheme.type.caption)
+                                    2 -> {
+                                        // Pager: 左右横滑切页，不消费事件
+                                    }
+                                    3 -> {
+                                        panOffset += delta
+                                        change.consume()
+                                    }
+                                    else -> {
+                                        totalPan += delta
+                                        if (totalPan.getDistance() > touchSlop) {
+                                            if (totalPan.y > 0 && totalPan.y > abs(totalPan.x) * 1.1f) {
+                                                dragMode = 1
+                                                change.consume()
+                                                val nextDismiss = (dismissOffsetY.value + totalPan.y).coerceAtLeast(0f)
+                                                scope.launch { dismissOffsetY.snapTo(nextDismiss) }
+                                            } else {
+                                                dragMode = 2
                                             }
                                         }
                                     }
                                 }
-                                else -> {
-                                    SubcomposeAsyncImageContent()
+                            }
+                        }
+                    } while (event.changes.any { it.pressed })
+
+                    if (dismissOffsetY.value > 0f) {
+                        if (dismissOffsetY.value > dismissThreshold) {
+                            onDismiss()
+                        } else {
+                            scope.launch {
+                                dismissOffsetY.animateTo(0f, spring(stiffness = Spring.StiffnessMediumLow))
+                            }
+                        }
+                    }
+
+                    if (zoom < 1f || zoom <= 1.05f) {
+                        if (zoom != 1f || panOffset != Offset.Zero) {
+                            animateResetTo(1f, Offset.Zero)
+                        }
+                    } else {
+                        val maxPanX = if (containerSize.width > 0) ((zoom - 1f) * containerSize.width / 2f).coerceAtLeast(0f) else 0f
+                        val maxPanY = if (containerSize.height > 0) ((zoom - 1f) * containerSize.height / 2f).coerceAtLeast(0f) else 0f
+                        val clampedX = panOffset.x.coerceIn(-maxPanX, maxPanX)
+                        val clampedY = panOffset.y.coerceIn(-maxPanY, maxPanY)
+                        if (clampedX != panOffset.x || clampedY != panOffset.y) {
+                            animateResetTo(zoom, Offset(clampedX, clampedY))
+                        }
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = zoom
+                    scaleY = zoom
+                    translationX = panOffset.x
+                    translationY = panOffset.y
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            // 1. 底层常驻预览图：优先从内存/磁盘缓存秒显，作为无缝垫底底图，大图加载全过程及切换时永不卸载，杜绝闪屏
+            if (!item.previewUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(item.previewUrl)
+                        .build(),
+                    contentDescription = item.description,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            // 2. 表层高清原图：加载成功后以 200ms crossfade 平滑覆盖在预览图之上
+            SubcomposeAsyncImage(
+                model = originalRequest,
+                contentDescription = item.description ?: "图片预览",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                val state = painter.state
+                when (state) {
+                    is AsyncImagePainter.State.Loading -> {
+                        if (showSpinner) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                IosActivityIndicator(
+                                    diameter = 34.dp,
+                                    color = Color.White.copy(alpha = 0.85f),
+                                )
+                            }
+                        }
+                    }
+                    is AsyncImagePainter.State.Error -> {
+                        // 仅在完全没有预览图垫底（即界面全黑、空无一物）时，才在中央显示重试卡片
+                        // 若已有 previewUrl 成功垫底，保持静默展示当前预览图，绝不弹窗打断与遮挡用户视线
+                        if (item.previewUrl.isNullOrBlank()) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(Color.Black.copy(alpha = 0.72f))
+                                        .border(0.6.dp, Color.White.copy(alpha = 0.2f), RoundedCornerShape(10.dp))
+                                        .padding(horizontal = 20.dp, vertical = 12.dp)
+                                        .clickable { reloadTrigger++ },
+                                ) {
+                                    Text("大图加载失败", color = Color.White, style = IosTheme.type.subheadline)
+                                    Text("点击重新加载", color = Color(0xFF64B5F6), style = IosTheme.type.caption)
                                 }
                             }
                         }
                     }
+                    else -> {
+                        SubcomposeAsyncImageContent()
+                    }
                 }
-                Row(
-                Modifier
-                    .align(Alignment.TopEnd)
-                    .zIndex(10f)
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = if (saving) "保存中…" else "保存",
-                    color = Color.White,
-                    style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(Color.Black.copy(alpha = 0.38f))
-                        .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
-                        .clickable(enabled = !saving) {
-                            saving = true
-                            scope.launch {
-                                var msg = saveMediaToPublicStorage(
-                                    context = context,
-                                    url = url,
-                                    suggestedName = null,
-                                    asImage = true,
-                                )
-                                // 若大图下载保存失败，且存在预览图，自动降级保存当前已缓存的预览图
-                                if (msg.startsWith("保存失败") && !previewUrl.isNullOrBlank() && previewUrl != url) {
-                                    msg = saveMediaToPublicStorage(
-                                        context = context,
-                                        url = previewUrl,
-                                        suggestedName = null,
-                                        asImage = true,
-                                    )
-                                }
-                                saving = false
-                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                )
-                Text(
-                    text = "关闭",
-                    color = Color.White,
-                    style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(Color.Black.copy(alpha = 0.38f))
-                        .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
-                        .clickable(onClick = onDismiss)
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                )
             }
         }
-    }
     }
 }
 
@@ -5775,14 +6590,18 @@ private fun TopicNotificationSelector(
     val isDark = IosTheme.colors.isDark
     val pillBg = if (isDark) Color(0xFF2C2C2E) else IosTheme.colors.fieldBackground
     val pillTextColor = if (isDark) Color(0xFFE5E5EA) else IosTheme.colors.label
+    val selectorShape = RoundedCornerShape(8.dp)
+    val selectorBorder = if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6)
 
     Box {
         Row(
             modifier = Modifier
-                .clip(RoundedCornerShape(12.dp))
+                .height(26.dp)
+                .clip(selectorShape)
                 .background(pillBg)
+                .border(0.75.dp, selectorBorder, selectorShape)
                 .clickable(enabled = enabled) { expanded = true }
-                .padding(horizontal = 8.dp, vertical = 4.dp),
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
@@ -5795,7 +6614,7 @@ private fun TopicNotificationSelector(
             Box(Modifier.size(6.dp).background(dotColor, CircleShape))
             Text(
                 text = "${currentLevel.badgeLabel} ▾",
-                style = IosTheme.type.footnote,
+                style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
                 color = pillTextColor,
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,

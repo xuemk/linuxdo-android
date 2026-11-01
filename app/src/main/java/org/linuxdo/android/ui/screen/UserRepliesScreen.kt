@@ -179,6 +179,7 @@ fun UserRepliesScreen(
                             )
                         }
                     }
+                item("bottom-spacer") { Spacer(Modifier.height(96.dp)) }
                 }
             }
         }
@@ -265,10 +266,11 @@ private fun UserReplyCard(
         )
 
         // 我的评论内容（一行多了省略号，参照 PC 样式）
-        if (item.commentExcerpt.isNotBlank()) {
+        val cleaned = cleanExcerpt(item.commentExcerpt)
+        if (!cleaned.isNullOrBlank()) {
             Spacer(Modifier.height(6.dp))
             Text(
-                text = item.commentExcerpt,
+                text = cleaned,
                 style = IosTheme.type.footnote.copy(fontSize = 14.sp),
                 color = IosTheme.colors.secondaryLabel,
                 maxLines = 1,
@@ -589,19 +591,7 @@ fun UserProfileScreen(
                             color = Color(0xFFA1A1AA),
                             maxLines = 1,
                         )
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color(0xFF253347))
-                                .padding(horizontal = 7.dp, vertical = 2.dp),
-                        ) {
-                            Text(
-                                text = "L${card?.trustLevel ?: 2} 成员",
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color(0xFF60A5FA),
-                            )
-                        }
+                        LevelBadge(card?.trustLevel ?: 2)
                     }
                 }
             }
@@ -775,6 +765,7 @@ fun UserProfileScreen(
                 androidx.compose.foundation.lazy.LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
                 ) {
                     items(items, key = { it.id }) { item ->
                         UserReplyCard(
@@ -1204,7 +1195,7 @@ private fun UserSummaryView(
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(96.dp))
     }
 }
 

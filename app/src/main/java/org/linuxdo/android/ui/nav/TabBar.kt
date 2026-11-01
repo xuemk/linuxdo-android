@@ -37,6 +37,7 @@ enum class MainTab(val label: String, val root: Route) {
 fun TabBar(
     selected: MainTab,
     homeFeedLabel: String = "首页",
+    categoriesTabLabel: String = "分类",
     unreadCount: Int = 0,
     onSelect: (MainTab) -> Unit,
 ) {
@@ -63,7 +64,7 @@ fun TabBar(
             MainTab.entries.forEach { tab ->
                 val isSelected = tab == selected
                 val color = if (isSelected) activeTint else inactiveTint
-                val label = if (tab == MainTab.Latest) homeFeedLabel else tab.label
+                val label = if (tab == MainTab.Latest) homeFeedLabel else if (tab == MainTab.Categories) categoriesTabLabel else tab.label
                 Column(
                     Modifier
                         .weight(1f)
@@ -112,14 +113,35 @@ fun TabBar(
                                         drawLine(color, Offset(size.width * 0.62f, size.height * 0.60f), Offset(size.width * 0.62f, size.height * 0.88f), stroke, StrokeCap.Round)
                                     }
                                 }
-                                MainTab.Categories -> repeat(4) { index ->
-                                    val x = size.width * (0.10f + index % 2 * 0.50f)
-                                    val y = size.height * (0.10f + index / 2 * 0.50f)
-                                    val rectSize = Size(size.width * 0.30f, size.height * 0.30f)
-                                    if (isSelected) {
-                                        drawRect(color, Offset(x, y), rectSize)
+                                MainTab.Categories -> {
+                                    if (categoriesTabLabel == "标签") {
+                                        val tagPath = Path().apply {
+                                            moveTo(size.width * 0.18f, size.height * 0.22f)
+                                            lineTo(size.width * 0.58f, size.height * 0.22f)
+                                            lineTo(size.width * 0.88f, size.height * 0.52f)
+                                            lineTo(size.width * 0.58f, size.height * 0.82f)
+                                            lineTo(size.width * 0.18f, size.height * 0.82f)
+                                            close()
+                                        }
+                                        if (isSelected) {
+                                            drawPath(tagPath, color)
+                                            val contrastColor = if (isDark) Color(0xFF1C1C1E) else Color(0xFFFFFFFF)
+                                            drawCircle(contrastColor, size.width * 0.08f, Offset(size.width * 0.36f, size.height * 0.52f))
+                                        } else {
+                                            drawPath(tagPath, color, style = Stroke(stroke, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                                            drawCircle(color, size.width * 0.07f, Offset(size.width * 0.36f, size.height * 0.52f), style = Stroke(stroke))
+                                        }
                                     } else {
-                                        drawRect(color, Offset(x, y), rectSize, style = Stroke(stroke))
+                                        repeat(4) { index ->
+                                            val x = size.width * (0.10f + index % 2 * 0.50f)
+                                            val y = size.height * (0.10f + index / 2 * 0.50f)
+                                            val rectSize = Size(size.width * 0.30f, size.height * 0.30f)
+                                            if (isSelected) {
+                                                drawRect(color, Offset(x, y), rectSize)
+                                            } else {
+                                                drawRect(color, Offset(x, y), rectSize, style = Stroke(stroke))
+                                            }
+                                        }
                                     }
                                 }
                                 MainTab.Search -> {

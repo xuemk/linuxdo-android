@@ -98,19 +98,19 @@ object Config {
      */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
-          "versionCode": 10,
-          "versionName": "1.2.0",
+          "versionCode": 17,
+          "versionName": "1.5.0",
           "forceUpdate": false,
           "minVersionCode": 1,
-          "title": "v1.2.0 版本更新",
+          "title": "LINUX DO Android v1.5.0 正式版更新说明",
           "changelog": [
-            "1、整体 UI 重构，全面升级首页、分类、搜索、详情与个人中心交互体验",
-            "2、增加支持安全登录认证（原生人机验证与网页授权认证）",
-            "3、新增浏览帖子数与阅读时长同步功能（默认关闭，开启可能触发掉盾）",
-            "4、支持评论正倒序切换、Emoji 表情面板、分类等级下拉切换及多项细节修复"
+            "1、内置免代理直连网络栈，无需系统代理即可直接登录畅刷论坛",
+            "2、新增话题标签（Tags）聚合与精准检索功能，找帖更高效",
+            "3、优化信息流纯净度与滑动性能，精细化打磨列表与详情体验",
+            "4、修复简评真实等级展示、非列表页底部Bar手势返回平滑复位等多项细节"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.2.0/linuxdo-1.2.0-release.apk",
-          "apkSha256": ""
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.5.0/linuxdo-1.5.0-release.apk",
+          "apkSha256": "08347eff53e5b1e98bf874b41df1d9f6e31922c2dad7c77e21666838f476d744"
         }
     """
 }

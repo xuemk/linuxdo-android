@@ -3,6 +3,7 @@ package org.linuxdo.android
 import android.app.Application
 import android.content.Context
 import android.webkit.WebSettings
+import android.webkit.WebView
 import android.os.Build
 import coil.ImageLoader
 import coil.ImageLoaderFactory
@@ -28,6 +29,8 @@ import org.linuxdo.android.net.AdaptiveDohDns
 import org.linuxdo.android.net.DohFailoverCoordinator
 import org.linuxdo.android.net.DohPresets
 import org.linuxdo.android.net.DohTransport
+import org.linuxdo.android.net.anycast.AnycastPool
+import org.linuxdo.android.net.proxy.LocalProxyServer
 import org.linuxdo.android.net.NetworkStateMonitor
 import org.linuxdo.android.net.buildBootstrapClient
 import org.linuxdo.android.net.buildSharedHttpClient
@@ -37,8 +40,32 @@ class App : Application(), ImageLoaderFactory {
     lateinit var container: AppContainer
         private set
 
+    private fun getProcessNameCompat(): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            return Application.getProcessName()
+        }
+        return try {
+            val cmdline = File("/proc/self/cmdline").readText().trim { it <= ' ' || it == '\u0000' }
+            if (cmdline.isNotEmpty()) cmdline else packageName
+        } catch (_: Exception) {
+            packageName
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
+        val currentProcess = getProcessNameCompat()
+        if (currentProcess != packageName) {
+            // 是 GeckoView 的沙盒子进程（如 :gpu, :tab 等），设置专属目录后缀并跳过主进程业务容器初始化
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val suffix = currentProcess.substringAfter(":", "child")
+                try {
+                    WebView.setDataDirectorySuffix(suffix)
+                } catch (_: Exception) {}
+            }
+            return
+        }
+
         container = AppContainer(this)
 
         org.linuxdo.android.push.LinuxDoPushSdk.init(
@@ -90,18 +117,50 @@ class AppContainer(context: Context) {
     val diagnostics = Diagnostics(File(context.filesDir, "diagnostics.log")).also {
         org.linuxdo.android.net.NetDiagnostics.sink = it
     }
+
+    init {
+        installCrashHandler(context, diagnostics)
+    }
     val sessionStore = SessionStore(context)
     val reading = ReadingStore(context)
     val accountManager = AccountManager(context)
     val draftStore = DraftStore(context)
     val historyStore = HistoryStore(context)
-    val userAgent: String = resolveUserAgent(context, sessionStore)
-    val browser = BrowserSession(context, userAgent, sessionStore, diagnostics)
+    private val initialUserAgent: String = resolveUserAgent(context, sessionStore)
+    val userAgent: String get() = sessionStore.userAgentOrNull() ?: initialUserAgent
+    val browser = BrowserSession(
+        appContext = context,
+        userAgent = userAgent,
+        store = sessionStore,
+        diagnostics = diagnostics,
+        httpClientProvider = { dohCoordinator.currentClient },
+        isProxyOrVpnActiveProvider = { networkMonitor.detect().shouldPauseDoh },
+    )
 
     val networkMonitor = NetworkStateMonitor(context) {
         // 当开启/关闭 VPN 或系统代理时，通知协调器刷新代次以暂停或恢复 DoH 直连
         dohCoordinator.refresh()
+        // VPN / 系统代理智能让渡：有真实 VPN 时清除 WebView 代理，无 VPN 时挂载本地代理
+        updateWebViewProxyState()
+        dohCoordinator.startSmartRouteMonitoring()
     }
+
+    /**
+     * 内置 Cloudflare Anycast IP 池 ——「直连优先」的寻址基座。
+     *
+     * 进程级单例：健康探测结果必须跨 transport 代次复用。若随代次重建，每次 VPN 切换或
+     * 故障轮换都会把已测得的节点健康状态清空，重新交一遍探测学费。
+     */
+    val anycastPool: AnycastPool = AnycastPool()
+
+    /**
+     * 本地 HTTP CONNECT 代理与 TLS Record 级分片服务（路径 B）。
+     * 为系统原生 WebView 访问 *.linux.do 提供免 DNS、Anycast 直连与 ClientHello Record 分片抗审查能力。
+     */
+    val localProxyServer: LocalProxyServer = LocalProxyServer(
+        targetSuffix = Config.HOST,
+        anycastPool = anycastPool,
+    )
 
     /**
      * 原生 DoH + ECH 自动故障转移协调器。
@@ -112,13 +171,16 @@ class AppContainer(context: Context) {
         store = sessionStore,
         userAgent = userAgent,
         networkMonitor = networkMonitor,
-        clientFactory = { dns, transport, coordinator ->
+        anycastPool = anycastPool,
+        clientFactory = { dns, transport, coordinator, routeMode ->
             buildSharedHttpClient(
                 store = sessionStore,
                 userAgent = userAgent,
                 dns = dns,
                 dohTransport = transport,
                 failoverCoordinator = coordinator,
+                anycastPool = anycastPool,
+                routeMode = routeMode,
             )
         },
     )
@@ -161,6 +223,7 @@ class AppContainer(context: Context) {
                 .build()
         }
         .crossfade(true)
+        .respectCacheHeaders(false)
         .build()
 
     private val okHttpTransport: OkHttpTransport = OkHttpTransport(
@@ -175,6 +238,8 @@ class AppContainer(context: Context) {
     /** 最近一次退到后台的时间（elapsedRealtime）；0 表示当前在前台或尚未退过后台。 */
     @Volatile private var backgroundSince = 0L
 
+    @Volatile private var lastShouldPauseDoh: Boolean? = null
+
     init {
         dohCoordinator.onEpochChanged = { epoch ->
             val label = epochLabel(epoch)
@@ -185,11 +250,38 @@ class AppContainer(context: Context) {
         networkMonitor.onDefaultNetworkChanged = {
             diagnostics.log("网络链路: 默认网络已切换，回收连接")
             dohCoordinator.recycleConnections("默认网络切换")
+            updateWebViewProxyState()
+        }
+        updateWebViewProxyState()
+    }
+
+    /**
+     * 根据当前网络环境自动更新 WebView 代理挂载状态（Task 3.1 / 3.5）。
+     * 检测到系统 VPN/代理开启时，主动释放本地代理，让渡系统网络；纯直连时挂载本地分片代理。
+     * 并在代理与直连状态切换时，自动清除旧网络出口下的 cf_clearance，避免携带异地 IP 凭据撞盾。
+     */
+    fun updateWebViewProxyState() {
+        val shouldPause = networkMonitor.detect().shouldPauseDoh
+        val previousPause = lastShouldPauseDoh
+        if (previousPause != null && previousPause != shouldPause) {
+            val oldFp = sessionStore.currentCfClearanceFp()
+            if (oldFp != "-") {
+                sessionStore.clearCookie(Config.CF_CLEARANCE_COOKIE)
+                sessionStore.clearChallengedClearances()
+                diagnostics.log("网络链路: 出口代理状态切换(shouldPause: $previousPause -> $shouldPause)，重置旧 cf_clearance(fp=$oldFp) 避免异地 IP 撞盾")
+            }
+        }
+        lastShouldPauseDoh = shouldPause
+        if (shouldPause) {
+            LocalProxyServer.clearWebViewProxyOverride()
+        } else {
+            LocalProxyServer.applyWebViewProxyOverride(localProxyServer.port)
         }
     }
 
     fun onAppBackground() {
         backgroundSince = android.os.SystemClock.elapsedRealtime()
+        dohCoordinator.setAppForeground(false)
     }
 
     /**
@@ -197,6 +289,7 @@ class AppContainer(context: Context) {
      * 必须在回前台的首批请求发出之前调用。
      */
     fun onAppForeground() {
+        dohCoordinator.setAppForeground(true)
         val since = backgroundSince
         backgroundSince = 0L
         if (since == 0L) return
@@ -221,12 +314,14 @@ class AppContainer(context: Context) {
             httpClientProvider = { httpClient },
         )
     }
-
     /**
      * 重建或刷新 OkHttp 客户端（DoH 偏好设置变更或手动切换后调用）。
      */
     fun rebuildHttpClient() {
         dohCoordinator.refresh()
+        if (sessionStore.isDohEnabled()) {
+            dohCoordinator.triggerSmartRouteEvaluation()
+        }
     }
 
     companion object {
@@ -234,7 +329,7 @@ class AppContainer(context: Context) {
         private const val STALE_CONNECTION_IDLE_MS = 5 * 60_000L
 
         private fun epochLabel(epoch: org.linuxdo.android.net.TransportEpoch): String =
-            "gen=${epoch.generation} " + if (epoch.transport != null) "原生直连(${epoch.server.name})" else "系统网络"
+            "gen=${epoch.generation} " + if (epoch.transport != null) "${epoch.routeMode.label}(${epoch.server.name})" else "系统网络"
 
         /**
          * 全应用共用同一个 UA。首次运行时由系统 WebView 的默认 UA 规整成 Chrome 移动端的形态
@@ -242,11 +337,16 @@ class AppContainer(context: Context) {
          * 因为 cf_clearance 与 UA 绑定,UA 漂移会触发重新挑战。
          */
         fun resolveUserAgent(context: Context, store: SessionStore): String {
-            val normalized = normalize(WebSettings.getDefaultUserAgent(context))
             val stored = store.userAgentOrNull()
             // 旧版本把设备段强行改成固定的 Android 10; K。它会与 WebView 自动
             // 发送的 Client Hints 不一致，CF 可能将同一会话视为指纹漂移。
             if (!stored.isNullOrBlank() && !stored.contains("Android 10; K")) return stored
+            val raw = try {
+                WebSettings.getDefaultUserAgent(context)
+            } catch (_: Throwable) {
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            }
+            val normalized = normalize(raw)
             store.saveUserAgent(normalized)
             return normalized
         }
@@ -256,6 +356,18 @@ class AppContainer(context: Context) {
             .replace(Regex("Version/[^ ]+ *"), "")
             .replace(Regex("\\s{2,}"), " ")
             .trim()
+    }
+}
+
+private fun installCrashHandler(context: Context, diagnostics: Diagnostics) {
+    val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        try {
+            diagnostics.recordCrash(thread, throwable, context)
+        } catch (_: Throwable) {
+        } finally {
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
     }
 }
 
