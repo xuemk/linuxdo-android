@@ -232,7 +232,15 @@ fun TopicListScreen(
     barsVisible: Boolean = true,
     blockedUsernames: Set<String> = emptySet(),
 ) {
-    val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
+    // 每个 feed 的滚动位置用 rememberLazyListState（内部走 rememberSaveable），
+    // 确保在 recomposition 或临时移出组合树后仍能还原 firstVisibleItemIndex + scrollOffset。
+    // 旧方案 remember { mutableMapOf() } + LazyListState() 不走 saveable，回复后
+    // refreshTopic silent 触发大量 state 更新时极易丢失位置。
+    // HomeFeedType 枚举顺序：Latest(0)、Unread(1)、Hot(2)、Posted(3)
+    val feedStateLatest = rememberLazyListState()
+    val feedStateUnread = rememberLazyListState()
+    val feedStateHot = rememberLazyListState()
+    val feedStatePosted = rememberLazyListState()
     val categoryListStates = remember { mutableMapOf<Int, LazyListState>() }
     val defaultListState = rememberLazyListState()
     var pendingSettledFeed by remember { mutableStateOf<HomeFeedType?>(null) }
@@ -247,8 +255,20 @@ fun TopicListScreen(
     } else {
         state
     }
+    // 将各 feed 的 rememberLazyListState 对象放入一个普通 Map，供统一访问。
+    // 不用 getOrPut 动态创建，每个已知 feed 提前声明好对应的 saveable state。
+    val feedListStates: Map<HomeFeedType, LazyListState> = remember(
+        feedStateLatest, feedStateUnread, feedStateHot, feedStatePosted
+    ) {
+        mapOf(
+            HomeFeedType.Latest to feedStateLatest,
+            HomeFeedType.Unread to feedStateUnread,
+            HomeFeedType.Hot to feedStateHot,
+            HomeFeedType.Posted to feedStatePosted,
+        )
+    }
     val listState = when {
-        effectiveFeed != null -> feedListStates.getOrPut(effectiveFeed) { LazyListState() }
+        effectiveFeed != null -> feedListStates[effectiveFeed] ?: feedStateLatest
         currentCategoryId != null -> categoryListStates.getOrPut(currentCategoryId) { LazyListState() }
         else -> defaultListState
     }
@@ -425,7 +445,7 @@ fun TopicListScreen(
         (abs(feedDragOffsetPx.value) / containerWidthPx).coerceIn(0f, 1f)
     } else 0f
 
-    val secondaryListState = incomingFeed?.let { feedListStates.getOrPut(it) { LazyListState() } }
+    val secondaryListState = incomingFeed?.let { feedListStates[it] ?: feedStateLatest }
     val incomingFeedState = incomingFeed?.let { feedStates[it] ?: TopicListUiState(initialLoading = true) }
     val incomingFilteredItems = remember(incomingFeedState?.items, blockedUsernames) {
         val raw = incomingFeedState?.items.orEmpty()
