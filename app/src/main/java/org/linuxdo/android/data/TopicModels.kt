@@ -979,6 +979,30 @@ data class ChatMembership(
     @SerialName("last_read_message_id") val lastReadMessageId: Long? = null,
 )
 
+/** 聊天消息中的上传附件（图片或文件） */
+@Serializable
+data class ChatUpload(
+    val id: Long = 0L,
+    val url: String = "",
+    @SerialName("original_filename") val originalFilename: String = "",
+    val width: Int? = null,
+    val height: Int? = null,
+    @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
+    val extension: String? = null,
+    val filesize: Long = 0L,
+) {
+    /** 判断是否为图片类型 */
+    val isImage: Boolean
+        get() = extension?.lowercase() in setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp")
+
+    /** 补全相对路径为完整 URL */
+    fun absoluteUrl(base: String): String = if (url.startsWith("http")) url else "$base$url"
+
+    /** 获取缩略图完整 URL，若无则退回原图 */
+    fun absoluteThumbnailUrl(base: String): String =
+        thumbnailUrl?.let { if (it.startsWith("http")) it else "$base$it" } ?: absoluteUrl(base)
+}
+
 @Serializable
 data class ChatMessageSummary(
     val id: Long,
@@ -987,6 +1011,8 @@ data class ChatMessageSummary(
     val cooked: String = "",
     @SerialName("created_at") val createdAt: String? = null,
     val user: ChatUserSummary? = null,
+    /** PC 端发送图片时携带的附件列表，移动端通过此字段渲染图片 */
+    val uploads: List<ChatUpload> = emptyList(),
 )
 
 @Serializable
