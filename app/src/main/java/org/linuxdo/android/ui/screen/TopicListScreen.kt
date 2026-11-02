@@ -167,6 +167,7 @@ data class TopicListUiState(
     val pendingPage: TopicPage? = null,
     val incomingTopicIds: Set<Long> = emptySet(),
     val highlightedTopicIds: Set<Long> = emptySet(),
+    val needsRefresh: Boolean = false,
 )
 
 /** "最新"与"某分类下的帖子"用同一个列表页,只是标题与数据源不同。 */
@@ -178,6 +179,8 @@ fun TopicListScreen(
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     onOpenTopic: (Topic) -> Unit,
+    onOpenItem: ((TopicListItem) -> Unit)? = null,
+    onRemoveBookmark: ((TopicListItem, (String) -> Unit) -> Unit)? = null,
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
     onBack: (() -> Unit)? = null,
@@ -198,6 +201,7 @@ fun TopicListScreen(
     onCreateTopic: (() -> Unit)? = null,
     onBookmarkTopic: ((Topic, (String) -> Unit) -> Unit)? = null,
     onFlagTopic: ((Topic, Int, String?, () -> Unit, (String) -> Unit) -> Unit)? = null,
+    onSaveTopic: ((Topic) -> Unit)? = null,
     sortOrder: TopicSortOrder = TopicSortOrder.Default,
     sortAscending: Boolean = false,
     onSortChange: (TopicSortOrder) -> Unit = {},
@@ -349,7 +353,7 @@ fun TopicListScreen(
     val (pinnedGroups, plainItems) = remember(filteredItems) { pinnedPrefixGroups(filteredItems) }
     val previewKeyPrefix = effectiveFeed?.name ?: currentCategoryId ?: "topic"
     val previewTopicsByKey = remember(plainItems, previewKeyPrefix) {
-        plainItems.associate { "${previewKeyPrefix}_${it.topic.id}" to it.topic }
+        plainItems.associate { "${previewKeyPrefix}_${it.listKey}" to it.topic }
     }
     val visiblePreviewTopics by remember(listState, previewTopicsByKey) {
         derivedStateOf {
@@ -589,6 +593,7 @@ fun TopicListScreen(
                     onCopyLink = copyTopicLink,
                     onBookmark = bookmarkTopicAction,
                     onFlag = flagTopicAction,
+                    onSave = onSaveTopic,
                     showTopicUnreadDot = showTopicUnreadDot,
                     topicUnreadDotPosition = topicUnreadDotPosition,
                 )
@@ -607,7 +612,7 @@ fun TopicListScreen(
 
         itemsIndexed(
             items = pagePlainItems,
-            key = { _, item -> "${keyPrefix}_${item.topic.id}" },
+            key = { _, item -> "${keyPrefix}_${item.listKey}" },
             contentType = { _, item ->
                 when {
                     feedDisplayMode == "graphic" -> "topic-graphic"
@@ -621,6 +626,21 @@ fun TopicListScreen(
             val isGraphic = feedDisplayMode == "graphic"
             val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
             Column(modifier = Modifier.fillMaxWidth()) {
+                if (item.bookmarkId != null) {
+                    var removing by remember(item.bookmarkId) { mutableStateOf(false) }
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(item.targetPostNumber?.let { "收藏于第 $it 楼" } ?: "话题书签",
+                            style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                        Spacer(Modifier.weight(1f))
+                        if (onRemoveBookmark != null) androidx.compose.material3.TextButton(
+                            enabled = !removing,
+                            onClick = {
+                                removing = true
+                                onRemoveBookmark(item) { message -> removing = false; showNotice(message) }
+                            },
+                        ) { Text(if (removing) "处理中…" else "取消收藏", style = IosTheme.type.caption) }
+                    }
+                }
                 TopicRow(
                     item = item,
                     isHighlighted = isHighlighted,
@@ -632,8 +652,9 @@ fun TopicListScreen(
                     onCopyLink = { copyTopicLink(item.topic) },
                     onBookmark = bookmarkTopicAction?.let { fn -> { fn(item.topic) } },
                     onFlag = flagTopicAction?.let { fn -> { fn(item.topic) } },
+                    onSave = onSaveTopic?.let { fn -> { fn(item.topic) } },
                     onOpenUser = onOpenUser,
-                    onClick = { onOpenTopic(item.topic) },
+                    onClick = { if (onOpenItem != null) onOpenItem(item) else onOpenTopic(item.topic) },
                     feedGraphicMode = isGraphic,
                     feedDisplayMode = feedDisplayMode,
                     showTopicUnreadDot = showTopicUnreadDot,
@@ -1233,6 +1254,7 @@ private fun NotificationLevelMenu(
     onCopyLink: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
     onFlag: (() -> Unit)? = null,
+    onSave: (() -> Unit)? = null,
 ) {
     if (!expanded) return
     DropdownMenu(
@@ -1269,9 +1291,26 @@ private fun NotificationLevelMenu(
                 )
             }
         }
-        val hasExtraActions = onCopyLink != null || onBookmark != null || onFlag != null
+        val hasExtraActions = onSave != null || onCopyLink != null || onBookmark != null || onFlag != null
         if (onPick != null && hasExtraActions) {
             IosDivider()
+        }
+        if (onSave != null) {
+            DropdownMenuItem(
+                text = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(17.dp), contentAlignment = Alignment.Center) {
+                            Text("▱", color = IosTheme.colors.secondaryLabel, fontSize = 15.sp)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("添加暂存", color = IosTheme.colors.label)
+                    }
+                },
+                onClick = {
+                    onDismiss()
+                    onSave()
+                },
+            )
         }
         if (onCopyLink != null) {
             DropdownMenuItem(
@@ -1369,6 +1408,7 @@ fun PinnedGroupCard(
     onCopyLink: ((Topic) -> Unit)? = null,
     onBookmark: ((Topic) -> Unit)? = null,
     onFlag: ((Topic) -> Unit)? = null,
+    onSave: ((Topic) -> Unit)? = null,
     isHighlighted: Boolean = false,
     showTopicUnreadDot: Boolean = true,
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
@@ -1376,7 +1416,7 @@ fun PinnedGroupCard(
     val head = items.firstOrNull() ?: return
     val rowBackground = topicRowBackground(isHighlighted)
     var menuTopicId by remember { mutableStateOf<Long?>(null) }
-    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
+    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null || onSave != null
     Column(
         Modifier
             .fillMaxWidth()
@@ -1459,6 +1499,7 @@ fun PinnedGroupCard(
                     onCopyLink = onCopyLink?.let { fn -> { fn(entry.topic) } },
                     onBookmark = onBookmark?.let { fn -> { fn(entry.topic) } },
                     onFlag = onFlag?.let { fn -> { fn(entry.topic) } },
+                    onSave = onSave?.let { fn -> { fn(entry.topic) } },
                 )
             }
         }
@@ -1695,6 +1736,7 @@ fun TopicRow(
     onCopyLink: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
     onFlag: (() -> Unit)? = null,
+    onSave: (() -> Unit)? = null,
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onClick: () -> Unit,
     feedGraphicMode: Boolean = true,
@@ -1703,7 +1745,7 @@ fun TopicRow(
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
 ) {
     var showLevelMenu by remember { mutableStateOf(false) }
-    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
+    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null || onSave != null
     val topic = item.topic
     // 首次组合查一次本地库；之后改读内存态，详情页或预取记下封面时这一行会随之刷新。
     val storedCoverUrl = remember(topic.id) { ExcerptCache.getCoverImage(topic.id) }
@@ -1720,7 +1762,11 @@ fun TopicRow(
     val accent = IosTheme.colors.accent
 
     // 观察响应式真实正文（一旦预取成功或点开详情，立即自动重组刷新）
-    val realExcerpt = if (feedDisplayMode == "no_excerpt") null else getTopicRealExcerpt(topic)
+    val realExcerpt = when {
+        feedDisplayMode == "no_excerpt" -> null
+        query != null || item.bookmarkId != null -> topic.excerpt
+        else -> getTopicRealExcerpt(topic)
+    }
 
     val excerpt = remember(realExcerpt, needle, accent) {
         val raw = realExcerpt
@@ -1834,6 +1880,7 @@ fun TopicRow(
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 // 2. 标题（紧随作者行，精致克制主标题，契合主流App信息流）
@@ -2007,6 +2054,7 @@ fun TopicRow(
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 // 3. 正文两行摘录 (严格保证两行知乎排版结构，固定最小高度防抖)
@@ -2204,6 +2252,7 @@ fun TopicRow(
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 Spacer(Modifier.height(6.dp))

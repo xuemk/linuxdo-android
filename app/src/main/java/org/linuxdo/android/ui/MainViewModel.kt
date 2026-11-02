@@ -16,6 +16,11 @@ import android.os.PersistableBundle
 import android.provider.OpenableColumns
 import android.text.Spanned
 import android.widget.Toast
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.linuxdo.android.data.SavedTopic
+import org.linuxdo.android.data.SavedTopicStore
+import org.linuxdo.android.data.TopicReadingPosition
 import androidx.lifecycle.AndroidViewModel
 import androidx.core.content.edit
 import androidx.lifecycle.viewModelScope
@@ -117,6 +122,12 @@ import org.linuxdo.android.net.RateLimitException
 import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.ui.screen.TopicListUiState
+import org.linuxdo.android.data.TopicSearchHit
+import org.linuxdo.android.data.TopicMetadata
+import org.linuxdo.android.data.TopicEditRules
+import org.linuxdo.android.data.TopicMetadataPatch
+import org.linuxdo.android.data.topicMetadataPatch
+import org.linuxdo.android.data.validateTopicMetadata
 
 enum class Screen { Boot, Login, Verify, List }
 
@@ -581,6 +592,28 @@ data class SearchUiState(
     val order: SearchOrder = SearchOrder.Relevance,
 )
 
+data class TopicSearchUiState(
+    val open: Boolean = false, val topicId: Long = 0, val title: String = "", val query: String = "",
+    val hits: List<TopicSearchHit> = emptyList(), val page: Int = 0, val hasMore: Boolean = false,
+    val loading: Boolean = false, val loadingMore: Boolean = false, val error: String? = null,
+    val order: SearchOrder = SearchOrder.Relevance,
+)
+
+data class TopicMetadataEditorUiState(
+    val open: Boolean = false, val topicId: Long = 0, val userId: Long = 0, val generation: Long = 0,
+    val original: TopicMetadata? = null, val rules: TopicEditRules? = null,
+    val title: String = "", val categoryId: Int? = null, val tags: List<String> = emptyList(),
+    val loading: Boolean = false, val saving: Boolean = false, val error: String? = null,
+    val tagQuery: String = "", val loadingTags: Boolean = false,
+    val tagOptions: List<org.linuxdo.android.data.DiscourseTagInfo> = emptyList(),
+    val tagError: String? = null, val requiredTagName: String? = null, val requiredTagMin: Int = 0,
+) {
+    val patch: TopicMetadataPatch? get() = original?.let { topicMetadataPatch(it, title, categoryId, tags, rules?.canTagTopics == true) }
+    val dirty: Boolean get() = patch?.changed == true
+    val validationError: String? get() = original?.let { original -> rules?.let { validateTopicMetadata(original, it, patch ?: TopicMetadataPatch()) } }
+    val canSave: Boolean get() = open && !loading && !saving && !loadingTags && original?.canEdit == true && rules != null && dirty && validationError == null
+}
+
 data class ProfileUiState(
     val content: ProfilePage = ProfilePage(),
     val loaded: Boolean = false,
@@ -631,6 +664,175 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val browser = container.browser
     private val userApiKeyAuthService = container.userApiKeyAuthService
     val diagnostics = container.diagnostics
+
+    private val savedTopicStore = SavedTopicStore(application)
+    private val savedTopicWriteGate = Mutex()
+    private val _savedTopics = MutableStateFlow<List<SavedTopic>>(emptyList())
+    val savedTopics = _savedTopics.asStateFlow()
+    private val _savedTopicsUserId = MutableStateFlow(0L)
+    val savedTopicsUserId = _savedTopicsUserId.asStateFlow()
+    private val _savedTopicsBusy = MutableStateFlow(false)
+    val savedTopicsBusy = _savedTopicsBusy.asStateFlow()
+    private val _savedTopicsNotice = MutableStateFlow<String?>(null)
+    val savedTopicsNotice = _savedTopicsNotice.asStateFlow()
+    private val _canUndoSavedTopics = MutableStateFlow(false)
+    val canUndoSavedTopics = _canUndoSavedTopics.asStateFlow()
+    private var removedSavedTopics: List<SavedTopic> = emptyList()
+    private val topicReadingPositions = mutableMapOf<Long, TopicReadingPosition>()
+
+    private fun publishSavedTopics(entries: List<SavedTopic>) {
+        _savedTopics.value = entries.sortedWith(compareByDescending<SavedTopic> { it.pinned }.thenByDescending { it.savedAt })
+    }
+
+    private fun changeSavedTopics(
+        userId: Long,
+        operation: suspend () -> List<SavedTopic>,
+        onSuccess: () -> Unit = {},
+    ) {
+        if (userId <= 0L || userId != _savedTopicsUserId.value || _savedTopicsBusy.value) return
+        val generation = accountScopeGeneration
+        _savedTopicsBusy.value = true
+        viewModelScope.launch {
+            try {
+                // 锁内发布：避免排在后面的旧结果覆盖较新的列表。
+                val published = savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { operation() }
+                    val sameScope = generation == accountScopeGeneration && userId == _savedTopicsUserId.value
+                    if (sameScope) publishSavedTopics(updated)
+                    sameScope
+                }
+                if (published) onSuccess()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (generation == accountScopeGeneration) _savedTopicsNotice.value = error.message ?: "暂存操作失败，请重试"
+            } finally {
+                if (generation == accountScopeGeneration) _savedTopicsBusy.value = false
+            }
+        }
+    }
+
+    fun saveTopic(userId: Long, topicId: Long) {
+        val detail = _details.value[topicId] ?: return
+        val topic = detail.topic ?: return
+        val entry = SavedTopic(
+            topicId = topicId, title = topic.title, savedAt = System.currentTimeMillis(),
+            categoryName = detail.category?.name, categoryColor = detail.category?.color,
+            totalPosts = maxOf(topic.postsCount, topic.postStream.stream.size, 1),
+            position = topicReadingPositions[topicId] ?: TopicReadingPosition(),
+        )
+        changeSavedTopics(userId, { savedTopicStore.add(userId, entry) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已加入暂存"
+        }
+    }
+
+    /** 列表长按加入暂存：没有阅读视口，按服务端已读楼层恢复。 */
+    fun saveTopicFromList(topic: Topic) {
+        val userId = _savedTopicsUserId.value
+        if (userId <= 0L) return
+        if (_savedTopics.value.any { it.topicId == topic.id }) {
+            _savedTopicsNotice.value = "已在暂存中"
+            return
+        }
+        val category = repository.cachedCategoryMap()[topic.categoryId]
+        val lastRead = topic.lastReadPostNumber?.takeIf { it > 1 }
+        val entry = SavedTopic(
+            topicId = topic.id, title = topic.title, savedAt = System.currentTimeMillis(),
+            categoryName = category?.name, categoryColor = category?.color,
+            totalPosts = maxOf(topic.postsCount, topic.highestPostNumber ?: 0, 1),
+            position = topicReadingPositions[topic.id]
+                ?: lastRead?.let { TopicReadingPosition(postNumber = it, atTop = false) }
+                ?: TopicReadingPosition(),
+        )
+        changeSavedTopics(userId, { savedTopicStore.add(userId, entry) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已加入暂存"
+        }
+    }
+
+    fun updateSavedTopicPosition(userId: Long, topicId: Long, position: TopicReadingPosition) {
+        if (userId <= 0L || userId != _savedTopicsUserId.value) return
+        if (topicReadingPositions.put(topicId, position) == position) return
+        if (_savedTopics.value.none { it.topicId == topicId }) return
+        val generation = accountScopeGeneration
+        val totalPosts = _details.value[topicId]?.topic?.postsCount ?: 0
+        viewModelScope.launch {
+            try {
+                savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { savedTopicStore.updatePosition(userId, topicId, position, totalPosts) }
+                    if (generation == accountScopeGeneration && userId == _savedTopicsUserId.value) publishSavedTopics(updated)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("暂存阅读位置保存失败: ${error.message}")
+            }
+        }
+    }
+
+    /** 复用列表静默探测和话题实时消息的数据，不额外发请求。 */
+    private fun syncSavedTopicTotals(totals: Map<Long, Int>) {
+        val userId = _savedTopicsUserId.value
+        if (userId <= 0L || totals.isEmpty()) return
+        val changed = _savedTopics.value.any { entry ->
+            totals[entry.topicId]?.let { it > 0 && it != entry.totalPosts } == true
+        }
+        if (!changed) return
+        val generation = accountScopeGeneration
+        viewModelScope.launch {
+            try {
+                savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { savedTopicStore.updateTotals(userId, totals) }
+                    if (generation == accountScopeGeneration && userId == _savedTopicsUserId.value) publishSavedTopics(updated)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("暂存楼层数同步失败: ${error.message}")
+            }
+        }
+    }
+
+    fun removeSavedTopic(userId: Long, topicId: Long) {
+        val removed = _savedTopics.value.filter { it.topicId == topicId }.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        changeSavedTopics(userId, { savedTopicStore.remove(userId, topicId) }) {
+            removedSavedTopics = removed
+            _canUndoSavedTopics.value = removed.isNotEmpty()
+            _savedTopicsNotice.value = "已移除暂存"
+        }
+    }
+
+    fun clearSavedTopics(userId: Long) {
+        val removed = _savedTopics.value.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        changeSavedTopics(userId, { savedTopicStore.clear(userId) }) {
+            removedSavedTopics = removed
+            _canUndoSavedTopics.value = removed.isNotEmpty()
+            _savedTopicsNotice.value = "已清空全部暂存"
+        }
+    }
+
+    fun undoSavedTopics(userId: Long) {
+        val removed = removedSavedTopics.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        if (removed.isEmpty()) return
+        changeSavedTopics(userId, { savedTopicStore.restore(userId, removed) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已撤销"
+        }
+    }
+
+    fun pinSavedTopic(userId: Long, topicId: Long) {
+        changeSavedTopics(userId, { savedTopicStore.togglePin(userId, topicId) })
+    }
+
+    fun clearSavedTopicsNotice() {
+        _savedTopicsNotice.value = null
+        _canUndoSavedTopics.value = false
+        removedSavedTopics = emptyList()
+    }
 
     private val initialHomeFeed = HomeFeedType.fromName(store.homeFeed())
     private val _feedStates = MutableStateFlow<Map<HomeFeedType, TopicListUiState>>(emptyMap())
@@ -731,6 +933,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val userRepliesStates = _userRepliesStates.asStateFlow()
     private val _search = MutableStateFlow(SearchUiState())
     val search = _search.asStateFlow()
+    private var searchSequence = 0L
+    private var topicSearchSequence = 0L
+    private var topicSearchJob: Job? = null
+    private val _topicSearch = MutableStateFlow(TopicSearchUiState())
+    val topicSearch = _topicSearch.asStateFlow()
+    private var metadataSequence = 0L
+    private var metadataJob: Job? = null
+    private var metadataTagJob: Job? = null
+    private var metadataTagSequence = 0L
+    private val _metadataEditor = MutableStateFlow(TopicMetadataEditorUiState())
+    val metadataEditor = _metadataEditor.asStateFlow()
+    private val _metadataUpdated = MutableStateFlow<TopicMetadata?>(null)
+    val metadataUpdated = _metadataUpdated.asStateFlow()
     private val _searchHistory = MutableStateFlow(store.getSearchHistory())
     val searchHistory = _searchHistory.asStateFlow()
     private val _profile = MutableStateFlow<Map<ProfileSection, ProfileUiState>>(emptyMap())
@@ -4010,15 +4225,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         previous: Boolean = false,
         resumePostNumber: Int? = null,
         fromNotification: Boolean = false,
+        restoredPosition: TopicReadingPosition? = null,
     ) {
         val pendingTarget = peekNotificationTopicPending(id)
         val isNotificationJump = fromNotification || (pendingTarget != null)
         val effectivePostNumber = postNumber ?: pendingTarget?.second
-        val current = if (!more && !previous && !retry) {
+        val base = if (!more && !previous && !retry) {
             restoreCachedTopicDetail(id) ?: DetailUiState()
         } else {
             _details.value[id] ?: DetailUiState()
         }
+        val current = restoredPosition?.let { base.copy(filterUserId = it.filterUserId, descending = it.descending) } ?: base
+        if (restoredPosition != null) _details.update { it + (id to current) }
         val targetPostNumber = effectivePostNumber ?: resumePostNumber
         val requestPostNumber = effectivePostNumber ?: resumePostNumber?.takeIf { it > 20 }
         if (!more && !previous) {
@@ -4103,8 +4321,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         nextCalibrationAt = SystemClock.elapsedRealtime() + 60_000L
                         needsCalibration = false
                     }
-                    val category = repository.categoryById(topic.categoryId)
-                    val emojis = repository.emojiUrls()
+                    val category = repository.cachedCategoryMap()[topic.categoryId]
+                    val emojis = current.emojiUrls
                     val rootPost = current.posts.filter { it.postNumber == 1 }
                     var posts = if (requestPostNumber != null) (rootPost + topic.postStream.posts).distinctBy { it.id }.sortedBy { it.postNumber }
                         else topic.postStream.posts.distinctBy { it.id }
@@ -4125,7 +4343,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             emojiUrls = emojis, windowStartId = topic.postStream.posts.minByOrNull { it.postNumber }?.id,
                             locateVersion = newLocateVersion,
                             locatePostNumber = if (isNotificationJump) effectiveTargetPostNumber else effectivePostNumber,
-                            confirmedReadPostNumbers = container.reading.confirmedPostNumbers(id)))
+                            confirmedReadPostNumbers = container.reading.confirmedPostNumbers(id),
+                            filterUserId = restoredPosition?.filterUserId,
+                            descending = restoredPosition?.descending ?: false))
+                    }
+                    val scopeGeneration = accountScopeGeneration
+                    viewModelScope.launch {
+                        val resolvedCategory = runCatching { repository.categoryById(topic.categoryId) }.getOrNull()
+                        val resolvedEmojis = repository.emojiUrls()
+                        if (scopeGeneration == accountScopeGeneration) _details.update { states ->
+                            states[id]?.let {
+                                states + (id to it.copy(
+                                    category = resolvedCategory ?: it.category,
+                                    emojiUrls = resolvedEmojis.ifEmpty { it.emojiUrls },
+                                ))
+                            } ?: states
+                        }
                     }
                     val firstPost = posts.firstOrNull { it.postNumber == 1 }
                         ?: topic.postStream.posts.firstOrNull { it.postNumber == 1 }
@@ -6004,6 +6237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateListCounters(fresh: List<TopicListItem>) {
         val byId = fresh.associate { it.topic.id to it.topic }
+        syncSavedTopicTotals(byId.mapValues { it.value.postsCount })
         mapTopicLists { list ->
             list.copy(items = mergeTopicCounters(list.items, byId),
                 pendingPage = list.pendingPage?.let { it.copy(items = mergeTopicCounters(it.items, byId)) })
@@ -6011,6 +6245,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun updateListPostCount(topicId: Long, count: Int, highestPostNumber: Int? = null) {
+        syncSavedTopicTotals(mapOf(topicId to count))
         fun update(items: List<TopicListItem>) = items.map { item ->
             if (item.topic.id != topicId) item else item.copy(topic = item.topic.copy(postsCount = count,
                 highestPostNumber = highestPostNumber ?: item.topic.highestPostNumber.takeIf { count <= item.topic.postsCount }))
@@ -6368,7 +6603,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (refresh && !more) incomingProbeGeneration++
         val current = _categoryTopics.value[id]
         if (pageJobs["category:$id"]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -6409,7 +6644,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val key = "${if (isBookmark) "bookmark" else "created"}:$username"
         val current = _userTopicStates.value[key]
         if (pageJobs[key]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -6419,7 +6654,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )) }
             try {
                 val result = if (isBookmark) repository.fetchUserBookmarks(username, page) else repository.fetchUserCreatedTopics(username, page)
-                val items = if (more) (previous.items + result.items).distinctBy { it.topic.id } else result.items
+                val items = if (more) (previous.items + result.items).distinctBy { it.listKey } else result.items
                 val hasMore = result.hasMore && result.items.isNotEmpty() && (!more || page > previous.page)
                 _userTopicStates.update { it + (key to TopicListUiState(items, page,
                     hasMore, initialLoading = false)) }
@@ -6481,8 +6716,291 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+fun openTopicSearch(topicId: Long, title: String) {
+        topicSearchJob?.cancel()
+        topicSearchSequence++
+        _topicSearch.value = if (_topicSearch.value.topicId == topicId) _topicSearch.value.copy(open = true, title = title)
+            else TopicSearchUiState(open = true, topicId = topicId, title = title, order = _search.value.order)
+    }
+
+    fun closeTopicSearch() {
+        topicSearchJob?.cancel()
+        topicSearchSequence++
+        _topicSearch.update { it.copy(open = false, loading = false, loadingMore = false) }
+    }
+
+    fun openTopicSearchHit(hit: TopicSearchHit) {
+        val search = _topicSearch.value
+        if (!search.open || search.hits.none { it.postId == hit.postId }) return
+        closeTopicSearch()
+        loadTopic(search.topicId, postNumber = hit.postNumber,
+            restoredPosition = TopicReadingPosition(postNumber = hit.postNumber, atTop = false,
+                descending = _details.value[search.topicId]?.descending ?: false))
+    }
+
+    fun updateTopicSearch(query: String, order: SearchOrder = _topicSearch.value.order) {
+        topicSearchJob?.cancel()
+        val sequence = ++topicSearchSequence
+        val current = _topicSearch.value
+        if (!current.open) return
+        _topicSearch.value = current.copy(query = query, order = order, hits = emptyList(), page = 0,
+            hasMore = false, loading = query.isNotBlank(), loadingMore = false, error = null)
+        if (query.isBlank()) return
+        topicSearchJob = viewModelScope.launch {
+            delay(500L)
+            performTopicSearch(sequence, more = false)
+        }
+    }
+
+    fun loadMoreTopicSearch() {
+        if (topicSearchJob?.isActive == true) return
+        val current = _topicSearch.value
+        if (!current.open || !current.hasMore) return
+        topicSearchJob = viewModelScope.launch { performTopicSearch(topicSearchSequence, more = true) }
+    }
+
+    private suspend fun performTopicSearch(sequence: Long, more: Boolean) {
+        val current = _topicSearch.value
+        val generation = accountScopeGeneration
+        val page = if (more) current.page + 1 else 1
+        _topicSearch.update { it.copy(loading = !more, loadingMore = more, error = null) }
+        try {
+            val result = repository.searchInTopic(current.topicId, current.query, page, current.order)
+            if (sequence != topicSearchSequence || generation != accountScopeGeneration) return
+            _topicSearch.update { it.copy(hits = (if (more) current.hits + result.hits else result.hits).distinctBy { hit -> hit.postId },
+                page = page, hasMore = result.hasMore, loading = false, loadingMore = false) }
+        } catch (error: CancellationException) { throw error }
+        catch (error: Exception) {
+            if (sequence != topicSearchSequence || generation != accountScopeGeneration) return
+            _topicSearch.update { it.copy(loading = false, loadingMore = false, error = error.message ?: "帖内搜索失败") }
+            handlePageFailure(error) { updateTopicSearch(current.query, current.order) }
+        }
+    }
+
+    fun openTopicMetadataEditor(topicId: Long, preserveInput: Boolean = false) {
+        if (_metadataEditor.value.saving || store.currentUserId() <= 0L) return
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        val previous = _metadataEditor.value
+        val pendingPatch = if (preserveInput && previous.topicId == topicId) previous.patch else null
+        val sequence = ++metadataSequence
+        val userId = store.currentUserId()
+        val generation = store.sessionGeneration
+        _metadataEditor.value = if (pendingPatch != null) previous.copy(loading = true, error = null, generation = generation)
+            else TopicMetadataEditorUiState(open = true, topicId = topicId, userId = userId, generation = generation, loading = true)
+        metadataJob = viewModelScope.launch {
+            try {
+                val original = repository.fetchTopicMetadata(topicId)
+                if (sequence != metadataSequence) return@launch
+                if (userId != store.currentUserId() || generation != store.sessionGeneration) {
+                    _metadataEditor.update { it.copy(loading = false, original = it.original?.copy(canEdit = false),
+                        error = "账号状态已变化，请重新核对编辑权限") }
+                    return@launch
+                }
+                if (!original.canEdit) {
+                    _metadataEditor.update { it.copy(original = original, loading = false, error = "当前账号无权编辑此话题") }
+                    return@launch
+                }
+                val rules = repository.fetchTopicEditRules()
+                if (sequence != metadataSequence) return@launch
+                if (userId != store.currentUserId() || generation != store.sessionGeneration) {
+                    _metadataEditor.update { it.copy(loading = false, original = it.original?.copy(canEdit = false),
+                        error = "账号状态已变化，请重新核对编辑权限") }
+                    return@launch
+                }
+                val pending = pendingPatch?.let { if (rules.canTagTopics) it else it.copy(tags = null) }?.applyTo(original) ?: original
+                _metadataEditor.value = TopicMetadataEditorUiState(open = true, topicId = topicId, userId = userId,
+                    generation = generation, original = original, rules = rules, title = pending.title,
+                    categoryId = pending.categoryId, tags = pending.tags)
+                if (!original.privateMessage && rules.canTagTopics) searchMetadataTags("")
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence != metadataSequence) return@launch
+                _metadataEditor.update { it.copy(loading = false, error = error.message ?: "编辑信息加载失败") }
+                handlePageFailure(error) { if (userId == store.currentUserId()) openTopicMetadataEditor(topicId, preserveInput = true) }
+            }
+        }
+    }
+
+    fun closeTopicMetadataEditor() {
+        if (_metadataEditor.value.saving) return
+        metadataSequence++
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        _metadataEditor.value = TopicMetadataEditorUiState()
+    }
+
+    fun updateMetadataTitle(title: String) {
+        _metadataEditor.update { if (it.saving || it.original?.canEdit != true) it else it.copy(title = title, error = null) }
+    }
+
+    fun updateMetadataCategory(id: Int) {
+        val state = _metadataEditor.value
+        if (state.saving || state.original?.canEdit != true || state.rules?.selectableCategories?.none { it.id == id } != false) return
+        _metadataEditor.update { it.copy(categoryId = id, error = null) }
+        if (state.rules?.canTagTopics == true) searchMetadataTags("")
+    }
+
+    fun updateMetadataTags(tags: List<String>) {
+        val state = _metadataEditor.value
+        if (state.saving || state.original?.canEdit != true || state.rules?.canTagTopics != true) return
+        if (tags.any { it !in state.tags && state.tagOptions.none { option -> option.name == it } }) {
+            _metadataEditor.update { it.copy(tagError = "请选择查询结果中的标签") }
+            return
+        }
+        if (tags.size > 5) {
+            _metadataEditor.update { it.copy(tagError = "最多选择 5 个标签") }
+            return
+        }
+        _metadataEditor.update { it.copy(tags = tags.distinct(), error = null) }
+        searchMetadataTags(state.tagQuery)
+    }
+
+    fun searchMetadataTags(query: String) {
+        metadataTagJob?.cancel()
+        val tagSequence = ++metadataTagSequence
+        val sequence = metadataSequence
+        val current = _metadataEditor.value
+        if (!current.open || current.rules?.canTagTopics != true || current.original?.privateMessage == true) return
+        _metadataEditor.update { it.copy(tagQuery = query, loadingTags = true, tagError = null) }
+        metadataTagJob = viewModelScope.launch {
+            delay(300L)
+            try {
+                val result = repository.searchTopicEditTags(current.categoryId, query, current.tags)
+                if (sequence != metadataSequence || tagSequence != metadataTagSequence || current.userId != store.currentUserId()) return@launch
+                _metadataEditor.update { it.copy(loadingTags = false, tagOptions = result.results,
+                    requiredTagName = result.requiredTagName, requiredTagMin = result.requiredTagMinCount) }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence == metadataSequence && tagSequence == metadataTagSequence) _metadataEditor.update {
+                    it.copy(loadingTags = false, tagOptions = emptyList(), tagError = error.message ?: "标签加载失败，请重试")
+                }
+            }
+        }
+    }
+
+    fun submitTopicMetadata() {
+        val current = _metadataEditor.value
+        val original = current.original ?: return
+        val rules = current.rules ?: return
+        val patch = current.patch ?: return
+        if (!current.canSave) return
+        if (current.userId != store.currentUserId() || current.generation != store.sessionGeneration) {
+            _metadataEditor.update { it.copy(error = "账号状态已变化，请重新打开编辑") }
+            return
+        }
+        val sequence = metadataSequence
+        val accountGeneration = accountScopeGeneration
+        _metadataEditor.update { it.copy(saving = true, error = null) }
+        metadataJob = viewModelScope.launch {
+            try {
+                val updated = repository.updateTopicMetadata(original, rules, patch, current.userId, current.generation)
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                applyTopicMetadata(updated, rules, patch.categoryId != null || patch.tags != null, current.userId)
+                _metadataEditor.value = TopicMetadataEditorUiState()
+                Toast.makeText(getApplication(), "话题信息已保存", Toast.LENGTH_SHORT).show()
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                if (error is org.linuxdo.android.net.NetworkTimeoutException || (error is org.linuxdo.android.net.HttpStatusException && error.status >= 500)) {
+                    val confirmed = try { repository.fetchTopicMetadata(current.topicId) }
+                        catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { null }
+                    val expected = patch.applyTo(original)
+                    val matches = confirmed != null && (patch.title == null || confirmed.title == expected.title) &&
+                        (patch.categoryId == null || confirmed.categoryId == expected.categoryId) &&
+                        (patch.tags == null || confirmed.tags.sorted() == expected.tags.sorted())
+                    if (matches && sequence == metadataSequence && accountGeneration == accountScopeGeneration) {
+                        applyTopicMetadata(confirmed!!, rules, patch.categoryId != null || patch.tags != null, current.userId)
+                        _metadataEditor.value = TopicMetadataEditorUiState()
+                        Toast.makeText(getApplication(), "已确认话题信息保存成功", Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                }
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                if (error is org.linuxdo.android.net.HttpStatusException && error.status == 403) {
+                    _details.update { states -> states[current.topicId]?.let { detail ->
+                        states + (current.topicId to detail.copy(topic = detail.topic?.copy(details = detail.topic.details.copy(canEdit = false))))
+                    } ?: states }
+                    updateCachedTopicDetail(current.topicId, refreshTtl = false)
+                }
+                _metadataEditor.update { it.copy(saving = false,
+                    original = if (error is org.linuxdo.android.net.HttpStatusException && error.status == 403) original.copy(canEdit = false) else original,
+                    error = error.message ?: "保存失败，请核对后重试") }
+                handlePageFailure(error) { if (current.userId == store.currentUserId()) openTopicMetadataEditor(current.topicId, preserveInput = true) }
+            } finally {
+                if (sequence == metadataSequence) _metadataEditor.update { it.copy(saving = false) }
+            }
+        }
+    }
+
+    private fun applyTopicMetadata(value: TopicMetadata, rules: TopicEditRules, membershipChanged: Boolean, userId: Long) {
+        val category = rules.categories.firstOrNull { it.id == value.categoryId }
+        fun patchList(list: TopicListUiState): TopicListUiState = list.copy(
+            items = list.items.map { item -> if (item.topic.id != value.topicId) item else item.copy(
+                topic = item.topic.copy(title = value.title, categoryId = value.categoryId, tags = value.tags), category = category) },
+            needsRefresh = list.needsRefresh || membershipChanged,
+        )
+        _details.update { states -> states[value.topicId]?.let { detail ->
+            states + (value.topicId to detail.copy(topic = detail.topic?.copy(title = value.title, categoryId = value.categoryId,
+                tags = value.tags, details = detail.topic.details.copy(canEdit = value.canEdit)), category = category))
+        } ?: states }
+        updateCachedTopicDetail(value.topicId, refreshTtl = false)
+        _state.update { it.copy(latest = patchList(it.latest)) }
+        _feedStates.update { states -> states.mapValues { patchList(it.value) } }
+        _categoryTopics.update { states -> states.mapValues { patchList(it.value) } }
+        _tagTopics.update { states -> states.mapValues { patchList(it.value) } }
+        _userTopicStates.update { states -> states.mapValues { patchList(it.value) } }
+        _search.update { it.copy(results = patchList(it.results).copy(needsRefresh = true)) }
+        _metadataUpdated.value = value
+        val generation = accountScopeGeneration
+        viewModelScope.launch {
+            try {
+                val saved = savedTopicWriteGate.withLock { withContext(Dispatchers.IO) {
+                    container.historyStore.updateMetadata(userId, value.topicId, value.title, category?.name, category?.color)
+                    savedTopicStore.updateMetadata(userId, value.topicId, value.title, category?.name, category?.color)
+                } }
+                if (generation == accountScopeGeneration && userId == store.currentUserId()) {
+                    publishSavedTopics(saved)
+                    _history.update { it.copy(entries = container.historyStore.entries(userId)) }
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { diagnostics.log("话题信息本地同步失败: ${error.message}") }
+        }
+    }
+
+    fun removeBookmarkFromList(item: TopicListItem, onResult: (String) -> Unit) {
+        val bookmarkId = item.bookmarkId ?: return
+        val key = "remove-bookmark:$bookmarkId"
+        if (pageJobs[key]?.isActive == true) return
+        val generation = accountScopeGeneration
+        val userId = store.currentUserId()
+        val sessionGeneration = store.sessionGeneration
+        pageJobs[key] = viewModelScope.launch {
+            try {
+                repository.unbookmarkPost(bookmarkId, userId, sessionGeneration)
+                if (generation != accountScopeGeneration) return@launch
+                _userTopicStates.update { states -> states.mapValues { (key, state) ->
+                    if (key.startsWith("bookmark:")) state.copy(items = state.items.filterNot { it.bookmarkId == bookmarkId }) else state
+                } }
+                _details.update { states -> states[item.topic.id]?.let { detail ->
+                    val posts = detail.posts.map { post -> if (post.bookmarkId == bookmarkId) post.copy(bookmarked = false, bookmarkId = null) else post }
+                    states + (item.topic.id to detail.copy(posts = posts, topic = detail.topic?.copy(postStream = detail.topic.postStream.copy(posts = posts))))
+                } ?: states }
+                updateCachedTopicDetail(item.topic.id, refreshTtl = false)
+                onResult("已取消这条书签")
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (generation == accountScopeGeneration) {
+                    onResult(error.message ?: "取消书签失败")
+                    handlePageFailure(error) { if (generation == accountScopeGeneration) removeBookmarkFromList(item, onResult) }
+                }
+            } finally { pageJobs.remove(key) }
+        }
+    }
+
     fun updateSearch(query: String) {
         searchJob?.cancel()
+        searchSequence++
         val trimmed = query.trim()
         _search.value = SearchUiState(query, TopicListUiState(initialLoading = trimmed.isNotEmpty(), hasMore = false), order = _search.value.order)
         if (trimmed.isEmpty()) return
@@ -6506,10 +7024,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun performSearch(query: String, page: Int) {
         val previous = _search.value
+        val sequence = searchSequence
+        val accountGeneration = accountScopeGeneration
         _search.update { it.copy(results = it.results.copy(initialLoading = page == 1, loadingMore = page > 1, error = null)) }
         try {
             val result = repository.search(query, page, previous.order)
-            val items = if (page == 1) result.items.distinctBy { it.topic.id } else (previous.results.items + result.items).distinctBy { it.topic.id }
+            if (sequence != searchSequence || accountGeneration != accountScopeGeneration) return
+            val items = if (page == 1) result.items.distinctBy { it.listKey } else (previous.results.items + result.items).distinctBy { it.listKey }
             val hasMore = result.hasMore && result.items.isNotEmpty() && (page == 1 || page > previous.results.page)
             _search.update { it.copy(
                 results = TopicListUiState(items, page, hasMore, initialLoading = false),
@@ -6521,6 +7042,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (sequence != searchSequence || accountGeneration != accountScopeGeneration) return
             _search.update { it.copy(results = it.results.copy(initialLoading = false, loadingMore = false, error = error.message ?: "搜索失败")) }
             handlePageFailure(error) { updateSearch(_search.value.query) }
         }
@@ -6892,7 +7414,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun loadTagTopics(tag: String, refresh: Boolean = false, more: Boolean = false) {
         val current = _tagTopics.value[tag]
         if (pageJobs["tag:$tag"]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -7393,6 +7915,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun restoreAccountScopedLocalState(userId: Long) {
+        _savedTopicsUserId.value = userId
+        publishSavedTopics(runCatching { savedTopicStore.entries(userId) }.getOrElse {
+            diagnostics.log("暂存列表读取失败: ${it.message}")
+            _savedTopicsNotice.value = "暂存列表读取失败，请重新打开应用后重试"
+            emptyList()
+        })
         _history.value = HistoryUiState(entries = container.historyStore.entries())
         val blocked = repository.getBlockedUsers(userId)
         _blockedUsers.value = blocked
@@ -7401,6 +7929,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun clearAccountScopedState() {
         accountScopeGeneration += 1
+        searchSequence++
+        closeTopicSearch()
+        metadataSequence++
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        _metadataEditor.value = TopicMetadataEditorUiState()
+        _metadataUpdated.value = null
+        _savedTopicsUserId.value = 0L
+        _savedTopics.value = emptyList()
+        _savedTopicsBusy.value = false
+        clearSavedTopicsNotice()
+        topicReadingPositions.clear()
         topicLiveJob?.cancel()
         topicLiveId = null
         topicLiveSessions.clear()

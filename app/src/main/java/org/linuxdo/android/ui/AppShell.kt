@@ -43,6 +43,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.Text
+import org.linuxdo.android.ui.screen.PostAction
+import org.linuxdo.android.ui.screen.PostActionIcon
 import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -509,6 +511,12 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val categoryTopics by viewModel.categoryTopics.collectAsStateWithLifecycle()
     val userTopicStates by viewModel.userTopicStates.collectAsStateWithLifecycle()
     val search by viewModel.search.collectAsStateWithLifecycle()
+    val topicSearch by viewModel.topicSearch.collectAsStateWithLifecycle()
+    val metadataEditor by viewModel.metadataEditor.collectAsStateWithLifecycle()
+    val metadataUpdated by viewModel.metadataUpdated.collectAsStateWithLifecycle()
+    LaunchedEffect(metadataUpdated) {
+        metadataUpdated?.let { value -> stacks.values.forEach { it.updateTopicTitle(value.topicId, value.title) } }
+    }
     val searchHistory by viewModel.searchHistory.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val userBadges by viewModel.userBadges.collectAsStateWithLifecycle()
@@ -573,6 +581,18 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val feedDisplayMode by viewModel.feedDisplayMode.collectAsStateWithLifecycle()
     val blockedUsers by viewModel.blockedUsers.collectAsStateWithLifecycle()
     val blockedUsernameSet = remember(blockedUsers) { blockedUsers.map { it.username.lowercase() }.toSet() }
+    val savedTopics by viewModel.savedTopics.collectAsStateWithLifecycle()
+    val savedTopicsUserId by viewModel.savedTopicsUserId.collectAsStateWithLifecycle()
+    val savedTopicsBusy by viewModel.savedTopicsBusy.collectAsStateWithLifecycle()
+    val savedTopicsNotice by viewModel.savedTopicsNotice.collectAsStateWithLifecycle()
+    val canUndoSavedTopics by viewModel.canUndoSavedTopics.collectAsStateWithLifecycle()
+    var showSavedTopics by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(savedTopicsNotice) {
+        if (savedTopicsNotice != null) {
+            delay(if (canUndoSavedTopics) 6_000L else 3_000L)
+            viewModel.clearSavedTopicsNotice()
+        }
+    }
 
     LaunchedEffect(pendingNotificationTarget) {
         val target = pendingNotificationTarget ?: return@LaunchedEffect
@@ -621,11 +641,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         }
     }
     val browsing = state.screen == Screen.List
+    LaunchedEffect(browsing, savedTopicsUserId) {
+        if (!browsing || savedTopicsUserId <= 0L) showSavedTopics = false
+    }
     var detailOverlay by rememberSaveable { mutableStateOf(false) }
     var showConnectSheet by rememberSaveable { mutableStateOf(false) }
     var privateMessageRecipient by rememberSaveable { mutableStateOf<String?>(null) }
     var globalBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
-    val contentObscured = topicCreator.open || composer.open || detailOverlay ||
+    val contentObscured = topicCreator.open || composer.open || detailOverlay || showSavedTopics || topicSearch.open || metadataEditor.open ||
         showConnectSheet || globalBrowserUrl != null || privateMessageRecipient != null || accountState.switching ||
         userCard.loading || userCard.user != null || userCard.error != null
     val visibleRoute = stack.current
@@ -662,15 +685,17 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         Box(Modifier.fillMaxSize()) {
             holder.SaveableStateProvider(selected.name) {
                 key(selected) {
-                    IosNavHost(stack, interactive = browsing && !topicCreator.open) { route ->
+                    IosNavHost(stack, interactive = browsing && !topicCreator.open && !showSavedTopics && !topicSearch.open && !metadataEditor.open) { route ->
                         val active = browsing && stack.current == route
+                        // 仅回写标题时保持加载身份，避免保存后重新按阅读游标跳楼。
+                        val routeLoadIdentity = if (route is Route.TopicDetail) route.copy(title = "") else route
                         // 首次详情响应可补齐历史位置，之后固定；0 代表新话题，不能被阅读回执改写。
-                        var entryResumeFloor by rememberSaveable(route) {
+                        var entryResumeFloor by rememberSaveable(routeLoadIdentity) {
                             mutableIntStateOf((route as? Route.TopicDetail)?.let {
                                 viewModel.resolveResumePostNumber(it.topicId, it.postNumber)
                             } ?: -1)
                         }
-                        var topicEntryLoaded by rememberSaveable(route) { mutableStateOf(false) }
+                        var topicEntryLoaded by rememberSaveable(routeLoadIdentity) { mutableStateOf(false) }
                         val entryDetail = (route as? Route.TopicDetail)?.let { details[it.topicId] }
                         if (entryResumeFloor == -1 && topicEntryLoaded && entryDetail?.topic != null && !entryDetail.loading) {
                             SideEffect { entryResumeFloor = entryDetail.topic.lastReadPostNumber?.takeIf { it > 1 } ?: 0 }
@@ -682,10 +707,17 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     if (!topicEntryLoaded || viewModel.details.value[route.topicId]?.topic == null) {
                                         topicEntryLoaded = true
                                         viewModel.loadTopic(route.topicId, postNumber = route.postNumber,
-                                            resumePostNumber = resumePostNumber)
+                                            resumePostNumber = resumePostNumber,
+                                            restoredPosition = route.savedPosition ?: route.postNumber?.let {
+                                                org.linuxdo.android.data.TopicReadingPosition(postNumber = it, atTop = it == 1,
+                                                    descending = details[route.topicId]?.descending ?: false)
+                                            })
                                     }
                                 }
                                 Route.CategoryList -> viewModel.loadCategories()
+                                Route.TopicList -> if (state.latest.needsRefresh) viewModel.refreshLatest()
+                                Route.Search -> if (search.results.needsRefresh) viewModel.updateSearch(search.query)
+                                is Route.TagTopics -> viewModel.loadTagTopics(route.tag)
                                 is Route.CategoryTopics -> {
                                     if (!categories.loaded && !categories.loading) viewModel.loadCategories()
                                     viewModel.loadCategory(route.categoryId, route.slug)
@@ -743,6 +775,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
                                     viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
                                 },
+                                onSaveTopic = if (savedTopicsUserId > 0L) viewModel::saveTopicFromList else null,
                                 sortOrder = topicSortOrder,
                                 sortAscending = topicSortAscending,
                                 onSortChange = { viewModel.setTopicSort(it) },
@@ -810,6 +843,10 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 TopicDetailScreen(
                                     title = route.title,
                                     state = details[route.topicId] ?: DetailUiState(loading = true),
+                                    initialPosition = route.savedPosition,
+                                    onReadingPosition = { viewModel.updateSavedTopicPosition(savedTopicsUserId, route.topicId, it) },
+                                    savedTopicCount = savedTopics.size,
+                                    onOpenSavedTopics = { showSavedTopics = true },
                                     onBack = { stack.pop() },
                                     onRetry = { viewModel.retryTopic(route.topicId, resumePostNumber) },
                                     onRefresh = { viewModel.refreshTopic(route.topicId) },
@@ -845,8 +882,69 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         stack.push(Route.TopicDetail(id, title, postNumber))
                                     },
                                     onJumpToFloor = { viewModel.jumpToFloor(route.topicId, it) },
+                                    onOpenTag = { tag -> stack.push(Route.TagTopics(tag)) },
                                     active = isForeground,
-                                    trailing = {},
+                                    trailing = {
+                                        var more by remember { mutableStateOf(false) }
+                                        Box {
+                                            TextButton(onClick = { more = true }, modifier = Modifier.width(44.dp)) {
+                                                Text("⋯", color = IosTheme.colors.accent, fontSize = 22.sp)
+                                            }
+                                            androidx.compose.material3.DropdownMenu(
+                                                expanded = more, onDismissRequest = { more = false },
+                                                containerColor = if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White,
+                                                tonalElevation = 0.dp,
+                                                modifier = Modifier.background(if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White),
+                                            ) {
+                                                val isSaved = savedTopics.any { it.topicId == route.topicId }
+                                                androidx.compose.material3.DropdownMenuItem(
+                                                    text = {
+                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                            PostActionIcon(PostAction.Bookmark, isSaved, modifier = Modifier.size(18.dp))
+                                                            Spacer(Modifier.width(8.dp))
+                                                            Text(
+                                                                text = if (isSaved) "已暂存" else "话题暂存",
+                                                                color = if (isSaved) IosTheme.colors.accent else IosTheme.colors.label,
+                                                            )
+                                                        }
+                                                    },
+                                                    enabled = savedTopicsUserId > 0L && !savedTopicsBusy && details[route.topicId]?.topic != null,
+                                                    onClick = {
+                                                        more = false
+                                                        if (isSaved) showSavedTopics = true else viewModel.saveTopic(savedTopicsUserId, route.topicId)
+                                                    },
+                                                )
+                                                if (details[route.topicId]?.topic?.details?.canEdit == true) {
+                                                    androidx.compose.material3.DropdownMenuItem(
+                                                        text = {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                PostActionIcon(PostAction.Edit, false, modifier = Modifier.size(18.dp))
+                                                                Spacer(Modifier.width(8.dp))
+                                                                Text("话题编辑", color = IosTheme.colors.label)
+                                                            }
+                                                        },
+                                                        onClick = {
+                                                            more = false
+                                                            viewModel.openTopicMetadataEditor(route.topicId)
+                                                        },
+                                                    )
+                                                }
+                                                androidx.compose.material3.DropdownMenuItem(
+                                                    text = {
+                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                            PostActionIcon(PostAction.Search, false, modifier = Modifier.size(18.dp))
+                                                            Spacer(Modifier.width(8.dp))
+                                                            Text("帖内搜索", color = IosTheme.colors.label)
+                                                        }
+                                                    },
+                                                    onClick = {
+                                                        more = false
+                                                        viewModel.openTopicSearch(route.topicId, details[route.topicId]?.topic?.title ?: route.title)
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    },
                                     onToggleOrder = { viewModel.toggleCommentOrder(route.topicId) },
                                     onPostsVisible = { viewModel.onPostsVisible(route.topicId, it) },
                                     onLiveViewport = { atEnd, scrolling -> viewModel.onTopicViewport(route.topicId, atEnd, scrolling) },
@@ -854,9 +952,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onScrolled = { viewModel.onTopicScrolled(route.topicId) },
                                     onOverlayActive = { detailOverlay = it },
                                     onSetFilterUser = { viewModel.setTopicAuthorFilter(route.topicId, it) },
-                                    onVotePoll = { postId, pollName, optionIds ->
-                                        viewModel.votePoll(route.topicId, postId, pollName, optionIds)
-                                    },
+                                    onVotePoll = { postId, pollName, optionIds -> viewModel.votePoll(route.topicId, postId, pollName, optionIds) },
                                     onSetNotificationLevel = { viewModel.setTopicNotificationLevel(route.topicId, it) },
                                     signedIn = state.username != null,
                                     onToggleBookmark = { viewModel.toggleBookmark(route.topicId, it) },
@@ -1024,6 +1120,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
                                         viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
                                     },
+                                    onSaveTopic = if (savedTopicsUserId > 0L) viewModel::saveTopicFromList else null,
                                     sortOrder = topicSortOrder,
                                     sortAscending = topicSortAscending,
                                     onSortChange = { viewModel.setTopicSort(it, currentCategoryId = route.categoryId, currentCategorySlug = route.slug) },
@@ -1071,8 +1168,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onQuery = viewModel::updateSearch,
                                 onLoadMore = viewModel::loadMoreSearch,
                                 onOpenTopic = {
-                                    viewModel.recordTopicListOpen(it.id, it.postsCount)
-                                    stack.push(Route.TopicDetail(it.id, it.title))
+                                    viewModel.recordTopicListOpen(it.topic.id, it.topic.postsCount)
+                                    stack.push(Route.TopicDetail(it.topic.id, it.topic.title, it.targetPostNumber))
                                 },
                                 onOrder = viewModel::setSearchOrder,
                                 active = active,
@@ -1234,6 +1331,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         viewModel.recordTopicListOpen(it.id, it.postsCount)
                                         stack.push(Route.TopicDetail(it.id, it.title))
                                     },
+                                    onOpenItem = { item ->
+                                        viewModel.recordTopicListOpen(item.topic.id, item.topic.postsCount)
+                                        stack.push(Route.TopicDetail(item.topic.id, item.topic.title, item.targetPostNumber))
+                                    },
+                                    onRemoveBookmark = if (route.isBookmark && route.username.equals(state.username, ignoreCase = true)) viewModel::removeBookmarkFromList else null,
                                     onScrollBusyChanged = viewModel::setTopicListScrollBusy,
                                     onBarsVisibilityChange = viewModel::setBottomBarVisible,
                                     barsVisible = isBottomBarVisible,
@@ -1247,12 +1349,13 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onSetNotificationLevel = { topic, level ->
                                         viewModel.setTopicNotificationLevel(topic.id, level)
                                     },
-                                    onBookmarkTopic = { topic, onResult ->
+                                    onBookmarkTopic = if (route.isBookmark) null else { topic, onResult ->
                                         viewModel.bookmarkTopicFromList(topic.id, onResult)
                                     },
                                     onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
                                         viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
                                     },
+                                    onSaveTopic = if (savedTopicsUserId > 0L) viewModel::saveTopicFromList else null,
                                     sortOrder = topicSortOrder,
                                     sortAscending = topicSortAscending,
                                     onSortChange = { viewModel.setTopicSort(it) },
@@ -1472,6 +1575,45 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         val isTopicListRoute = stack.current is Route.TopicList || stack.current is Route.CategoryTopics || stack.current is Route.UserTopics || stack.current is Route.TagTopics
         val effectiveBottomBarVisible = isBottomBarVisible || !isTopicListRoute
         val shouldShowTabBar = effectiveBottomBarVisible && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
+        if (savedTopics.isNotEmpty() && !isDetailRoute && browsing && !contentObscured && !isKeyboardOpen) {
+            SavedTopicChip(
+                savedTopics.size, { showSavedTopics = true },
+                Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = if (shouldShowTabBar) 76.dp else 16.dp),
+            )
+        }
+        if (showSavedTopics) {
+            SavedTopicsSheet(
+                entries = savedTopics,
+                currentTopicId = (stack.current as? Route.TopicDetail)?.topicId,
+                busy = savedTopicsBusy, notice = savedTopicsNotice, canUndo = canUndoSavedTopics,
+                onOpen = { entry ->
+                    if ((stack.current as? Route.TopicDetail)?.topicId != entry.topicId) {
+                        stack.switchSavedTopic(Route.TopicDetail(entry.topicId, entry.title, entry.position.postNumber, entry.position))
+                    }
+                    showSavedTopics = false
+                },
+                onRemove = { viewModel.removeSavedTopic(savedTopicsUserId, it) },
+                onPin = { viewModel.pinSavedTopic(savedTopicsUserId, it) },
+                onClear = { viewModel.clearSavedTopics(savedTopicsUserId) },
+                onUndo = { viewModel.undoSavedTopics(savedTopicsUserId) },
+                onDismiss = { showSavedTopics = false },
+            )
+        } else if (savedTopicsNotice != null && browsing && !contentObscured) {
+            SavedTopicsNotice(
+                savedTopicsNotice!!, canUndoSavedTopics, { viewModel.undoSavedTopics(savedTopicsUserId) },
+                Modifier.align(Alignment.BottomCenter).padding(start = 16.dp, end = 16.dp, bottom = 100.dp),
+            )
+        }
+        if (browsing && topicSearch.open) {
+            TopicSearchSheet(topicSearch, { viewModel.updateTopicSearch(it) },
+                { viewModel.updateTopicSearch(topicSearch.query, it) }, viewModel::loadMoreTopicSearch,
+                viewModel::openTopicSearchHit, viewModel::closeTopicSearch)
+        }
+        if (browsing && metadataEditor.open) {
+            TopicMetadataEditorSheet(metadataEditor, viewModel::updateMetadataTitle, viewModel::updateMetadataCategory,
+                viewModel::updateMetadataTags, viewModel::searchMetadataTags, viewModel::submitTopicMetadata,
+                { viewModel.openTopicMetadataEditor(metadataEditor.topicId, preserveInput = true) }, viewModel::closeTopicMetadataEditor)
+        }
         androidx.compose.animation.AnimatedVisibility(
             visible = shouldShowTabBar,
             modifier = Modifier.align(Alignment.BottomCenter),

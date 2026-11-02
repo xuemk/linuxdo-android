@@ -52,7 +52,6 @@ import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
-import org.linuxdo.android.ui.html.CookedParser
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.MediaType.Companion.toMediaType
@@ -173,6 +172,43 @@ private data class SearchResponse(
     val posts: List<Post> = emptyList(),
     @SerialName("grouped_search_result") val grouped: SearchResults = SearchResults(),
 )
+
+internal data class BookmarkTarget(val topicId: Long, val bookmarkId: Long?, val postNumber: Int?)
+
+internal fun parseTopicMetadata(root: JsonObject, expectedId: Long): TopicMetadata {
+    val id = (root["id"] as? JsonPrimitive)?.longOrNull
+    require(id == expectedId && expectedId > 0) { "话题信息不匹配，请重新打开编辑" }
+    val details = root["details"] as? JsonObject
+    val tags = (root["tags"] as? JsonArray).orEmpty().mapNotNull {
+        val name = (it as? JsonPrimitive)?.contentOrNull ?: ((it as? JsonObject)?.get("name") as? JsonPrimitive)?.contentOrNull
+        name?.takeIf(String::isNotBlank)
+    }.distinct()
+    return TopicMetadata(expectedId, (root["title"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
+        (root["category_id"] as? JsonPrimitive)?.intOrNull, tags,
+        (details?.get("can_edit") as? JsonPrimitive)?.booleanOrNull == true,
+        (root["archetype"] as? JsonPrimitive)?.contentOrNull == "private_message")
+}
+
+internal fun bookmarkTarget(value: JsonObject): BookmarkTarget? {
+    fun number(key: String) = (value[key] as? JsonPrimitive)?.longOrNull?.takeIf { it > 0L }
+    fun text(key: String) = (value[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+    val isTopic = text("bookmarkable_type").equals("Topic", ignoreCase = true)
+    val explicitTopic = number("topic_id") ?: number("bookmarkable_id")?.takeIf { isTopic }
+    val parts = runCatching { URI(text("bookmarkable_url")).path.orEmpty().split('/').filter(String::isNotEmpty) }.getOrDefault(emptyList())
+    val topicIndex = when {
+        parts.firstOrNull() != "t" -> -1
+        parts.size >= 4 -> 2
+        explicitTopic != null -> parts.indexOf(explicitTopic.toString()).takeIf { it > 0 } ?: -1
+        parts.getOrNull(1)?.toLongOrNull() == null -> 2
+        else -> 1
+    }
+    val topic = explicitTopic ?: parts.getOrNull(topicIndex)?.toLongOrNull()?.takeIf { it > 0 } ?: return null
+    fun floor(key: String) = number(key)?.takeIf { it <= Int.MAX_VALUE }?.toInt()
+    val post = floor("linked_post_number") ?: floor("post_number")
+        ?: parts.getOrNull(topicIndex + 1)?.takeIf { topicIndex > 0 }?.toIntOrNull()?.takeIf { it > 0 }
+        ?: 1.takeIf { isTopic }
+    return BookmarkTarget(topic, number("id") ?: number("bookmark_id"), post)
+}
 
 class TopicRepository(
     private val transportProvider: () -> Transport,
@@ -384,24 +420,21 @@ class TopicRepository(
     suspend fun fetchUserBookmarks(username: String, page: Int): TopicPage {
         val userPath = encode(username)
         val pageQuery = if (page > 0) "&page=$page" else ""
-        val root = objectRequest("/u/$userPath/bookmarks.json?q=&acting_username=$pageQuery", burst = page == 0)
+        val root = objectRequest("/u/$userPath/bookmarks.json?q=$pageQuery", burst = page == 0)
         val listObj = root["user_bookmark_list"] as? JsonObject
         val bookmarks = listObj?.objects("bookmarks") ?: root.objects("bookmarks")
         val moreUrl = listObj?.text("more_bookmarks_url").orEmpty().ifBlank { root.text("more_bookmarks_url") }
         val known = categoryCache ?: categories()
-        val urlTopicRegex = Regex("/t/(?:[^/]+/)?(\\d+)")
 
         val items = bookmarks.mapNotNull { bm ->
-            val topicId = bm.number("topic_id")
-                ?: bm.number("bookmarkable_id")?.takeIf { bm.text("bookmarkable_type").equals("Topic", ignoreCase = true) }
-                ?: urlTopicRegex.find(bm.text("bookmarkable_url"))?.groupValues?.getOrNull(1)?.toLongOrNull()
-                ?: return@mapNotNull null
+            val target = bookmarkTarget(bm) ?: return@mapNotNull null
+            val topicId = target.topicId
 
             val rawTitle = bm.text("title").ifBlank { bm.text("fancy_title") }.ifBlank { bm.text("name") }
             val title = Jsoup.parseBodyFragment(rawTitle).text().ifBlank { "已收藏话题" }
             val slug = bm.text("slug").ifBlank { "topic" }
             val highest = bm.text("highest_post_number").toIntOrNull()
-            val linked = bm.text("linked_post_number").toIntOrNull() ?: bm.text("post_number").toIntOrNull()
+            val linked = target.postNumber
             val postsCount = bm.text("posts_count").toIntOrNull() ?: highest ?: linked ?: 1
             val replyCount = bm.text("reply_count").toIntOrNull() ?: (postsCount - 1).coerceAtLeast(0)
             val categoryId = bm.text("category_id").toIntOrNull()
@@ -448,8 +481,10 @@ class TopicRepository(
                 category = categoryId?.let { known[it] },
                 trustLevel = null,
                 notificationLevel = notificationLevel,
+                bookmarkId = target.bookmarkId,
+                targetPostNumber = linked,
             )
-        }.distinctBy { it.topic.id }
+        }.distinctBy { it.listKey }
 
         return TopicPage(
             items = items,
@@ -469,7 +504,6 @@ class TopicRepository(
             burst = burst, present = present, retryAllowed = present)
         return withContext(Dispatchers.Default) {
             json.decodeFromString<TopicDetail>(body).also { detail ->
-                CookedParser.prewarm(detail.postStream.posts)
                 detail.postStream.posts.forEach { post ->
                     AvatarCache.record(post.username, post.animatedAvatar)
                 }
@@ -981,7 +1015,7 @@ class TopicRepository(
         val body = request("/t/$topicId/posts.json?$query&track_visit=false",
             present = present, retryAllowed = present)
         return withContext(Dispatchers.Default) {
-            json.decodeFromString<PostStreamResponse>(body).postStream.posts.also { CookedParser.prewarm(it) }
+            json.decodeFromString<PostStreamResponse>(body).postStream.posts
         }
     }
 
@@ -1089,7 +1123,7 @@ class TopicRepository(
                     ?: root["posts"] as? JsonArray
                 else -> null
             } ?: return@withContext emptyList()
-            array.map { json.decodeFromJsonElement(Post.serializer(), it) }.also { CookedParser.prewarm(it) }
+            array.map { json.decodeFromJsonElement(Post.serializer(), it) }
         }
     }
 
@@ -1998,9 +2032,13 @@ class TopicRepository(
      * 删除书签。
      * DELETE /bookmarks/{id}.json
      */
-    suspend fun unbookmarkPost(bookmarkId: Long) {
+    suspend fun unbookmarkPost(bookmarkId: Long, expectedUserId: Long? = null, expectedGeneration: Long? = null) {
         require(bookmarkId > 0L) { "缺少书签信息，请刷新楼层后再取消收藏" }
-        mutate("/bookmarks/$bookmarkId.json", "DELETE")
+        mutate("/bookmarks/$bookmarkId.json", "DELETE", beforeAttempt = {
+            if (expectedUserId != null && (expectedUserId <= 0L || sessionStore?.currentUserId() != expectedUserId || sessionStore?.sessionGeneration != expectedGeneration)) {
+                throw CancellationException("账号已切换，已取消操作")
+            }
+        })
     }
 
     /**
@@ -2199,15 +2237,18 @@ class TopicRepository(
         method: String,
         body: String? = null,
         contentType: String = Transport.JSON_CONTENT_TYPE,
+        beforeAttempt: () -> Unit = {},
     ): String {
         ensureRequestAllowed()
         var revalidated = false
         var csrfRefreshed = false
         var rateLimitRetried = false
         while (true) {
+            beforeAttempt()
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
             val result = postGate.withLock {
                 throttlePost(burst = true)
+                beforeAttempt()
                 val transport = transportProvider()
                 try { transport.write(path, method, body, csrf, contentType) } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
             }
@@ -2285,32 +2326,117 @@ class TopicRepository(
         val orderedQuery = if (order.key.isEmpty()) query else
             query.replace(Regex("(?:^|\\s)order:\\S+"), " ").trim() + " order:${order.key}"
         val response = json.decodeFromString<SearchResponse>(
-            request("/search.json?q=${encode(orderedQuery)}&page=$page"),
+            request("/search.json?q=${encode(orderedQuery)}&page=$page&type_filter=topic"),
         )
         val known = categories()
         val posts = response.posts.groupBy { it.topicId }
+        val topicsById = response.topics.associateBy { it.id }
+        val matches: List<Pair<Topic, Post?>> = response.posts.filter { it.postNumber > 0 }.mapNotNull { post ->
+            topicsById[post.topicId]?.let { it to post }
+        }
+        val matchedTopics = matches.mapTo(hashSetOf()) { it.first.id }
+        val entries = matches + response.topics.filterNot { it.id in matchedTopics }.map { it to null }
         return SearchPage(
-            items = response.topics.map { topic ->
-                val author = posts[topic.id]?.firstOrNull()
+            items = entries.map { (topic, author) ->
                 val cachedLevel = sessionStore?.getTopicNotificationLevel(topic.id)
                 val effectiveLevelCode = cachedLevel ?: topic.notificationLevel?.takeIf { it in 0..3 && it != 1 }
                 val notificationLevel = effectiveLevelCode?.let { TopicNotificationLevel.fromCode(it) }
                 TopicListItem(
-                    topic = reading?.mergeReadState(topic) ?: topic,
+                    topic = (reading?.mergeReadState(topic) ?: topic).copy(
+                        excerpt = if (author != null) Jsoup.parseBodyFragment(author.blurb.ifBlank { author.cooked }).text() else topic.excerpt),
                     authorUsername = author?.username,
                     authorName = author?.name,
                     avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
                     staticAvatarUrl = avatarUrlOf(author?.avatarTemplate, null, size = 64),
                     category = known[topic.categoryId],
                     notificationLevel = notificationLevel,
+                    targetPostNumber = author?.postNumber?.takeIf { it > 0 },
                 )
             },
-            excerpts = posts.mapValues { (_, matches) -> matches.first().blurb },
+            excerpts = posts.mapValues { (_, matches) -> Jsoup.parseBodyFragment(matches.first().blurb).text() },
             hasMore = response.grouped.more && response.topics.isNotEmpty(),
         )
     }
 
     private fun encode(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+
+    suspend fun searchInTopic(topicId: Long, query: String, page: Int, order: SearchOrder): TopicSearchPage {
+        require(topicId > 0L)
+        val clean = query.replace(Regex("(?i)(?:^|\\s)topic:\\S+"), " ")
+            .replace(Regex("(?i)(?:^|\\s)order:\\S+"), " ").trim()
+        if (clean.isBlank()) return TopicSearchPage(emptyList(), false)
+        val scoped = "$clean topic:$topicId" + if (order.key.isBlank()) "" else " order:${order.key}"
+        val response = json.decodeFromString<SearchResponse>(request("/search.json?q=${encode(scoped)}&page=$page&type_filter=topic"))
+        val hits = response.posts.filter { it.topicId == topicId && it.postNumber > 0 }.distinctBy { it.id }.map {
+            TopicSearchHit(it.id, it.postNumber, it.username, avatarUrlOf(it.avatarTemplate, it.animatedAvatar, size = 64),
+                it.createdAt, Jsoup.parseBodyFragment(it.blurb.ifBlank { it.cooked }).text())
+        }
+        return TopicSearchPage(hits, response.grouped.more && response.posts.isNotEmpty())
+    }
+
+    suspend fun fetchTopicMetadata(topicId: Long): TopicMetadata {
+        return parseTopicMetadata(objectRequest("/t/$topicId.json?track_visit=false"), topicId)
+    }
+
+    suspend fun fetchTopicEditRules(): TopicEditRules {
+        val site = objectRequest("/site.json")
+        val categories = site.objects("categories").map { json.decodeFromJsonElement(Category.serializer(), it) }
+        val settings = try {
+            val html = request("/", present = false, retryAllowed = false)
+            val doc = Jsoup.parse(html)
+            val element = doc.getElementById("data-preloaded") ?: doc.selectFirst("[data-preloaded]")
+            val raw = if (element?.tagName() == "script") element.data() else element?.attr("data-preloaded")
+            val preloaded = raw?.takeIf { it.isNotBlank() }?.let { json.parseToJsonElement(it) as? JsonObject }
+            when (val value = preloaded?.get("siteSettings")) {
+                is JsonObject -> value
+                is JsonPrimitive -> json.parseToJsonElement(value.content) as? JsonObject
+                else -> null
+            }
+        } catch (error: CancellationException) { throw error }
+        catch (_: Exception) { null }
+        return TopicEditRules(
+            categories = flattenCategories(categories).distinctBy { it.id },
+            canTagTopics = (site["can_tag_topics"] as? JsonPrimitive)?.booleanOrNull == true,
+            minTitleLength = settings?.number("min_topic_title_length")?.toInt()?.takeIf { it > 0 } ?: 15,
+            minPmTitleLength = settings?.number("min_personal_message_title_length")?.toInt()?.takeIf { it > 0 } ?: 2,
+            uncategorizedId = settings?.number("uncategorized_category_id")?.toInt() ?: 1,
+        )
+    }
+
+    suspend fun searchTopicEditTags(categoryId: Int?, query: String, selectedTags: List<String>): DiscourseTagSearchResult {
+        val params = mutableListOf("q=${encode(query)}", "limit=8", "filterForInput=true")
+        categoryId?.let { params += "categoryId=$it" }
+        selectedTags.forEach { params += "selected_tags[]=${encode(it)}" }
+        val root = objectRequest("/tags/filter/search?${params.joinToString("&")}")
+        val group = root["required_tag_group"] as? JsonObject
+        return DiscourseTagSearchResult(
+            root.objects("results").mapNotNull { obj -> obj.text("name").takeIf { it.isNotBlank() }?.let {
+                DiscourseTagInfo(it, obj.text("text").ifBlank { it }, obj.number("count")?.toInt() ?: 0)
+            } }, group?.text("name"), group?.number("min_count")?.toInt() ?: 1,
+        )
+    }
+
+    suspend fun updateTopicMetadata(original: TopicMetadata, rules: TopicEditRules, patch: TopicMetadataPatch, userId: Long, generation: Long): TopicMetadata {
+        require(userId > 0L) { "请先登录账号" }
+        require(patch.changed) { "话题信息没有变化" }
+        validateTopicMetadata(original, rules, patch)?.let { throw IllegalArgumentException(it) }
+        val guard = {
+            val session = sessionStore ?: throw CancellationException("缺少账号状态")
+            if (session.currentUserId() != userId || session.sessionGeneration != generation || session.sessionChanging) {
+                throw CancellationException("账号已切换，已取消编辑")
+            }
+        }
+        guard()
+        mutate("/t/-/${original.topicId}.json", "PUT", patch.formBody(), Transport.FORM_CONTENT_TYPE, guard)
+        guard()
+        val confirmed = try { fetchTopicMetadata(original.topicId) }
+            catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { null }
+        guard()
+        if (patch.tags?.isEmpty() == true && (confirmed == null || confirmed.tags.isNotEmpty())) {
+            throw HttpStatusException(503, "保存请求已返回，但尚未确认标签清空，请核对后重试")
+        }
+        return confirmed ?: patch.applyTo(original)
+    }
 
     suspend fun fetchProfile(
         username: String,

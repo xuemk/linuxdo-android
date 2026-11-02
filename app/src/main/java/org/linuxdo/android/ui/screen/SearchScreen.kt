@@ -57,7 +57,7 @@ fun SearchScreen(
     state: SearchUiState,
     onQuery: (String) -> Unit,
     onLoadMore: () -> Unit,
-    onOpenTopic: (Topic) -> Unit,
+    onOpenTopic: (TopicListItem) -> Unit,
     onOrder: (SearchOrder) -> Unit,
     active: Boolean = true,
     scrollToTopRequest: Int = 0,
@@ -357,23 +357,29 @@ fun SearchScreen(
                 if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {
                     item("empty") { EmptyNotice() }
                 }
-                itemsIndexed(state.results.items, key = { index, item -> "${item.topic.id}_$index" }) { index, item ->
+                itemsIndexed(state.results.items, key = { _, item -> item.listKey }) { index, item ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(IosTheme.colors.card),
                     ) {
+                        item.targetPostNumber?.let { floor ->
+                            Text("命中第 $floor 楼", style = IosTheme.type.caption, color = IosTheme.colors.accent,
+                                modifier = Modifier.clickable { onOpenTopic(item) }.padding(start = 16.dp, top = 8.dp))
+                        }
                         val topicWithExcerpt = remember(item, state.excerpts[item.topic.id]) {
-                            if (state.excerpts[item.topic.id] != null) {
+                            if (item.targetPostNumber == null && item.topic.excerpt.isNullOrBlank() && state.excerpts[item.topic.id] != null) {
                                 item.copy(topic = item.topic.copy(excerpt = state.excerpts[item.topic.id]))
                             } else item
                         }
                         TopicRow(
                             item = topicWithExcerpt,
                             query = state.query,
+                            feedGraphicMode = false,
+                            feedDisplayMode = "small_image",
                             onClick = {
                                 focusManager.clearFocus()
-                                onOpenTopic(item.topic)
+                                onOpenTopic(item)
                             },
                         )
                         if (index < state.results.items.lastIndex) {

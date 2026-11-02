@@ -17,6 +17,8 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.drop
+import org.linuxdo.android.data.TopicReadingPosition
+import org.linuxdo.android.ui.html.segmentCookedBlocks
 import kotlin.math.abs
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -351,6 +353,11 @@ fun TopicDetailScreen(
     onOpenExternalLink: (String) -> Unit = {},
     trailing: @Composable () -> Unit = {},
     blockedUsernames: Set<String> = emptySet(),
+    initialPosition: TopicReadingPosition? = null,
+    onReadingPosition: (TopicReadingPosition) -> Unit = {},
+    savedTopicCount: Int = 0,
+    onOpenSavedTopics: () -> Unit = {},
+    onOpenTag: (String) -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -358,8 +365,9 @@ fun TopicDetailScreen(
     val textToolbar = LocalTextToolbar.current
     var selectionResetKey by remember { mutableIntStateOf(0) }
     var pictureGallery by remember { mutableStateOf<Pair<List<ImageViewerItem>, Int>?>(null) }
-    var collapsed by rememberSaveable { mutableStateOf(emptyList<Long>()) }
-    var expanded by rememberSaveable { mutableStateOf(emptyList<Long>()) }
+    var collapsed by rememberSaveable { mutableStateOf(initialPosition?.collapsed.orEmpty()) }
+    var expanded by rememberSaveable { mutableStateOf(initialPosition?.expanded.orEmpty()) }
+    var savedPositionRestored by rememberSaveable { mutableStateOf(initialPosition == null) }
     val locateTarget = state.locatePostNumber ?: initialPostNumber
     val explicitLocateVersion = if (state.locatePostNumber != null) state.locateVersion else 0
     var located by rememberSaveable(locateTarget, explicitLocateVersion) { mutableStateOf(locateTarget == null) }
@@ -430,17 +438,44 @@ fun TopicDetailScreen(
             flatPostRows(displayedPosts, descending = state.descending)
         }
     }
-    val tocEntries = remember(state.posts) {
-        state.posts.sortedBy { it.postNumber }.flatMap { post ->
-            fun headings(blocks: List<CookedBlock>): List<CookedBlock.Heading> = blocks.flatMap { block ->
-                when (block) {
-                    is CookedBlock.Heading -> listOf(block)
-                    is CookedBlock.Quote -> headings(block.blocks)
-                    is CookedBlock.ListBlock -> block.entries.flatMap(::headings)
-                    else -> emptyList()
+    val reportUnknownTag by rememberUpdatedState(onUnknownTag)
+    var preparedBodies by remember(topicId) { mutableStateOf(emptyMap<Long, PreparedPostBody>()) }
+    val preparationAnchor by remember { derivedStateOf {
+        list.layoutInfo.visibleItemsInfo.firstNotNullOfOrNull { postIdFromListKey(it.key) }
+    } }
+    LaunchedEffect(state.posts, active, preparationAnchor) {
+        if (!active) return@LaunchedEffect
+        val postsById = state.posts.associateBy { it.id }
+        preparedBodies = preparedBodies.filter { (id, body) -> postsById[id]?.let(body::matches) == true }
+        val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
+        val targetFloor = initialPosition?.postNumber ?: initialPostNumber
+        val pending = state.posts.filter { post -> preparedBodies[post.id]?.matches(post) != true }
+            .sortedBy { if (it.id in visibleIds || it.postNumber == targetFloor) 0 else 1 }
+        for (post in pending) {
+            val body = withContext(Dispatchers.Default) {
+                val blocks = try {
+                    CookedParser.parsePostCached(post, reportUnknownTag)
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    val plain = org.jsoup.Jsoup.parseBodyFragment(post.cooked).text()
+                    listOf(CookedBlock.Paragraph(listOf(InlineText(plain))))
                 }
+                PreparedPostBody(post, blocks, segmentCookedBlocks(blocks), extractPostImages(blocks), collectHeadings(blocks))
             }
-            headings(CookedParser.parsePostCached(post)).map { heading ->
+            preparedBodies = preparedBodies + (post.id to body)
+            // 分帧发布已准备好的楼层，首屏不等待整批正文。
+            withFrameNanos { }
+        }
+    }
+    val slices = remember(rows, preparedBodies) {
+        rows.flatMap { row ->
+            val body = preparedBodies[row.post.id]?.takeIf { it.matches(row.post) }
+            List(body?.parts?.size ?: 1) { index -> PostContentSlice(row, body, index) }
+        }
+    }
+    val tocEntries = remember(state.posts, preparedBodies) {
+        state.posts.sortedBy { it.postNumber }.flatMap { post ->
+            preparedBodies[post.id]?.headings.orEmpty().map { heading ->
                 TocEntry(post.id, post.postNumber, heading.level, heading.title, heading.anchor)
             }
         }
@@ -485,7 +520,7 @@ fun TopicDetailScreen(
         val visibleIds = layout.visibleItemsInfo.filter { item ->
             val overlap = minOf(item.offset + item.size, layout.viewportEndOffset) - maxOf(item.offset, layout.viewportStartOffset)
             overlap > 0
-        }.mapNotNull { it.key as? Long }.toSet()
+        }.mapNotNull { postIdFromListKey(it.key) }.toSet()
         rows.filter { it.post.id in visibleIds }.map { it.post.postNumber }
     } }
     val currentPostNumber by remember(rows, visiblePostNumbers) { derivedStateOf {
@@ -493,7 +528,7 @@ fun TopicDetailScreen(
     } }
     val firstPostId = remember(rows) { rows.firstOrNull { it.post.postNumber == 1 }?.post?.id }
     val firstPostVisible by remember(list, firstPostId) {
-        derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { it.key == firstPostId } }
+        derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { postIdFromListKey(it.key) == firstPostId } }
     }
     LaunchedEffect(visiblePostNumbers, active) {
         onPostsVisible(if (active) visiblePostNumbers else emptyList())
@@ -526,7 +561,7 @@ fun TopicDetailScreen(
     }
     val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView) {
         derivedStateOf {
-            val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
+            val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
             val visibleRows = rows.filter { it.post.id in visibleIds }
             if (visibleRows.isEmpty()) {
                 val first = rows.firstOrNull()?.post?.postNumber ?: 1
@@ -577,6 +612,8 @@ fun TopicDetailScreen(
     val opPinned = rows.firstOrNull()?.post?.postNumber == 1
     val headRows = if (opPinned) rows.take(1) else emptyList()
     val bodyRows = if (opPinned) rows.drop(1) else rows
+    val headSlices = if (opPinned) slices.takeWhile { it.row.post.id == headRows.first().post.id } else emptyList()
+    val bodySlices = slices.drop(headSlices.size)
     val replyTotal = (totalPosts - 1).coerceAtLeast(0)
     val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
     val topErrorCount = if (showTopError && state.error != null) 1 else 0
@@ -588,11 +625,51 @@ fun TopicDetailScreen(
     val hasHeadPost = rows.any { it.post.postNumber == 1 }
     val showPreviousGap = state.previousIds.isNotEmpty() && !hasHeadPost
 
-    fun lazyIndexOf(rowIndex: Int): Int {
+    fun lazyIndexOf(rowIndex: Int, partIndex: Int = 0): Int {
         val afterHead = rowIndex >= headRows.size
         val orderBarBefore = if (showOrderBar && afterHead) 1 else 0
         val gapBefore = if (showPreviousGap && afterHead) 1 else 0
-        return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
+        val postId = rows.getOrNull(rowIndex)?.post?.id
+        val sliceIndex = slices.indexOfFirst { it.row.post.id == postId }.takeIf { it >= 0 } ?: slices.size
+        val count = preparedBodies[postId]?.parts?.size ?: 1
+        return 1 + topErrorCount + orderBarBefore + gapBefore + sliceIndex + partIndex.coerceIn(0, count - 1)
+    }
+
+    LaunchedEffect(active, state.loading, preparedBodies, rows, savedPositionRestored) {
+        val position = initialPosition ?: return@LaunchedEffect
+        if (!active || savedPositionRestored || state.loading || state.error != null) return@LaunchedEffect
+        val target = rows.firstOrNull { it.post.postNumber == position.postNumber }
+            ?: rows.minByOrNull { kotlin.math.abs(it.post.postNumber - position.postNumber) }
+            ?: return@LaunchedEffect
+        if (preparedBodies[target.post.id] == null) return@LaunchedEffect
+        if (position.atTop) list.scrollToItem(0)
+        else list.scrollToItem(lazyIndexOf(rows.indexOf(target), position.partIndex), position.offset.coerceAtLeast(0))
+        located = true
+        savedPositionRestored = true
+    }
+
+    val latestPositionCallback by rememberUpdatedState(onReadingPosition)
+    val latestPositionProvider by rememberUpdatedState(newValue = {
+        val anchor = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == list.firstVisibleItemIndex }
+        val slice = slices.firstOrNull { it.key == anchor?.key }
+        if (located && savedPositionRestored && state.topic != null && (slice?.body != null || list.firstVisibleItemIndex == 0)) {
+            TopicReadingPosition(
+                postNumber = slice?.row?.post?.postNumber ?: 1,
+                partIndex = slice?.partIndex ?: 0,
+                offset = list.firstVisibleItemScrollOffset,
+                atTop = list.firstVisibleItemIndex == 0,
+                filterUserId = state.filterUserId, descending = state.descending,
+                collapsed = collapsed, expanded = expanded,
+            )
+        } else null
+    })
+    LaunchedEffect(active, located, savedPositionRestored, state.filterUserId, state.descending, collapsed, expanded) {
+        if (active) snapshotFlow {
+            if (!list.isScrollInProgress) latestPositionProvider() else null
+        }.collect { position -> position?.let(latestPositionCallback) }
+    }
+    DisposableEffect(topicId, active) {
+        onDispose { if (active) latestPositionProvider()?.let(latestPositionCallback) }
     }
 
     val latestEdgeVisible = if (state.descending) list.firstVisibleItemIndex <= lazyIndexOf(headRows.size)
@@ -604,12 +681,14 @@ fun TopicDetailScreen(
     var anchoredRealtimeVersion by remember { mutableIntStateOf(state.realtimeVersion) }
     if (anchoredRealtimeVersion != state.realtimeVersion) {
         val firstIndex = list.firstVisibleItemIndex
-        val anchorId = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }?.key as? Long
+        val anchorKey = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }?.key
+        val anchorId = postIdFromListKey(anchorKey)
+        val anchorPart = partIndexFromListKey(anchorKey)
         val anchorRow = rows.indexOfFirst { it.post.id == anchorId }
         val offset = list.firstVisibleItemScrollOffset
         SideEffect {
             anchoredRealtimeVersion = state.realtimeVersion
-            if (anchorRow >= 0 && !list.isScrollInProgress) list.requestScrollToItem(lazyIndexOf(anchorRow), offset)
+            if (anchorRow >= 0 && !list.isScrollInProgress) list.requestScrollToItem(lazyIndexOf(anchorRow, anchorPart), offset)
         }
     }
 
@@ -618,7 +697,8 @@ fun TopicDetailScreen(
         val index = rows.indexOfFirst { it.post.id == target.postId }
         if (index >= 0) {
             tocTarget = target.anchor
-            list.animateScrollToItem(lazyIndexOf(index))
+            val part = preparedBodies[target.postId]?.parts?.indexOfFirst { blocks -> containsHeading(blocks, target.anchor) } ?: 0
+            list.animateScrollToItem(lazyIndexOf(index, part.coerceAtLeast(0)))
             withFrameNanos { }
         } else {
             // 目标楼层可能折叠着或还没加载进来。先尝试按楼层号就近定位，
@@ -702,13 +782,13 @@ fun TopicDetailScreen(
         if (!showOrderBar) return@LaunchedEffect
         // 定位尚未完成时，不允许倒序切换滚动覆盖初始定位位置
         if (!located) return@LaunchedEffect
-        list.scrollToItem(1 + topErrorCount + headRows.size)
+        list.scrollToItem(1 + topErrorCount + headSlices.size)
     }
 
     LaunchedEffect(active, locateTarget, pendingTargetFloor, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty(), explicitLocateVersion) {
         val targetLocateNumber = pendingTargetFloor ?: locateTarget
         val needLocate = (!located && locateTarget != null) || pendingTargetFloor != null
-        if (active && needLocate && !state.loading && state.error == null && targetLocateNumber != null) {
+        if (active && needLocate && !state.loading && state.error == null && targetLocateNumber != null && (savedPositionRestored || initialPosition == null)) {
             // 目标楼层可能已被删除(抽楼)或超出当前加载范围。此时不能直接 return，
             // 否则 located 永远为 false，会连带锁死倒序切换等依赖它的逻辑。
             // 降级为「第一个不小于目标楼层的可见楼层」，再不行就按帖子顺序找最近的一层。
@@ -743,7 +823,7 @@ fun TopicDetailScreen(
                 if (index >= 0) {
                     list.scrollToItem(lazyIndexOf(index))
                     withFrameNanos { }
-                    if (list.layoutInfo.visibleItemsInfo.none { it.key == target.id }) {
+                    if (list.layoutInfo.visibleItemsInfo.none { postIdFromListKey(it.key) == target.id }) {
                         list.scrollToItem(lazyIndexOf(index))
                     }
                     if (isUserJump) highlightedPost = target.id
@@ -756,7 +836,7 @@ fun TopicDetailScreen(
     }
 
     // 向上回填前序切片时锁定当前首个可见楼层锚点，新楼层前置插入后在同一帧恢复视口位置，防止跳屏。
-    var upwardAnchor by remember { mutableStateOf<Pair<Long, Int>?>(null) }
+    var upwardAnchor by remember { mutableStateOf<Triple<Long, Int, Int>?>(null) }
     var upwardPrevRowCount by remember { mutableIntStateOf(0) }
     val triggerLoadPrevious = {
         // 已包含 1 楼时不存在"更早的可见楼层"，前序仅剩被删除/占位的幽灵 id。
@@ -764,11 +844,11 @@ fun TopicDetailScreen(
         if (!hasHeadPost && !state.loading && state.previousIds.isNotEmpty()) {
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
             val anchorItem = list.layoutInfo.visibleItemsInfo.firstOrNull { info ->
-                val key = info.key as? Long ?: return@firstOrNull false
+                val key = postIdFromListKey(info.key) ?: return@firstOrNull false
                 key != firstPostId
             }
             if (anchorItem != null) {
-                upwardAnchor = (anchorItem.key as Long) to anchorItem.offset
+                upwardAnchor = Triple(postIdFromListKey(anchorItem.key)!!, partIndexFromListKey(anchorItem.key), anchorItem.offset)
                 upwardPrevRowCount = rows.size
             }
             onLoadPrevious()
@@ -779,7 +859,7 @@ fun TopicDetailScreen(
         if (rows.size > upwardPrevRowCount) {
             val idx = rows.indexOfFirst { it.post.id == anchor.first }
             if (idx >= 0) {
-                list.scrollToItem(lazyIndexOf(idx), (-anchor.second).coerceAtLeast(0))
+                list.scrollToItem(lazyIndexOf(idx, anchor.second), (-anchor.third).coerceAtLeast(0))
             }
             upwardAnchor = null
         }
@@ -790,7 +870,7 @@ fun TopicDetailScreen(
             val info = list.layoutInfo.visibleItemsInfo
             val hasGap = info.any { it.key == "load-previous" }
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
-            val firstPostAtTop = firstPostId != null && info.firstOrNull()?.key == firstPostId
+            val firstPostAtTop = firstPostId != null && postIdFromListKey(info.firstOrNull()?.key) == firstPostId
             hasGap && !firstPostAtTop && list.isScrollInProgress
         }
     }
@@ -800,13 +880,34 @@ fun TopicDetailScreen(
         }
     }
 
-    // 发布后的状态收尾不改变视口，也不自动高亮新回复。
-    LaunchedEffect(state.createdPostId) {
-        if (state.createdPostId != null) onCreatedPostShown()
+    // 用户发表回复后，自动滚动定位到新发表的楼层并高亮显示
+    LaunchedEffect(state.createdPostId, rows) {
+        val createdId = state.createdPostId ?: return@LaunchedEffect
+        val createdPost = state.posts.firstOrNull { it.id == createdId }
+        val parentNumber = createdPost?.effectiveReplyToPostNumber()
+        if (parentNumber != null && parentNumber > 1) {
+            val parentPost = state.posts.firstOrNull { it.postNumber == parentNumber }
+            if (parentPost != null && parentPost.id in collapsed) {
+                collapsed = collapsed - parentPost.id
+            }
+        }
+        val targetIdx = rows.indexOfFirst { it.post.id == createdId }
+        if (targetIdx >= 0) {
+            withFrameNanos { }
+            val lazyIndex = lazyIndexOf(targetIdx)
+            if (kotlin.math.abs(list.firstVisibleItemIndex - lazyIndex) <= 15) {
+                list.animateScrollToItem(lazyIndex)
+            } else {
+                list.scrollToItem(lazyIndex)
+            }
+            highlightedPost = createdId
+            onCreatedPostShown()
+        }
     }
 
     @Composable
-    fun RenderPostEntry(row: TreePost) {
+    fun RenderPostEntry(slice: PostContentSlice) {
+        val row = slice.row
         val post = row.post
         val isTopicAuthor = topicAuthorUsername != null && post.username == topicAuthorUsername
         val unreadDotVisible = showUnreadDot && signedIn && !post.yours && !post.read &&
@@ -820,13 +921,13 @@ fun TopicDetailScreen(
             Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
                 PostRow(
                     post = post,
+                    slice = slice,
                     isTopicAuthor = isTopicAuthor,
                     compactBottom = hasExpandedSubtree || showCollapsedSubtreeBar,
                     showReplyToHint = !treeView,
                     unreadDotVisible = unreadDotVisible,
                     unreadDotPosition = unreadDotPosition,
                     onPicture = { list, idx -> pictureGallery = list to idx },
-                    onUnknownTag = onUnknownTag,
                     reactions = state.topic?.validReactions.orEmpty(),
                     emojiUrls = state.emojiUrls,
                     busy = writeBusy,
@@ -853,7 +954,7 @@ fun TopicDetailScreen(
                     onEdit = { onOpenComposer(ComposerTarget.Edit(topicId, post.id, post.postNumber)) },
                     onDelete = { deleteTarget = post },
                 )
-                if (showCollapsedSubtreeBar) {
+                if (slice.last && showCollapsedSubtreeBar) {
                     val replyLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
                     val totalHint = maxOf(row.totalSubtreeCount, row.allLoadedCount, post.replyCount, row.childCount)
                     Box(
@@ -882,7 +983,7 @@ fun TopicDetailScreen(
                         )
                     }
                 }
-                if (!hasExpandedSubtree) {
+                if (slice.last && !hasExpandedSubtree) {
                     IosDivider()
                 }
             }
@@ -890,7 +991,7 @@ fun TopicDetailScreen(
             // ── 贴吧式“楼中楼”子回复区域（默认最多展示前 3 条预览，点击展开全部，与主评论同宽） ──
             val selfHasMore = post.replyCount > row.childCount && post.id !in state.completedReplies
             val isRootExpanded = row.rootPostId in expanded
-            val topCorner = if (row.isFirstInSubtree) 10.dp else 0.dp
+            val topCorner = if (row.isFirstInSubtree && slice.first) 10.dp else 0.dp
             val boxShape = RoundedCornerShape(
                 topStart = topCorner,
                 topEnd = topCorner,
@@ -905,7 +1006,7 @@ fun TopicDetailScreen(
                         .clip(boxShape)
                         .background(IosTheme.colors.fieldBackground),
                 ) {
-                    if (!row.isFirstInSubtree) {
+                    if (slice.first && !row.isFirstInSubtree) {
                         Box(
                             Modifier
                                 .fillMaxWidth()
@@ -916,11 +1017,11 @@ fun TopicDetailScreen(
                     }
                     SubReplyRow(
                         row = row,
+                        slice = slice,
                         isTopicAuthor = isTopicAuthor,
                         unreadDotVisible = unreadDotVisible,
                         unreadDotPosition = unreadDotPosition,
                         onPicture = { list, idx -> pictureGallery = list to idx },
-                        onUnknownTag = onUnknownTag,
                         reactions = state.topic?.validReactions.orEmpty(),
                         emojiUrls = state.emojiUrls,
                         busy = writeBusy,
@@ -952,7 +1053,7 @@ fun TopicDetailScreen(
                         },
                     )
                 }
-                if (row.isLastInSubtree) {
+                if (slice.last && row.isLastInSubtree) {
                     val moreTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
                     val moreLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
                     val hasHiddenLoaded = row.allLoadedCount > row.subtreeSize
@@ -1021,7 +1122,7 @@ fun TopicDetailScreen(
                                     .clip(RoundedCornerShape(4.dp))
                                     .clickable {
                                         val rootId = row.rootPostId
-                                        val visibleRoot = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key == rootId }
+                                        val visibleRoot = list.layoutInfo.visibleItemsInfo.firstOrNull { postIdFromListKey(it.key) == rootId }
                                         val rootRowIndex = rows.indexOfFirst { it.post.id == rootId }
                                         val needScrollToRoot = visibleRoot == null || visibleRoot.offset < 0
                                         if (row.allLoadedCount > DEFAULT_SUB_REPLY_LIMIT && rootId in expanded) {
@@ -1031,7 +1132,7 @@ fun TopicDetailScreen(
                                             collapsed = (collapsed + rootId).distinct()
                                         }
                                         if (needScrollToRoot && rootRowIndex >= 0) {
-                                            val targetLazyIndex = lazyIndexOf(rootRowIndex)
+                                            val targetLazyIndex = lazyIndexOf(rootRowIndex, partIndexFromListKey(visibleRoot?.key))
                                             scope.launch {
                                                 list.scrollToItem(targetLazyIndex, 0)
                                             }
@@ -1136,6 +1237,14 @@ fun TopicDetailScreen(
                                         // 1. 分类标签（位置不动，稳定居左）
                                         state.category?.let { CategoryTag(it) }
 
+                                        val topicTags = remember(state.topic?.tags) {
+                                            state.topic?.tags.orEmpty().filter { it.isNotBlank() }.distinct()
+                                        }
+                                        if (topicTags.isNotEmpty()) {
+                                            if (state.category != null) Spacer(Modifier.width(6.dp))
+                                            TopicTagSelector(tags = topicTags, onOpenTag = onOpenTag)
+                                        }
+
                                         // 弹性占位：将后续功能按键组整体推向右端
                                         Spacer(Modifier.weight(1f))
 
@@ -1219,11 +1328,11 @@ fun TopicDetailScreen(
                             if (showTopError) state.error?.let { message ->
                                 item("top-error") { ErrorNotice(message, onRetry) }
                             }
-                            items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            items(headSlices, key = { it.key }, contentType = { if (it.first) "post" else "post-part" }) { slice -> RenderPostEntry(slice) }
                             if (showOrderBar) stickyHeader(key = "order-bar") {
                                 val isPinned by remember {
                                     derivedStateOf {
-                                        list.firstVisibleItemIndex >= 1 + topErrorCount + headRows.size
+                                        list.firstVisibleItemIndex >= 1 + topErrorCount + headSlices.size
                                     }
                                 }
                                 CommentOrderBar(
@@ -1248,7 +1357,7 @@ fun TopicDetailScreen(
                                     onClick = triggerLoadPrevious,
                                 )
                             }
-                            items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            items(bodySlices, key = { it.key }, contentType = { if (it.first) "post" else "post-part" }) { slice -> RenderPostEntry(slice) }
                             if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
                                 item("loading") { IosLoadingBox() }
                             }
@@ -1309,6 +1418,8 @@ fun TopicDetailScreen(
                         if (effectiveFloorTotal > 3 && !firstPostVisible) {
                             ReadingProgressPill(
                                 indicator = readingFloorIndicator,
+                                savedCount = savedTopicCount,
+                                onOpenSavedTopics = onOpenSavedTopics,
                                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                                 onScrollToTop = {
                                     if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
@@ -1316,6 +1427,12 @@ fun TopicDetailScreen(
                                 onOpenJumpBar = {
                                     showJumpBar = !showJumpBar
                                 },
+                            )
+                        }
+                        if (savedTopicCount > 0 && (effectiveFloorTotal <= 3 || firstPostVisible)) {
+                            org.linuxdo.android.ui.SavedTopicChip(
+                                savedTopicCount, onOpenSavedTopics,
+                                Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                             )
                         }
                         if (canReply) {
@@ -2076,6 +2193,8 @@ private fun ReplyFab(enabled: Boolean, onClick: () -> Unit) {
 @Composable
 private fun ReadingProgressPill(
     indicator: ReadingFloorIndicator,
+    savedCount: Int,
+    onOpenSavedTopics: () -> Unit,
     modifier: Modifier = Modifier,
     onScrollToTop: () -> Unit,
     onOpenJumpBar: () -> Unit,
@@ -2139,6 +2258,14 @@ private fun ReadingProgressPill(
                 color = IosTheme.colors.secondaryLabel,
                 fontWeight = FontWeight.Medium,
             )
+        }
+        if (savedCount > 0) {
+            Box(Modifier.width(0.8.dp).height(12.dp).background(IosTheme.colors.separator))
+            Box(
+                Modifier.clickable(onClick = onOpenSavedTopics).height(40.dp).padding(horizontal = 12.dp)
+                    .semantics { contentDescription = "打开暂存话题，共 $savedCount 篇" },
+                contentAlignment = Alignment.Center,
+            ) { Text("暂存 $savedCount", style = IosTheme.type.footnote, color = IosTheme.colors.accent) }
         }
     }
 }
@@ -3381,13 +3508,13 @@ private fun UnreadDot(visible: Boolean) {
 @OptIn(ExperimentalFoundationApi::class)
 private fun PostRow(
     post: Post,
+    slice: PostContentSlice,
     isTopicAuthor: Boolean = false,
     compactBottom: Boolean = false,
     showReplyToHint: Boolean = true,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
-    onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
     busy: Boolean,
@@ -3414,18 +3541,19 @@ private fun PostRow(
     signedIn: Boolean = false,
     canFlag: Boolean = !post.yours,
 ) {
-    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
+    val blocks = slice.blocks
     val background = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card
     val canManage = post.canEdit || post.canDelete
     Column(
         Modifier
             .fillMaxWidth()
             .background(background)
-            .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = if (compactBottom) 8.dp else 16.dp),
+            .padding(start = 16.dp, end = 16.dp, top = if (slice.first) 16.dp else 0.dp, bottom = if (!slice.last) 0.dp else if (compactBottom) 8.dp else 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         // 长按放在头部这一行,而不是整条楼层:正文裹在 SelectionContainer 里,
         // 长按那里是"选择文本",两个手势会抢。
+        if (slice.first) {
         Row(
             Modifier.fillMaxWidth().then(
                 if (canManage) Modifier
@@ -3527,8 +3655,10 @@ private fun PostRow(
             }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.footnote, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture, pollPost = post)
-        PostActions(
+        }
+        if (slice.body == null) PreparingPostBody()
+        else CookedContent(blocks, onPicture, postImages = slice.body.images, pollPost = post)
+        if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
             emojiUrls = emojiUrls,
@@ -3563,11 +3693,11 @@ private fun PostRow(
 @OptIn(ExperimentalFoundationApi::class)
 private fun SubReplyRow(
     row: TreePost,
+    slice: PostContentSlice,
     isTopicAuthor: Boolean,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
-    onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
     busy: Boolean,
@@ -3595,16 +3725,17 @@ private fun SubReplyRow(
     canFlag: Boolean = !row.post.yours,
 ) {
     val post = row.post
-    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
+    val blocks = slice.blocks
     val canManage = post.canEdit || post.canDelete
     val bg = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent
     Column(
         Modifier
             .fillMaxWidth()
             .background(bg)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(start = 12.dp, end = 12.dp, top = if (slice.first) 10.dp else 0.dp, bottom = if (slice.last) 10.dp else 0.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        if (slice.first) {
         Row(
             Modifier.fillMaxWidth().then(
                 if (canManage) Modifier
@@ -3684,8 +3815,10 @@ private fun SubReplyRow(
             }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.caption, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture, subReply = true, pollPost = post)
-        PostActions(
+        }
+        if (slice.body == null) PreparingPostBody()
+        else CookedContent(blocks, onPicture, postImages = slice.body.images, subReply = true, pollPost = post)
+        if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
             emojiUrls = emojiUrls,
@@ -3710,7 +3843,7 @@ private fun SubReplyRow(
             signedIn = signedIn,
             canFlag = canFlag,
         )
-        if (selfHasMore) {
+        if (slice.last && selfHasMore) {
             Text(
                 text = if (selfLoadingReplies) "正在加载回复…" else "查看该层更多回复 >",
                 style = IosTheme.type.caption,
@@ -4709,7 +4842,7 @@ private fun ReactionIcon(name: String, urls: Map<String, String>, modifier: Modi
     AsyncImage(urls[name] ?: "https://linux.do/images/emoji/twemoji/$name.png?v=15", name, modifier = modifier)
 }
 
-internal enum class PostAction { Solution, Like, Boost, Reply, Edit, Delete, Bookmark, CopyLink, Flag, More }
+internal enum class PostAction { Solution, Like, Boost, Reply, Edit, Delete, Bookmark, CopyLink, Flag, More, Pin, Search }
 
 @Composable
 internal fun PostActionIcon(
@@ -4876,6 +5009,28 @@ internal fun PostActionIcon(
                     drawCircle(color, r, Offset(12f, 12f))
                     drawCircle(color, r, Offset(18.5f, 12f))
                 }
+                // 置顶图钉 (Pin)
+                PostAction.Pin -> {
+                    drawLine(color, Offset(8f, 5f), Offset(16f, 5f), 1.8f, cap = StrokeCap.Round)
+                    shape.moveTo(9.5f, 5f)
+                    shape.lineTo(10.5f, 10.5f)
+                    shape.lineTo(7f, 13.5f)
+                    shape.lineTo(17f, 13.5f)
+                    shape.lineTo(13.5f, 10.5f)
+                    shape.lineTo(14.5f, 5f)
+                    shape.close()
+                    if (selected) {
+                        drawPath(shape, color)
+                    } else {
+                        drawPath(shape, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    }
+                    drawLine(color, Offset(12f, 13.5f), Offset(12f, 20f), 1.8f, cap = StrokeCap.Round)
+                }
+                // 搜索放大镜 (Search)
+                PostAction.Search -> {
+                    drawCircle(color, radius = 5.5f, center = Offset(10.5f, 10.5f), style = Stroke(1.8f))
+                    drawLine(color, Offset(14.5f, 14.5f), Offset(19.5f, 19.5f), 2.2f, cap = StrokeCap.Round)
+                }
             }
         }
     }
@@ -4967,6 +5122,12 @@ private fun CookedContent(
                 is CookedBlock.Onebox -> OneboxCard(block)
                 is CookedBlock.Poll -> PollCard(block, pollPost?.id)
                 is CookedBlock.Code -> {
+                    if (block.copyText != null) {
+                        val clipboard = LocalClipboardManager.current
+                        TextButton(onClick = { clipboard.setText(AnnotatedString(block.copyText)) }) {
+                            Text("复制完整代码", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                        }
+                    }
                     val codeResetKey = LocalSelectionResetKey.current
                     key(codeResetKey) {
                         DecryptableSelection {
@@ -5121,7 +5282,7 @@ private fun CookedContent(
                 is CookedBlock.ListBlock -> block.entries.forEachIndexed { index, entry ->
                     Row {
                         Text(
-                            text = block.start?.let { "${it + index}. " } ?: "• ",
+                            text = if (block.continuation && index == 0) "" else block.start?.let { "${it + index}. " } ?: "• ",
                             style = if (subReply) IosTheme.type.subheadline.copy(fontSize = 14.sp, lineHeight = 19.5.sp)
                                     else IosTheme.type.body.copy(fontSize = 15.5.sp, lineHeight = 22.sp),
                             modifier = Modifier.widthIn(min = 22.dp),
@@ -6580,6 +6741,116 @@ private fun resolveDownloadFileName(
     return base
 }
 
+// 全角字符按 2 个宽度计，近似视觉宽度，避免中文标签被误判为“短”。
+private fun tagDisplayWidth(tag: String): Int =
+    tag.fold(0) { width, char -> width + if (char.code >= 0x2E80) 2 else 1 }
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TopicTagSelector(
+    tags: List<String>,
+    onOpenTag: (String) -> Unit,
+) {
+    val primaryTag = remember(tags) { tags.minBy(::tagDisplayWidth) }
+    val hasMore = tags.size > 1
+    var expanded by remember(tags) { mutableStateOf(false) }
+    val isDark = IosTheme.colors.isDark
+    val shape = RoundedCornerShape(8.dp)
+    val pillBg = if (isDark) Color(0xFF2C2C2E) else IosTheme.colors.fieldBackground
+    val borderColor = if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6)
+    val textColor = IosTheme.colors.secondaryLabel
+    val textStyle = IosTheme.type.footnote.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+
+    Box {
+        Row(
+            modifier = Modifier
+                .height(IntrinsicSize.Min)
+                .clip(shape)
+                .border(0.75.dp, borderColor, shape)
+                .background(pillBg),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                modifier = Modifier
+                    .clickable { onOpenTag(primaryTag) }
+                    .padding(start = 7.dp, end = if (hasMore) 5.dp else 7.dp, top = 2.5.dp, bottom = 2.5.dp)
+                    .widthIn(max = 112.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("#", style = textStyle, color = IosTheme.colors.tertiaryLabel)
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    text = primaryTag,
+                    style = textStyle,
+                    color = textColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (hasMore) {
+                Box(
+                    Modifier
+                        .width(0.75.dp)
+                        .fillMaxHeight()
+                        .padding(vertical = 4.dp)
+                        .background(borderColor),
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .clickable { expanded = !expanded }
+                        .padding(horizontal = 7.dp)
+                        .semantics { contentDescription = "展开全部 ${tags.size} 个标签" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(if (expanded) "▴" else "▾", style = textStyle, color = textColor)
+                }
+            }
+        }
+
+        if (hasMore) {
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.background(IosTheme.colors.card),
+            ) {
+                FlowRow(
+                    modifier = Modifier
+                        .widthIn(max = 260.dp)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    tags.forEach { tag ->
+                        val isCurrent = tag == primaryTag
+                        Text(
+                            text = "# $tag",
+                            style = textStyle,
+                            color = if (isCurrent) IosTheme.colors.accent else IosTheme.colors.label,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .widthIn(max = 236.dp)
+                                .clip(shape)
+                                .background(if (isCurrent) IosTheme.colors.accent.copy(alpha = 0.12f) else pillBg)
+                                .border(
+                                    0.75.dp,
+                                    if (isCurrent) IosTheme.colors.accent.copy(alpha = 0.35f) else borderColor,
+                                    shape,
+                                )
+                                .clickable {
+                                    expanded = false
+                                    onOpenTag(tag)
+                                }
+                                .padding(horizontal = 9.dp, vertical = 5.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun TopicNotificationSelector(
     currentLevel: TopicNotificationLevel,
@@ -6785,6 +7056,61 @@ private fun FlagDialog(
                     Text(if (submitting) "提交中…" else "提交", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
                 }
             }
+        }
+    }
+}
+
+private data class PreparedPostBody(
+    val source: Post,
+    val blocks: List<CookedBlock>,
+    val parts: List<List<CookedBlock>>,
+    val images: List<ImageViewerItem>,
+    val headings: List<CookedBlock.Heading>,
+) {
+    fun matches(post: Post): Boolean =
+        source.cooked == post.cooked && source.polls == post.polls && source.pollsVotes == post.pollsVotes
+}
+
+private data class PostContentSlice(val row: TreePost, val body: PreparedPostBody?, val partIndex: Int) {
+    val first: Boolean get() = partIndex == 0
+    val last: Boolean get() = partIndex == (body?.parts?.lastIndex ?: 0)
+    val key: Any get() = if (first) row.post.id else "part/${row.post.id}/$partIndex"
+    val blocks: List<CookedBlock> get() = body?.parts?.getOrNull(partIndex).orEmpty()
+}
+
+private fun postIdFromListKey(key: Any?): Long? = when (key) {
+    is Long -> key
+    is String -> if (key.startsWith("part/")) key.substringAfter("part/").substringBefore('/').toLongOrNull() else null
+    else -> null
+}
+
+private fun partIndexFromListKey(key: Any?): Int =
+    if (key is String && key.startsWith("part/")) key.substringAfterLast('/').toIntOrNull() ?: 0 else 0
+
+private fun containsHeading(blocks: List<CookedBlock>, anchor: String): Boolean = blocks.any {
+    when (it) {
+        is CookedBlock.Heading -> it.anchor == anchor
+        is CookedBlock.Quote -> containsHeading(it.blocks, anchor)
+        is CookedBlock.ListBlock -> it.entries.any { entry -> containsHeading(entry, anchor) }
+        else -> false
+    }
+}
+
+private fun collectHeadings(blocks: List<CookedBlock>): List<CookedBlock.Heading> = blocks.flatMap {
+    when (it) {
+        is CookedBlock.Heading -> listOf(it)
+        is CookedBlock.Quote -> collectHeadings(it.blocks)
+        is CookedBlock.ListBlock -> it.entries.flatMap(::collectHeadings)
+        else -> emptyList()
+    }
+}
+
+@Composable
+private fun PreparingPostBody() {
+    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        repeat(3) { index ->
+            Box(Modifier.fillMaxWidth(if (index == 2) 0.68f else 1f).height(9.dp)
+                .clip(RoundedCornerShape(5.dp)).background(IosTheme.colors.separator.copy(alpha = 0.35f)))
         }
     }
 }

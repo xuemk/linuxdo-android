@@ -384,7 +384,85 @@ data class Category(
     @SerialName("subcategory_list") val subcategoryList: List<Category> = emptyList(),
     @SerialName("allowed_tags") val allowedTags: List<String> = emptyList(),
     @SerialName("read_restricted") val readRestricted: Boolean = false,
+    val permission: Int? = null,
+    @SerialName("minimum_required_tags") val minimumRequiredTags: Int = 0,
+    @SerialName("required_tag_groups") val requiredTagGroups: List<RequiredTopicTagGroup> = emptyList(),
+    @SerialName("allowed_tag_groups") val allowedTagGroups: List<String> = emptyList(),
+    @SerialName("allow_global_tags") val allowGlobalTags: Boolean = true,
 )
+
+@Serializable
+data class RequiredTopicTagGroup(val name: String = "", @SerialName("min_count") val minCount: Int = 1)
+
+data class TopicMetadata(
+    val topicId: Long,
+    val title: String,
+    val categoryId: Int?,
+    val tags: List<String>,
+    val canEdit: Boolean,
+    val privateMessage: Boolean = false,
+)
+
+data class TopicEditRules(
+    val categories: List<Category> = emptyList(),
+    val canTagTopics: Boolean = false,
+    val minTitleLength: Int = 15,
+    val minPmTitleLength: Int = 2,
+    val uncategorizedId: Int = 1,
+) {
+    val selectableCategories: List<Category>
+        get() = categories.filter { it.id != uncategorizedId && it.permission != null && it.permission <= 1 }
+}
+
+data class TopicMetadataPatch(val title: String? = null, val categoryId: Int? = null, val tags: List<String>? = null) {
+    val changed: Boolean get() = title != null || categoryId != null || tags != null
+
+    fun applyTo(original: TopicMetadata): TopicMetadata = original.copy(
+        title = title ?: original.title, categoryId = categoryId ?: original.categoryId, tags = tags ?: original.tags,
+    )
+
+    fun formBody(): String {
+        fun encode(value: String) = java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8.name())
+        val fields = mutableListOf<Pair<String, String>>()
+        title?.let { fields += "title" to it }
+        categoryId?.let { fields += "category_id" to it.toString() }
+        tags?.let { values ->
+            if (values.isEmpty()) fields += "tags[]" to ""
+            else values.forEach { fields += "tags[]" to it }
+        }
+        return fields.joinToString("&") { (key, value) -> "${encode(key)}=${encode(value)}" }
+    }
+}
+
+internal fun topicMetadataPatch(original: TopicMetadata, title: String, categoryId: Int?, tags: List<String>, canTag: Boolean): TopicMetadataPatch {
+    val cleaned = tags.map(String::trim).filter(String::isNotEmpty).distinct()
+    return TopicMetadataPatch(
+        title.trim().takeIf { it != original.title.trim() },
+        categoryId?.takeIf { !original.privateMessage && it != original.categoryId },
+        cleaned.takeIf { !original.privateMessage && canTag && it.sorted() != original.tags.distinct().sorted() },
+    )
+}
+
+internal fun validateTopicMetadata(original: TopicMetadata, rules: TopicEditRules, patch: TopicMetadataPatch): String? {
+    if (!original.canEdit) return "当前账号无权编辑此话题"
+    val result = patch.applyTo(original)
+    if (patch.title != null) {
+        val title = patch.title.trim()
+        val minimum = if (original.privateMessage) rules.minPmTitleLength else rules.minTitleLength
+        if (title.isBlank()) return "请输入话题标题"
+        if (title.length < minimum) return "标题至少需要 $minimum 个字符"
+        if (title.length > 200) return "标题最多 200 个字符"
+    }
+    if (original.privateMessage && (patch.categoryId != null || patch.tags != null)) return "私信不支持修改分类和标签"
+    if (patch.categoryId != null && rules.selectableCategories.none { it.id == patch.categoryId }) return "当前账号不能使用这个分类"
+    if (patch.tags != null && !rules.canTagTopics) return "当前账号不能修改标签"
+    if (patch.tags != null && patch.tags.size > 5) return "最多选择 5 个标签"
+    if (!original.privateMessage) {
+        val category = rules.categories.firstOrNull { it.id == result.categoryId } ?: return "请选择有效分类"
+        if (result.tags.size < category.minimumRequiredTags) return "该分类至少需要 ${category.minimumRequiredTags} 个标签"
+    }
+    return null
+}
 
 /** 获取该分类支持的固定标签列表；不同分类可能不同，不可自定义随意输入。 */
 fun fixedTagsForCategory(category: Category?): List<String> {
@@ -654,7 +732,15 @@ data class TopicListItem(
     val trustLevel: Int? = null,
     val notificationLevel: TopicNotificationLevel? = null,
     val notificationLevelUpdating: Boolean = false,
+    /** 搜索命中或书签指向的楼层；为空时按普通进入话题处理。 */
+    val targetPostNumber: Int? = null,
+    /** 书签列表条目的独立书签 ID；同一话题可有多条。 */
+    val bookmarkId: Long? = null,
 ) {
+    /** 列表 key：书签按书签 ID 区分，其余按话题 ID。 */
+    val listKey: String get() = bookmarkId?.let { "bm$it" }
+        ?: targetPostNumber?.let { "${topic.id}:$it" } ?: topic.id.toString()
+
     /** 优先展示论坛昵称（如“用户已注销”），无昵称则回退到用户名（如“NullUser”），对齐 fluxdo */
     val displayName: String
         get() = authorName?.trim()?.takeIf { it.isNotEmpty() } ?: authorUsername.orEmpty()
@@ -1295,6 +1381,8 @@ data class PostStream(
 /** 话题级权限。没有 can_create_post 字段的旧响应按"可回复"处理,由服务端最终裁决。 */
 @Serializable
 data class TopicDetails(
+    /** 话题标题/分类/标签的编辑权限，对齐 FluxDO：缺失按 false，等级与身份由服务端判定。 */
+    @SerialName("can_edit") val canEdit: Boolean = false,
     @SerialName("can_create_post") val canCreatePost: Boolean = true,
     @SerialName("notification_level") val notificationLevel: Int = 1,
 )
@@ -1313,8 +1401,11 @@ data class TopicDetail(
     val details: TopicDetails = TopicDetails(),
     @SerialName("message_bus_last_id") val messageBusLastId: Long? = null,
     @SerialName("highest_post_number") val highestPostNumber: Int? = null,
+    val tags: List<@Serializable(with = TagNameSerializer::class) String> = emptyList(),
+    val archetype: String = "regular",
 ) {
     val canReply: Boolean get() = details.canCreatePost && !closed && !archived
+    val isPrivateMessage: Boolean get() = archetype == "private_message"
 }
 
 data class SearchPage(
@@ -1322,6 +1413,18 @@ data class SearchPage(
     val excerpts: Map<Long, String>,
     val hasMore: Boolean,
 )
+
+/** 帖内搜索的单条命中。 */
+data class TopicSearchHit(
+    val postId: Long,
+    val postNumber: Int,
+    val username: String,
+    val avatarUrl: String?,
+    val createdAt: String?,
+    val blurb: String,
+)
+
+data class TopicSearchPage(val hits: List<TopicSearchHit>, val hasMore: Boolean)
 
 enum class SearchOrder(val label: String, val key: String) {
     Relevance("相关性", ""), Latest("最新帖子", "latest"), Likes("赞最多", "likes"),

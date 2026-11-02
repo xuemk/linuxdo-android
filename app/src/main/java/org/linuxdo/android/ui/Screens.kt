@@ -16,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
@@ -88,6 +90,7 @@ import java.util.Date
 import kotlin.math.min
 import org.linuxdo.android.Config
 import org.linuxdo.android.BuildConfig
+import org.linuxdo.android.data.SavedTopic
 import org.linuxdo.android.service.NotificationHelper
 import org.linuxdo.android.service.ApkUpdateInstaller
 import org.linuxdo.android.data.DiscourseTagInfo
@@ -176,6 +179,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import kotlinx.coroutines.flow.first
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.geometry.Size
@@ -7675,6 +7679,7 @@ private fun CategoryPickerDialog(
     selectedCategoryId: Int?,
     onSelect: (Int) -> Unit,
     onDismiss: () -> Unit,
+    includeAllLevels: Boolean = false,
 ) {
     Dialog(
         onDismissRequest = onDismiss,
@@ -7714,10 +7719,10 @@ private fun CategoryPickerDialog(
                 items(groups, key = { it.first.id }) { (parent, levels) ->
                     val baseName = categoryBaseNameOf(parent.name)
                     val dotColor = parseCategoryColor(parent.color) ?: IosTheme.colors.accent
-                    val variants = remember(parent, levels) {
+                    val variants = remember(parent, levels, includeAllLevels) {
                         (listOf(parent) + levels.sortedBy { categoryLevelOf(it) })
                             .distinctBy { it.id }
-                            .filter { categoryLevelOf(it) in 0..3 }
+                            .filter { includeAllLevels || categoryLevelOf(it) in 0..3 }
                     }
                     val isGroupSelected = selectedCategoryId != null && variants.any { it.id.toInt() == selectedCategoryId }
 
@@ -8785,6 +8790,690 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
                         drawCircle(actionTint, 1.1f, Offset(12f, 10f))
                         drawCircle(actionTint, 1.1f, Offset(15.5f, 10f))
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SavedTopicChip(
+    count: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier
+            .clip(RoundedCornerShape(50))
+            .background(IosTheme.colors.card.copy(alpha = 0.97f))
+            .border(0.5.dp, IosTheme.colors.separator, RoundedCornerShape(50))
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = "打开暂存话题，共 $count 篇" }
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("▱", color = IosTheme.colors.accent, fontSize = 17.sp)
+        Spacer(Modifier.width(6.dp))
+        Text("暂存 $count", color = IosTheme.colors.accent, style = IosTheme.type.footnote)
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+internal fun SavedTopicsSheet(
+    entries: List<SavedTopic>,
+    currentTopicId: Long?,
+    busy: Boolean,
+    notice: String?,
+    canUndo: Boolean,
+    onOpen: (SavedTopic) -> Unit,
+    onRemove: (Long) -> Unit,
+    onPin: (Long) -> Unit,
+    onClear: () -> Unit,
+    onUndo: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var confirmClear by rememberSaveable { mutableStateOf(false) }
+    val height = minOf(443f, androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp * 0.53f).dp
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.groupedBackground,
+        contentColor = IosTheme.colors.label,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("暂存话题", style = IosTheme.type.title3, color = IosTheme.colors.label)
+            Text("  ${entries.size} / 10", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            Spacer(Modifier.weight(1f))
+            TextButton(enabled = !busy && entries.isNotEmpty(), onClick = { confirmClear = true }) {
+                Text("全部清空", color = IosTheme.colors.accent)
+            }
+            TextButton(onClick = onDismiss, modifier = Modifier.width(44.dp)) {
+                Text("×", color = IosTheme.colors.secondaryLabel, fontSize = 23.sp)
+            }
+        }
+        Text(
+            "点卡片继续阅读 · 左滑移除 · 长按置顶",
+            modifier = Modifier.padding(start = 20.dp, bottom = 14.dp),
+            style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel,
+        )
+        if (entries.isEmpty()) {
+            Column(
+                Modifier.fillMaxWidth().height(170.dp).padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text("还没有暂存话题", style = IosTheme.type.headline, color = IosTheme.colors.label)
+                Spacer(Modifier.height(10.dp))
+                Text("在话题右上角点“暂存”，下次从这里接着读",
+                    style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            }
+        } else {
+            androidx.compose.foundation.lazy.LazyColumn(
+                modifier = Modifier.fillMaxWidth().height(height),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                items(entries, key = { it.topicId }) { entry ->
+                    SavedTopicCard(
+                        entry, entry.topicId == currentTopicId, busy,
+                        onOpen = { onOpen(entry) },
+                        onRemove = { onRemove(entry.topicId) },
+                        onPin = { onPin(entry.topicId) },
+                    )
+                }
+            }
+        }
+        if (notice != null) {
+            SavedTopicsNotice(notice, canUndo, onUndo, Modifier.padding(12.dp))
+        }
+    }
+    if (confirmClear) {
+        ClearSavedTopicsDialog(
+            count = entries.size,
+            onDismiss = { confirmClear = false },
+            onConfirm = { confirmClear = false; onClear() },
+        )
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun SavedTopicCard(
+    entry: SavedTopic,
+    current: Boolean,
+    busy: Boolean,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit,
+    onPin: () -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    val dismiss = androidx.compose.material3.rememberSwipeToDismissBoxState(
+        confirmValueChange = {
+            if (it == androidx.compose.material3.SwipeToDismissBoxValue.Settled) true
+            else if (it == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart && !busy) {
+                onRemove()
+                true
+            } else false
+        },
+    )
+    LaunchedEffect(busy) {
+        if (!busy && dismiss.currentValue != androidx.compose.material3.SwipeToDismissBoxValue.Settled) dismiss.reset()
+    }
+    androidx.compose.material3.SwipeToDismissBox(
+        state = dismiss,
+        enableDismissFromStartToEnd = false,
+        enableDismissFromEndToStart = !busy,
+        backgroundContent = {
+            // 仅在左滑时绘制红色底，静止状态下不让它透出卡片。
+            if (dismiss.dismissDirection == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart) {
+                Box(
+                    Modifier.fillMaxWidth().fillMaxHeight().clip(RoundedCornerShape(16.dp)).background(Color(0xFFE55D66)),
+                    contentAlignment = Alignment.CenterEnd,
+                ) { Text("移除", color = Color.White, modifier = Modifier.padding(end = 24.dp)) }
+            }
+        },
+    ) {
+        Box {
+            Column(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(IosTheme.colors.card)
+                    .border(
+                        if (current) 1.5.dp else 0.7.dp,
+                        if (current) IosTheme.colors.accent else IosTheme.colors.separator,
+                        RoundedCornerShape(16.dp),
+                    )
+                    .combinedClickable(enabled = !busy, onClick = onOpen, onLongClick = { menu = true })
+                    .padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 12.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.weight(1f).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            listOfNotNull(entry.categoryName, "已置顶".takeIf { entry.pinned }).joinToString(" · "),
+                            style = IosTheme.type.caption, color = IosTheme.colors.accent,
+                            modifier = Modifier.weight(1f, fill = false), maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                        if (current) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "当前",
+                                style = IosTheme.type.caption.copy(fontSize = 10.5.sp),
+                                color = IosTheme.colors.accent,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .border(0.75.dp, IosTheme.colors.accent, RoundedCornerShape(5.dp))
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                            )
+                        }
+                    }
+                    Box(
+                        Modifier.size(28.dp).clickable(enabled = !busy) { menu = true }
+                            .semantics { contentDescription = "暂存操作：${entry.title}" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("⋯", color = IosTheme.colors.secondaryLabel, fontSize = 20.sp)
+                        androidx.compose.material3.DropdownMenu(
+                            expanded = menu,
+                            onDismissRequest = { menu = false },
+                            containerColor = if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White,
+                            tonalElevation = 0.dp,
+                            modifier = Modifier.background(if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White),
+                        ) {
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PostActionIcon(PostAction.Pin, entry.pinned, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = if (entry.pinned) "取消置顶" else "置顶",
+                                            color = if (entry.pinned) IosTheme.colors.accent else IosTheme.colors.label,
+                                        )
+                                    }
+                                },
+                                onClick = { menu = false; onPin() },
+                                enabled = !busy,
+                            )
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PostActionIcon(PostAction.Delete, false, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("移除暂存", color = IosTheme.colors.destructive)
+                                    }
+                                },
+                                onClick = { menu = false; onRemove() },
+                                enabled = !busy,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    entry.title, style = IosTheme.type.body.copy(fontSize = 15.sp, lineHeight = 21.sp),
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                    color = IosTheme.colors.label, maxLines = 2, minLines = 2,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(9.dp))
+                val floor = entry.position.postNumber.coerceAtLeast(1)
+                val total = maxOf(entry.totalPosts, floor, 1)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("读到第 $floor / $total 楼", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        org.linuxdo.android.ui.format.RelativeTime.format(java.time.Instant.ofEpochMilli(entry.savedAt).toString()) + "暂存",
+                        style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel,
+                        maxLines = 1,
+                    )
+                }
+                Spacer(Modifier.height(9.dp))
+                Box(Modifier.fillMaxWidth().height(2.dp).clip(RoundedCornerShape(2.dp)).background(IosTheme.colors.separator.copy(alpha = 0.45f))) {
+                    Box(Modifier.fillMaxWidth((floor.toFloat() / total).coerceIn(0f, 1f)).height(2.dp).background(IosTheme.colors.accent.copy(alpha = 0.65f)))
+                }
+            }
+        }
+    }
+}
+
+// 与评论删除确认框（TopicDetailScreen.DeleteConfirmDialog）保持同一套样式。
+@Composable
+private fun ClearSavedTopicsDialog(count: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Column(
+            Modifier
+                .widthIn(min = 280.dp, max = 340.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "确认清空全部暂存？",
+                style = IosTheme.type.headline,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                color = IosTheme.colors.label,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "将移除这 $count 篇暂存话题，清空后可立即撤销。论坛收藏和浏览历史不受影响。",
+                style = IosTheme.type.footnote,
+                color = IosTheme.colors.secondaryLabel,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFFFF3B30))
+                        .clickable(onClick = onConfirm),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "全部清空",
+                        style = IosTheme.type.subheadline.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SavedTopicsNotice(message: String, canUndo: Boolean, onUndo: () -> Unit, modifier: Modifier = Modifier) {
+    androidx.compose.material3.Snackbar(
+        modifier = modifier,
+        action = { if (canUndo) TextButton(onClick = onUndo) { Text("撤销", color = Color(0xFFD4C7FF)) } },
+    ) { Text(message) }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+internal fun TopicSearchSheet(
+    state: TopicSearchUiState,
+    onQuery: (String) -> Unit,
+    onOrder: (org.linuxdo.android.data.SearchOrder) -> Unit,
+    onLoadMore: () -> Unit,
+    onOpen: (org.linuxdo.android.data.TopicSearchHit) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val list = rememberLazyListState()
+    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var sorting by remember { mutableStateOf(false) }
+    val nearEnd by remember { derivedStateOf {
+        (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 3
+    } }
+    LaunchedEffect(nearEnd, state.hits.size, state.hasMore, state.loadingMore, state.error) {
+        if (nearEnd && state.hits.isNotEmpty() && state.hasMore && !state.loading && !state.loadingMore && state.error == null) onLoadMore()
+    }
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.groupedBackground,
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        tonalElevation = 0.dp,
+        dragHandle = {
+            Box(Modifier.fillMaxWidth().background(IosTheme.colors.card).padding(top = 10.dp, bottom = 6.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.width(40.dp).height(4.dp).clip(RoundedCornerShape(3.dp)).background(IosTheme.colors.separator))
+            }
+        },
+    ) {
+        val focus = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = LocalSoftwareKeyboardController.current
+        val window = androidx.compose.ui.platform.LocalWindowInfo.current
+        val requester = remember(state.topicId) { FocusRequester() }
+        LaunchedEffect(state.topicId) {
+            // 等当前弹层取得窗口焦点，避免菜单退场和弹层入场时 IME 请求丢失。
+            androidx.compose.runtime.snapshotFlow {
+                sheetState.currentValue != androidx.compose.material3.SheetValue.Hidden && window.isWindowFocused
+            }.first { it }
+            androidx.compose.runtime.withFrameNanos { }
+            requester.requestFocus()
+            androidx.compose.runtime.withFrameNanos { }
+            keyboard?.show()
+        }
+        Column(Modifier.fillMaxWidth().fillMaxHeight(0.86f)) {
+            ReaderPanelHeader("贴内搜索", onClose = { keyboard?.hide(); onDismiss() })
+            Column(Modifier.padding(horizontal = 16.dp)) {
+                Text(state.title, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
+                ReaderSearchField(
+                    state.query, onQuery, "搜索当前话题", requester = requester,
+                    onSearch = { focus.clearFocus(); keyboard?.hide() },
+                )
+                Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (state.hits.isEmpty()) "搜索结果" else "已找到 ${state.hits.size}${if (state.hasMore) "+" else ""} 条结果",
+                        style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel, modifier = Modifier.weight(1f))
+                    Box {
+                        ReaderActionPill(state.order.label + " ▾", onClick = { focus.clearFocus(); keyboard?.hide(); sorting = true })
+                        DropdownMenu(sorting, { sorting = false }, modifier = Modifier.background(IosTheme.colors.card)) {
+                            org.linuxdo.android.data.SearchOrder.entries.forEach { order ->
+                                DropdownMenuItem(
+                                    text = { Text(order.label, style = IosTheme.type.body,
+                                        color = if (order == state.order) IosTheme.colors.accent else IosTheme.colors.label) },
+                                    onClick = { sorting = false; onOrder(order) },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            LazyColumn(
+                state = list, modifier = Modifier.weight(1f),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (state.loading) item("loading") { org.linuxdo.android.ui.design.IosLoadingBox() }
+                if (!state.loading && state.hits.isEmpty() && state.error == null) item("empty") {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        ReaderSearchGlyph(Modifier.size(32.dp))
+                        Spacer(Modifier.height(16.dp))
+                        Text(if (state.query.isBlank()) "搜索话题中的内容" else "没有找到匹配楼层",
+                            style = IosTheme.type.headline, color = IosTheme.colors.secondaryLabel)
+                        Spacer(Modifier.height(6.dp))
+                        Text(if (state.query.isBlank()) "输入关键词即可查找" else "换个关键词再试试",
+                            style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                    }
+                }
+                items(state.hits, key = { it.postId }) { hit ->
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                        .background(IosTheme.colors.card)
+                        .clickable { focus.clearFocus(); keyboard?.hide(); onOpen(hit) }.padding(15.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            org.linuxdo.android.ui.design.UserAvatar(
+                                avatarUrl = hit.avatarUrl, username = hit.username, modifier = Modifier.size(30.dp), cornerRadius = 8.dp)
+                            Column(Modifier.weight(1f).padding(start = 9.dp)) {
+                                Text(hit.username, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold,
+                                    color = IosTheme.colors.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                hit.createdAt?.takeIf { it.isNotBlank() }?.let {
+                                    Text(org.linuxdo.android.ui.format.RelativeTime.format(it), style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                }
+                            }
+                            Text("#${hit.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.accent,
+                                fontWeight = FontWeight.SemiBold, modifier = Modifier.clip(RoundedCornerShape(8.dp))
+                                    .background(IosTheme.colors.accent.copy(alpha = 0.09f)).padding(horizontal = 9.dp, vertical = 5.dp))
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Text(hit.blurb, style = IosTheme.type.body.copy(fontSize = 14.5.sp, lineHeight = 22.sp),
+                            color = IosTheme.colors.label, maxLines = 5, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                if (state.loadingMore) item("more") { org.linuxdo.android.ui.design.IosLoadingBox() }
+                state.error?.let { error -> item("error") {
+                    ReaderEditorError(error, onRetry = { if (state.hits.isEmpty()) onQuery(state.query) else onLoadMore() })
+                } }
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+internal fun TopicMetadataEditorSheet(
+    state: TopicMetadataEditorUiState,
+    onTitle: (String) -> Unit,
+    onCategory: (Int) -> Unit,
+    onTags: (List<String>) -> Unit,
+    onTagQuery: (String) -> Unit,
+    onSave: () -> Unit,
+    onRetry: () -> Unit,
+    onClose: () -> Unit,
+) {
+    var discard by remember { mutableStateOf(false) }
+    var selectCategory by remember { mutableStateOf(false) }
+    val editable = state.original?.canEdit == true && !state.saving && !state.loading
+    val category = state.rules?.categories?.firstOrNull { it.id == state.categoryId }
+    val requestClose = { if (!state.saving) { if (state.dirty) discard = true else onClose() } }
+    Dialog(onDismissRequest = requestClose, properties = androidx.compose.ui.window.DialogProperties(
+        usePlatformDefaultWidth = false, decorFitsSystemWindows = false, dismissOnClickOutside = false)) {
+        androidx.activity.compose.BackHandler(enabled = true, onBack = requestClose)
+        val focus = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = LocalSoftwareKeyboardController.current
+        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).systemBarsPadding().imePadding()) {
+            ReaderPanelHeader(
+                "话题编辑", onClose = requestClose, closeEnabled = !state.saving,
+                actionText = if (state.saving) "保存中…" else "保存", actionEnabled = state.canSave,
+                onAction = { focus.clearFocus(); keyboard?.hide(); onSave() },
+            )
+            org.linuxdo.android.ui.design.IosFullDivider()
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                if (state.loading) org.linuxdo.android.ui.design.IosLoadingBox()
+                state.error?.let { Box(Modifier.padding(horizontal = 16.dp)) { ReaderEditorError(it, onRetry = if (state.saving) null else onRetry) } }
+                if (state.original != null && !state.loading) {
+                    IosGroupCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("话题标题", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                            BasicTextField(
+                                value = state.title, onValueChange = onTitle, enabled = editable,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 70.dp),
+                                minLines = 2, maxLines = 5,
+                                textStyle = IosTheme.type.body.copy(fontSize = 18.sp, lineHeight = 27.sp,
+                                    fontWeight = FontWeight.Medium, color = if (editable) IosTheme.colors.label else IosTheme.colors.secondaryLabel),
+                                cursorBrush = androidx.compose.ui.graphics.SolidColor(IosTheme.colors.accent),
+                                decorationBox = { field -> Box {
+                                    if (state.title.isEmpty()) Text("输入话题标题", style = IosTheme.type.body, color = IosTheme.colors.tertiaryLabel)
+                                    field()
+                                } },
+                            )
+                            val changedTitle = state.patch?.title != null
+                            val minimum = if (state.original.privateMessage) state.rules?.minPmTitleLength ?: 2 else state.rules?.minTitleLength ?: 15
+                            val length = state.title.trim().length
+                            Row(Modifier.fillMaxWidth()) {
+                                Text(if (changedTitle) "至少 $minimum 个字符" else "",
+                                    style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel, modifier = Modifier.weight(1f))
+                                Text("$length / 200", style = IosTheme.type.caption,
+                                    color = if (changedTitle && (length < minimum || length > 200)) IosTheme.colors.destructive else IosTheme.colors.tertiaryLabel)
+                            }
+                        }
+                    }
+                    if (!state.original.privateMessage) {
+                        IosGroupCard(Modifier.fillMaxWidth()) {
+                            Row(Modifier.fillMaxWidth()
+                                .clickable(enabled = editable && state.rules?.selectableCategories?.isNotEmpty() == true) { selectCategory = true }
+                                .padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                                    Text("分类", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.size(8.dp).clip(CircleShape).background(category?.color?.let(::parseCategoryColor) ?: IosTheme.colors.accent))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(category?.name ?: "请选择分类", style = IosTheme.type.body, color = IosTheme.colors.label,
+                                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                                org.linuxdo.android.ui.design.IosChevron()
+                            }
+                        }
+                        IosGroupCard(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Row(Modifier.fillMaxWidth()) {
+                                    Text("标签", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, modifier = Modifier.weight(1f))
+                                    Text("${state.tags.size} / 5", style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                }
+                                androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    state.tags.forEach { tag ->
+                                        Text(tag + if (editable && state.rules?.canTagTopics == true) "  ×" else "",
+                                            style = IosTheme.type.footnote, color = IosTheme.colors.accent,
+                                            modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(IosTheme.colors.accent.copy(alpha = 0.1f))
+                                                .clickable(enabled = editable && state.rules?.canTagTopics == true) { onTags(state.tags - tag) }
+                                                .padding(horizontal = 12.dp, vertical = 9.dp))
+                                    }
+                                }
+                                if (state.tags.isEmpty()) Text("未选择标签", style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                                if (state.rules?.canTagTopics == true) {
+                                    ReaderSearchField(
+                                        state.tagQuery, onTagQuery, "搜索并添加标签", enabled = editable,
+                                        background = IosTheme.colors.fieldBackground,
+                                        onSearch = { focus.clearFocus(); keyboard?.hide() },
+                                    )
+                                    state.requiredTagName?.let {
+                                        Text("请从「$it」组至少选择 ${state.requiredTagMin} 个标签",
+                                            style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                                    }
+                                    if (state.loadingTags) Text("正在加载…", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                                    state.tagError?.let { error ->
+                                        ReaderEditorError(error, onRetry = if (editable) ({ onTagQuery(state.tagQuery) }) else null)
+                                    }
+                                    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        state.tagOptions.filterNot { it.name in state.tags }.forEach { option ->
+                                            Text("+ " + option.text, style = IosTheme.type.footnote, color = IosTheme.colors.label,
+                                                modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(IosTheme.colors.fieldBackground)
+                                                    .clickable(enabled = editable) { onTags(state.tags + option.name) }
+                                                    .padding(horizontal = 11.dp, vertical = 9.dp))
+                                        }
+                                    }
+                                    if (!state.loadingTags && state.tagError == null && state.tagOptions.isEmpty()) {
+                                        Text("没有找到可选标签", style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                    }
+                                } else {
+                                    Text("当前账号不能修改标签，已有标签会保留", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                }
+                                category?.minimumRequiredTags?.takeIf { it > 0 }?.let {
+                                    Text("该分类至少需要 $it 个标签", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                }
+                            }
+                        }
+                    }
+                    if (state.dirty) state.validationError?.let { Box(Modifier.padding(horizontal = 16.dp)) { ReaderEditorError(it) } }
+                }
+            }
+        }
+    }
+    if (selectCategory) CategoryPickerDialog(
+        groups = compactCategoryGroups(state.rules?.selectableCategories.orEmpty()),
+        selectedCategoryId = state.categoryId,
+        onSelect = { categoryId -> selectCategory = false; onCategory(categoryId) },
+        onDismiss = { selectCategory = false },
+        includeAllLevels = true,
+    )
+    if (discard) ReaderDiscardDialog(onDiscard = { discard = false; onClose() }, onCancel = { discard = false })
+}
+
+@Composable
+private fun ReaderPanelHeader(
+    title: String,
+    onClose: () -> Unit,
+    closeEnabled: Boolean = true,
+    actionText: String? = null,
+    actionEnabled: Boolean = true,
+    onAction: () -> Unit = {},
+) {
+    Row(Modifier.fillMaxWidth().background(IosTheme.colors.card).height(54.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(34.dp).clip(CircleShape).background(IosTheme.colors.fieldBackground)
+            .clickable(enabled = closeEnabled, onClick = onClose).semantics { contentDescription = "关闭$title" },
+            contentAlignment = Alignment.Center) {
+            Text("✕", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+        }
+        Text(title, style = IosTheme.type.headline.copy(fontSize = 17.sp), color = IosTheme.colors.label,
+            modifier = Modifier.weight(1f).padding(horizontal = 12.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (actionText != null) ReaderActionPill(actionText, actionEnabled, onAction)
+    }
+}
+
+@Composable
+private fun ReaderActionPill(text: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(Modifier.clip(RoundedCornerShape(18.dp))
+        .background(if (enabled) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.fieldBackground)
+        .clickable(enabled = enabled, onClick = onClick).padding(horizontal = 14.dp, vertical = 9.dp),
+        contentAlignment = Alignment.Center) {
+        Text(text, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold,
+            color = if (enabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel)
+    }
+}
+
+@Composable
+private fun ReaderSearchGlyph(modifier: Modifier = Modifier) {
+    val color = IosTheme.colors.secondaryLabel
+    Canvas(modifier) {
+        val stroke = size.minDimension * 0.085f
+        drawCircle(color, radius = size.minDimension * 0.29f, center = Offset(size.width * 0.42f, size.height * 0.42f), style = Stroke(stroke))
+        drawLine(color, Offset(size.width * 0.64f, size.height * 0.64f), Offset(size.width * 0.88f, size.height * 0.88f),
+            strokeWidth = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun ReaderSearchField(
+    value: String, onChange: (String) -> Unit, placeholder: String,
+    enabled: Boolean = true, requester: FocusRequester? = null,
+    background: Color = IosTheme.colors.card, onSearch: () -> Unit = {},
+) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(background)
+        .padding(horizontal = 13.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        ReaderSearchGlyph(Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        BasicTextField(
+            value = value, onValueChange = onChange, singleLine = true, enabled = enabled,
+            modifier = Modifier.weight(1f).then(if (requester != null) Modifier.focusRequester(requester) else Modifier),
+            textStyle = IosTheme.type.body.copy(fontSize = 14.5.sp, color = IosTheme.colors.label),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(IosTheme.colors.accent),
+            keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { onSearch() }),
+            decorationBox = { field -> Box {
+                if (value.isEmpty()) Text(placeholder, style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                field()
+            } },
+        )
+        if (value.isNotEmpty()) Box(Modifier.padding(start = 8.dp).size(22.dp).clip(CircleShape)
+            .background(IosTheme.colors.separator.copy(alpha = 0.4f))
+            .clickable(enabled = enabled) { onChange("") }
+            .semantics { contentDescription = "清空搜索内容" }, contentAlignment = Alignment.Center) {
+            Text("×", color = IosTheme.colors.secondaryLabel, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun ReaderEditorError(message: String, onRetry: (() -> Unit)? = null) {
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+        .background(IosTheme.colors.destructive.copy(alpha = 0.07f)).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(message, style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
+        if (onRetry != null) ReaderActionPill("重试", onClick = onRetry)
+    }
+}
+
+@Composable
+private fun ReaderDiscardDialog(onDiscard: () -> Unit, onCancel: () -> Unit) {
+    Dialog(onDismissRequest = onCancel) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(IosTheme.colors.card).padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("放弃本次修改？", style = IosTheme.type.headline, color = IosTheme.colors.label)
+            Text("尚未保存的话题信息将不会提交。", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Box(Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.fieldBackground).clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
+                    Text("继续编辑", style = IosTheme.type.footnote, color = IosTheme.colors.label)
+                }
+                Box(Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.destructive).clickable(onClick = onDiscard), contentAlignment = Alignment.Center) {
+                    Text("放弃修改", style = IosTheme.type.footnote, color = Color.White)
                 }
             }
         }

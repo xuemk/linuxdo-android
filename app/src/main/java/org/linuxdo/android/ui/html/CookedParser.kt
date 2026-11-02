@@ -22,7 +22,7 @@ data class InlineText(
 
 sealed interface CookedBlock {
     data class Paragraph(val runs: List<InlineText>) : CookedBlock
-    data class Code(val text: String) : CookedBlock
+    data class Code(val text: String, val copyText: String? = null) : CookedBlock
     data class Quote(val blocks: List<CookedBlock>) : CookedBlock
     data class Picture(
         val url: String,
@@ -46,8 +46,120 @@ sealed interface CookedBlock {
     ) : CookedBlock {
         data class Option(val id: String, val title: String, val votes: Int)
     }
-    data class ListBlock(val entries: List<List<CookedBlock>>, val start: Int?) : CookedBlock
+    data class ListBlock(val entries: List<List<CookedBlock>>, val start: Int?, val continuation: Boolean = false) : CookedBlock
     data object Divider : CookedBlock
+}
+
+/** 分段与屏幕宽度无关，重进页面时可用同一个段号恢复位置。 */
+internal fun segmentCookedBlocks(blocks: List<CookedBlock>, budget: Int = 1400): List<List<CookedBlock>> {
+    require(budget >= 64)
+    fun textCost(text: String): Int = text.length + text.count { it == '\n' } * 30
+    fun cut(text: String): List<String> {
+        val pieces = mutableListOf<String>()
+        var start = 0
+        while (start < text.length) {
+            var end = start
+            var weight = 0
+            while (end < text.length) {
+                val count = Character.charCount(Character.codePointAt(text, end))
+                val nextCost = count + if (text[end] == '\n') 30 else 0
+                if (end > start && weight + nextCost > budget) break
+                weight += nextCost
+                end += count
+            }
+            if (end < text.length) {
+                val newline = text.lastIndexOf('\n', end - 1)
+                if (newline >= start + (end - start) / 2) end = newline + 1
+            }
+            pieces += text.substring(start, end)
+            start = end
+        }
+        return pieces.ifEmpty { listOf("") }
+    }
+    fun cost(block: CookedBlock): Int = when (block) {
+        is CookedBlock.Paragraph -> block.runs.sumOf { textCost(it.text).coerceAtLeast(1) }
+        is CookedBlock.Code -> textCost(block.text)
+        is CookedBlock.Quote -> block.blocks.sumOf { cost(it) }
+        is CookedBlock.ListBlock -> block.entries.sumOf { entry -> entry.sumOf { cost(it) } }
+        is CookedBlock.Picture, is CookedBlock.Video, is CookedBlock.Poll -> budget / 2
+        else -> 120
+    }
+    fun split(block: CookedBlock): List<CookedBlock> = when (block) {
+        is CookedBlock.Paragraph -> {
+            val parts = mutableListOf<CookedBlock>()
+            var runs = mutableListOf<InlineText>()
+            var length = 0
+            for (run in block.runs) {
+                val pieces = if (run.emojiUrl == null) cut(run.text) else listOf(run.text)
+                for (piece in pieces) {
+                    val weight = textCost(piece)
+                    if (length + weight > budget && runs.isNotEmpty()) {
+                        parts += CookedBlock.Paragraph(runs.toList())
+                        runs = mutableListOf()
+                        length = 0
+                    }
+                    runs += run.copy(text = piece)
+                    length += weight
+                }
+            }
+            if (runs.isNotEmpty()) parts += CookedBlock.Paragraph(runs.toList())
+            parts.ifEmpty { listOf(block) }
+        }
+        is CookedBlock.Code -> {
+            val pieces = cut(block.text)
+            pieces.mapIndexed { index, text ->
+                CookedBlock.Code(text, if (index == 0 && pieces.size > 1) block.copyText ?: block.text else block.copyText)
+            }
+        }
+        is CookedBlock.Quote -> segmentCookedBlocks(block.blocks, budget).map { CookedBlock.Quote(it) }
+        is CookedBlock.ListBlock -> {
+            val parts = mutableListOf<CookedBlock>()
+            var entries = mutableListOf<List<CookedBlock>>()
+            var length = 0
+            var firstEntry = 0
+            block.entries.forEachIndexed { index, entry ->
+                val size = entry.sumOf { cost(it) }
+                if (size > budget) {
+                    if (entries.isNotEmpty()) {
+                        parts += CookedBlock.ListBlock(entries.toList(), block.start?.plus(firstEntry))
+                        entries = mutableListOf()
+                        length = 0
+                    }
+                    segmentCookedBlocks(entry, budget).forEachIndexed { part, children ->
+                        parts += CookedBlock.ListBlock(listOf(children), block.start?.plus(index), continuation = part > 0)
+                    }
+                    firstEntry = index + 1
+                    return@forEachIndexed
+                }
+                if (entries.isNotEmpty() && (length + size > budget || entries.size >= 6)) {
+                    parts += CookedBlock.ListBlock(entries.toList(), block.start?.plus(firstEntry))
+                    entries = mutableListOf()
+                    length = 0
+                    firstEntry = index
+                }
+                entries += entry
+                length += size
+            }
+            if (entries.isNotEmpty()) parts += CookedBlock.ListBlock(entries, block.start?.plus(firstEntry))
+            parts.ifEmpty { listOf(block) }
+        }
+        else -> listOf(block)
+    }
+    val result = mutableListOf<List<CookedBlock>>()
+    var pending = mutableListOf<CookedBlock>()
+    var length = 0
+    for (block in blocks.flatMap(::split)) {
+        val size = cost(block)
+        if (pending.isNotEmpty() && (length + size > budget || pending.size >= 6)) {
+            result += pending.toList()
+            pending = mutableListOf()
+            length = 0
+        }
+        pending += block
+        length += size
+    }
+    if (pending.isNotEmpty()) result += pending.toList()
+    return result.ifEmpty { listOf(emptyList()) }
 }
 
 /** Only HTTP(S) links are handed to the image loader or external browser. */
@@ -128,14 +240,6 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             return parsed
         }
 
-        fun prewarm(posts: Iterable<Post>) {
-            for (post in posts) {
-                parsePostCached(post)
-                for (boost in post.boosts) {
-                    parseCached(boost.cooked)
-                }
-            }
-        }
     }
 
     private fun isLightboxMeta(element: Element): Boolean =
