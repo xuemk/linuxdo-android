@@ -39,4 +39,5 @@ screen*.png
 *.dump.xml
 sheet_dump.xml
 uidump.xml
+/package.ps1
 
