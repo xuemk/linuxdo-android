@@ -12,8 +12,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 「直连优先」模式下的 DNS 适配层：对目标域名直接给出内置 Anycast IP，彻底跳过 A 记录解析。
  *
- * 只接管目标域名，其余一律委托 [fallback]：ProxyController 之外的第三方域名（hCaptcha、CDN）
- * 没有内置 IP 可用，硬接管只会让它们失联。
+ * 主站与静态资源域 ldstatic.com 共用直连池，避免 DoH 不可用时正文正常、图片却解析失败。
+ * 其余第三方域名（hCaptcha、其他 CDN）仍委托 [fallback]，不套用主站的 IP。
  *
  * 返回**整个有序池**而非单个最优节点 —— OkHttp 会按顺序逐个尝试，相当于免费获得一层连接级
  * 故障转移；只给一个 IP 的话，该节点瞬时抖动就会让请求直接失败。
@@ -57,6 +57,7 @@ class AnycastDns(
 
     private fun isTargetHost(hostname: String): Boolean {
         val host = hostname.trimEnd('.').lowercase()
-        return host == targetHost || host.endsWith(".$targetHost")
+        return host == targetHost || host.endsWith(".$targetHost") ||
+            host == "ldstatic.com" || host.endsWith(".ldstatic.com")
     }
 }
