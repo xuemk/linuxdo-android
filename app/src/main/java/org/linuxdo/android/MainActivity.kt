@@ -25,6 +25,9 @@ class MainActivity : ComponentActivity() {
         }
         handleNotificationIntent(intent)
         handleDeepLinkIntent(intent)
+        // 在 Activity 尚未进入 RESUMED 前提前初始化 GeckoRuntime，避免首帧合成（已处于 RESUMED）时
+        // GeckoRuntime.init 同步触发 LifecycleListener.onResume 与 GeckoThread 启动产生竞态。
+        org.linuxdo.android.net.gecko.GeckoManager.getOrCreateRuntime(applicationContext)
         val browser = (application as App).container.browser
         setContent {
             AppShell(viewModel, browser)

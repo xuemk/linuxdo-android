@@ -272,7 +272,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                             )
                             if (!webReady) {
                                 VerifyLoadingLayer(
-                                    stalled = verifyPageState == BrowserSession.VerifyPageState.STALLED,
+                                    state = verifyPageState,
                                     onRetry = viewModel::retryVerification,
                                     modifier = Modifier
                                         .fillMaxSize()
@@ -350,10 +350,10 @@ private fun ReadSyncVerifyBanner(
     }
 }
 
-/** 验证页加载层：加载中显示转圈，未取得验证凭据或页面异常时提供重试。 */
+/** 验证页加载层：加载中显示转圈；验证页打不开，或验证通过但 App 请求仍被拦截时提供重试。 */
 @Composable
 private fun VerifyLoadingLayer(
-    stalled: Boolean,
+    state: BrowserSession.VerifyPageState,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -362,14 +362,20 @@ private fun VerifyLoadingLayer(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
     ) {
-        if (stalled) {
+        val failure = when (state) {
+            BrowserSession.VerifyPageState.STALLED -> "验证未完成" to "验证页面加载失败，请检查网络后重试"
+            BrowserSession.VerifyPageState.MISMATCH ->
+                "验证未生效" to "网页验证已通过，但 App 的请求仍被 Cloudflare 拦截。请切换网络（如开关代理或换移动数据/Wi-Fi）后重试"
+            else -> null
+        }
+        if (failure != null) {
             Text(
-                text = "验证未完成",
+                text = failure.first,
                 style = IosTheme.type.navTitle,
                 color = IosTheme.colors.label,
             )
             Text(
-                text = "未取得新的安全凭据，请检查网络后重试",
+                text = failure.second,
                 color = IosTheme.colors.secondaryLabel,
                 fontSize = 14.sp,
                 lineHeight = 20.sp,

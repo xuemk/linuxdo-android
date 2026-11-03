@@ -389,7 +389,15 @@ data class Category(
     @SerialName("required_tag_groups") val requiredTagGroups: List<RequiredTopicTagGroup> = emptyList(),
     @SerialName("allowed_tag_groups") val allowedTagGroups: List<String> = emptyList(),
     @SerialName("allow_global_tags") val allowGlobalTags: Boolean = true,
-)
+) {
+    /**
+     * 当前用户是否可在该分类下创建话题（对齐 FluxDO `Category.canCreateTopic` 与 Discourse 权限定义）：
+     * - 排除默认“未分类”（`id != uncategorizedId`）
+     * - `permission <= 1`（0 = full, 1 = create/reply；2 = reply only、3 = see 或 null 均不可发帖）
+     */
+    fun canCreateTopic(uncategorizedId: Int = 1): Boolean =
+        id != uncategorizedId && permission != null && permission <= 1
+}
 
 @Serializable
 data class RequiredTopicTagGroup(val name: String = "", @SerialName("min_count") val minCount: Int = 1)
@@ -411,7 +419,7 @@ data class TopicEditRules(
     val uncategorizedId: Int = 1,
 ) {
     val selectableCategories: List<Category>
-        get() = categories.filter { it.id != uncategorizedId && it.permission != null && it.permission <= 1 }
+        get() = creatableCategories(categories, uncategorizedId)
 }
 
 data class TopicMetadataPatch(val title: String? = null, val categoryId: Int? = null, val tags: List<String>? = null) {
@@ -481,9 +489,27 @@ fun fixedTagsForCategory(category: Category?): List<String> {
     }
 }
 
-/** 把嵌套的分类树摊平成一维,便于按 id 查找。 */
+/** 把嵌套的分类树摊平成一维,便于按 id 查找。展开时补齐子分类的 parentCategoryId。 */
 fun flattenCategories(categories: List<Category>): List<Category> =
-    categories.flatMap { listOf(it) + flattenCategories(it.subcategoryList) }
+    categories.flatMap { parent ->
+        listOf(parent) + flattenCategories(
+            parent.subcategoryList.map { sub ->
+                if (sub.parentCategoryId == null) sub.copy(parentCategoryId = parent.id) else sub
+            },
+        )
+    }
+
+/**
+ * 提取可用于创建/移入话题的平铺分类列表（排除“未分类”与无发帖权限分类，对齐 FluxDO）。
+ * 同时清空 `subcategoryList`，防止后续 [compactCategoryGroups] 再次展开父分类时将已过滤掉的只读子分类带回。
+ */
+fun creatableCategories(categories: List<Category>, uncategorizedId: Int = 1): List<Category> {
+    val all = flattenCategories(categories).distinctBy { it.id }
+    val hasPermissionInfo = all.any { it.permission != null }
+    return all
+        .filter { if (hasPermissionInfo) it.canCreateTopic(uncategorizedId) else it.id != uncategorizedId }
+        .map { it.copy(subcategoryList = emptyList()) }
+}
 
 /** 只有与父模块同名的 Lv 子分类合并,具名子模块保留独立入口。 */
 fun compactCategoryGroups(categories: List<Category>): List<Pair<Category, List<Category>>> {

@@ -19,6 +19,7 @@ import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.StorageController
 import org.mozilla.geckoview.WebRequestError
 import java.io.File
 import java.io.Closeable
@@ -26,13 +27,16 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 object GeckoManager {
     private const val TAG = "GeckoManager"
@@ -58,6 +62,8 @@ object GeckoManager {
 
         val configFile = File(context.filesDir, "geckoview-config.yaml")
         // prefs 的键是原始 Gecko 参数名；类型由 YAML 值决定，不追加类型后缀。
+        // disableIPv6：OkHttp 直连只走 Anycast IPv4，双栈网络下 Gecko 走 IPv6 过盾拿到的 cf_clearance 交给 OkHttp 会被判为另一访客。
+        // 该配置只在创建 GeckoRuntime 时读取，改动需重启进程生效。
         val configContent = """
             prefs:
               network.proxy.type: 5
@@ -66,6 +72,7 @@ object GeckoManager {
               network.dns.echconfig.enabled: true
               network.dns.http3_echconfig.enabled: true
               network.dns.use_https_rr_as_altsvc: true
+              network.dns.disableIPv6: true
         """.trimIndent()
 
         configFile.writeText(configContent, Charsets.UTF_8)
@@ -78,6 +85,13 @@ object GeckoManager {
             .consoleOutput(false)
             .debugLogging(false)
             .build()
+
+        if (org.mozilla.gecko.util.ThreadUtils.sGeckoHandler == null) {
+            // GeckoRuntime.init 在 ProcessLifecycleOwner 已处于 RESUMED 时会同步回调 LifecycleListener.onResume()
+            // 并调用 ThreadUtils.sGeckoHandler.post(...)，而此时新启动的 GeckoThread 可能尚未完成 sGeckoHandler 赋值。
+            // 先预置主线程 Handler 兜底，待 GeckoThread.run() 启动后会自动覆盖为 Gecko 线程自身的 Handler。
+            org.mozilla.gecko.util.ThreadUtils.sGeckoHandler = Handler(Looper.getMainLooper())
+        }
 
         val rt = GeckoRuntime.create(context.applicationContext, settings)
         runtime = rt
@@ -310,20 +324,24 @@ object GeckoManager {
     }
 
     /**
-     * 清理 GeckoView 数据库中的旧 cf_clearance，避免二次验证时命中旧值导致误判
+     * 经 Gecko 自身的 StorageController 清掉主站（含 .linux.do 域 Cookie）的全部 Cookie，迫使 CF 重新挑战并签发新凭据。
+     * 不能直接改 cookies.sqlite：Gecko 以内存中的 Cookie 为准，删库后旧值仍会被发出并写回。
+     * 会一并清掉 Gecko 侧的 _t/_forum_session，登录流程每次都会重建，验证页不依赖它们。
      */
-    fun clearCfClearanceFromDb(context: Context) {
-        val dbFile = findCookiesDbFile(context) ?: return
-        try {
-            val flags = SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.NO_LOCALIZED_COLLATORS
-            val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, flags)
-            db.use {
-                it.execSQL("DELETE FROM moz_cookies WHERE host LIKE '%linux.do%' AND name = 'cf_clearance'")
-                Log.d(TAG, "已从 GeckoView cookies.sqlite 中清除旧 cf_clearance")
+    suspend fun clearSiteCookies(context: Context): Boolean = withContext(Dispatchers.Main) {
+        val result = getOrCreateRuntime(context).storageController
+            .clearDataFromHost(Config.HOST, StorageController.ClearFlags.COOKIES)
+        withTimeoutOrNull(5_000L) {
+            suspendCancellableCoroutine<Boolean> { continuation ->
+                result.accept(
+                    { if (continuation.isActive) continuation.resume(true) },
+                    { error ->
+                        Log.w(TAG, "清理 Gecko 站点 Cookie 失败: ${error?.message}")
+                        if (continuation.isActive) continuation.resume(false)
+                    },
+                )
             }
-        } catch (e: Throwable) {
-            Log.w(TAG, "清理 GeckoView cf_clearance 异常: ${e.message}")
-        }
+        } ?: false
     }
 
     /**

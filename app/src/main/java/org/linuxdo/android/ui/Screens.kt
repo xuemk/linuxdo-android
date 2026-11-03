@@ -191,6 +191,7 @@ import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.AvatarCache
 import org.linuxdo.android.data.isAnimatedAvatarPath
 import org.linuxdo.android.data.compactCategoryGroups
+import org.linuxdo.android.data.creatableCategories
 import org.linuxdo.android.data.fixedTagsForCategory
 import org.linuxdo.android.data.flattenCategories
 import org.linuxdo.android.ui.design.IosNavBar
@@ -6858,13 +6859,13 @@ fun TopicCreatorSheet(
     }
 
     val flattenedCategories = remember(categories) {
-        flattenCategories(categories)
+        creatableCategories(categories)
     }
     val categoryGroups = remember(flattenedCategories) {
         compactCategoryGroups(flattenedCategories)
     }
     val selectedCategory = remember(flattenedCategories, state.categoryId) {
-        state.categoryId?.let { id -> flattenedCategories.firstOrNull { it.id.toInt() == id } }
+        state.categoryId?.let { id -> flattenedCategories.firstOrNull { it.id == id } }
     }
     val selectedGroup = remember(categoryGroups, state.categoryId) {
         val targetId = state.categoryId ?: return@remember null
@@ -6878,7 +6879,6 @@ fun TopicCreatorSheet(
         } else {
             (listOf(selectedGroup.first) + selectedGroup.second.sortedBy { categoryLevelOf(it) })
                 .distinctBy { it.id }
-                .filter { categoryLevelOf(it) in 0..3 }
         }
     }
 
@@ -7543,7 +7543,7 @@ fun TopicCreatorSheet(
             groups = categoryGroups,
             selectedCategoryId = state.categoryId,
             onSelect = { id ->
-                val newCat = categories.firstOrNull { it.id.toInt() == id }
+                val newCat = flattenedCategories.firstOrNull { it.id == id }
                 val newAllowed = fixedTagsForCategory(newCat)
                 val validTags = state.tags.filter { it in newAllowed }
                 if (validTags != state.tags) {
@@ -7553,6 +7553,7 @@ fun TopicCreatorSheet(
                 showCategoryDialog = false
             },
             onDismiss = { showCategoryDialog = false },
+            includeAllLevels = true,
         )
     }
 

@@ -6,11 +6,24 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
   }
   const store = sender.tab && sender.tab.cookieStoreId;
   const scope = store ? { storeId: store } : {};
-  const cookies = (await browser.cookies.getAll({ domain: "linux.do", ...scope }))
-    .filter(cookie => cookie.domain.replace(/^\./, "") === "linux.do");
+  const unpartitioned = await browser.cookies.getAll({ domain: "linux.do", ...scope });
+  let combined = unpartitioned;
+  try {
+    const partitioned = await browser.cookies.getAll({ domain: "linux.do", partitionKey: {}, ...scope });
+    combined = unpartitioned.concat(partitioned);
+  } catch (e) {}
+  const seen = new Set();
+  const cookies = combined.filter(cookie => {
+    if (cookie.domain.replace(/^\./, "") !== "linux.do") return false;
+    const key = `${cookie.name}|${cookie.domain}|${cookie.path}|${JSON.stringify(cookie.partitionKey || null)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   const remove = cookie => browser.cookies.remove({
     url: "https://linux.do" + cookie.path,
     name: cookie.name,
+    ...(cookie.partitionKey ? { partitionKey: cookie.partitionKey } : {}),
     ...scope
   });
   switch (request.command) {

@@ -5115,11 +5115,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * - 从首页进入时 `initialCategoryId` 为 `null`（分类默认为空）。
      * - 从指定分区进入时 `initialCategoryId` 为当前分区的 `categoryId`（已包含当前所选等级 Lv.0~3）。
      */
+    /**
+     * 校验预设分类或草稿分类是否允许当前用户创建话题（对齐 FluxDO `_applyCurrentFilter` 与 `_restoreCategoryFromDraft`）。
+     * 若分类列表已就绪且该分类不在可创建列表中（如“未分类”、“公告”或高信任等级只读分区），则回退为 null。
+     */
+    private fun resolveCreatableCategoryId(categoryId: Int?): Int? {
+        val targetId = categoryId ?: return null
+        val currentItems = _categories.value.items
+        if (currentItems.isEmpty()) return targetId
+        val creatable = org.linuxdo.android.data.creatableCategories(currentItems)
+        return targetId.takeIf { id -> creatable.any { it.id == id } }
+    }
+
+    /**
+     * 若当前分类缓存尚未合并 `/site.json` 的发帖权限（例如首次升级后冷启动命中旧版持久化缓存），
+     * 打开话题发布器时立即后台拉取合并一次，并二次校验当前已选分类。
+     */
+    private fun ensureTopicCreatorCategoryPermissions() {
+        if (repository.hasSyncedCategoryPermissions()) return
+        val requestScopeGeneration = accountScopeGeneration
+        viewModelScope.launch {
+            val updated = runCatching { repository.ensureCategoryPermissionsFromSite() }.getOrNull() ?: return@launch
+            if (requestScopeGeneration != accountScopeGeneration) return@launch
+            val (freshList, rawJson) = updated
+            if (rawJson.isNotBlank()) {
+                container.preferences.edit { putString("cached_categories_json", rawJson) }
+            }
+            _categories.value = CategoriesUiState(items = freshList, loaded = true, order = store.loadCategoryOrder())
+            val currentCatId = _topicCreator.value.categoryId
+            if (_topicCreator.value.open && currentCatId != null) {
+                val validatedId = resolveCreatableCategoryId(currentCatId)
+                if (validatedId != currentCatId) {
+                    _topicCreator.update { state ->
+                        val next = state.copy(categoryId = validatedId)
+                        next.copy(savedSnapshot = next.currentSnapshot)
+                    }
+                }
+            }
+        }
+    }
+
     fun openTopicCreator(initialCategoryId: Int? = null) {
         if (_topicCreator.value.submitting || _topicCreator.value.savingDraft) return
         if (!_categories.value.loaded && !_categories.value.loading) {
             loadCategories()
         }
+        val validCategoryId = resolveCreatableCategoryId(initialCategoryId)
         val existingNewTopicDraft = _drafts.value.items.firstOrNull { it.draftKey == "new_topic" }
         val baseState = TopicCreatorUiState(
             open = true,
@@ -5128,12 +5169,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = "createTopic",
             title = "",
             raw = "",
-            categoryId = initialCategoryId,
+            categoryId = validCategoryId,
             tags = emptyList(),
         )
         _topicCreator.value = baseState.copy(savedSnapshot = baseState.currentSnapshot)
+        ensureTopicCreatorCategoryPermissions()
         populateCreatorEmojisAndSequence("new_topic")
-        loadTopicCreatorTags(initialCategoryId)
+        loadTopicCreatorTags(validCategoryId)
     }
 
     /** 如果是话题回复类草稿，直接打开该话题的回复栏并将草稿内容填入。 */
@@ -5159,6 +5201,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!_categories.value.loaded && !_categories.value.loading) {
             loadCategories()
         }
+        val validCategoryId = if (draft.isNewTopic) resolveCreatableCategoryId(draft.categoryId) else draft.categoryId
         val baseState = TopicCreatorUiState(
             open = true,
             draftKey = draft.draftKey,
@@ -5168,12 +5211,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             replyToPostNumber = draft.replyToPostNumber,
             title = draft.title,
             raw = draft.raw,
-            categoryId = draft.categoryId,
+            categoryId = validCategoryId,
             tags = draft.tags,
         )
         _topicCreator.value = baseState.copy(savedSnapshot = baseState.currentSnapshot)
+        ensureTopicCreatorCategoryPermissions()
         populateCreatorEmojisAndSequence(draft.draftKey)
-        loadTopicCreatorTags(draft.categoryId)
+        loadTopicCreatorTags(validCategoryId)
     }
 
     private fun populateCreatorEmojisAndSequence(targetDraftKey: String) {
@@ -7150,6 +7194,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                         restoreAccountScopedLocalState(currentId)
                     }
                     _state.update { it.copy(username = cachedUser, screen = Screen.List) }
+                    browser.prewarmCfClearanceIfNeeded("会话缓存启动")
                     resumeAfterVerification?.also { resumeAfterVerification = null }?.invoke()
                     loadLatest(page = 0, pullRefresh = false)
                     viewModelScope.launch {
@@ -7193,6 +7238,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                     rememberCurrentAccount(currentUser)
                     container.preferences.edit { putString("cached_username", username) }
                     _state.update { it.copy(username = username, screen = Screen.List) }
+                    browser.prewarmCfClearanceIfNeeded("登录完成启动")
                     resumeAfterVerification?.also { resumeAfterVerification = null }?.invoke()
                     loadLatest(page = 0, pullRefresh = false)
                     viewModelScope.launch {
@@ -7527,7 +7573,21 @@ fun openTopicSearch(topicId: Long, title: String) {
     suspend fun pollVerification() {
         if (verifying) return
         if (_state.value.screen == Screen.Verify) {
-            if (!browser.interactiveVerificationComplete()) return
+            if (verificationMismatch || !browser.interactiveVerificationComplete()) return
+            val attempt = verificationAttempt
+            verifying = true
+            val usable = try {
+                repository.probeClearanceAfterVerification()
+            } finally {
+                verifying = false
+            }
+            if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+            if (!usable) {
+                verificationMismatch = true
+                browser.logVerifyGeckoEgress()
+                diagnostics.log("验证页已通过，但 App 请求仍被 Cloudflare 挑战，提示用户切换网络后重试")
+                return
+            }
             repository.clearCachedCsrfToken()
             unreadChallengeBackoffUntil = 0L
             if (verificationFromReadSync || _readSyncVerifyBanner.value) {
@@ -8056,6 +8116,8 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (screen == Screen.Verify) {
             verificationReturnScreen = _state.value.screen
             verificationDismissed = false
+            verificationMismatch = false
+            verificationAttempt++
             store.requireVerification()
         }
         if (screen == Screen.Verify) diagnostics.recordInteractiveRequired(reason.ifBlank { "未知" })
@@ -8064,6 +8126,8 @@ fun openTopicSearch(topicId: Long, title: String) {
         // Verify 时打开根 URL 触发 Cloudflare 人机验证。
         if (screen == Screen.Verify) {
             browser.beginInteractiveVerification()
+        } else if (screen == Screen.Login) {
+            browser.prewarmCfClearanceIfNeeded("进入登录页")
         }
     }
 
@@ -8094,10 +8158,18 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
     private var verificationDismissed = false
 
+    /** 验证页已通过但 OkHttp 复核仍被挑战；置位后停止轮询，等用户换网络后点重试。 */
+    @Volatile private var verificationMismatch = false
+
+    /** 每次进入或重试验证递增，丢弃上一轮迟到的复核结果。 */
+    private var verificationAttempt = 0
+
     fun cancelVerification() {
         // 未通过验证就返回：横幅保持显示，用户可随时再次进入
         verificationFromReadSync = false
         verificationDismissed = true
+        verificationMismatch = false
+        verificationAttempt++
         resumeAfterVerification = null
         _state.update { it.copy(screen = if (verificationReturnScreen == Screen.Boot) Screen.Login else verificationReturnScreen) }
         viewModelScope.launch {
@@ -8109,9 +8181,13 @@ fun openTopicSearch(topicId: Long, title: String) {
     /** 验证页加载异常（chrome-error 或数秒内无页面完成），用于提示检查网络或代理。 */
     fun isVerificationPageStalled(): Boolean = browser.isVerificationPageStalled()
 
-    fun verifyPageState(): org.linuxdo.android.net.BrowserSession.VerifyPageState = browser.verifyPageState()
+    fun verifyPageState(): org.linuxdo.android.net.BrowserSession.VerifyPageState =
+        if (verificationMismatch) org.linuxdo.android.net.BrowserSession.VerifyPageState.MISMATCH
+        else browser.verifyPageState()
 
     fun retryVerification() {
+        verificationMismatch = false
+        verificationAttempt++
         viewModelScope.launch { browser.beginInteractiveVerification() }
     }
 

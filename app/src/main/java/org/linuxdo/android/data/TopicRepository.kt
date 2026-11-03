@@ -665,6 +665,29 @@ class TopicRepository(
         onTimingsRecovered?.invoke()
     }
 
+    /**
+     * 验证页收口后，用 App 实际的请求通道发一个不重验的 GET 复核凭据。
+     * 验证页走 Gecko 自己的 DoH/ECH 与 TLS 栈，签发的 cf_clearance 不一定被 CF 认作同一访客；
+     * 仍被挑战时返回 false 并记录出口摘要，由界面如实提示，而不是假装验证成功。
+     * 网络失败（status 0）不算凭据问题，交给后续正常请求报错。
+     */
+    suspend fun probeClearanceAfterVerification(): Boolean {
+        val transport = transportProvider()
+        val result = try {
+            transport.getWithoutRevalidate("/session/current.json", present = false)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            diagnostics.log("验证后凭据复核异常(${transport.name}): ${error.javaClass.simpleName}，按非凭据问题放行")
+            return true
+        }
+        diagnostics.log("验证后凭据复核(${transport.name}): /session/current.json -> ${result.status} challenged=${result.challenged}")
+        if (!result.challenged) return true
+        val trace = transport.getWithoutRevalidate("${Config.BASE_URL}/cdn-cgi/trace", present = false)
+        diagnostics.log("[诊断] 出口对照 ${transport.name}: ${NetDiagnostics.egressTraceSummary(trace.body)}")
+        return false
+    }
+
     /** 用户手工过盾后调用：解除熔断并让下一次心跳优先走 WebView 网络栈。 */
     fun onManualVerificationCompleted() {
         timingsCooldownUntil = 0L
@@ -924,14 +947,19 @@ class TopicRepository(
                 }
             }
 
-            // 遇到失败（403/挑战/超时等），进入 3 分钟熔断冷却，期间不再发送阅读心跳，杜绝任何刷屏或阻塞
-            timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
-            val reason = if (isBadCsrf) "BAD CSRF" else if (primaryResult.challenged) "CF挑战" else "HTTP ${primaryResult.status}"
-            diagnostics.log("阅读进度上报未成功($reason)，进入 3 分钟熔断冷却，静默放弃本次同步")
-            // 仅对确认的 CF 挑战拦截记入 403/挑战事件，避免误伤
-            if (primaryResult.challenged) {
-                notify403OrChallenged("/topics/timings", "timings CF挑战")
-                onTimingsVerificationRequired?.invoke()
+            // 仅对鉴权/风控拦截（401/403/CF挑战）进入 3 分钟全局熔断冷却；
+            // 普通网络抖动（HTTP 0）或服务端临时错误（5xx）不触发全局熔断，交由单话题调度器按 5/10/20/40s 退避并保留待报楼层。
+            if (primaryResult.challenged || primaryResult.status == 401 || primaryResult.status == 403) {
+                timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
+                val reason = if (isBadCsrf) "BAD CSRF" else if (primaryResult.challenged) "CF挑战" else "HTTP ${primaryResult.status}"
+                diagnostics.log("阅读进度上报未成功($reason)，进入 3 分钟熔断冷却，静默放弃本次同步")
+                // 仅对确认的 CF 挑战拦截记入 403/挑战事件，避免误伤
+                if (primaryResult.challenged) {
+                    notify403OrChallenged("/topics/timings", "timings CF挑战")
+                    onTimingsVerificationRequired?.invoke()
+                }
+            } else {
+                diagnostics.log("阅读进度上报网络或临时异常(HTTP ${primaryResult.status})，保留待报批次并按退避周期重试")
             }
             return false
         } catch (cancelled: CancellationException) {
@@ -3067,6 +3095,57 @@ class TopicRepository(
         "800" -> "关注"; "801" -> "关注的人发布话题"; "802" -> "关注的人回复"; else -> "社区通知"
     }
 
+    @Volatile
+    private var categoryPermissionsSyncedGeneration = -1L
+
+    fun hasSyncedCategoryPermissions(): Boolean {
+        val currentGen = sessionStore?.sessionGeneration ?: 0L
+        return categoryPermissionsSyncedGeneration == currentGen
+    }
+
+    /**
+     * 对齐 FluxDO（`getCategories()` 从 `/site.json` 获取分类列表）：
+     * Discourse 的 `/site.json` 会通过 `Category.topic_create_allowed(guardian)` 计算每个分类及子分类的真实发帖权限
+     * （可发帖分类下发 `permission <= 1`，只读/高信任等级/公告分类为 `null` 或 `> 1`），并包含完整的标签约束字段。
+     * 将 `/site.json` 的分类权限与标签规则合并到分类树中，确保创建/编辑话题时的可选分类与服务端权限严格一致。
+     */
+    private suspend fun mergeSiteCategoryMetadata(categories: List<Category>): List<Category> {
+        val currentGen = sessionStore?.sessionGeneration ?: 0L
+        val siteById = runCatching {
+            val site = objectRequest("/site.json")
+            site.objects("categories")
+                .map { json.decodeFromJsonElement(Category.serializer(), it) }
+                .associateBy { it.id }
+        }.getOrDefault(emptyMap())
+        if (siteById.isEmpty()) return categories
+        categoryPermissionsSyncedGeneration = currentGen
+        fun mergeOne(category: Category): Category {
+            val siteCat = siteById[category.id]
+            val mergedSubs = category.subcategoryList.map { sub ->
+                mergeOne(if (sub.parentCategoryId == null) sub.copy(parentCategoryId = category.id) else sub)
+            }
+            return if (siteCat != null) {
+                category.copy(
+                    permission = siteCat.permission,
+                    parentCategoryId = category.parentCategoryId ?: siteCat.parentCategoryId,
+                    allowedTags = siteCat.allowedTags.ifEmpty { category.allowedTags },
+                    minimumRequiredTags = siteCat.minimumRequiredTags,
+                    requiredTagGroups = siteCat.requiredTagGroups.ifEmpty { category.requiredTagGroups },
+                    allowedTagGroups = siteCat.allowedTagGroups.ifEmpty { category.allowedTagGroups },
+                    allowGlobalTags = siteCat.allowGlobalTags,
+                    readRestricted = siteCat.readRestricted,
+                    subcategoryList = mergedSubs,
+                )
+            } else {
+                category.copy(
+                    permission = null,
+                    subcategoryList = mergedSubs,
+                )
+            }
+        }
+        return categories.map(::mergeOne)
+    }
+
     /** 冷启动从本地持久化 JSON 预热分类缓存（0ms 内存就绪，避免首屏阻塞等待网络）。 */
     fun seedCategoriesFromJson(rawJson: String) {
         if (rawJson.isBlank()) return
@@ -3085,23 +3164,52 @@ class TopicRepository(
 
     /**
      * 向服务端探测最新分类树（Stale-While-Revalidate）。
-     * 若与本地缓存不一致（新增/改名/改色/子分类调整），更新内存缓存并返回最新数据与原始 JSON 供持久化落盘；
+     * 若与本地缓存不一致（新增/改名/改色/子分类调整/发帖权限更新），更新内存缓存并返回最新数据与原始 JSON 供持久化落盘；
      * 若完全一致则返回 null，避免无意义的界面重组。
      */
     suspend fun refreshCategoriesFromServer(): Pair<List<Category>, String>? = categoryGate.withLock {
         val raw = request("/categories.json?include_subcategories=true")
-        val freshList = json.decodeFromString<CategoryListResponse>(raw).categoryList.categories
+        val decoded = json.decodeFromString<CategoryListResponse>(raw).categoryList.categories
+        val freshList = mergeSiteCategoryMetadata(decoded)
         val freshMap = flattenCategories(freshList).associateBy { it.id }
         val changed = categoryListCache != freshList || categoryCache != freshMap
         categoryListCache = freshList
         categoryCache = freshMap
-        if (changed) freshList to raw else null
+        if (changed) {
+            val mergedRaw = runCatching {
+                json.encodeToString(CategoryListResponse(CategoryListPayload(freshList)))
+            }.getOrDefault(raw)
+            freshList to mergedRaw
+        } else null
+    }
+
+    /** 若当前分类缓存尚未合并 `/site.json` 权限，则拉取并合并一次，返回更新后的分类树与序列化 JSON。 */
+    suspend fun ensureCategoryPermissionsFromSite(): Pair<List<Category>, String>? = categoryGate.withLock {
+        val current = categoryListCache ?: return@withLock null
+        if (hasSyncedCategoryPermissions()) return@withLock null
+        val merged = mergeSiteCategoryMetadata(current)
+        if (!hasSyncedCategoryPermissions()) return@withLock null
+        val freshMap = flattenCategories(merged).associateBy { it.id }
+        val changed = categoryListCache != merged || categoryCache != freshMap
+        categoryListCache = merged
+        categoryCache = freshMap
+        if (changed) {
+            val mergedRaw = runCatching {
+                json.encodeToString(CategoryListResponse(CategoryListPayload(merged)))
+            }.getOrNull()
+            merged to mergedRaw.orEmpty()
+        } else null
     }
 
     suspend fun fetchCategories(): List<Category> = categoryGate.withLock {
-        categoryListCache ?: json.decodeFromString<CategoryListResponse>(
-            request("/categories.json?include_subcategories=true"),
-        ).categoryList.categories.also { categoryListCache = it }
+        categoryListCache ?: run {
+            val raw = request("/categories.json?include_subcategories=true")
+            val decoded = json.decodeFromString<CategoryListResponse>(raw).categoryList.categories
+            mergeSiteCategoryMetadata(decoded).also { freshList ->
+                categoryListCache = freshList
+                categoryCache = flattenCategories(freshList).associateBy { it.id }
+            }
+        }
     }
 
     fun cachedTagList(): List<DiscourseTag>? = tagListCache

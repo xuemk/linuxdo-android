@@ -492,6 +492,25 @@ object NetDiagnostics {
         sink?.log("[诊断] $message")
     }
 
+    /**
+     * 把 /cdn-cgi/trace 的 key=value 文本压成一行出口摘要，IP 只保留前段，诊断日志会被用户转发。
+     * 不是 trace 格式（被挑战页、错误页）时只给出正文特征。
+     */
+    fun egressTraceSummary(body: String): String {
+        val fields = body.lineSequence()
+            .mapNotNull { line -> line.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0].trim() to it[1].trim() } }
+            .toMap()
+        if (!fields.containsKey("colo")) return "非trace响应 ${bodyFeatures(body)}"
+        val ip = fields["ip"].orEmpty()
+        val maskedIp = when {
+            ip.contains(':') -> "v6 " + ip.split(':').take(2).joinToString(":") + ":*"
+            ip.isNotBlank() -> "v4 " + ip.split('.').take(2).joinToString(".") + ".*.*"
+            else -> "-"
+        }
+        return "ip=$maskedIp colo=${fields["colo"]} loc=${fields["loc"] ?: "-"} http=${fields["http"] ?: "-"}" +
+            " tls=${fields["tls"] ?: "-"} sni=${fields["sni"] ?: "-"} warp=${fields["warp"] ?: "-"}"
+    }
+
     /** 同一类 GET 失败 60 秒内只记一次，写请求每次都记。 */
     private fun shouldTrace(method: String, path: String, status: Int): Boolean {
         if (method != "GET") return true

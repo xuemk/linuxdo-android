@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.linuxdo.android.Config
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoSession
@@ -130,6 +131,18 @@ class GeckoAuthBridge private constructor(
     suspend fun clearCfClearance() {
         request("clearCf")
     }
+
+    /** 当前文档是否命中各组标记词，返回 组名 -> 是否命中。 */
+    suspend fun probeMarkers(groups: Map<String, List<String>>): Map<String, Boolean> {
+        val payload = JSONObject()
+        groups.forEach { (name, words) -> payload.put(name, JSONArray(words)) }
+        val raw = request("markers", JSONObject().put("groups", payload))
+        val result = JSONObject(raw)
+        return groups.keys.associateWith { result.optBoolean(it) }
+    }
+
+    /** 用 Gecko 自己的网络栈请求 /cdn-cgi/trace，供与 OkHttp 出口对照。 */
+    suspend fun readEgressTrace(): String = JSONTokener(request("trace")).nextValue()?.toString().orEmpty()
 
     fun close() {
         if (closed) return
