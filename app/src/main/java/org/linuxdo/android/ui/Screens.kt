@@ -1,4 +1,4 @@
-﻿package org.linuxdo.android.ui
+package org.linuxdo.android.ui
 
 import android.content.Context
 import android.Manifest
@@ -6549,13 +6549,14 @@ internal data class PollBuilderSpec(
     val step: Int? = null,
     val closeMillis: Long? = null,
     val pollName: String? = null,
+    val extraAttrs: Map<String, String> = emptyMap(),
 ) {
     /** 组装标准 Discourse `[poll ...]` BBCode（对齐官方 poll-ui-builder 与 Fluxdo PollSpec.toBBCode） */
     fun toBBCode(existingPollCount: Int = 0): String {
         val sb = StringBuilder("[poll")
-        val nameToUse = pollName ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null
+        val nameToUse = pollName ?: extraAttrs["name"] ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null
         if (!nameToUse.isNullOrBlank()) {
-            sb.append(" name=$nameToUse")
+            sb.append(if (nameToUse.contains(' ')) " name=\"$nameToUse\"" else " name=$nameToUse")
         }
         sb.append(" type=$type results=$results")
         if (type != POLL_TYPE_REGULAR) {
@@ -6571,6 +6572,11 @@ internal data class PollBuilderSpec(
         }
         if (closeMillis != null) {
             sb.append(" close=${java.time.Instant.ofEpochMilli(closeMillis)}")
+        }
+        // 未建模的扩展属性原样写回 (groups/status/dynamic 等)
+        for ((k, v) in extraAttrs) {
+            if (k.equals("name", ignoreCase = true)) continue
+            sb.append(if (v.contains(' ')) " $k=\"$v\"" else " $k=$v")
         }
         sb.append("]\n")
         val trimmedTitle = title.trim()
@@ -6590,58 +6596,64 @@ internal data class PollBuilderSpec(
     }
 
     companion object {
-        private val POLL_REGEX = Regex("""(?s)\[poll(?:\s+([^\]]*))?\](.*?)\[/poll\]""")
+        private val POLL_REGEX = Regex("""(?s)^\s*\[poll(?:\s+([^\]]*))?\](.*?)\[/poll\]\s*$""", RegexOption.IGNORE_CASE)
+        private val MANAGED_KEYS = setOf(
+            "name", "type", "results", "public", "charttype", "min", "max", "step", "close"
+        )
 
         fun fromBBCode(block: String): PollBuilderSpec? {
             val match = POLL_REGEX.matchEntire(block.trim()) ?: return null
             val attrStr = match.groupValues[1]
             val body = match.groupValues[2]
 
-            var name: String? = null
-            var type = POLL_TYPE_REGULAR
-            var results = "always"
-            var publicVoter = true
-            var chartType = "bar"
-            var min: Int? = null
-            var max: Int? = null
-            var step: Int? = null
-            var closeMillis: Long? = null
-
+            val attrs = linkedMapOf<String, String>()
             val attrTokens = Regex("""(\w+)=(?:"([^"]*)"|'([^']*)'|(\S+))""")
             for (attr in attrTokens.findAll(attrStr)) {
-                val key = attr.groupValues[1]
+                val key = attr.groupValues[1].lowercase()
                 val value = attr.groupValues[2].ifEmpty {
                     attr.groupValues[3].ifEmpty { attr.groupValues[4] }
                 }
-                when (key) {
-                    "name" -> name = value
-                    "type" -> type = value
-                    "results" -> results = value
-                    "public" -> publicVoter = value.equals("true", ignoreCase = true)
-                    "chartType" -> chartType = value
-                    "min" -> min = value.toIntOrNull()
-                    "max" -> max = value.toIntOrNull()
-                    "step" -> step = value.toIntOrNull()
-                    "close" -> {
-                        closeMillis = runCatching {
-                            java.time.Instant.parse(value).toEpochMilli()
-                        }.getOrNull()
-                    }
-                }
+                attrs[key] = value
+            }
+
+            val type = attrs["type"]?.lowercase() ?: POLL_TYPE_REGULAR
+            if (type != POLL_TYPE_REGULAR && type != POLL_TYPE_MULTIPLE && type != POLL_TYPE_NUMBER) {
+                // ranked_choice 等表单暂不支持的类型，回退原始 BBCode 编辑，不强转卡片
+                return null
+            }
+
+            val closeRaw = attrs["close"]
+            val closeMillis = if (!closeRaw.isNullOrBlank()) {
+                runCatching {
+                    java.time.Instant.parse(closeRaw).toEpochMilli()
+                }.getOrNull() ?: return null
+            } else {
+                null
             }
 
             var title = ""
             val options = mutableListOf<String>()
             for (line in body.lines()) {
                 val trimmed = line.trim()
-                if (trimmed.startsWith("#")) {
-                    title = trimmed.removePrefix("#").trim()
-                } else if (trimmed.startsWith("*")) {
-                    options.add(trimmed.removePrefix("*").trim())
-                } else if (trimmed.startsWith("-")) {
-                    options.add(trimmed.removePrefix("-").trim())
+                if (trimmed.isEmpty()) continue
+                if (trimmed.startsWith("# ") && title.isEmpty()) {
+                    title = trimmed.substring(2).trim()
+                } else if (trimmed.startsWith("* ") || trimmed.startsWith("- ")) {
+                    options.add(trimmed.substring(2).trim())
+                } else {
+                    // 体内出现无法归类的非空行（嵌套块、多标题、复杂 Markdown 等）→ 拒绝解析，保留原始 BBCode
+                    return null
                 }
             }
+
+            val results = attrs["results"] ?: "always"
+            val publicVoter = attrs["public"]?.equals("true", ignoreCase = true) ?: true
+            val chartType = if (attrs["charttype"]?.equals("pie", ignoreCase = true) == true) "pie" else "bar"
+            val min = attrs["min"]?.toIntOrNull()
+            val max = attrs["max"]?.toIntOrNull()
+            val step = attrs["step"]?.toIntOrNull()
+            val name = attrs["name"]
+            val extraAttrs = attrs.filterKeys { it !in MANAGED_KEYS }
 
             return PollBuilderSpec(
                 type = type,
@@ -6655,9 +6667,33 @@ internal data class PollBuilderSpec(
                 step = step,
                 closeMillis = closeMillis,
                 pollName = name,
+                extraAttrs = extraAttrs,
             )
         }
     }
+}
+
+/** 从当前正文中提取已占用的投票名称集合，从 2 开始递增分配第一个未占用的 poll$n */
+internal fun nextAvailablePollName(raw: String): String? {
+    val pollHeaders = Regex("""\[poll\b([^\]]*)\]""", RegexOption.IGNORE_CASE).findAll(raw).toList()
+    if (pollHeaders.isEmpty()) return null
+    val nameRegex = Regex("""\bname=(?:"([^"]*)"|'([^']*)'|(\S+))""", RegexOption.IGNORE_CASE)
+    val usedNames = mutableSetOf<String>()
+    for (header in pollHeaders) {
+        val attrPart = header.groupValues[1]
+        val m = nameRegex.find(attrPart)
+        val name = if (m != null) {
+            m.groupValues[1].ifEmpty { m.groupValues[2].ifEmpty { m.groupValues[3] } }
+        } else {
+            "poll"
+        }
+        usedNames.add(name.lowercase())
+    }
+    var index = 2
+    while ("poll$index" in usedNames) {
+        index++
+    }
+    return "poll$index"
 }
 
 /** 所见即所得投票预览卡片 Span (参照 PC 端 Discourse 编辑器投票卡片交互) */
@@ -7002,12 +7038,21 @@ internal data class EditorCompletionToken(val marker: Char, val term: String, va
 internal fun editorCompletionToken(text: String, start: Int, end: Int): EditorCompletionToken? {
     if (start != end || start !in 1..text.length) return null
     val prefix = text.substring(0, start)
-    val tokenStart = prefix.indexOfLast { it.isWhitespace() } + 1
-    val token = prefix.substring(tokenStart)
-    val marker = token.firstOrNull()?.takeIf { it == '@' || it == '#' } ?: return null
-    fun valid(character: Char) = character.isLetterOrDigit() || character == '_' || character == '-' ||
+    fun valid(marker: Char, character: Char) = character.isLetterOrDigit() || character == '_' || character == '-' ||
         (marker == '@' && character == '.') || (marker == '#' && character == ':')
-    if (token.drop(1).any { !valid(it) } || token.length > 80) return null
+    var scan = start - 1
+    while (scan >= 0 && (prefix[scan].isLetterOrDigit() || prefix[scan] == '_' || prefix[scan] == '-' || prefix[scan] == '.' || prefix[scan] == ':')) {
+        scan--
+    }
+    if (scan < 0) return null
+    val marker = prefix[scan].takeIf { it == '@' || it == '#' } ?: return null
+    if (scan > 0) {
+        val prev = prefix[scan - 1]
+        if (prev.code < 128 && (prev.isLetterOrDigit() || prev == '_' || prev == '/')) return null
+    }
+    val tokenStart = scan
+    val token = prefix.substring(tokenStart)
+    if (token.drop(1).any { !valid(marker, it) } || token.length > 80) return null
     var fence: Char? = null
     var fenceLength = 0
     prefix.lineSequence().forEach { line ->
@@ -7023,7 +7068,7 @@ internal fun editorCompletionToken(text: String, start: Int, end: Int): EditorCo
     }
     if (fence != null || prefix.substringAfterLast('\n').count { it == '`' } % 2 != 0) return null
     var tokenEnd = start
-    while (tokenEnd < text.length && valid(text[tokenEnd])) tokenEnd++
+    while (tokenEnd < text.length && text[tokenEnd].code < 128 && valid(marker, text[tokenEnd])) tokenEnd++
     return EditorCompletionToken(marker, token.drop(1), tokenStart, start, tokenEnd)
 }
 
@@ -7079,11 +7124,23 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
             override fun afterTextChanged(s: Editable?) {
                 if (isInternalUpdating) return
-                if (beforeSpans.isNotEmpty() && s != null) {
-                    val currentSpans = s.getSpans(0, s.length, CreatorMediaSpan::class.java).toSet()
-                    for (oldSpan in beforeSpans) {
-                        if (oldSpan !in currentSpans) {
-                            onRemoveAttachment?.invoke(oldSpan.media.id)
+                if (s != null) {
+                    for (pollSpan in s.getSpans(0, s.length, CreatorPollSpan::class.java)) {
+                        if (s.getSpanStart(pollSpan) >= s.getSpanEnd(pollSpan)) {
+                            s.removeSpan(pollSpan)
+                        }
+                    }
+                    for (mediaSpan in s.getSpans(0, s.length, CreatorMediaSpan::class.java)) {
+                        if (s.getSpanStart(mediaSpan) >= s.getSpanEnd(mediaSpan)) {
+                            s.removeSpan(mediaSpan)
+                        }
+                    }
+                    if (beforeSpans.isNotEmpty()) {
+                        val currentSpans = s.getSpans(0, s.length, CreatorMediaSpan::class.java).toSet()
+                        for (oldSpan in beforeSpans) {
+                            if (oldSpan !in currentSpans) {
+                                onRemoveAttachment?.invoke(oldSpan.media.id)
+                            }
                         }
                     }
                 }
@@ -7201,8 +7258,10 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
                 layoutParams = android.widget.LinearLayout.LayoutParams(-1, (56 * density).toInt())
                 setOnClickListener {
                     if (currentCompletion() == token) {
-                        val value = suggestion.insertion + " "
-                        text?.replace(token.start, token.end, value)
+                        val ed = text
+                        val needLeadingSpace = ed != null && token.start > 0 && !ed[token.start - 1].isWhitespace()
+                        val value = (if (needLeadingSpace) " " else "") + suggestion.insertion + " "
+                        ed?.replace(token.start, token.end, value)
                         setSelection(token.start + value.length)
                     }
                     dismissCompletion()
@@ -7370,8 +7429,36 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
     }
 
     fun updatePollSpan(span: CreatorPollSpan, newSpec: PollBuilderSpec) {
-        span.spec = newSpec
-        postInvalidate()
+        val ed = text ?: return
+        var start = ed.getSpanStart(span)
+        var end = ed.getSpanEnd(span)
+        var targetSpan = span
+
+        if (start < 0 || end <= start) {
+            val allPollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java)
+                .filter { ed.getSpanStart(it) >= 0 && ed.getSpanEnd(it) > ed.getSpanStart(it) }
+            val matched = allPollSpans.firstOrNull { it === span }
+                ?: allPollSpans.firstOrNull { it.spec == span.spec }
+                ?: allPollSpans.firstOrNull { it.spec.pollName != null && it.spec.pollName == span.spec.pollName }
+                ?: allPollSpans.firstOrNull()
+            if (matched != null) {
+                targetSpan = matched
+                start = ed.getSpanStart(matched)
+                end = ed.getSpanEnd(matched)
+            }
+        }
+
+        if (start >= 0 && end > start) {
+            isInternalUpdating = true
+            ed.removeSpan(targetSpan)
+            val newSpan = createPollSpan(newSpec)
+            val replacement = OBJECT_REPLACEMENT_CHAR
+            ed.replace(start, end, replacement)
+            ed.setSpan(newSpan, start, start + replacement.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            isInternalUpdating = false
+            requestLayout()
+            invalidate()
+        }
         onMarkdownChange?.invoke(exportToMarkdown())
     }
 
@@ -7379,13 +7466,16 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         val ed = text ?: return
         val start = ed.getSpanStart(span)
         val end = ed.getSpanEnd(span)
-        if (start >= 0 && end >= start) {
+        if (start >= 0 && end > start) {
             isInternalUpdating = true
             val deleteStart = if (start > 0 && ed[start - 1] == '\n') start - 1 else start
             val deleteEnd = if (end < ed.length && ed[end] == '\n') end + 1 else end
+            ed.removeSpan(span)
             ed.delete(deleteStart, deleteEnd)
             isInternalUpdating = false
             onMarkdownChange?.invoke(exportToMarkdown())
+        } else {
+            ed.removeSpan(span)
         }
     }
 
@@ -7449,13 +7539,16 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (span.media.id == mediaId) {
                 val start = ed.getSpanStart(span)
                 val end = ed.getSpanEnd(span)
-                if (start >= 0 && end >= start) {
+                if (start >= 0 && end > start) {
                     isInternalUpdating = true
                     val deleteStart = if (start > 0 && ed[start - 1] == '\n') start - 1 else start
                     val deleteEnd = if (end < ed.length && ed[end] == '\n') end + 1 else end
+                    ed.removeSpan(span)
                     ed.delete(deleteStart, deleteEnd)
                     isInternalUpdating = false
                     onMarkdownChange?.invoke(exportToMarkdown())
+                } else {
+                    ed.removeSpan(span)
                 }
                 break
             }
@@ -7546,7 +7639,7 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         val pollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java).map { span ->
             Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span.spec.toBBCode())
         }
-        val allSpans = (mediaSpans + pollSpans).filter { it.first >= 0 && it.second >= it.first }
+        val allSpans = (mediaSpans + pollSpans).filter { it.first >= 0 && it.second > it.first }
             .sortedBy { it.first }
 
         if (allSpans.isEmpty()) return ed.toString().trimEnd()
@@ -8412,11 +8505,11 @@ fun TopicCreatorSheet(
     // 投票构建器弹窗（支持全新创建与所见即所得卡片编辑回显）
     if (showPollDialog) {
         val currentRaw = editorView?.exportToMarkdown() ?: state.raw
-        val existingPollCount = remember(currentRaw) {
-            Regex("""\[poll[\s\]]""").findAll(currentRaw).count()
+        val suggestedPollName = remember(currentRaw) {
+            nextAvailablePollName(currentRaw)
         }
         PollBuilderDialog(
-            existingPollCount = existingPollCount,
+            suggestedPollName = suggestedPollName,
             initialSpec = editingPollTarget?.second,
             onDismiss = {
                 showPollDialog = false
@@ -8822,8 +8915,8 @@ private fun TagPickerDialog(
 }
 
 @Composable
-private fun PollBuilderDialog(
-    existingPollCount: Int,
+internal fun PollBuilderDialog(
+    suggestedPollName: String? = null,
     initialSpec: PollBuilderSpec? = null,
     onDismiss: () -> Unit,
     onConfirm: (PollBuilderSpec) -> Unit,
@@ -8957,7 +9050,8 @@ private fun PollBuilderDialog(
                     max = if (pollType == POLL_TYPE_REGULAR) null else maxVal,
                     step = if (pollType == POLL_TYPE_NUMBER) stepVal else null,
                     closeMillis = closeMillis,
-                    pollName = initialSpec?.pollName ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null,
+                    pollName = initialSpec?.pollName ?: suggestedPollName,
+                    extraAttrs = initialSpec?.extraAttrs.orEmpty(),
                 )
                 onConfirm(spec)
             }

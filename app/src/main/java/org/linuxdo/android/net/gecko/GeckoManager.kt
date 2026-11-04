@@ -347,7 +347,10 @@ object GeckoManager {
     /**
      * 从 GeckoView 的 moz_cookies SQLite 数据库中提取 linux.do 的凭据 (如 cf_clearance, _t, _forum_session)
      */
-    fun extractCookiesFromDb(context: Context): Map<String, String> {
+    fun extractCookiesFromDb(
+        context: Context,
+        excludeClearances: Set<String> = emptySet(),
+    ): Map<String, String> {
         val result = mutableMapOf<String, String>()
         val dbFile = findCookiesDbFile(context) ?: return result
 
@@ -355,10 +358,17 @@ object GeckoManager {
             val flags = SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS
             val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, flags)
             db.use {
-                val cursor = it.rawQuery(
-                    "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
-                    null
-                )
+                val cursor = try {
+                    it.rawQuery(
+                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%' ORDER BY lastAccessed ASC, expiry ASC",
+                        null
+                    )
+                } catch (_: Throwable) {
+                    it.rawQuery(
+                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
+                        null
+                    )
+                }
                 cursor.use { c ->
                     val nameIdx = c.getColumnIndex("name")
                     val valIdx = c.getColumnIndex("value")
@@ -367,6 +377,9 @@ object GeckoManager {
                             val name = c.getString(nameIdx)
                             val value = c.getString(valIdx)
                             if (!name.isNullOrBlank() && !value.isNullOrBlank()) {
+                                if (name.equals("cf_clearance", ignoreCase = true) && value in excludeClearances) {
+                                    continue
+                                }
                                 result[name] = value
                             }
                         }

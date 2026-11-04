@@ -94,6 +94,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import org.linuxdo.android.ui.RichMarkdownEditorView
+import org.linuxdo.android.ui.CreatorPollSpan
+import org.linuxdo.android.ui.PollBuilderDialog
+import org.linuxdo.android.ui.PollBuilderSpec
+import org.linuxdo.android.ui.nextAvailablePollName
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.geometry.Offset
@@ -3266,6 +3270,8 @@ private fun ComposerSheet(
     val keyboardController = LocalSoftwareKeyboardController.current
     var isFullScreen by rememberSaveable { mutableStateOf(false) }
     var showEmojiPicker by rememberSaveable { mutableStateOf(false) }
+    var showPollDialog by remember { mutableStateOf(false) }
+    var editingPollTarget by remember { mutableStateOf<Pair<CreatorPollSpan, PollBuilderSpec>?>(null) }
     var previewingImage by remember { mutableStateOf<String?>(null) }
     var editorView by remember(target) { mutableStateOf<RichMarkdownEditorView?>(null) }
 
@@ -3302,7 +3308,14 @@ private fun ComposerSheet(
     val busy = composer.submitting || composer.uploading
 
     BackHandler(enabled = true) {
-        onClose()
+        when {
+            showPollDialog -> {
+                showPollDialog = false
+                editingPollTarget = null
+            }
+            showEmojiPicker -> showEmojiPicker = false
+            else -> onClose()
+        }
     }
 
     Box(
@@ -3328,7 +3341,7 @@ private fun ComposerSheet(
                     when {
                         isFullScreen -> Modifier.fillMaxHeight(0.92f)
                         showEmojiPicker -> Modifier.height(420.dp)
-                        composer.attachments.isNotEmpty() || composer.uploading -> Modifier.height(380.dp)
+                        composer.attachments.isNotEmpty() || composer.uploading || composer.draft.contains("[poll", ignoreCase = true) -> Modifier.height(380.dp)
                         else -> Modifier.height(280.dp)
                     }
                 )
@@ -3408,6 +3421,10 @@ private fun ComposerSheet(
                                 setOnMarkdownChangeListener { newRaw -> onDraftChange(newRaw) }
                                 setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
                                 setOnPreviewImageListener { previewUrl -> previewingImage = previewUrl }
+                                setOnEditPollListener { span, spec ->
+                                    editingPollTarget = Pair(span, spec)
+                                    showPollDialog = true
+                                }
                                 editorView = this
                                 post { requestInputFocus() }
                             }
@@ -3415,6 +3432,10 @@ private fun ComposerSheet(
                         update = { view ->
                             view.updateThemeColors(textColorInt, hintColorInt)
                             view.setCompletionSource(completionSource, topicId = target.topicId)
+                            view.setOnEditPollListener { span, spec ->
+                                editingPollTarget = Pair(span, spec)
+                                showPollDialog = true
+                            }
                         },
                     )
                 }
@@ -3511,6 +3532,32 @@ private fun ComposerSheet(
                     )
                 }
 
+                Spacer(Modifier.width(8.dp))
+
+                // 投票 Icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(if (showPollDialog) IosTheme.colors.accent.copy(alpha = 0.12f) else Color.Transparent)
+                        .clickable(enabled = !busy) {
+                            keyboardController?.hide()
+                            showEmojiPicker = false
+                            editingPollTarget = null
+                            showPollDialog = true
+                        }
+                        .semantics { contentDescription = "插入投票" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposerPollIcon(
+                        tint = when {
+                            busy -> IosTheme.colors.tertiaryLabel
+                            showPollDialog -> IosTheme.colors.accent
+                            else -> IosTheme.colors.label
+                        },
+                    )
+                }
+
                 if (composer.uploading) {
                     Spacer(Modifier.width(10.dp))
                     IosActivityIndicator(diameter = 16.dp)
@@ -3565,6 +3612,31 @@ private fun ComposerSheet(
             runCatching { focus.requestFocus() }
             keyboardController?.show()
         }
+    }
+
+    if (showPollDialog) {
+        val currentRaw = editorView?.exportToMarkdown() ?: composer.draft
+        val suggestedPollName = remember(currentRaw) {
+            nextAvailablePollName(currentRaw)
+        }
+        PollBuilderDialog(
+            suggestedPollName = suggestedPollName,
+            initialSpec = editingPollTarget?.second,
+            onDismiss = {
+                showPollDialog = false
+                editingPollTarget = null
+            },
+            onConfirm = { resultSpec ->
+                val targetPoll = editingPollTarget
+                if (targetPoll != null) {
+                    editorView?.updatePollSpan(targetPoll.first, resultSpec)
+                } else {
+                    editorView?.insertPoll(resultSpec)
+                }
+                showPollDialog = false
+                editingPollTarget = null
+            },
+        )
     }
 
     previewingImage?.let { previewUrl ->
@@ -5551,13 +5623,9 @@ private fun DetailsCard(
 ) {
     var expanded by rememberSaveable(block.id) { mutableStateOf(block.initiallyOpen) }
     val target = LocalTocTarget.current
-    val parts = remember(block.blocks) { segmentCookedBlocks(block.blocks) }
-    val scroll = rememberLazyListState()
     LaunchedEffect(target, block.id) {
         if (target != null && containsHeading(block.blocks, target)) {
             expanded = true
-            withFrameNanos { }
-            scroll.scrollToItem(parts.indexOfFirst { containsHeading(it, target) }.coerceAtLeast(0))
         }
     }
     Column(
@@ -5574,15 +5642,11 @@ private fun DetailsCard(
             Box(Modifier.weight(1f)) { RichParagraph(block.summary, compact = true) }
         }
         if (expanded) {
-            LazyColumn(
-                state = scroll,
-                modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
-                contentPadding = PaddingValues(12.dp),
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(parts.size, key = { it }) { index ->
-                    CookedContent(parts[index], onPicture, postImages, compact, subReply, post)
-                }
+                CookedContent(block.blocks, onPicture, postImages, compact, subReply, post)
             }
         }
     }
@@ -5628,7 +5692,11 @@ private fun CookedTable(
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (table.caption.isNotEmpty()) RichParagraph(table.caption, compact = true)
         BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val columnWidth = (maxWidth / table.columns.coerceAtMost(2)).coerceIn(110.dp, 220.dp)
+            val columnWidth = when (table.columns) {
+                1 -> maxWidth
+                2, 3 -> (maxWidth / table.columns).coerceAtLeast(100.dp)
+                else -> (maxWidth / 3).coerceIn(110.dp, 200.dp)
+            }
             Box(Modifier.horizontalScroll(rememberScrollState())) {
                 Layout(
                     content = {
@@ -5779,7 +5847,7 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
         }
     }
     LaunchedEffect(pageActive, visible, fullscreen) {
-        if (!pageActive || (!visible && !fullscreen)) session?.close()
+        if (!pageActive || (video && !visible && !fullscreen)) session?.close()
     }
     LaunchedEffect(player) {
         if (player == null) return@LaunchedEffect
@@ -5828,7 +5896,7 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
             }) { Text("${speed}×", style = IosTheme.type.caption) }
             if (video && player != null) TextButton(onClick = { fullscreen = true }) { Text("全屏", style = IosTheme.type.caption) }
         }
-        if (!video) {
+        if (!video || player != null) {
             Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(mediaTime(position), style = IosTheme.type.caption)
                 Slider(

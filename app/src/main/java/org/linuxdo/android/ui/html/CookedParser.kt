@@ -439,6 +439,18 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                 lazyVideoOf(element)?.let(output::add)
                 continue
             }
+            if (element?.hasClass("video-placeholder-container") == true) {
+                flush()
+                val url = contentUrl(element.attr("data-video-src").ifBlank { element.attr("data-original-video-src") })
+                if (url != null) {
+                    output += CookedBlock.Video(
+                        url = url,
+                        posterUrl = contentUrl(element.attr("data-thumbnail-src").ifBlank { element.attr("data-poster-src") }),
+                        title = element.attr("title").ifBlank { "视频" },
+                    )
+                }
+                continue
+            }
             if (element?.hasClass("poll") == true) {
                 flush()
                 pollBlockOf(element)?.let(output::add)
@@ -541,7 +553,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     output += blocks(element.childNodes())
                 }
                 else -> {
-                    if (element != null && element.select("$CONTENT_IMAGES, video, audio, details, table, .lazy-video-container, .d-image-grid").isNotEmpty()) {
+                    if (element != null && element.select("$CONTENT_IMAGES, video, audio, details, table, .lazy-video-container, .video-placeholder-container, .d-image-grid").isNotEmpty()) {
                         flush()
                         output += blocks(element.childNodes())
                     } else pending += inline(node)

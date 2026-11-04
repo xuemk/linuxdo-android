@@ -118,6 +118,7 @@ class BrowserSession(
     /** 进入本轮验证前已存在的 cf_clearance，再次读到它们不算新签发。 */
     private var verifyStaleClearances: Set<String> = emptySet()
     private var verifyProbeJob: Job? = null
+    private var prewarmJob: Job? = null
     private var mainGeckoInitJob: Job? = null
 
     /** 系统 WebView 的 /challenge 导航是否已穿过 Cloudflare 到达 Discourse 源站（返回源站 404），供路径 B 判断就绪。 */
@@ -222,6 +223,7 @@ class BrowserSession(
         val bridge = geckoBridges[view]
         val generation = store.sessionGeneration
         val previousCookies = store.syncFromWebView()
+        val staleForSync = setOfNotNull(cfClearanceBeforeChallenge).filter { it.isNotBlank() }.toSet()
         var bridgeClearance: String? = null
         if (bridge != null) {
             val snapshot = bridge.readCookies()
@@ -232,7 +234,13 @@ class BrowserSession(
                 val name = cookie.getString("name")
                 val value = cookie.getString("value")
                 if (name.equals(CF_CLEARANCE_COOKIE, ignoreCase = true) && value.isNotBlank()) {
-                    bridgeClearance = value
+                    val isCandidateFresh = value !in staleForSync && !store.isClearanceChallenged(value)
+                    if (isCandidateFresh || bridgeClearance == null) {
+                        bridgeClearance = value
+                    }
+                    if (!isCandidateFresh && bridgeClearance != null && bridgeClearance != value) {
+                        return@mapNotNull null
+                    }
                 }
                 Cookie.Builder().apply {
                     name(name)
@@ -246,12 +254,13 @@ class BrowserSession(
             }
             store.applyResponseCookies(cookies, requestGeneration = generation, sentCookies = previousCookies)
         }
-        val geckoClearance = bridgeClearance ?: if (view is GeckoView) {
-            val context = attachedActivityContext ?: appContext
-            withContext(Dispatchers.IO) {
-                GeckoManager.extractCookiesFromDb(context)[CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }
-            }
-        } else null
+        val geckoClearance = bridgeClearance?.takeIf { it !in staleForSync && !store.isClearanceChallenged(it) }
+            ?: if (view is GeckoView) {
+                val context = attachedActivityContext ?: appContext
+                withContext(Dispatchers.IO) {
+                    GeckoManager.extractCookiesFromDb(context, staleForSync)[CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }
+                }
+            } else bridgeClearance
         if (
             !geckoClearance.isNullOrBlank() &&
             !store.isClearanceChallenged(geckoClearance) &&
@@ -2356,6 +2365,7 @@ class BrowserSession(
                 origin == Config.BASE_URL -> {
                     authHtmlInjected = true
                     diagnostics.log("已取得站点第一方上下文,注入内联 hCaptcha 登录页")
+                    refreshBrowserCookies(view) {}
                     evaluateBrowserScript(view,
                         "(function(){document.open();document.write(${JSONObject.quote(html)});document.close();})();",
                     ) {
@@ -2724,7 +2734,7 @@ class BrowserSession(
 
     /**
      * 当应用未持有有效 cf_clearance 且未处于交互验证/登录弹窗时，
-     * 利用后台已挂载的 [mainGeckoView] 静默访问一次 /challenge 获取 cf_clearance（恢复 1.5.0 登录凭据预热能力）。
+     * 优先利用已挂载的 [mainGeckoView]，若未挂载则复用无头 [ensureCfClearance] 静默访问 /challenge 获取 cf_clearance。
      * 若当前已有有效 cf_clearance 则直接跳过，绝不覆盖正在使用的凭据。
      */
     fun prewarmCfClearanceIfNeeded(reason: String = "后台凭据预热") {
@@ -2732,12 +2742,19 @@ class BrowserSession(
             scope.launch(Dispatchers.Main) { prewarmCfClearanceIfNeeded(reason) }
             return
         }
-        val view = mainGeckoView ?: return
-        if (mainGeckoInitJob?.isActive == true) return
-        if (verifyPhase == VerifyPhase.RUNNING || verifyProbeJob?.isActive == true) return
+        if (verifyPhase == VerifyPhase.RUNNING || verifyProbeJob?.isActive == true || prewarmJob?.isActive == true) return
         if (authGeckoView != null || isInCfMode || awaitingSecondFactorLogin) return
         if (currentCfClearance() != null) return
-        startSilentPrewarmLoad(view, reason)
+        val view = mainGeckoView
+        if (view != null) {
+            if (mainGeckoInitJob?.isActive == true) return
+            startSilentPrewarmLoad(view, reason)
+        } else {
+            if (solveMutex.isLocked) return
+            prewarmJob = scope.launch {
+                runCatching { ensureCfClearance(reason) }
+            }
+        }
     }
 
     private fun startSilentPrewarmLoad(view: GeckoView, reason: String) {
@@ -2791,7 +2808,7 @@ class BrowserSession(
                     isInCfMode ||
                     awaitingSecondFactorLogin
                 ) return@launch
-                val fresh = readVerifyGeckoClearance(view)
+                val fresh = readVerifyGeckoClearance(view, staleSet)
                     ?.takeIf { it !in staleSet && !store.isClearanceChallenged(it) }
                 if (!fresh.isNullOrBlank() && fresh != lastAdopted) {
                     adoptGeckoClearance(fresh)
@@ -2925,7 +2942,7 @@ class BrowserSession(
             if (verifyPhase != VerifyPhase.RUNNING || mainGeckoView !== view) return
             if (verifyLoadFailed) continue
             val now = SystemClock.elapsedRealtime()
-            val fresh = readVerifyGeckoClearance(view)?.takeIf { it !in verifyStaleClearances }
+            val fresh = readVerifyGeckoClearance(view, verifyStaleClearances)?.takeIf { it !in verifyStaleClearances }
             // markers 为 null：页面切换中桥暂未重连，或桥初始化失败。此时不改动遮罩状态。
             val markers = probeGeckoMarkers(view)
 
@@ -3013,7 +3030,10 @@ class BrowserSession(
      * 优先经脚本桥读 Gecko 内存中的 Cookie；桥不可用或没读到时再查 cookies.sqlite（扩展接口可能看不到分区 Cookie）。
      * 数据库里清理前的旧值已记入 [verifyStaleClearances]，不会被误当新签发。
      */
-    private suspend fun readVerifyGeckoClearance(view: GeckoView): String? {
+    private suspend fun readVerifyGeckoClearance(
+        view: GeckoView,
+        excludeClearances: Set<String> = verifyStaleClearances,
+    ): String? {
         val bridge = geckoBridges[view]
         if (bridge != null) {
             val snapshot = try {
@@ -3024,17 +3044,20 @@ class BrowserSession(
                 null
             }
             val fromBridge = snapshot?.let { cookies ->
-                (0 until cookies.length())
+                val values = (0 until cookies.length())
                     .map { cookies.getJSONObject(it) }
-                    .firstOrNull { it.optString("name") == CF_CLEARANCE_COOKIE }
-                    ?.optString("value")
-                    ?.takeIf { it.isNotBlank() }
+                    .filter { it.optString("name").equals(CF_CLEARANCE_COOKIE, ignoreCase = true) }
+                    .map { it.optString("value") }
+                    .filter { it.isNotBlank() }
+                values.lastOrNull { it !in excludeClearances && !store.isClearanceChallenged(it) }
+                    ?: values.lastOrNull { it !in excludeClearances }
             }
             if (fromBridge != null) return fromBridge
         }
         val context = attachedActivityContext ?: appContext
         return withContext(Dispatchers.IO) {
-            GeckoManager.extractCookiesFromDb(context)[CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }
+            GeckoManager.extractCookiesFromDb(context, excludeClearances)[CF_CLEARANCE_COOKIE]
+                ?.takeIf { it.isNotBlank() && it !in excludeClearances }
         }
     }
 
@@ -3232,6 +3255,8 @@ class BrowserSession(
      * 直连时根本连不上 /challenge，以前它在后台报错就把验证页判成"未完成"，而用户能操作的 Gecko 页面其实已经打开。
      */
     suspend fun beginInteractiveVerification() = withContext(Dispatchers.Main) {
+        prewarmJob?.cancel()
+        prewarmJob = null
         // 重试时现场已无 clearance，保留首次进入时记下的那枚，供放弃验证时回填
         store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let { verificationClearance = it }
         verifyPhase = VerifyPhase.RUNNING
@@ -3299,6 +3324,8 @@ class BrowserSession(
         verifyPhase = VerifyPhase.IDLE
         verifyProbeJob?.cancel()
         verifyProbeJob = null
+        prewarmJob?.cancel()
+        prewarmJob = null
         resetVerifyPageFlags()
         mainGeckoSession?.let { session ->
             session.stop()
@@ -3378,7 +3405,7 @@ class BrowserSession(
             while (SystemClock.elapsedRealtime() < deadline) {
                 delay(POLL_INTERVAL_MS)
                 val clearance = withContext(Dispatchers.IO) {
-                    GeckoManager.extractCookiesFromDb(context)[CF_CLEARANCE_COOKIE]
+                    GeckoManager.extractCookiesFromDb(context, staleClearances)[CF_CLEARANCE_COOKIE]
                 }
                 if (!clearance.isNullOrBlank() && clearance !in staleClearances) {
                     diagnostics.log("Headless GeckoSession 静默补签成功取得 cf_clearance: ${clearanceFingerprint(clearance)}")

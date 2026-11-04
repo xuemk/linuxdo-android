@@ -6,16 +6,30 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
   }
   const store = sender.tab && sender.tab.cookieStoreId;
   const scope = store ? { storeId: store } : {};
-  const unpartitioned = await browser.cookies.getAll({ domain: "linux.do", ...scope });
-  let combined = unpartitioned;
+  const storeIds = new Set([undefined]);
+  if (store) storeIds.add(store);
   try {
-    const partitioned = await browser.cookies.getAll({ domain: "linux.do", partitionKey: {}, ...scope });
-    combined = unpartitioned.concat(partitioned);
+    const stores = await browser.cookies.getAllCookieStores();
+    for (const item of stores || []) {
+      if (item && item.id) storeIds.add(item.id);
+    }
   } catch (e) {}
+  let combined = [];
+  for (const storeId of storeIds) {
+    const storeScope = storeId ? { storeId } : {};
+    try {
+      const unpartitioned = await browser.cookies.getAll({ domain: "linux.do", ...storeScope });
+      combined = combined.concat(unpartitioned);
+    } catch (e) {}
+    try {
+      const partitioned = await browser.cookies.getAll({ domain: "linux.do", partitionKey: {}, ...storeScope });
+      combined = combined.concat(partitioned);
+    } catch (e) {}
+  }
   const seen = new Set();
   const cookies = combined.filter(cookie => {
     if (cookie.domain.replace(/^\./, "") !== "linux.do") return false;
-    const key = `${cookie.name}|${cookie.domain}|${cookie.path}|${JSON.stringify(cookie.partitionKey || null)}`;
+    const key = `${cookie.name}|${cookie.value || ""}|${cookie.domain}|${cookie.path}|${cookie.storeId || ""}|${JSON.stringify(cookie.partitionKey || null)}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -24,7 +38,7 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
     url: "https://linux.do" + cookie.path,
     name: cookie.name,
     ...(cookie.partitionKey ? { partitionKey: cookie.partitionKey } : {}),
-    ...scope
+    ...(cookie.storeId ? { storeId: cookie.storeId } : scope)
   });
   switch (request.command) {
     case "cookies":
