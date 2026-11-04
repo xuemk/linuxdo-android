@@ -1,4 +1,4 @@
-package org.linuxdo.android.ui
+﻿package org.linuxdo.android.ui
 
 import android.content.Context
 import android.Manifest
@@ -204,6 +204,9 @@ import org.linuxdo.android.ui.screen.ComposerEmojiIcon
 import org.linuxdo.android.ui.screen.ComposerImageIcon
 import org.linuxdo.android.ui.screen.ComposerBoldIcon
 import org.linuxdo.android.ui.screen.ComposerPollIcon
+import android.graphics.Typeface
+import android.text.TextUtils
+import androidx.core.graphics.ColorUtils
 import org.linuxdo.android.ui.screen.ComposerTagIcon
 import org.linuxdo.android.ui.screen.ComposerLockIcon
 import org.linuxdo.android.ui.screen.PostAction
@@ -6519,6 +6522,469 @@ internal class CreatorMediaSpan(
     }
 }
 
+// ==========================================
+// ── 可视化投票构建器数据结构与所见即所得 Span ──
+// ==========================================
+
+internal const val POLL_TYPE_REGULAR = "regular"
+internal const val POLL_TYPE_MULTIPLE = "multiple"
+internal const val POLL_TYPE_NUMBER = "number"
+
+internal val POLL_RESULT_OPTIONS = listOf(
+    "always" to "始终可见",
+    "on_vote" to "投票后可见",
+    "on_close" to "关闭后可见",
+    "staff_only" to "仅管理人员可见",
+)
+
+internal data class PollBuilderSpec(
+    val type: String = POLL_TYPE_REGULAR,
+    val results: String = "always",
+    val publicVoter: Boolean = true,
+    val chartType: String = "bar",
+    val title: String = "",
+    val options: List<String> = emptyList(),
+    val min: Int? = null,
+    val max: Int? = null,
+    val step: Int? = null,
+    val closeMillis: Long? = null,
+    val pollName: String? = null,
+) {
+    /** 组装标准 Discourse `[poll ...]` BBCode（对齐官方 poll-ui-builder 与 Fluxdo PollSpec.toBBCode） */
+    fun toBBCode(existingPollCount: Int = 0): String {
+        val sb = StringBuilder("[poll")
+        val nameToUse = pollName ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null
+        if (!nameToUse.isNullOrBlank()) {
+            sb.append(" name=$nameToUse")
+        }
+        sb.append(" type=$type results=$results")
+        if (type != POLL_TYPE_REGULAR) {
+            if (min != null) sb.append(" min=$min")
+            if (max != null) sb.append(" max=$max")
+        }
+        if (type == POLL_TYPE_NUMBER) {
+            sb.append(" step=${step ?: 1}")
+        }
+        sb.append(" public=$publicVoter")
+        if (type != POLL_TYPE_NUMBER) {
+            sb.append(" chartType=$chartType")
+        }
+        if (closeMillis != null) {
+            sb.append(" close=${java.time.Instant.ofEpochMilli(closeMillis)}")
+        }
+        sb.append("]\n")
+        val trimmedTitle = title.trim()
+        if (trimmedTitle.isNotEmpty()) {
+            sb.append("# $trimmedTitle\n")
+        }
+        if (type != POLL_TYPE_NUMBER) {
+            for (opt in options) {
+                val o = opt.trim()
+                if (o.isNotEmpty()) {
+                    sb.append("* $o\n")
+                }
+            }
+        }
+        sb.append("[/poll]")
+        return sb.toString()
+    }
+
+    companion object {
+        private val POLL_REGEX = Regex("""(?s)\[poll(?:\s+([^\]]*))?\](.*?)\[/poll\]""")
+
+        fun fromBBCode(block: String): PollBuilderSpec? {
+            val match = POLL_REGEX.matchEntire(block.trim()) ?: return null
+            val attrStr = match.groupValues[1]
+            val body = match.groupValues[2]
+
+            var name: String? = null
+            var type = POLL_TYPE_REGULAR
+            var results = "always"
+            var publicVoter = true
+            var chartType = "bar"
+            var min: Int? = null
+            var max: Int? = null
+            var step: Int? = null
+            var closeMillis: Long? = null
+
+            val attrTokens = Regex("""(\w+)=(?:"([^"]*)"|'([^']*)'|(\S+))""")
+            for (attr in attrTokens.findAll(attrStr)) {
+                val key = attr.groupValues[1]
+                val value = attr.groupValues[2].ifEmpty {
+                    attr.groupValues[3].ifEmpty { attr.groupValues[4] }
+                }
+                when (key) {
+                    "name" -> name = value
+                    "type" -> type = value
+                    "results" -> results = value
+                    "public" -> publicVoter = value.equals("true", ignoreCase = true)
+                    "chartType" -> chartType = value
+                    "min" -> min = value.toIntOrNull()
+                    "max" -> max = value.toIntOrNull()
+                    "step" -> step = value.toIntOrNull()
+                    "close" -> {
+                        closeMillis = runCatching {
+                            java.time.Instant.parse(value).toEpochMilli()
+                        }.getOrNull()
+                    }
+                }
+            }
+
+            var title = ""
+            val options = mutableListOf<String>()
+            for (line in body.lines()) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("#")) {
+                    title = trimmed.removePrefix("#").trim()
+                } else if (trimmed.startsWith("*")) {
+                    options.add(trimmed.removePrefix("*").trim())
+                } else if (trimmed.startsWith("-")) {
+                    options.add(trimmed.removePrefix("-").trim())
+                }
+            }
+
+            return PollBuilderSpec(
+                type = type,
+                results = results,
+                publicVoter = publicVoter,
+                chartType = chartType,
+                title = title,
+                options = options,
+                min = min,
+                max = max,
+                step = step,
+                closeMillis = closeMillis,
+                pollName = name,
+            )
+        }
+    }
+}
+
+/** 所见即所得投票预览卡片 Span (参照 PC 端 Discourse 编辑器投票卡片交互) */
+internal class CreatorPollSpan(
+    var spec: PollBuilderSpec,
+    private val context: Context,
+    private val view: EditText,
+    private val onEdit: (CreatorPollSpan, PollBuilderSpec) -> Unit,
+    private val onRemove: (CreatorPollSpan) -> Unit,
+) : ReplacementSpan() {
+
+    private val density = context.resources.displayMetrics.density
+    val lastDrawBounds = RectF()
+    val closeBtnBounds = RectF()
+    val editBtnBounds = RectF()
+
+    private fun getAvailableWidth(): Float {
+        val w = view.width - view.paddingLeft - view.paddingRight
+        if (w > 100) return w.toFloat()
+        val screenW = context.resources.displayMetrics.widthPixels
+        val pad = view.paddingLeft + view.paddingRight
+        val fallback = screenW - (if (pad > 0) pad else (32 * density).toInt())
+        return fallback.coerceAtLeast(100).toFloat()
+    }
+
+    private fun computeHeight(): Float {
+        val padTop = 14f * density
+        val padBottom = 14f * density
+        var leftH = padTop
+
+        val hasTitle = spec.title.isNotBlank()
+        leftH += if (hasTitle) 36f * density else 24f * density
+
+        leftH += when (spec.type) {
+            POLL_TYPE_NUMBER -> 36f * density
+            else -> {
+                val optsCount = spec.options.count { it.isNotBlank() }.coerceAtLeast(2)
+                optsCount * 28f * density
+            }
+        }
+
+        leftH += 8f * density + 30f * density + padBottom
+
+        val rightH = padTop + 28f * density + 16f * density + 14f * density + 3 * 20f * density + padBottom
+
+        return maxOf(leftH, rightH).coerceAtLeast(140f * density)
+    }
+
+    override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int {
+        val cardH = computeHeight()
+        val totalH = cardH + 12f * density
+        if (fm != null) {
+            val totalInt = totalH.toInt()
+            fm.ascent = -totalInt
+            fm.descent = 0
+            fm.top = fm.ascent
+            fm.bottom = 0
+        }
+        return getAvailableWidth().toInt()
+    }
+
+    override fun draw(
+        canvas: Canvas,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint
+    ) {
+        val availWidth = getAvailableWidth()
+        val cardHeight = computeHeight()
+        val lineH = (bottom - top).toFloat()
+        val drawLeft = x
+        val drawTop = top + (lineH - cardHeight) / 2f
+        val drawRight = x + availWidth
+        val drawBottom = drawTop + cardHeight
+
+        lastDrawBounds.set(drawLeft, drawTop, drawRight, drawBottom)
+
+        val isDark = ColorUtils.calculateLuminance(view.currentTextColor) > 0.5f
+
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF1E2023.toInt() else 0xFFFBFBFC.toInt()
+            style = Paint.Style.FILL
+        }
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF32353A.toInt() else 0xFFE2E4E8.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * density
+        }
+
+        val cornerR = 10f * density
+        val cardRect = RectF(drawLeft, drawTop, drawRight, drawBottom)
+        canvas.drawRoundRect(cardRect, cornerR, cornerR, bgPaint)
+        canvas.drawRoundRect(cardRect, cornerR, cornerR, borderPaint)
+
+        // 右上角关闭按钮 ✕
+        val closeSize = 26f * density
+        closeBtnBounds.set(
+            drawRight - closeSize - 6f * density,
+            drawTop + 6f * density,
+            drawRight - 6f * density,
+            drawTop + closeSize + 6f * density
+        )
+        val closeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0x26FFFFFF else 0x1A000000
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(closeBtnBounds.centerX(), closeBtnBounds.centerY(), closeSize / 2f, closeBgPaint)
+        val closeXPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFFA0A5AD.toInt() else 0xFF8A8F98.toInt()
+            textSize = 12f * density
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        canvas.drawText("✕", closeBtnBounds.centerX(), closeBtnBounds.centerY() + 4f * density, closeXPaint)
+
+        // 划分左右两栏：右侧固定约 116.dp
+        val rightColWidth = (116f * density).coerceAtMost(availWidth * 0.36f)
+        val dividerX = drawRight - rightColWidth
+
+        // 纵向分割线
+        canvas.drawLine(
+            dividerX,
+            drawTop + 10f * density,
+            dividerX,
+            drawBottom - 10f * density,
+            borderPaint
+        )
+
+        // ── 绘制左侧区域 ──
+        val padLeft = drawLeft + 14f * density
+        val leftContentRight = dividerX - 12f * density
+        var curY = drawTop + 14f * density
+
+        // 1. 标题
+        val titleText = spec.title.trim().ifEmpty { "投票标题" }
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (spec.title.isNotBlank()) view.currentTextColor else (if (isDark) 0xFF7A808A.toInt() else 0xFF999EA7.toInt())
+            textSize = 15f * density
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val titleMetrics = titlePaint.fontMetrics
+        val titleBase = curY - titleMetrics.ascent
+        val maxTitleW = (leftContentRight - padLeft).coerceAtLeast(50f)
+        val titleEllipsized = TextUtils.ellipsize(titleText, android.text.TextPaint(titlePaint), maxTitleW, TextUtils.TruncateAt.END).toString()
+        canvas.drawText(titleEllipsized, padLeft, titleBase, titlePaint)
+        curY += 24f * density
+
+        // 标题下细水平分割线（对齐 PC 截图）
+        val dividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF2A2D33.toInt() else 0xFFECEEF2.toInt()
+            strokeWidth = 1f * density
+        }
+        canvas.drawLine(padLeft, curY, leftContentRight, curY, dividerPaint)
+        curY += 12f * density
+
+        // 2. 选项列表
+        val optTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = view.currentTextColor
+            textSize = 13.5f * density
+        }
+        val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF6D737D.toInt() else 0xFF9096A0.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1.6f * density
+        }
+
+        if (spec.type == POLL_TYPE_NUMBER) {
+            val minV = spec.min ?: 1
+            val maxV = (spec.max ?: 5).coerceAtLeast(minV)
+            val stepV = (spec.step ?: 1).coerceAtLeast(1)
+            var pillX = padLeft
+            val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (isDark) 0xFF2A2D33.toInt() else 0xFFE9ECF0.toInt()
+                style = Paint.Style.FILL
+            }
+            val numTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = view.currentTextColor
+                textSize = 12f * density
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            var v = minV
+            while (v <= maxV && pillX + 26f * density <= leftContentRight) {
+                val pillRect = RectF(pillX, curY, pillX + 24f * density, curY + 24f * density)
+                canvas.drawRoundRect(pillRect, 6f * density, 6f * density, pillPaint)
+                canvas.drawText(v.toString(), pillRect.centerX(), pillRect.centerY() + 4f * density, numTextPaint)
+                pillX += 28f * density
+                v += stepV
+            }
+            curY += 32f * density
+        } else {
+            val validOptions = spec.options.map { it.trim() }.filter { it.isNotEmpty() }
+                .ifEmpty { listOf("选项 1", "选项 2") }
+
+            for (opt in validOptions) {
+                val lineCenterY = curY + 10f * density
+                val maxTextWidth = leftContentRight - padLeft - 24f * density
+                val ellipsizedOpt = TextUtils.ellipsize(opt, android.text.TextPaint(optTextPaint), maxTextWidth, TextUtils.TruncateAt.END).toString()
+
+                if (spec.type == POLL_TYPE_MULTIPLE) {
+                    val boxSize = 13f * density
+                    val boxRect = RectF(padLeft, lineCenterY - boxSize / 2f, padLeft + boxSize, lineCenterY + boxSize / 2f)
+                    canvas.drawRoundRect(boxRect, 2.5f * density, 2.5f * density, boxPaint)
+                } else {
+                    val radius = 6.5f * density
+                    canvas.drawCircle(padLeft + radius, lineCenterY, radius, boxPaint)
+                }
+
+                canvas.drawText(ellipsizedOpt, padLeft + 22f * density, lineCenterY + 4.5f * density, optTextPaint)
+                curY += 28f * density
+            }
+        }
+
+        // 3. 底部“编辑投票”按钮（对齐 PC 截图）
+        val editBtnTop = (drawBottom - 14f * density - 28f * density).coerceAtLeast(curY + 6f * density)
+        val editBtnW = 96f * density
+        val editBtnH = 28f * density
+        editBtnBounds.set(padLeft, editBtnTop, padLeft + editBtnW, editBtnTop + editBtnH)
+
+        val editBtnBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF2B2E34.toInt() else 0xFFF0F2F5.toInt()
+            style = Paint.Style.FILL
+        }
+        val editBtnBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF3D414A.toInt() else 0xFFD8DCE3.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * density
+        }
+        canvas.drawRoundRect(editBtnBounds, 6f * density, 6f * density, editBtnBgPaint)
+        canvas.drawRoundRect(editBtnBounds, 6f * density, 6f * density, editBtnBorderPaint)
+
+        val editBtnTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFFB0B6C0.toInt() else 0xFF555A63.toInt()
+            textSize = 12f * density
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText("✎ 编辑投票", editBtnBounds.centerX(), editBtnBounds.centerY() + 4f * density, editBtnTextPaint)
+
+        // ── 绘制右侧区域（对齐 PC 截图）──
+        val rightLeft = dividerX + 10f * density
+        val rightAvailW = (drawRight - rightLeft - 8f * density).coerceAtLeast(30f)
+        var rightY = drawTop + 14f * density
+
+        val voterNumPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = view.currentTextColor
+            textSize = 24f * density
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val numMetrics = voterNumPaint.fontMetrics
+        canvas.drawText("0", rightLeft + 4f * density, rightY - numMetrics.ascent, voterNumPaint)
+        rightY += 28f * density
+
+        val voterLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF7A808A.toInt() else 0xFF8A9099.toInt()
+            textSize = 11.5f * density
+        }
+        canvas.drawText("投票人", rightLeft + 4f * density, rightY + 4f * density, voterLabelPaint)
+        rightY += 16f * density
+
+        canvas.drawLine(rightLeft + 4f * density, rightY + 6f * density, rightLeft + 40f * density, rightY + 6f * density, dividerPaint)
+        rightY += 16f * density
+
+        val metaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF8E95A0.toInt() else 0xFF6D737D.toInt()
+            textSize = 10.5f * density
+        }
+
+        val metaLines = mutableListOf<String>()
+        when (spec.type) {
+            POLL_TYPE_REGULAR -> metaLines.add("• 单选投票")
+            POLL_TYPE_MULTIPLE -> {
+                val maxV = spec.max ?: 2
+                val minV = spec.min ?: 1
+                if (minV == maxV) {
+                    metaLines.add("≡ 选择 $minV 个选项")
+                } else {
+                    metaLines.add("≡ 最多选择 $maxV 个选项")
+                }
+            }
+            POLL_TYPE_NUMBER -> metaLines.add("≡ 评分投票")
+        }
+
+        if (spec.publicVoter) {
+            metaLines.add("👁 投票为公开")
+        } else {
+            metaLines.add("🔒 匿名投票")
+        }
+
+        val closeMillisVal = spec.closeMillis
+        if (closeMillisVal != null) {
+            val dateStr = runCatching {
+                val localTime = java.time.Instant.ofEpochMilli(closeMillisVal)
+                    .atZone(java.time.ZoneId.systemDefault())
+                "${localTime.year}-${localTime.monthValue.toString().padStart(2, '0')}-${localTime.dayOfMonth.toString().padStart(2, '0')}"
+            }.getOrNull()
+            if (dateStr != null) {
+                metaLines.add("🕒 截止: $dateStr")
+            }
+        }
+
+        for (meta in metaLines) {
+            val ellipsizedMeta = TextUtils.ellipsize(meta, android.text.TextPaint(metaPaint), rightAvailW, TextUtils.TruncateAt.END).toString()
+            canvas.drawText(ellipsizedMeta, rightLeft + 4f * density, rightY + 6f * density, metaPaint)
+            rightY += 18f * density
+        }
+    }
+
+    fun handleTouch(eventX: Float, eventY: Float): Boolean {
+        if (closeBtnBounds.contains(eventX, eventY)) {
+            onRemove(this)
+            return true
+        } else if (editBtnBounds.contains(eventX, eventY)) {
+            onEdit(this, spec)
+            return true
+        } else if (lastDrawBounds.contains(eventX, eventY)) {
+            return true
+        }
+        return false
+    }
+}
+
 internal val LocalEditorSuggestionSource = androidx.compose.runtime.staticCompositionLocalOf<
     suspend (EditorCompletionRequest) -> List<EditorSuggestion>
 > { { emptyList() } }
@@ -6561,11 +7027,18 @@ internal fun editorCompletionToken(text: String, start: Int, end: Int): EditorCo
     return EditorCompletionToken(marker, token.drop(1), tokenStart, start, tokenEnd)
 }
 
+private sealed interface InitialSpanItem {
+    val range: IntRange
+    data class Media(override val range: IntRange, val media: AttachedMedia) : InitialSpanItem
+    data class Poll(override val range: IntRange, val spec: PollBuilderSpec) : InitialSpanItem
+}
+
 internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     private var onMarkdownChange: ((String) -> Unit)? = null
     private var onRemoveAttachment: ((String) -> Unit)? = null
     private var onPreviewImage: ((String) -> Unit)? = null
+    private var onEditPoll: ((CreatorPollSpan, PollBuilderSpec) -> Unit)? = null
 
     private var isInternalUpdating = false
     private val density = resources.displayMetrics.density
@@ -6788,6 +7261,12 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (ed != null) {
                 val touchX = event.x - totalPaddingLeft + scrollX
                 val touchY = event.y - totalPaddingTop + scrollY
+                val pollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java)
+                for (span in pollSpans) {
+                    if (span.handleTouch(touchX, touchY)) {
+                        return true
+                    }
+                }
                 val spans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java)
                 for (span in spans) {
                     if (span.handleTouch(touchX, touchY)) {
@@ -6797,6 +7276,10 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    fun setOnEditPollListener(listener: (CreatorPollSpan, PollBuilderSpec) -> Unit) {
+        onEditPoll = listener
     }
 
     fun setOnMarkdownChangeListener(listener: (String) -> Unit) {
@@ -6840,7 +7323,7 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         requestFocus()
     }
 
-    /** 块级插入（对齐 Fluxdo insertBlockSnippet）：非行首先补换行，末尾补换行，确保 [poll] 等块级语法独立成段 */
+    /** 块级插入（对齐 Fluxdo insertBlockSnippet）：非行首先补换行，末尾补换行，确保独立成段 */
     fun insertBlockSnippet(snippet: String) {
         val ed = text ?: return
         val start = selectionStart.coerceAtLeast(0)
@@ -6856,6 +7339,68 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         ed.replace(min, max, blockText)
         setSelection((min + blockText.length).coerceIn(0, ed.length))
         requestFocus()
+    }
+
+    /** 插入所见即所得投票卡片 Span (对齐 PC 端 Discourse 编辑器交互) */
+    fun insertPoll(spec: PollBuilderSpec) {
+        val ed = text ?: return
+        val cursor = selectionStart.coerceAtLeast(0)
+        val sb = SpannableStringBuilder()
+        val isStartOfLine = cursor == 0 || (cursor > 0 && ed[cursor - 1] == '\n')
+        if (!isStartOfLine) sb.append("\n")
+        val spanStart = sb.length
+        sb.append(OBJECT_REPLACEMENT_CHAR)
+        sb.setSpan(
+            createPollSpan(spec),
+            spanStart,
+            sb.length,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        val hasTrailingNewline = cursor < ed.length && ed[cursor] == '\n'
+        if (!hasTrailingNewline) {
+            sb.append("\n")
+        }
+
+        val end = selectionEnd.coerceAtLeast(cursor)
+        ed.replace(cursor, end, sb)
+        val newCaret = (cursor + sb.length).coerceIn(0, ed.length)
+        setSelection(newCaret)
+        requestFocus()
+        onMarkdownChange?.invoke(exportToMarkdown())
+    }
+
+    fun updatePollSpan(span: CreatorPollSpan, newSpec: PollBuilderSpec) {
+        span.spec = newSpec
+        postInvalidate()
+        onMarkdownChange?.invoke(exportToMarkdown())
+    }
+
+    fun removePollSpan(span: CreatorPollSpan) {
+        val ed = text ?: return
+        val start = ed.getSpanStart(span)
+        val end = ed.getSpanEnd(span)
+        if (start >= 0 && end >= start) {
+            isInternalUpdating = true
+            val deleteStart = if (start > 0 && ed[start - 1] == '\n') start - 1 else start
+            val deleteEnd = if (end < ed.length && ed[end] == '\n') end + 1 else end
+            ed.delete(deleteStart, deleteEnd)
+            isInternalUpdating = false
+            onMarkdownChange?.invoke(exportToMarkdown())
+        }
+    }
+
+    private fun createPollSpan(spec: PollBuilderSpec): CreatorPollSpan {
+        return CreatorPollSpan(
+            spec = spec,
+            context = context,
+            view = this,
+            onEdit = { span, sp ->
+                onEditPoll?.invoke(span, sp)
+            },
+            onRemove = { span ->
+                removePollSpan(span)
+            }
+        )
     }
 
     fun insertMedia(media: AttachedMedia) {
@@ -6919,61 +7464,73 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     fun setInitialMarkdown(raw: String, attachments: List<AttachedMedia>) {
         isInternalUpdating = true
-        if (attachments.isEmpty()) {
-            setText(raw)
-            setSelection(raw.length)
-            isInternalUpdating = false
-            return
-        }
+        val matches = mutableListOf<InitialSpanItem>()
 
-        data class Match(val range: IntRange, val media: AttachedMedia)
-        val matches = mutableListOf<Match>()
         for (media in attachments) {
             val shortUrl = media.uploaded.shortUrl
             if (shortUrl.isBlank()) continue
             val pattern = Regex("""(!?\[[^\]]*\]\(${Regex.escape(shortUrl)}\))""")
             val m = pattern.find(raw)
             if (m != null) {
-                matches.add(Match(m.range, media))
+                matches.add(InitialSpanItem.Media(m.range, media))
             }
         }
 
+        val pollRegex = Regex("""(?s)\[poll(?:\s+[^\]]*)?\](.*?)\[/poll\]""")
+        for (m in pollRegex.findAll(raw)) {
+            val spec = PollBuilderSpec.fromBBCode(m.value)
+            if (spec != null) {
+                matches.add(InitialSpanItem.Poll(m.range, spec))
+            }
+        }
+
+        if (matches.isEmpty() && attachments.isEmpty()) {
+            setText(raw)
+            setSelection(raw.length)
+            isInternalUpdating = false
+            return
+        }
+
         val sb = SpannableStringBuilder()
-        if (matches.isEmpty()) {
-            sb.append(raw.trimEnd())
-            for (media in attachments) {
-                if (sb.isNotEmpty() && !sb.endsWith("\n")) sb.append("\n")
-                val spanStart = sb.length
-                sb.append(OBJECT_REPLACEMENT_CHAR)
-                sb.setSpan(createSpan(media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        matches.sortBy { it.range.first }
+        var cursor = 0
+        for (match in matches) {
+            if (match.range.first > cursor) {
+                val textBefore = raw.substring(cursor, match.range.first)
+                val trimmed = if (textBefore.endsWith("\n\n")) textBefore.trimEnd('\n') + "\n" else textBefore
+                sb.append(trimmed)
+            }
+            if (sb.isNotEmpty() && !sb.endsWith("\n")) {
                 sb.append("\n")
             }
-        } else {
-            matches.sortBy { it.range.first }
-            var cursor = 0
-            for (match in matches) {
-                if (match.range.first > cursor) {
-                    val textBefore = raw.substring(cursor, match.range.first)
-                    // 卡片自身独占高度，若前序段落末尾有多余空行（如 \n\n），收拢为单换行避免留白过大
-                    val trimmed = if (textBefore.endsWith("\n\n")) textBefore.trimEnd('\n') + "\n" else textBefore
-                    sb.append(trimmed)
+            val spanStart = sb.length
+            sb.append(OBJECT_REPLACEMENT_CHAR)
+            when (match) {
+                is InitialSpanItem.Media -> {
+                    sb.setSpan(createSpan(match.media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
-                if (sb.isNotEmpty() && !sb.endsWith("\n")) {
-                    sb.append("\n")
-                }
-                val spanStart = sb.length
-                sb.append(OBJECT_REPLACEMENT_CHAR)
-                sb.setSpan(createSpan(match.media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                sb.append("\n")
-                cursor = match.range.last + 1
-                // 跳过紧随卡片后面的连续空行换行符（如 Markdown 常用的 \n\n）
-                while (cursor < raw.length && raw[cursor] == '\n') {
-                    cursor++
+                is InitialSpanItem.Poll -> {
+                    sb.setSpan(createPollSpan(match.spec), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
             }
-            if (cursor < raw.length) {
-                sb.append(raw.substring(cursor))
+            sb.append("\n")
+            cursor = match.range.last + 1
+            while (cursor < raw.length && raw[cursor] == '\n') {
+                cursor++
             }
+        }
+        if (cursor < raw.length) {
+            sb.append(raw.substring(cursor))
+        }
+
+        val matchedMediaIds = matches.filterIsInstance<InitialSpanItem.Media>().map { it.media.id }.toSet()
+        val unplacedAttachments = attachments.filter { it.id !in matchedMediaIds }
+        for (media in unplacedAttachments) {
+            if (sb.isNotEmpty() && !sb.endsWith("\n")) sb.append("\n")
+            val spanStart = sb.length
+            sb.append(OBJECT_REPLACEMENT_CHAR)
+            sb.setSpan(createSpan(media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append("\n")
         }
 
         setText(sb)
@@ -6983,16 +7540,20 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     fun exportToMarkdown(): String {
         val ed = text ?: return ""
-        val spans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java)
-        if (spans.isEmpty()) return ed.toString().trimEnd()
+        val mediaSpans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java).map { span ->
+            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span.media.toMarkdown())
+        }
+        val pollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java).map { span ->
+            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span.spec.toBBCode())
+        }
+        val allSpans = (mediaSpans + pollSpans).filter { it.first >= 0 && it.second >= it.first }
+            .sortedBy { it.first }
 
-        val sorted = spans.map { span ->
-            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span)
-        }.filter { it.first >= 0 && it.second >= it.first }.sortedBy { it.first }
+        if (allSpans.isEmpty()) return ed.toString().trimEnd()
 
         val sb = StringBuilder()
         var cursor = 0
-        for ((start, end, span) in sorted) {
+        for ((start, end, md) in allSpans) {
             if (start > cursor) {
                 val seg = ed.subSequence(cursor, start).toString()
                 sb.append(seg.trimEnd('\n'))
@@ -7000,7 +7561,7 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (sb.isNotEmpty()) {
                 sb.append("\n\n")
             }
-            sb.append(span.media.toMarkdown())
+            sb.append(md)
             sb.append("\n\n")
             cursor = end
         }
@@ -7048,6 +7609,7 @@ fun TopicCreatorSheet(
     val keyboard = LocalSoftwareKeyboardController.current
     var showEmojiPicker by remember { mutableStateOf(false) }
     var showPollDialog by remember { mutableStateOf(false) }
+    var editingPollTarget by remember { mutableStateOf<Pair<CreatorPollSpan, PollBuilderSpec>?>(null) }
     var showCategoryDialog by remember { mutableStateOf(false) }
     var showTagDialog by remember { mutableStateOf(false) }
     var showCloseConfirmDialog by remember { mutableStateOf(false) }
@@ -7084,7 +7646,10 @@ fun TopicCreatorSheet(
 
     BackHandler {
         when {
-            showPollDialog -> showPollDialog = false
+            showPollDialog -> {
+                showPollDialog = false
+                editingPollTarget = null
+            }
             showEmojiPicker -> showEmojiPicker = false
             else -> attemptClose()
         }
@@ -7633,12 +8198,20 @@ fun TopicCreatorSheet(
                         setOnMarkdownChangeListener { newRaw -> onRawChange(newRaw) }
                         setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
                         setOnPreviewImageListener { previewUrl -> previewingImage = previewUrl }
+                        setOnEditPollListener { span, spec ->
+                            editingPollTarget = Pair(span, spec)
+                            showPollDialog = true
+                        }
                         editorView = this
                     }
                 },
                 update = { view ->
                     view.updateThemeColors(textColorInt, hintColorInt)
                     view.setCompletionSource(completionSource, categoryId = state.categoryId)
+                    view.setOnEditPollListener { span, spec ->
+                        editingPollTarget = Pair(span, spec)
+                        showPollDialog = true
+                    }
                 },
             )
 
@@ -7753,7 +8326,7 @@ fun TopicCreatorSheet(
 
             Spacer(Modifier.width(4.dp))
 
-            // 投票图标：参照 Fluxdo PollBuilderDialog，点击弹出可视化投票构建器并在光标处插入 [poll] BBCode
+            // 投票图标：参照 Fluxdo PollBuilderDialog，点击弹出可视化投票构建器并在光标处插入所见即所得投票卡片
             Box(
                 modifier = Modifier
                     .size(36.dp)
@@ -7764,6 +8337,7 @@ fun TopicCreatorSheet(
                     .clickable(enabled = canPickMedia) {
                         keyboard?.hide()
                         showEmojiPicker = false
+                        editingPollTarget = null
                         showPollDialog = true
                     },
                 contentAlignment = Alignment.Center,
@@ -7835,7 +8409,7 @@ fun TopicCreatorSheet(
         )
     }
 
-    // 投票构建器弹窗（参照 Fluxdo PollBuilderDialog）
+    // 投票构建器弹窗（支持全新创建与所见即所得卡片编辑回显）
     if (showPollDialog) {
         val currentRaw = editorView?.exportToMarkdown() ?: state.raw
         val existingPollCount = remember(currentRaw) {
@@ -7843,10 +8417,20 @@ fun TopicCreatorSheet(
         }
         PollBuilderDialog(
             existingPollCount = existingPollCount,
-            onDismiss = { showPollDialog = false },
-            onInsert = { bbcode ->
+            initialSpec = editingPollTarget?.second,
+            onDismiss = {
                 showPollDialog = false
-                editorView?.insertBlockSnippet(bbcode)
+                editingPollTarget = null
+            },
+            onConfirm = { resultSpec ->
+                val target = editingPollTarget
+                if (target != null) {
+                    editorView?.updatePollSpan(target.first, resultSpec)
+                } else {
+                    editorView?.insertPoll(resultSpec)
+                }
+                showPollDialog = false
+                editingPollTarget = null
             },
         )
     }
@@ -8237,90 +8821,42 @@ private fun TagPickerDialog(
     }
 }
 
-// ==========================================
-// ── 可视化投票构建器 (参照 Fluxdo PollBuilderDialog) ──
-// ==========================================
-
-private const val POLL_TYPE_REGULAR = "regular"
-private const val POLL_TYPE_MULTIPLE = "multiple"
-private const val POLL_TYPE_NUMBER = "number"
-
-private val POLL_RESULT_OPTIONS = listOf(
-    "always" to "始终可见",
-    "on_vote" to "投票后可见",
-    "on_close" to "关闭后可见",
-    "staff_only" to "仅管理人员可见",
-)
-
-private data class PollBuilderSpec(
-    val type: String,
-    val results: String,
-    val publicVoter: Boolean,
-    val chartType: String,
-    val title: String,
-    val options: List<String>,
-    val min: Int? = null,
-    val max: Int? = null,
-    val step: Int? = null,
-    val closeMillis: Long? = null,
-) {
-    /** 组装标准 Discourse `[poll ...]` BBCode（对齐官方 poll-ui-builder 与 Fluxdo PollSpec.toBBCode） */
-    fun toBBCode(existingPollCount: Int = 0): String {
-        val sb = StringBuilder("[poll")
-        if (existingPollCount > 0) {
-            sb.append(" name=poll${existingPollCount + 1}")
-        }
-        sb.append(" type=$type results=$results")
-        if (type != POLL_TYPE_REGULAR) {
-            if (min != null) sb.append(" min=$min")
-            if (max != null) sb.append(" max=$max")
-        }
-        if (type == POLL_TYPE_NUMBER) {
-            sb.append(" step=${step ?: 1}")
-        }
-        sb.append(" public=$publicVoter")
-        if (type != POLL_TYPE_NUMBER) {
-            sb.append(" chartType=$chartType")
-        }
-        if (closeMillis != null) {
-            sb.append(" close=${java.time.Instant.ofEpochMilli(closeMillis)}")
-        }
-        sb.append("]\n")
-        val trimmedTitle = title.trim()
-        if (trimmedTitle.isNotEmpty()) {
-            sb.append("# $trimmedTitle\n")
-        }
-        if (type != POLL_TYPE_NUMBER) {
-            for (opt in options) {
-                val o = opt.trim()
-                if (o.isNotEmpty()) {
-                    sb.append("* $o\n")
-                }
-            }
-        }
-        sb.append("[/poll]")
-        return sb.toString()
-    }
-}
-
 @Composable
 private fun PollBuilderDialog(
     existingPollCount: Int,
+    initialSpec: PollBuilderSpec? = null,
     onDismiss: () -> Unit,
-    onInsert: (String) -> Unit,
+    onConfirm: (PollBuilderSpec) -> Unit,
 ) {
     val context = LocalContext.current
-    var pollType by remember { mutableStateOf(POLL_TYPE_REGULAR) }
-    var pollTitle by remember { mutableStateOf("") }
-    val pollOptions = remember { mutableStateListOf("", "") }
-    var minText by remember { mutableStateOf("1") }
-    var maxText by remember { mutableStateOf("2") }
-    var stepText by remember { mutableStateOf("1") }
-    var showAdvanced by remember { mutableStateOf(false) }
-    var resultsVisibility by remember { mutableStateOf("always") }
-    var publicVoter by remember { mutableStateOf(true) }
-    var chartType by remember { mutableStateOf("bar") }
-    var closeMillis by remember { mutableStateOf<Long?>(null) }
+    var pollType by remember(initialSpec) { mutableStateOf(initialSpec?.type ?: POLL_TYPE_REGULAR) }
+    var pollTitle by remember(initialSpec) { mutableStateOf(initialSpec?.title.orEmpty()) }
+    val pollOptions = remember(initialSpec) {
+        mutableStateListOf<String>().apply {
+            if (!initialSpec?.options.isNullOrEmpty()) {
+                addAll(initialSpec!!.options)
+            } else {
+                addAll(listOf("", ""))
+            }
+        }
+    }
+    var minText by remember(initialSpec) { mutableStateOf(initialSpec?.min?.toString() ?: "1") }
+    var maxText by remember(initialSpec) { mutableStateOf(initialSpec?.max?.toString() ?: "2") }
+    var stepText by remember(initialSpec) { mutableStateOf(initialSpec?.step?.toString() ?: "1") }
+    var showAdvanced by remember(initialSpec) {
+        mutableStateOf(
+            initialSpec != null && (
+                initialSpec.closeMillis != null ||
+                initialSpec.results != "always" ||
+                !initialSpec.publicVoter ||
+                initialSpec.chartType != "bar"
+            )
+        )
+    }
+    var resultsVisibility by remember(initialSpec) { mutableStateOf(initialSpec?.results ?: "always") }
+    var publicVoter by remember(initialSpec) { mutableStateOf(initialSpec?.publicVoter ?: true) }
+    var chartType by remember(initialSpec) { mutableStateOf(initialSpec?.chartType ?: "bar") }
+    var closeMillis by remember(initialSpec) { mutableStateOf(initialSpec?.closeMillis) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     val validOptions = pollOptions.map { it.trim() }.filter { it.isNotEmpty() }
@@ -8421,8 +8957,9 @@ private fun PollBuilderDialog(
                     max = if (pollType == POLL_TYPE_REGULAR) null else maxVal,
                     step = if (pollType == POLL_TYPE_NUMBER) stepVal else null,
                     closeMillis = closeMillis,
+                    pollName = initialSpec?.pollName ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null,
                 )
-                onInsert(spec.toBBCode(existingPollCount))
+                onConfirm(spec)
             }
         }
     }
@@ -8450,7 +8987,7 @@ private fun PollBuilderDialog(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = "创建投票",
+                    text = if (initialSpec != null) "编辑投票" else "创建投票",
                     style = IosTheme.type.headline.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
                     color = IosTheme.colors.label,
                     modifier = Modifier.weight(1f),
@@ -8965,7 +9502,7 @@ private fun PollBuilderDialog(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "插入投票",
+                        text = if (initialSpec != null) "保存修改" else "插入投票",
                         style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
                         color = Color.White,
                     )
