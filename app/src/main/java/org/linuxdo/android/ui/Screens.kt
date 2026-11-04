@@ -203,6 +203,7 @@ import org.linuxdo.android.ui.screen.ComposerAttachmentIcon
 import org.linuxdo.android.ui.screen.ComposerEmojiIcon
 import org.linuxdo.android.ui.screen.ComposerImageIcon
 import org.linuxdo.android.ui.screen.ComposerBoldIcon
+import org.linuxdo.android.ui.screen.ComposerPollIcon
 import org.linuxdo.android.ui.screen.ComposerTagIcon
 import org.linuxdo.android.ui.screen.ComposerLockIcon
 import org.linuxdo.android.ui.screen.PostAction
@@ -6839,6 +6840,24 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         requestFocus()
     }
 
+    /** 块级插入（对齐 Fluxdo insertBlockSnippet）：非行首先补换行，末尾补换行，确保 [poll] 等块级语法独立成段 */
+    fun insertBlockSnippet(snippet: String) {
+        val ed = text ?: return
+        val start = selectionStart.coerceAtLeast(0)
+        val end = selectionEnd.coerceAtLeast(0)
+        val min = minOf(start, end)
+        val max = maxOf(start, end)
+        val needsLeadingNewline = min > 0 && ed[min - 1] != '\n'
+        val blockText = buildString {
+            if (needsLeadingNewline) append('\n')
+            append(snippet)
+            append('\n')
+        }
+        ed.replace(min, max, blockText)
+        setSelection((min + blockText.length).coerceIn(0, ed.length))
+        requestFocus()
+    }
+
     fun insertMedia(media: AttachedMedia) {
         val ed = text ?: return
         val cursor = selectionStart.coerceAtLeast(0)
@@ -7028,6 +7047,7 @@ fun TopicCreatorSheet(
     val completionSource = LocalEditorSuggestionSource.current
     val keyboard = LocalSoftwareKeyboardController.current
     var showEmojiPicker by remember { mutableStateOf(false) }
+    var showPollDialog by remember { mutableStateOf(false) }
     var showCategoryDialog by remember { mutableStateOf(false) }
     var showTagDialog by remember { mutableStateOf(false) }
     var showCloseConfirmDialog by remember { mutableStateOf(false) }
@@ -7064,6 +7084,7 @@ fun TopicCreatorSheet(
 
     BackHandler {
         when {
+            showPollDialog -> showPollDialog = false
             showEmojiPicker -> showEmojiPicker = false
             else -> attemptClose()
         }
@@ -7730,6 +7751,30 @@ fun TopicCreatorSheet(
                 )
             }
 
+            Spacer(Modifier.width(4.dp))
+
+            // 投票图标：参照 Fluxdo PollBuilderDialog，点击弹出可视化投票构建器并在光标处插入 [poll] BBCode
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (showPollDialog) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent,
+                    )
+                    .clickable(enabled = canPickMedia) {
+                        keyboard?.hide()
+                        showEmojiPicker = false
+                        showPollDialog = true
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                ComposerPollIcon(
+                    tint = if (showPollDialog) IosTheme.colors.accent
+                    else if (canPickMedia) IosTheme.colors.secondaryLabel
+                    else IosTheme.colors.tertiaryLabel,
+                )
+            }
+
             Spacer(Modifier.weight(1f))
 
             if (state.uploading) {
@@ -7787,6 +7832,22 @@ fun TopicCreatorSheet(
                 showTagDialog = false
             },
             onDismiss = { showTagDialog = false },
+        )
+    }
+
+    // 投票构建器弹窗（参照 Fluxdo PollBuilderDialog）
+    if (showPollDialog) {
+        val currentRaw = editorView?.exportToMarkdown() ?: state.raw
+        val existingPollCount = remember(currentRaw) {
+            Regex("""\[poll[\s\]]""").findAll(currentRaw).count()
+        }
+        PollBuilderDialog(
+            existingPollCount = existingPollCount,
+            onDismiss = { showPollDialog = false },
+            onInsert = { bbcode ->
+                showPollDialog = false
+                editorView?.insertBlockSnippet(bbcode)
+            },
         )
     }
 
@@ -8173,6 +8234,786 @@ private fun TagPickerDialog(
                 }
             }
         }
+    }
+}
+
+// ==========================================
+// ── 可视化投票构建器 (参照 Fluxdo PollBuilderDialog) ──
+// ==========================================
+
+private const val POLL_TYPE_REGULAR = "regular"
+private const val POLL_TYPE_MULTIPLE = "multiple"
+private const val POLL_TYPE_NUMBER = "number"
+
+private val POLL_RESULT_OPTIONS = listOf(
+    "always" to "始终可见",
+    "on_vote" to "投票后可见",
+    "on_close" to "关闭后可见",
+    "staff_only" to "仅管理人员可见",
+)
+
+private data class PollBuilderSpec(
+    val type: String,
+    val results: String,
+    val publicVoter: Boolean,
+    val chartType: String,
+    val title: String,
+    val options: List<String>,
+    val min: Int? = null,
+    val max: Int? = null,
+    val step: Int? = null,
+    val closeMillis: Long? = null,
+) {
+    /** 组装标准 Discourse `[poll ...]` BBCode（对齐官方 poll-ui-builder 与 Fluxdo PollSpec.toBBCode） */
+    fun toBBCode(existingPollCount: Int = 0): String {
+        val sb = StringBuilder("[poll")
+        if (existingPollCount > 0) {
+            sb.append(" name=poll${existingPollCount + 1}")
+        }
+        sb.append(" type=$type results=$results")
+        if (type != POLL_TYPE_REGULAR) {
+            if (min != null) sb.append(" min=$min")
+            if (max != null) sb.append(" max=$max")
+        }
+        if (type == POLL_TYPE_NUMBER) {
+            sb.append(" step=${step ?: 1}")
+        }
+        sb.append(" public=$publicVoter")
+        if (type != POLL_TYPE_NUMBER) {
+            sb.append(" chartType=$chartType")
+        }
+        if (closeMillis != null) {
+            sb.append(" close=${java.time.Instant.ofEpochMilli(closeMillis)}")
+        }
+        sb.append("]\n")
+        val trimmedTitle = title.trim()
+        if (trimmedTitle.isNotEmpty()) {
+            sb.append("# $trimmedTitle\n")
+        }
+        if (type != POLL_TYPE_NUMBER) {
+            for (opt in options) {
+                val o = opt.trim()
+                if (o.isNotEmpty()) {
+                    sb.append("* $o\n")
+                }
+            }
+        }
+        sb.append("[/poll]")
+        return sb.toString()
+    }
+}
+
+@Composable
+private fun PollBuilderDialog(
+    existingPollCount: Int,
+    onDismiss: () -> Unit,
+    onInsert: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    var pollType by remember { mutableStateOf(POLL_TYPE_REGULAR) }
+    var pollTitle by remember { mutableStateOf("") }
+    val pollOptions = remember { mutableStateListOf("", "") }
+    var minText by remember { mutableStateOf("1") }
+    var maxText by remember { mutableStateOf("2") }
+    var stepText by remember { mutableStateOf("1") }
+    var showAdvanced by remember { mutableStateOf(false) }
+    var resultsVisibility by remember { mutableStateOf("always") }
+    var publicVoter by remember { mutableStateOf(true) }
+    var chartType by remember { mutableStateOf("bar") }
+    var closeMillis by remember { mutableStateOf<Long?>(null) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    val validOptions = pollOptions.map { it.trim() }.filter { it.isNotEmpty() }
+    val isNumber = pollType == POLL_TYPE_NUMBER
+
+    val onTypeSelect = { newType: String ->
+        pollType = newType
+        errorMsg = null
+        when (newType) {
+            POLL_TYPE_MULTIPLE -> {
+                minText = "1"
+                maxText = validOptions.size.coerceIn(2, 999).toString()
+            }
+            POLL_TYPE_NUMBER -> {
+                minText = "1"
+                maxText = "10"
+                stepText = "1"
+            }
+        }
+    }
+
+    val pickCloseDateTime = {
+        val cal = java.util.Calendar.getInstance()
+        if (closeMillis != null) {
+            cal.timeInMillis = closeMillis!!
+        } else {
+            cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            cal.set(java.util.Calendar.HOUR_OF_DAY, 12)
+            cal.set(java.util.Calendar.MINUTE, 0)
+            cal.set(java.util.Calendar.SECOND, 0)
+            cal.set(java.util.Calendar.MILLISECOND, 0)
+        }
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                android.app.TimePickerDialog(
+                    context,
+                    { _, hourOfDay, minute ->
+                        val picked = java.util.Calendar.getInstance().apply {
+                            set(year, month, dayOfMonth, hourOfDay, minute, 0)
+                            set(java.util.Calendar.MILLISECOND, 0)
+                        }
+                        closeMillis = picked.timeInMillis
+                    },
+                    cal.get(java.util.Calendar.HOUR_OF_DAY),
+                    cal.get(java.util.Calendar.MINUTE),
+                    true,
+                ).show()
+            },
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH),
+            cal.get(java.util.Calendar.DAY_OF_MONTH),
+        ).apply {
+            datePicker.minDate = System.currentTimeMillis()
+        }.show()
+    }
+
+    val closeLabel = remember(closeMillis) {
+        if (closeMillis == null) {
+            "不自动关闭"
+        } else {
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(closeMillis!!))
+        }
+    }
+
+    val validateAndSubmit = {
+        val minVal = minText.trim().toIntOrNull()
+        val maxVal = maxText.trim().toIntOrNull()
+        val stepVal = stepText.trim().toIntOrNull()
+        val opts = pollOptions.map { it.trim() }.filter { it.isNotEmpty() }
+
+        when {
+            pollType != POLL_TYPE_NUMBER && opts.isEmpty() -> {
+                errorMsg = "至少需要填写 1 个有效投票选项"
+            }
+            pollType == POLL_TYPE_MULTIPLE && (minVal == null || maxVal == null || minVal < 1 || minVal > maxVal || maxVal > opts.size) -> {
+                errorMsg = "需满足 1 ≤ 最少选 ≤ 至多选 ≤ 有效选项数(${opts.size})"
+            }
+            pollType == POLL_TYPE_NUMBER && (minVal == null || maxVal == null || stepVal == null || minVal < 0 || maxVal < minVal) -> {
+                errorMsg = "需满足 0 ≤ 最小值 ≤ 最大值"
+            }
+            pollType == POLL_TYPE_NUMBER && (stepVal ?: 0) < 1 -> {
+                errorMsg = "步长至少为 1"
+            }
+            pollType == POLL_TYPE_NUMBER && (((maxVal!! - minVal!! + 1).toDouble() / stepVal!!) < 2.0) -> {
+                errorMsg = "评分范围除以步长至少要产生 2 个分值选项"
+            }
+            else -> {
+                errorMsg = null
+                val spec = PollBuilderSpec(
+                    type = pollType,
+                    results = resultsVisibility,
+                    publicVoter = publicVoter,
+                    chartType = chartType,
+                    title = pollTitle,
+                    options = opts,
+                    min = if (pollType == POLL_TYPE_REGULAR) null else minVal,
+                    max = if (pollType == POLL_TYPE_REGULAR) null else maxVal,
+                    step = if (pollType == POLL_TYPE_NUMBER) stepVal else null,
+                    closeMillis = closeMillis,
+                )
+                onInsert(spec.toBBCode(existingPollCount))
+            }
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .heightIn(max = 620.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(IosTheme.colors.card)
+                .padding(horizontal = 18.dp, vertical = 16.dp),
+        ) {
+            // 1. 顶部栏：投票图标 + 标题 + 关闭按钮
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ComposerPollIcon(
+                    tint = IosTheme.colors.accent,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "创建投票",
+                    style = IosTheme.type.headline.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                    color = IosTheme.colors.label,
+                    modifier = Modifier.weight(1f),
+                )
+                IosTextAction("关闭", color = IosTheme.colors.secondaryLabel, onClick = onDismiss)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 2. 投票类型胶囊切换栏（单选 / 多选 / 评分）
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(38.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(IosTheme.colors.fieldBackground)
+                    .padding(3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val typeTabs = listOf(
+                    POLL_TYPE_REGULAR to "单选",
+                    POLL_TYPE_MULTIPLE to "多选",
+                    POLL_TYPE_NUMBER to "评分",
+                )
+                for ((typeKey, typeLabel) in typeTabs) {
+                    val selected = pollType == typeKey
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(50))
+                            .background(if (selected) IosTheme.colors.accent else Color.Transparent)
+                            .clickable { onTypeSelect(typeKey) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = typeLabel,
+                            style = IosTheme.type.subheadline.copy(
+                                fontSize = 13.5.sp,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                            ),
+                            color = if (selected) Color.White else IosTheme.colors.secondaryLabel,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 3. 中部可滚动表单区域
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                // 投票标题输入
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = "投票标题（可选）",
+                        style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    PollTextInputField(
+                        value = pollTitle,
+                        onValueChange = { pollTitle = it },
+                        placeholder = "输入投票主题或问题…",
+                    )
+                }
+
+                // 投票选项列表（单选/多选显示）
+                if (!isNumber) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "投票选项",
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            Text(
+                                text = "已填 ${validOptions.size} 项",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.tertiaryLabel,
+                            )
+                        }
+
+                        pollOptions.forEachIndexed { idx, optText ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.accent.copy(alpha = 0.12f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "${idx + 1}",
+                                        style = IosTheme.type.caption.copy(
+                                            fontSize = 11.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                        ),
+                                        color = IosTheme.colors.accent,
+                                    )
+                                }
+
+                                Box(modifier = Modifier.weight(1f)) {
+                                    PollTextInputField(
+                                        value = optText,
+                                        onValueChange = { newVal ->
+                                            pollOptions[idx] = newVal
+                                            if (errorMsg != null) errorMsg = null
+                                        },
+                                        placeholder = "选项 ${idx + 1}",
+                                    )
+                                }
+
+                                val canRemove = pollOptions.size > 1
+                                Box(
+                                    modifier = Modifier
+                                        .size(30.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (canRemove) IosTheme.colors.fieldBackground
+                                            else Color.Transparent
+                                        )
+                                        .clickable(enabled = canRemove) {
+                                            if (pollOptions.size > 1) {
+                                                pollOptions.removeAt(idx)
+                                                if (errorMsg != null) errorMsg = null
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "✕",
+                                        style = IosTheme.type.caption.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
+                                        color = if (canRemove) IosTheme.colors.secondaryLabel else IosTheme.colors.tertiaryLabel.copy(alpha = 0.35f),
+                                    )
+                                }
+                            }
+                        }
+
+                        // 添加选项按钮
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(IosTheme.colors.accent.copy(alpha = 0.10f))
+                                .clickable {
+                                    pollOptions.add("")
+                                    if (pollType == POLL_TYPE_MULTIPLE) {
+                                        val nextMax = (validOptions.size + 1).coerceAtLeast(2)
+                                        if ((maxText.toIntOrNull() ?: 2) < nextMax) {
+                                            maxText = nextMax.toString()
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "＋ 添加选项",
+                                style = IosTheme.type.subheadline.copy(
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                ),
+                                color = IosTheme.colors.accent,
+                            )
+                        }
+                    }
+                }
+
+                // 多选：至少选 / 至多选
+                if (pollType == POLL_TYPE_MULTIPLE) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "至少选",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            PollTextInputField(
+                                value = minText,
+                                onValueChange = { minText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "至多选",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            PollTextInputField(
+                                value = maxText,
+                                onValueChange = { maxText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "${validOptions.size.coerceAtLeast(2)}",
+                                isNumber = true,
+                            )
+                        }
+                    }
+                }
+
+                // 评分：最小值 / 最大值 / 步长
+                if (isNumber) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("最小值", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = minText,
+                                onValueChange = { minText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("最大值", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = maxText,
+                                onValueChange = { maxText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "10",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("步长", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = stepText,
+                                onValueChange = { stepText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                    }
+                }
+
+                // 高级选项折叠开关（参照 Fluxdo _showAdvanced）
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showAdvanced = !showAdvanced }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (showAdvanced) "▾ 高级选项" else "▸ 高级选项",
+                        style = IosTheme.type.subheadline.copy(
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.Medium,
+                        ),
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = if (showAdvanced) "收起" else "结果可见性 · 公开投票人 · 截止时间",
+                        style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                        color = IosTheme.colors.tertiaryLabel,
+                    )
+                }
+
+                if (showAdvanced) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(IosTheme.colors.fieldBackground.copy(alpha = 0.65f))
+                            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        // 结果可见性
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "结果可见性",
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            @OptIn(ExperimentalLayoutApi::class)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                for ((resVal, resLabel) in POLL_RESULT_OPTIONS) {
+                                    val selected = resultsVisibility == resVal
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(
+                                                if (selected) IosTheme.colors.accent
+                                                else IosTheme.colors.card
+                                            )
+                                            .border(
+                                                0.5.dp,
+                                                if (selected) IosTheme.colors.accent else IosTheme.colors.separator.copy(alpha = 0.6f),
+                                                RoundedCornerShape(8.dp),
+                                            )
+                                            .clickable { resultsVisibility = resVal }
+                                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = resLabel,
+                                            style = IosTheme.type.caption.copy(
+                                                fontSize = 12.sp,
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                            ),
+                                            color = if (selected) Color.White else IosTheme.colors.label,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 公开投票人
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "公开投票人",
+                                    style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                    color = IosTheme.colors.label,
+                                )
+                                Text(
+                                    text = "显示每个选项的具体投票用户头像与名单",
+                                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                                    color = IosTheme.colors.tertiaryLabel,
+                                )
+                            }
+                            IosSwitch(
+                                checked = publicVoter,
+                                onCheckedChange = { publicVoter = it },
+                            )
+                        }
+
+                        // 图表类型（非评分模式展示）
+                        if (!isNumber) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "图表样式",
+                                    style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                    color = IosTheme.colors.label,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val chartTabs = listOf("bar" to "柱状图", "pie" to "饼图")
+                                    for ((cKey, cLabel) in chartTabs) {
+                                        val selected = chartType == cKey
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(if (selected) IosTheme.colors.accent else IosTheme.colors.card)
+                                                .border(
+                                                    0.5.dp,
+                                                    if (selected) IosTheme.colors.accent else IosTheme.colors.separator.copy(alpha = 0.6f),
+                                                    RoundedCornerShape(8.dp),
+                                                )
+                                                .clickable { chartType = cKey }
+                                                .padding(horizontal = 12.dp, vertical = 5.dp),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Text(
+                                                text = cLabel,
+                                                style = IosTheme.type.caption.copy(
+                                                    fontSize = 12.sp,
+                                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                                ),
+                                                color = if (selected) Color.White else IosTheme.colors.label,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 自动关闭时间
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "自动关闭",
+                                style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.label,
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(IosTheme.colors.card)
+                                    .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                    .clickable { pickCloseDateTime() }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = closeLabel,
+                                    style = IosTheme.type.caption.copy(
+                                        fontSize = 12.sp,
+                                        fontWeight = if (closeMillis != null) FontWeight.SemiBold else FontWeight.Normal,
+                                    ),
+                                    color = if (closeMillis != null) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                                )
+                            }
+                            if (closeMillis != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(26.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.card)
+                                        .clickable { closeMillis = null },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "✕",
+                                        style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                        color = IosTheme.colors.secondaryLabel,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 校验错误提示
+                errorMsg?.let { err ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(IosTheme.colors.destructive.copy(alpha = 0.10f))
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                    ) {
+                        Text(
+                            text = err,
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+                            color = IosTheme.colors.destructive,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+            IosDivider()
+            Spacer(Modifier.height(12.dp))
+
+            // 4. 底部操作按钮：取消 + 插入投票
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable { onDismiss() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1.3f)
+                        .height(42.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(IosTheme.colors.accent)
+                        .clickable { validateAndSubmit() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "插入投票",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PollTextInputField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    isNumber: Boolean = false,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            keyboardOptions = if (isNumber) KeyboardOptions(keyboardType = KeyboardType.Number) else KeyboardOptions.Default,
+            textStyle = IosTheme.type.subheadline.copy(
+                fontSize = 14.sp,
+                color = IosTheme.colors.label,
+            ),
+            cursorBrush = SolidColor(IosTheme.colors.accent),
+            modifier = Modifier.fillMaxWidth(),
+            decorationBox = { innerField ->
+                Box(Modifier.fillMaxWidth()) {
+                    if (value.isEmpty()) {
+                        Text(
+                            text = placeholder,
+                            style = IosTheme.type.subheadline.copy(fontSize = 14.sp),
+                            color = IosTheme.colors.tertiaryLabel,
+                        )
+                    }
+                    innerField()
+                }
+            },
+        )
     }
 }
 

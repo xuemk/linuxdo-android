@@ -2794,6 +2794,29 @@ fun ComposerBoldIcon(tint: Color, modifier: Modifier = Modifier) {
     }
 }
 
+/** 投票图标：对齐 Fluxdo squarePollVertical，圆角方框 + 三根高低错落投票柱状条，与粗体/表情/图片图标保持一致的 22.dp 规范 */
+@Composable
+fun ComposerPollIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(22.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(3f, 3f),
+                size = androidx.compose.ui.geometry.Size(18f, 18f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(3.5f, 3.5f),
+                style = stroke,
+            )
+            // 左柱（中等高度）
+            drawLine(tint, Offset(8f, 16.8f), Offset(8f, 12.2f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+            // 中柱（最高）
+            drawLine(tint, Offset(12f, 16.8f), Offset(12f, 7.6f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+            // 右柱（中高）
+            drawLine(tint, Offset(16f, 16.8f), Offset(16f, 10.0f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+        }
+    }
+}
+
 /** 矢量标签吊牌图标：横向尖角吊牌外轮廓 + 圆孔，与表情/图片/附件保持视觉规范一致 */
 @Composable
 fun ComposerTagIcon(tint: Color, modifier: Modifier = Modifier) {
