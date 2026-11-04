@@ -45,6 +45,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.viewinterop.AndroidView
+import org.linuxdo.android.ui.RichMarkdownEditorView
+import org.linuxdo.android.ui.LocalEditorSuggestionSource
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
@@ -81,6 +85,10 @@ fun PrivateMessageComposeSheet(
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
+    val completionSource = LocalEditorSuggestionSource.current
+    var editorView by remember { mutableStateOf<RichMarkdownEditorView?>(null) }
+    val textColor = IosTheme.colors.label.toArgb()
+    val hintColor = IosTheme.colors.tertiaryLabel.toArgb()
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null && onUploadAttachment != null) {
@@ -285,22 +293,22 @@ fun PrivateMessageComposeSheet(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 12.dp),
             ) {
-                BasicTextField(
-                    value = raw,
-                    onValueChange = { raw = it },
-                    textStyle = TextStyle(fontSize = 16.sp, color = IosTheme.colors.label, lineHeight = 24.sp),
-                    cursorBrush = SolidColor(IosTheme.colors.accent),
+                AndroidView(
                     modifier = Modifier.fillMaxSize(),
-                    decorationBox = { innerTextField ->
-                        Box {
-                            if (raw.isEmpty()) {
-                                Text(
-                                    "在此撰写私信正文，支持完整 Markdown 语法...",
-                                    style = TextStyle(fontSize = 16.sp, color = IosTheme.colors.tertiaryLabel, lineHeight = 24.sp),
-                                )
-                            }
-                            innerTextField()
+                    factory = { context ->
+                        RichMarkdownEditorView(context).apply {
+                            updateThemeColors(textColor, hintColor)
+                            setCompletionSource(completionSource)
+                            setInitialMarkdown(raw, emptyList())
+                            setOnMarkdownChangeListener { raw = it }
+                            hint = "在此撰写私信正文，支持 Markdown"
+                            editorView = this
                         }
+                    },
+                    update = {
+                        it.updateThemeColors(textColor, hintColor)
+                        it.setCompletionSource(completionSource)
+                        it.isEnabled = !sending
                     },
                 )
             }
@@ -449,7 +457,7 @@ fun PrivateMessageComposeSheet(
                         .size(36.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .clickable(enabled = !isUploading && !sending) {
-                            raw = if (raw.endsWith(" ") || raw.isEmpty()) "${raw}**粗体文字**" else "$raw **粗体文字**"
+                            editorView?.insertToken("**粗体文字**")
                         },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -483,7 +491,7 @@ fun PrivateMessageComposeSheet(
                 QuickEmojiPicker(
                     enabled = !isUploading && !sending,
                     onSelect = { emoji ->
-                        raw += emoji
+                        editorView?.insertToken(emoji)
                     },
                 )
             }

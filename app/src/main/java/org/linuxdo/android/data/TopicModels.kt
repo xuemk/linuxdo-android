@@ -863,6 +863,8 @@ data class Post(
     @SerialName("accepted_answer") val acceptedAnswer: Boolean = false,
     @SerialName("can_edit") val canEdit: Boolean = false,
     @SerialName("can_delete") val canDelete: Boolean = false,
+    val version: Int = 1,
+    @SerialName("can_view_edit_history") val canViewEditHistory: Boolean = false,
     @SerialName("bookmarked") val bookmarked: Boolean = false,
     @SerialName("bookmark_id") val bookmarkId: Long? = null,
     /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
@@ -872,6 +874,38 @@ data class Post(
     val displayName: String
         get() = name?.trim()?.takeIf { it.isNotEmpty() } ?: username
 }
+
+data class EditorSuggestion(
+    val insertion: String,
+    val label: String,
+    val description: String = "",
+    val avatarUrl: String? = null,
+)
+
+data class EditorCompletionRequest(val marker: Char, val term: String, val topicId: Long? = null, val categoryId: Int? = null)
+
+@Serializable
+data class PostRevision(
+    @SerialName("current_revision") val currentRevision: Int = 1,
+    @SerialName("previous_revision") val previousRevision: Int = 1,
+    @SerialName("next_revision") val nextRevision: Int? = null,
+    @SerialName("last_revision") val lastRevision: Int = 1,
+    val username: String = "",
+    @SerialName("display_username") val displayUsername: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("edit_reason") val editReason: String? = null,
+    @SerialName("current_hidden") val currentHidden: Boolean = false,
+    @SerialName("previous_hidden") val previousHidden: Boolean = false,
+    @SerialName("diff_error") val diffError: Boolean = false,
+    @SerialName("body_changes") val bodyChanges: RevisionBodyChanges? = null,
+    @SerialName("title_changes") val titleChanges: JsonElement? = null,
+)
+
+@Serializable
+data class RevisionBodyChanges(
+    @SerialName("inline") val inlineHtml: String? = null,
+    @SerialName("side_by_side_markdown") val markdownHtml: String? = null,
+)
 
 @Serializable
 data class DiscoursePollOption(

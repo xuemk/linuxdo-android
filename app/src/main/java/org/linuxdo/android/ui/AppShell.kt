@@ -892,6 +892,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     active = isForeground,
                                     trailing = {
                                         var more by remember { mutableStateOf(false) }
+                                        val shareActions = org.linuxdo.android.ui.screen.LocalTopicShareActions.current
                                         Box {
                                             TextButton(onClick = { more = true }, modifier = Modifier.width(44.dp)) {
                                                 Text("⋯", color = IosTheme.colors.accent, fontSize = 22.sp)
@@ -948,6 +949,36 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                                         viewModel.openTopicSearch(route.topicId, details[route.topicId]?.topic?.title ?: route.title)
                                                     },
                                                 )
+                                                shareActions?.let { actions ->
+                                                    androidx.compose.material3.DropdownMenuItem(
+                                                        text = {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                PostActionIcon(PostAction.Share, false, modifier = Modifier.size(18.dp))
+                                                                Spacer(Modifier.width(8.dp))
+                                                                Text(if (actions.shareLoading) "正在生成分享图…" else "生成分享图", color = IosTheme.colors.label)
+                                                            }
+                                                        },
+                                                        enabled = !actions.shareLoading,
+                                                        onClick = {
+                                                            more = false
+                                                            actions.onShareImage()
+                                                        },
+                                                    )
+                                                    androidx.compose.material3.DropdownMenuItem(
+                                                        text = {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                PostActionIcon(PostAction.Markdown, false, modifier = Modifier.size(18.dp))
+                                                                Spacer(Modifier.width(8.dp))
+                                                                Text(if (actions.copyLoading) "正在复制…" else "复制 Markdown 原文", color = IosTheme.colors.label)
+                                                            }
+                                                        },
+                                                        enabled = !actions.copyLoading,
+                                                        onClick = {
+                                                            more = false
+                                                            actions.onCopyMarkdown()
+                                                        },
+                                                    )
+                                                }
                                             }
                                         }
                                     },

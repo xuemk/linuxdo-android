@@ -2191,6 +2191,37 @@ class TopicRepository(
     suspend fun fetchPostRaw(postId: Long): String =
         objectRequest("/posts/$postId.json").text("raw")
 
+    suspend fun fetchPostMarkdown(topicId: Long, postNumber: Int): String {
+        require(topicId > 0 && postNumber > 0)
+        return request("/raw/$topicId/$postNumber")
+    }
+
+    suspend fun fetchPostRevision(postId: Long, revision: Int? = null): PostRevision {
+        require(postId > 0 && (revision == null || revision > 0))
+        val body = request("/posts/$postId/revisions/${revision?.toString() ?: "latest"}.json")
+        return json.decodeFromString<PostRevision>(body)
+    }
+
+    suspend fun searchEditorSuggestions(query: EditorCompletionRequest): List<EditorSuggestion> {
+        require(query.marker == '@' || query.marker == '#')
+        val path = if (query.marker == '@') buildString {
+            append("/u/search/users.json?term=").append(encode(query.term))
+            append("&include_groups=false&limit=8")
+            query.topicId?.takeIf { it > 0 }?.let { append("&topic_id=").append(it) }
+            query.categoryId?.takeIf { it > 0 }?.let { append("&category_id=").append(it) }
+        } else "/hashtags/search.json?term=${encode(query.term)}&order%5B%5D=category&order%5B%5D=tag"
+        val result = json.parseToJsonElement(request(path, present = false, retryAllowed = false)).jsonObject
+        return if (query.marker == '@') result.objects("users").mapNotNull { user ->
+            val username = user.text("username").takeIf { it.matches(Regex("[A-Za-z0-9_.-]+")) } ?: return@mapNotNull null
+            EditorSuggestion("@$username", user.text("name").ifBlank { username }, "@$username",
+                user.text("avatar_template").takeIf { it.isNotBlank() }?.let { avatarUrlOf(it) })
+        } else result.objects("results").mapNotNull { item ->
+            val ref = item.text("ref").takeIf { it.isNotBlank() && it.none(Char::isWhitespace) } ?: return@mapNotNull null
+            EditorSuggestion("#$ref", item.text("text").ifBlank { ref },
+                if (item.text("type") == "category") "分类 · $ref" else "标签 · $ref")
+        }
+    }
+
     suspend fun votePoll(postId: Long, pollName: String, optionIds: List<String>): DiscoursePoll {
         require(optionIds.isNotEmpty())
         val body = buildString {

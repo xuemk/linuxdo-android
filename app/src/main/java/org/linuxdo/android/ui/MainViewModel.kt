@@ -65,6 +65,9 @@ import org.linuxdo.android.service.NotificationKeepAliveService
 import org.linuxdo.android.service.NotificationHelper
 import org.linuxdo.android.service.ApkUpdateInstaller
 import org.linuxdo.android.data.TopicRepository
+import org.linuxdo.android.data.EditorSuggestion
+import org.linuxdo.android.data.EditorCompletionRequest
+import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.Topic
 import org.linuxdo.android.data.ExcerptCache
 import org.linuxdo.android.data.ReadTimingBatch
@@ -428,6 +431,14 @@ data class TagsUiState(
 )
 
 /** 编辑器要做的事。三种目标共用一个输入框,区别只在提交时调哪个接口。 */
+internal fun appendQuoteToDraft(draft: String, username: String, postNumber: Int, topicId: Long, selection: String): String {
+    if (selection.isBlank() || postNumber <= 0 || topicId <= 0) return draft
+    val author = username.filter { it.isLetterOrDigit() || it in "_.-" }
+    val quoted = selection.trim().replace(Regex("\\[(/?quote)(?=[=\\]\\s])", RegexOption.IGNORE_CASE), "&#91;$1")
+    val separator = if (draft.isEmpty() || draft.endsWith("\n\n")) "" else if (draft.endsWith("\n")) "\n" else "\n\n"
+    return "$draft$separator[quote=\"$author, post:$postNumber, topic:$topicId\"]\n$quoted\n[/quote]\n\n"
+}
+
 sealed interface ComposerTarget {
     val topicId: Long
 
@@ -442,6 +453,7 @@ sealed interface ComposerTarget {
         override val topicId: Long,
         val postNumber: Int,
         val username: String,
+        val quote: String? = null,
     ) : ComposerTarget
 
     /** 编辑自己的楼层。 */
@@ -3660,6 +3672,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun createPrivateMessage(targetUsernames: List<String>, title: String, raw: String): Long =
         repository.createPrivateMessage(targetUsernames, title, raw)
 
+    suspend fun loadPostMarkdown(topicId: Long, postNumber: Int): String {
+        val generation = store.sessionGeneration
+        val raw = repository.fetchPostMarkdown(topicId, postNumber)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return raw
+    }
+
+    suspend fun loadPostRevision(postId: Long, revision: Int?): org.linuxdo.android.data.PostRevision {
+        val generation = store.sessionGeneration
+        val result = repository.fetchPostRevision(postId, revision)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return result
+    }
+
+    suspend fun loadTopicPreview(topicId: Long): org.linuxdo.android.data.TopicDetail {
+        val generation = store.sessionGeneration
+        val detail = repository.fetchTopic(topicId, trackVisit = false, present = false)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return detail
+    }
+
+    suspend fun searchEditorSuggestions(query: EditorCompletionRequest): List<EditorSuggestion> {
+        if (!store.hasSession()) return emptyList()
+        val generation = store.sessionGeneration
+        val local = if (query.marker == '@') _details.value[query.topicId]?.posts.orEmpty()
+            .filter { it.username.matches(Regex("[A-Za-z0-9_.-]+")) }
+            .filter { it.username.contains(query.term, ignoreCase = true) || it.displayName.contains(query.term, ignoreCase = true) }
+            .distinctBy { it.username.lowercase() }.take(8)
+            .map { EditorSuggestion("@${it.username}", it.displayName, "本帖参与者 · @${it.username}", avatarUrlOf(it.avatarTemplate)) }
+            else emptyList()
+        val remote = try {
+            repository.searchEditorSuggestions(query)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            if (local.isEmpty()) throw error else emptyList()
+        }
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return (local + remote).distinctBy { it.insertion.lowercase() }.take(8)
+    }
+
     fun loadTrustReport(refresh: Boolean = false) {
         val username = _state.value.username ?: return
         val current = _trustReport.value
@@ -4851,7 +4904,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val localDraft = if (needsDraft) null else localDraftKey(target)?.let { key ->
             container.draftStore.get(store.currentUserId(), key)
         }
-        _composer.value = ComposerUiState(target = target, draft = localDraft.orEmpty(), loadingDraft = needsDraft)
+        val draft = if (target is ComposerTarget.ReplyTo && !target.quote.isNullOrBlank()) {
+            appendQuoteToDraft(localDraft.orEmpty(), target.username, target.postNumber, target.topicId, target.quote)
+        } else localDraft.orEmpty()
+        _composer.value = ComposerUiState(target = target, draft = draft, loadingDraft = needsDraft)
+        if (target is ComposerTarget.ReplyTo && target.quote != null) {
+            localDraftKey(target)?.let { container.draftStore.put(store.currentUserId(), it, draft) }
+        }
         if (target !is ComposerTarget.Edit) return
         pageJobs["draft:${target.postId}"] = viewModelScope.launch {
             try {

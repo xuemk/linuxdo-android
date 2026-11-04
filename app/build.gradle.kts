@@ -63,6 +63,12 @@ dependencies {
     // DoH (DNS over HTTPS) 支持：纯 Kotlin 实现，无本地库，增量 < 30KB
     implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
 
+    val media3Version = "1.5.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
+    implementation("androidx.media3:media3-datasource-okhttp:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

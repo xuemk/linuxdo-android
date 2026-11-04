@@ -1047,6 +1047,7 @@ private fun ChatComposerBottomSheet(
     onSend: (String, List<Long>) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val completionSource = org.linuxdo.android.ui.LocalEditorSuggestionSource.current
     var isFullScreen by rememberSaveable { mutableStateOf(false) }
     var showSheetEmojiPicker by rememberSaveable { mutableStateOf(false) }
     var editorView by remember { mutableStateOf<RichMarkdownEditorView?>(null) }
@@ -1158,6 +1159,7 @@ private fun ChatComposerBottomSheet(
                             factory = { ctx ->
                                 RichMarkdownEditorView(ctx).apply {
                                     updateThemeColors(textColorInt, hintColorInt)
+                                    setCompletionSource(completionSource)
                                     setInitialMarkdown(draft, pendingAttachments)
                                     setOnMarkdownChangeListener { newRaw -> onDraftChange(newRaw) }
                                     setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
@@ -1166,6 +1168,7 @@ private fun ChatComposerBottomSheet(
                             },
                             update = { view ->
                                 view.updateThemeColors(textColorInt, hintColorInt)
+                                view.setCompletionSource(completionSource)
                             },
                         )
                     }

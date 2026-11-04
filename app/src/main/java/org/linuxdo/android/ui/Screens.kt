@@ -113,6 +113,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
+import org.linuxdo.android.data.EditorSuggestion
+import org.linuxdo.android.data.EditorCompletionRequest
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
@@ -6515,6 +6518,48 @@ internal class CreatorMediaSpan(
     }
 }
 
+internal val LocalEditorSuggestionSource = androidx.compose.runtime.staticCompositionLocalOf<
+    suspend (EditorCompletionRequest) -> List<EditorSuggestion>
+> { { emptyList() } }
+
+internal val LocalPostMarkdownLoader = androidx.compose.runtime.staticCompositionLocalOf<suspend (Long, Int) -> String> {
+    { _, _ -> error("原文暂不可用") }
+}
+internal val LocalPostRevisionLoader = androidx.compose.runtime.staticCompositionLocalOf<suspend (Long, Int?) -> org.linuxdo.android.data.PostRevision> {
+    { _, _ -> error("编辑历史暂不可用") }
+}
+internal val LocalTopicPreviewLoader = androidx.compose.runtime.staticCompositionLocalOf<(suspend (Long) -> org.linuxdo.android.data.TopicDetail)?> { null }
+
+internal data class EditorCompletionToken(val marker: Char, val term: String, val start: Int, val cursor: Int, val end: Int)
+
+internal fun editorCompletionToken(text: String, start: Int, end: Int): EditorCompletionToken? {
+    if (start != end || start !in 1..text.length) return null
+    val prefix = text.substring(0, start)
+    val tokenStart = prefix.indexOfLast { it.isWhitespace() } + 1
+    val token = prefix.substring(tokenStart)
+    val marker = token.firstOrNull()?.takeIf { it == '@' || it == '#' } ?: return null
+    fun valid(character: Char) = character.isLetterOrDigit() || character == '_' || character == '-' ||
+        (marker == '@' && character == '.') || (marker == '#' && character == ':')
+    if (token.drop(1).any { !valid(it) } || token.length > 80) return null
+    var fence: Char? = null
+    var fenceLength = 0
+    prefix.lineSequence().forEach { line ->
+        val trimmed = line.trimStart()
+        val lead = trimmed.firstOrNull()
+        if (lead == '`' || lead == '~') {
+            val length = trimmed.takeWhile { it == lead }.length
+            if (length >= 3) {
+                if (fence == null) { fence = lead; fenceLength = length }
+                else if (fence == lead && length >= fenceLength && trimmed.drop(length).isBlank()) fence = null
+            }
+        }
+    }
+    if (fence != null || prefix.substringAfterLast('\n').count { it == '`' } % 2 != 0) return null
+    var tokenEnd = start
+    while (tokenEnd < text.length && valid(text[tokenEnd])) tokenEnd++
+    return EditorCompletionToken(marker, token.drop(1), tokenStart, start, tokenEnd)
+}
+
 internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     private var onMarkdownChange: ((String) -> Unit)? = null
@@ -6523,6 +6568,15 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     private var isInternalUpdating = false
     private val density = resources.displayMetrics.density
+    private var completionSource: (suspend (EditorCompletionRequest) -> List<EditorSuggestion>)? = null
+    private var completionTopicId: Long? = null
+    private var completionCategoryId: Int? = null
+    private var completionScope: kotlinx.coroutines.CoroutineScope? = null
+    private var completionJob: kotlinx.coroutines.Job? = null
+    private var requestedCompletion: EditorCompletionToken? = null
+    private var completionPopup: android.widget.PopupWindow? = null
+    private val completionImages = mutableListOf<coil.request.Disposable>()
+    private val completionRunnable = Runnable { searchCompletion() }
 
     init {
         background = null
@@ -6560,8 +6614,171 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
                     }
                 }
                 onMarkdownChange?.invoke(exportToMarkdown())
+                removeCallbacks(completionRunnable)
+                post(completionRunnable)
             }
         })
+    }
+
+    fun setCompletionSource(
+        source: suspend (EditorCompletionRequest) -> List<EditorSuggestion>,
+        topicId: Long? = null,
+        categoryId: Int? = null,
+    ) {
+        if (completionTopicId != topicId || completionCategoryId != categoryId) dismissCompletion()
+        completionSource = source
+        completionTopicId = topicId
+        completionCategoryId = categoryId
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        completionScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(completionRunnable)
+        dismissCompletion()
+        completionScope?.cancel()
+        completionScope = null
+        super.onDetachedFromWindow()
+    }
+
+    override fun onSelectionChanged(selStart: Int, selEnd: Int) {
+        super.onSelectionChanged(selStart, selEnd)
+        if (completionSource != null) {
+            removeCallbacks(completionRunnable)
+            post(completionRunnable)
+        }
+    }
+
+    override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
+        super.onFocusChanged(focused, direction, previouslyFocusedRect)
+        if (completionSource == null) return
+        if (!focused) dismissCompletion() else if (completionSource != null) post(completionRunnable)
+    }
+
+    override fun onKeyPreIme(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_BACK && completionPopup?.isShowing == true) {
+            if (event.action == android.view.KeyEvent.ACTION_UP) dismissCompletion()
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
+
+    private fun currentCompletion(): EditorCompletionToken? {
+        val editable = text ?: return null
+        if (!hasFocus() || !isEnabled || isInternalUpdating ||
+            android.view.inputmethod.BaseInputConnection.getComposingSpanStart(editable) >= 0) return null
+        return editorCompletionToken(editable.toString(), selectionStart, selectionEnd)
+    }
+
+    private fun dismissCompletion() {
+        completionJob?.cancel()
+        completionJob = null
+        requestedCompletion = null
+        completionPopup?.dismiss()
+        completionPopup = null
+        completionImages.forEach { it.dispose() }
+        completionImages.clear()
+    }
+
+    private fun searchCompletion() {
+        val source = completionSource ?: return
+        val token = currentCompletion()
+        if (token == null) { dismissCompletion(); return }
+        if (token == requestedCompletion && (completionJob?.isActive == true || completionPopup?.isShowing == true)) return
+        dismissCompletion()
+        requestedCompletion = token
+        val query = EditorCompletionRequest(token.marker, token.term, completionTopicId, completionCategoryId)
+        completionJob = completionScope?.launch {
+            kotlinx.coroutines.delay(300)
+            val suggestions = try {
+                source(query)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                emptyList()
+            }
+            if (isAttachedToWindow && currentCompletion() == token && requestedCompletion == token && suggestions.isNotEmpty()) {
+                showCompletion(token, suggestions)
+            }
+        }
+    }
+
+    private fun showCompletion(token: EditorCompletionToken, suggestions: List<EditorSuggestion>) {
+        val textLayout = layout ?: return
+        val frame = android.graphics.Rect().also { getWindowVisibleDisplayFrame(it) }
+        val location = IntArray(2).also { getLocationOnScreen(it) }
+        val line = textLayout.getLineForOffset(token.cursor)
+        val caretX = location[0] + totalPaddingLeft + textLayout.getPrimaryHorizontal(token.cursor).toInt() - scrollX
+        val caretTop = location[1] + totalPaddingTop + textLayout.getLineTop(line) - scrollY
+        val caretBottom = location[1] + totalPaddingTop + textLayout.getLineBottom(line) - scrollY
+        val popupWidth = minOf((300 * density).toInt(), frame.width()).coerceAtLeast(1)
+        val popupHeight = minOf((suggestions.size * 56 * density).toInt(), (240 * density).toInt(), frame.height() / 2).coerceAtLeast(1)
+        val dark = android.graphics.Color.luminance(currentTextColor) > 0.5f
+        val backgroundColor = if (dark) android.graphics.Color.rgb(38, 38, 40) else android.graphics.Color.WHITE
+        val rows = android.widget.LinearLayout(context).apply { orientation = android.widget.LinearLayout.VERTICAL }
+        suggestions.forEach { suggestion ->
+            val row = android.widget.LinearLayout(context).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding((12 * density).toInt(), (6 * density).toInt(), (12 * density).toInt(), (6 * density).toInt())
+                layoutParams = android.widget.LinearLayout.LayoutParams(-1, (56 * density).toInt())
+                setOnClickListener {
+                    if (currentCompletion() == token) {
+                        val value = suggestion.insertion + " "
+                        text?.replace(token.start, token.end, value)
+                        setSelection(token.start + value.length)
+                    }
+                    dismissCompletion()
+                }
+            }
+            suggestion.avatarUrl?.let { avatar ->
+                val image = android.widget.ImageView(context).apply {
+                    layoutParams = android.widget.LinearLayout.LayoutParams((32 * density).toInt(), (32 * density).toInt()).apply {
+                        marginEnd = (8 * density).toInt()
+                    }
+                    scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(backgroundColor)
+                    }
+                    clipToOutline = true
+                }
+                row.addView(image)
+                completionImages += coil.Coil.imageLoader(context).enqueue(ImageRequest.Builder(context).data(avatar).target(image).build())
+            }
+            row.addView(android.widget.TextView(context).apply {
+                text = "${suggestion.label}\n${suggestion.description}"
+                setTextColor(this@RichMarkdownEditorView.currentTextColor)
+                textSize = 13f
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+            rows.addView(row)
+        }
+        val scroll = android.widget.ScrollView(context).apply { addView(rows) }
+        val popup = android.widget.PopupWindow(scroll, popupWidth, popupHeight, false).apply {
+            isOutsideTouchable = true
+            inputMethodMode = android.widget.PopupWindow.INPUT_METHOD_NEEDED
+            elevation = 8 * density
+            setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+                setColor(backgroundColor)
+                cornerRadius = 10 * density
+            })
+            setOnDismissListener {
+                completionImages.forEach { it.dispose() }
+                completionImages.clear()
+                completionPopup = null
+                requestedCompletion = null
+            }
+        }
+        completionPopup = popup
+        val left = caretX.coerceIn(frame.left, (frame.right - popupWidth).coerceAtLeast(frame.left))
+        val top = (if (frame.bottom - caretBottom >= popupHeight) caretBottom else caretTop - popupHeight)
+            .coerceIn(frame.top, (frame.bottom - popupHeight).coerceAtLeast(frame.top))
+        popup.showAtLocation(rootView, Gravity.TOP or Gravity.LEFT, left, top)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -6808,6 +7025,7 @@ fun TopicCreatorSheet(
     onClose: () -> Unit,
     onClearNotice: () -> Unit,
 ) {
+    val completionSource = LocalEditorSuggestionSource.current
     val keyboard = LocalSoftwareKeyboardController.current
     var showEmojiPicker by remember { mutableStateOf(false) }
     var showCategoryDialog by remember { mutableStateOf(false) }
@@ -7389,6 +7607,7 @@ fun TopicCreatorSheet(
                 factory = { ctx ->
                     RichMarkdownEditorView(ctx).apply {
                         updateThemeColors(textColorInt, hintColorInt)
+                        setCompletionSource(completionSource, categoryId = state.categoryId)
                         setInitialMarkdown(state.raw, state.attachments)
                         setOnMarkdownChangeListener { newRaw -> onRawChange(newRaw) }
                         setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
@@ -7398,6 +7617,7 @@ fun TopicCreatorSheet(
                 },
                 update = { view ->
                     view.updateThemeColors(textColorInt, hintColorInt)
+                    view.setCompletionSource(completionSource, categoryId = state.categoryId)
                 },
             )
 
