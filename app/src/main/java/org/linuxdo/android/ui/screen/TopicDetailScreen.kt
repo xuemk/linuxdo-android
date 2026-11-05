@@ -180,6 +180,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -232,11 +233,13 @@ import org.linuxdo.android.ui.format.RelativeTime
 import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
+import org.linuxdo.android.ui.html.isImageLinkUrl
 import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
 import org.linuxdo.android.net.awaitImageRetrySlot
 import org.linuxdo.android.net.isTransientImageError
 
 private val LocalOpenTopic = compositionLocalOf<((Long, String, Int?) -> Unit)?> { null }
+private val LocalOpenPicture = compositionLocalOf<((List<ImageViewerItem>, Int) -> Unit)?> { null }
 private val LocalSelectionResetKey = compositionLocalOf { 0 }
 private val LocalOpenExternalUrl = compositionLocalOf<(String) -> Unit> { {} }
 private val LocalVotePoll = compositionLocalOf<(Long, String, List<String>) -> Unit> { { _, _, _ -> } }
@@ -5377,7 +5380,9 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
         for (b in list) {
             when (b) {
                 is CookedBlock.Picture -> {
-                    result.add(ImageViewerItem(url = b.originalUrl, previewUrl = b.url, description = b.description))
+                    if (b.svgMarkup == null) {
+                        result.add(ImageViewerItem(url = b.originalUrl, previewUrl = b.url, description = b.description))
+                    }
                 }
                 is CookedBlock.Quote -> traverse(b.blocks)
                 is CookedBlock.Details -> traverse(b.blocks)
@@ -5392,6 +5397,102 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
     return result
 }
 
+private val SVG_SCRIPT_REGEX = Regex("<script\\b[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE)
+private val SVG_EVENT_ATTR_REGEX = Regex("\\s+on[a-z0-9_]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)", RegexOption.IGNORE_CASE)
+private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)(?:javascript|vbscript|file)\\s*:")
+private val SVG_ANIMATION_REGEX = Regex("(?i)(@keyframes|-webkit-keyframes|\\banimation\\s*:|\\banimation-name\\s*:|<animate\\b|<animateTransform\\b|<animateMotion\\b|<animateColor\\b|<set\\b)")
+
+private fun sanitizeSvgMarkup(raw: String): String {
+    val startIdx = raw.indexOf("<svg", ignoreCase = true)
+    val endIdx = raw.lastIndexOf("</svg>", ignoreCase = true)
+    var svg = if (startIdx >= 0 && endIdx > startIdx) {
+        raw.substring(startIdx, endIdx + 6)
+    } else {
+        raw.trim()
+    }
+    svg = svg.replace(SVG_SCRIPT_REGEX, "")
+    svg = svg.replace(SVG_EVENT_ATTR_REGEX, "")
+    svg = svg.replace(SVG_DANGEROUS_URI_REGEX, "about:blank#")
+    val tagEnd = svg.indexOf('>')
+    if (tagEnd > 0) {
+        val openTag = svg.substring(0, tagEnd)
+        if (!openTag.contains("xmlns=", ignoreCase = true)) {
+            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg xmlns=\"http://www.w3.org/2000/svg\"")
+        }
+    }
+    return svg
+}
+
+private fun hasSvgAnimation(svg: String): Boolean = SVG_ANIMATION_REGEX.containsMatchIn(svg)
+
+private fun extractSvgAspectRatio(svg: String): Float? = runCatching {
+    val el = Jsoup.parseBodyFragment(svg).selectFirst("svg") ?: return@runCatching null
+    fun parseDim(attr: String): Float? {
+        val v = el.attr(attr).trim()
+        if (v.isEmpty() || v.endsWith("%")) return null
+        return Regex("^([0-9]+(?:\\.[0-9]+)?)").find(v)?.groupValues?.get(1)?.toFloatOrNull()?.takeIf { it > 0f }
+    }
+    val w = parseDim("width")
+    val h = parseDim("height")
+    if (w != null && h != null) return@runCatching (w / h).takeIf { it.isFinite() && it > 0f }
+    val vb = el.attr("viewBox").ifBlank { el.attr("viewbox") }.trim()
+    if (vb.isNotEmpty()) {
+        val parts = vb.split(Regex("[\\s,]+")).mapNotNull { it.toFloatOrNull() }
+        if (parts.size >= 4 && parts[2] > 0f && parts[3] > 0f) {
+            return@runCatching (parts[2] / parts[3]).takeIf { it.isFinite() && it > 0f }
+        }
+    }
+    null
+}.getOrNull()
+
+private fun isSvgUrl(url: String): Boolean =
+    url.substringBefore('#').substringBefore('?').lowercase().endsWith(".svg")
+
+@Composable
+private fun InlineSvgView(
+    svgMarkup: String,
+    modifier: Modifier = Modifier,
+) {
+    val html = remember(svgMarkup) {
+        val clean = sanitizeSvgMarkup(svgMarkup)
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+            "<style>" +
+            "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;display:flex;align-items:center;justify-content:center;}" +
+            "svg{width:100%!important;height:100%!important;max-width:100%;max-height:100%;display:block;object-fit:contain;}" +
+            "</style></head><body>$clean</body></html>"
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            object : WebView(ctx) {
+                override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+            }.apply {
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                isVerticalScrollBarEnabled = false
+                isHorizontalScrollBarEnabled = false
+                isClickable = false
+                isFocusable = false
+                settings.apply {
+                    javaScriptEnabled = false
+                    allowFileAccess = false
+                    allowContentAccess = false
+                    setSupportZoom(false)
+                    defaultTextEncodingName = "UTF-8"
+                }
+                tag = html
+                loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            }
+        },
+        update = { webView ->
+            if (webView.tag != html) {
+                webView.tag = html
+                webView.loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            }
+        },
+    )
+}
+
 @Composable
 internal fun CookedContent(
     blocks: List<CookedBlock>,
@@ -5401,13 +5502,16 @@ internal fun CookedContent(
     subReply: Boolean = false,
     pollPost: Post? = null,
 ) {
-    CompositionLocalProvider(LocalSelectionPost provides pollPost) {
+    CompositionLocalProvider(
+        LocalSelectionPost provides pollPost,
+        LocalOpenPicture provides onPicture,
+    ) {
     Column(verticalArrangement = Arrangement.spacedBy(if (compact || subReply) 6.dp else 10.dp)) {
         blocks.forEach { block ->
             when (block) {
                 is CookedBlock.Paragraph -> RichParagraph(block.runs, compact = compact, subReply = subReply)
                 is CookedBlock.Heading -> CookedHeading(block)
-                is CookedBlock.Video -> InlineMediaCard(block.url, block.title, block.posterUrl, block.mimeType, video = true)
+                is CookedBlock.Video -> InlineMediaCard(block.url, block.title, block.posterUrl, block.mimeType, video = true, width = block.width, height = block.height)
                 is CookedBlock.Audio -> InlineMediaCard(block.url, block.title, mimeType = block.mimeType, video = false)
                 is CookedBlock.Details -> DetailsCard(block, onPicture, postImages, compact, subReply, pollPost)
                 is CookedBlock.Table -> CookedTable(block, onPicture, postImages, pollPost)
@@ -5446,20 +5550,35 @@ internal fun CookedContent(
                 }
                 is CookedBlock.Picture -> {
                     val maxPortraitHeight = if (subReply) 220.dp else 320.dp
-                    val ratioModifier = if (block.width > 0 && block.height > 0) {
-                        val rawRatio = block.width.toFloat() / block.height.toFloat()
-                        if (rawRatio >= 0.85f) {
+                    var currentUrl by remember(block.url) { mutableStateOf(block.url) }
+                    var isError by remember(block.url) { mutableStateOf(false) }
+                    var isLoading by remember(block.url) { mutableStateOf(block.svgMarkup == null) }
+                    var retryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var autoRetryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var pendingAutoRetry by remember(block.url) { mutableStateOf(false) }
+                    var loadedAspectRatio by remember(block.url) {
+                        mutableStateOf(block.svgMarkup?.let { extractSvgAspectRatio(it) })
+                    }
+                    var inlineSvgContent by remember(block.url) { mutableStateOf(block.svgMarkup) }
+
+                    val effectiveRatio = if (block.width > 0 && block.height > 0) {
+                        block.width.toFloat() / block.height.toFloat()
+                    } else {
+                        loadedAspectRatio
+                    }
+                    val ratioModifier = if (effectiveRatio != null && effectiveRatio > 0f) {
+                        if (effectiveRatio >= 0.85f) {
                             // 横图或近似方图：撑满宽度，高度由比例唯一确定，不加 heightIn 以避免与 fillMaxWidth 产生无解约束导致溢出重叠
                             Modifier
                                 .fillMaxWidth()
-                                .aspectRatio(rawRatio.coerceAtMost(4f))
+                                .aspectRatio(effectiveRatio.coerceAtMost(6f))
                                 .clip(RoundedCornerShape(14.dp))
                                 .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         } else {
                             // 竖屏长截图（如手机截图）：固定高度上限并按比例自适应宽度（左对齐，与网页端一致），既锁死高度防滚动抖动，又绝不越界遮挡文字
                             Modifier
                                 .height(maxPortraitHeight)
-                                .aspectRatio(rawRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
+                                .aspectRatio(effectiveRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
                                 .clip(RoundedCornerShape(14.dp))
                                 .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         }
@@ -5470,12 +5589,7 @@ internal fun CookedContent(
                             .clip(RoundedCornerShape(14.dp))
                             .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                     }
-                    var currentUrl by remember(block.url) { mutableStateOf(block.url) }
-                    var isError by remember(block.url) { mutableStateOf(false) }
-                    var isLoading by remember(block.url) { mutableStateOf(true) }
-                    var retryCount by remember(block.url) { mutableIntStateOf(0) }
-                    var autoRetryCount by remember(block.url) { mutableIntStateOf(0) }
-                    var pendingAutoRetry by remember(block.url) { mutableStateOf(false) }
+
                     if (pendingAutoRetry) {
                         LaunchedEffect(autoRetryCount) {
                             awaitImageRetrySlot(autoRetryCount)
@@ -5486,6 +5600,40 @@ internal fun CookedContent(
                     }
 
                     val context = LocalContext.current
+                    if (block.svgMarkup == null && isSvgUrl(currentUrl)) {
+                        LaunchedEffect(currentUrl, retryCount) {
+                            val fetched = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val container = (context.applicationContext as App).container
+                                    val host = runCatching { Uri.parse(currentUrl).host?.lowercase() }.getOrNull().orEmpty()
+                                    val isSite = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
+                                        host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+                                    val factory = if (isSite) container.dynamicCallFactory else externalMediaCallFactory
+                                    val req = Request.Builder()
+                                        .url(currentUrl)
+                                        .header("User-Agent", container.userAgent)
+                                        .header("Accept", "image/svg+xml,application/xml,text/xml,*/*;q=0.8")
+                                        .build()
+                                    factory.newCall(req).execute().use { resp ->
+                                        if (!resp.isSuccessful) return@use null
+                                        val body = resp.body?.string().orEmpty()
+                                        if (body.contains("<svg", ignoreCase = true)) body else null
+                                    }
+                                }.getOrNull()
+                            }
+                            if (fetched != null) {
+                                extractSvgAspectRatio(fetched)?.let { ratio ->
+                                    if (loadedAspectRatio == null) loadedAspectRatio = ratio
+                                }
+                                if (hasSvgAnimation(fetched) || isError) {
+                                    inlineSvgContent = fetched
+                                    isLoading = false
+                                    isError = false
+                                }
+                            }
+                        }
+                    }
+
                     val imageRequest = remember(currentUrl, retryCount) {
                         ImageRequest.Builder(context)
                             .data(currentUrl)
@@ -5502,52 +5650,72 @@ internal fun CookedContent(
                         ImageViewerItem(url = block.originalUrl, previewUrl = currentUrl, description = block.description)
                     )
 
+                    val activeSvgMarkup = inlineSvgContent
                     Box(
                         modifier = ratioModifier.background(IosTheme.colors.fieldBackground),
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (isLoading && !isError) {
-                            IosActivityIndicator(diameter = 20.dp)
-                        }
-                        AsyncImage(
-                            model = imageRequest,
-                            contentDescription = block.description,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .clickable { onPicture(imageList, clickedIndex) },
-                            onLoading = {
-                                isLoading = true
-                                isError = false
-                            },
-                            onSuccess = {
-                                isLoading = false
-                                isError = false
-                            },
-                            onError = { errorState ->
-                                val err = errorState.result.throwable
-                                android.util.Log.w("CookedContent", "Failed to load image: $currentUrl, reason: ${err.message}")
-                                if (isTransientImageError(err) && autoRetryCount < IMAGE_AUTO_RETRY_LIMIT) {
-                                    // 门禁冷却 / 429 / 网络抖动：换原图只会再撞一次，原地等冷却结束后重试同一地址
-                                    pendingAutoRetry = true
-                                } else if (currentUrl == block.url && block.url != block.originalUrl) {
-                                    // 缩略图拉取失败（如 Discourse 未生成或 404/超时），自动透明降级尝试原图！
-                                    currentUrl = block.originalUrl
+                        if (activeSvgMarkup != null) {
+                            val clickMod = if (block.svgMarkup == null) {
+                                Modifier.fillMaxSize().clickable { onPicture(imageList, clickedIndex) }
+                            } else {
+                                Modifier.fillMaxSize()
+                            }
+                            Box(modifier = clickMod, contentAlignment = Alignment.Center) {
+                                InlineSvgView(
+                                    svgMarkup = activeSvgMarkup,
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                            }
+                        } else {
+                            if (isLoading && !isError) {
+                                IosActivityIndicator(diameter = 20.dp)
+                            }
+                            AsyncImage(
+                                model = imageRequest,
+                                contentDescription = block.description,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clickable { onPicture(imageList, clickedIndex) },
+                                onLoading = {
                                     isLoading = true
-                                } else {
+                                    isError = false
+                                },
+                                onSuccess = { successState ->
                                     isLoading = false
-                                    isError = true
-                                }
-                            },
-                        )
-                        if (isError) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.padding(8.dp),
-                            ) {
-                                Text("图片未显示", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    isError = false
+                                    val drawable = successState.result.drawable
+                                    val dw = drawable.intrinsicWidth
+                                    val dh = drawable.intrinsicHeight
+                                    if (dw > 0 && dh > 0 && loadedAspectRatio == null) {
+                                        loadedAspectRatio = dw.toFloat() / dh.toFloat()
+                                    }
+                                },
+                                onError = { errorState ->
+                                    val err = errorState.result.throwable
+                                    android.util.Log.w("CookedContent", "Failed to load image: $currentUrl, reason: ${err.message}")
+                                    if (isTransientImageError(err) && autoRetryCount < IMAGE_AUTO_RETRY_LIMIT) {
+                                        // 门禁冷却 / 429 / 网络抖动：换原图只会再撞一次，原地等冷却结束后重试同一地址
+                                        pendingAutoRetry = true
+                                    } else if (currentUrl == block.url && block.url != block.originalUrl) {
+                                        // 缩略图拉取失败（如 Discourse 未生成或 404/超时），自动透明降级尝试原图！
+                                        currentUrl = block.originalUrl
+                                        isLoading = true
+                                    } else if (inlineSvgContent == null) {
+                                        isLoading = false
+                                        isError = true
+                                    }
+                                },
+                            )
+                            if (isError) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(8.dp),
+                                ) {
+                                    Text("图片未显示", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                     Text(
                                         text = "重新加载",
                                         style = IosTheme.type.caption,
@@ -5568,6 +5736,7 @@ internal fun CookedContent(
                                         },
                                     )
                                 }
+                            }
                             }
                         }
                     }
@@ -5773,6 +5942,13 @@ private class InlineMediaSession(val player: ExoPlayer, val generation: Long, pr
     }
 }
 
+private val externalMediaCallFactory: okhttp3.Call.Factory by lazy {
+    okhttp3.OkHttpClient.Builder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+}
+
 private fun mediaTime(position: Long): String {
     val seconds = position.coerceAtLeast(0) / 1000
     return if (seconds >= 3600) "%d:%02d:%02d".format(java.util.Locale.ROOT, seconds / 3600, seconds / 60 % 60, seconds % 60)
@@ -5781,7 +5957,15 @@ private fun mediaTime(position: Long): String {
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun InlineMediaCard(url: String, title: String, poster: String? = null, mimeType: String? = null, video: Boolean) {
+private fun InlineMediaCard(
+    url: String,
+    title: String,
+    poster: String? = null,
+    mimeType: String? = null,
+    video: Boolean,
+    width: Int = 0,
+    height: Int = 0,
+) {
     val context = LocalContext.current
     val container = (context.applicationContext as App).container
     val view = LocalView.current
@@ -5800,9 +5984,19 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
     var duration by remember(url) { mutableLongStateOf(0L) }
     var seeking by remember(url) { mutableStateOf<Float?>(null) }
     var error by remember(url) { mutableStateOf<String?>(null) }
-    fun start() {
+    var useDirectFallback by remember(url) { mutableStateOf(false) }
+    var videoAspectRatio by remember(url, width, height) {
+        mutableFloatStateOf(
+            if (width > 0 && height > 0) {
+                (width.toFloat() / height.toFloat()).coerceIn(9f / 16f, 21f / 9f)
+            } else {
+                16f / 9f
+            }
+        )
+    }
+    fun start(forceDirect: Boolean = useDirectFallback) {
         if (!pageActive) return
-        if (player != null && player.playerError == null) {
+        if (!forceDirect && player != null && player.playerError == null) {
             if (player.playbackState == Player.STATE_ENDED) {
                 player.seekTo(0)
                 player.play()
@@ -5813,7 +6007,11 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
         }
         session?.close()
         error = null
-        val dataSource = OkHttpDataSource.Factory(container.dynamicCallFactory)
+        val host = runCatching { Uri.parse(url).host?.lowercase() }.getOrNull().orEmpty()
+        val isSiteHost = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
+            host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+        val callFactory = if (isSiteHost && !forceDirect) container.dynamicCallFactory else externalMediaCallFactory
+        val dataSource = OkHttpDataSource.Factory(callFactory)
             .setUserAgent(container.sessionStore.userAgentOrNull() ?: container.userAgent)
         val next = ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSource)).build().apply {
@@ -5822,6 +6020,24 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
                 setHandleAudioBecomingNoisy(true)
                 volume = if (muted) 0f else 1f
                 setPlaybackSpeed(speed)
+                addListener(object : Player.Listener {
+                    override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                        if (videoSize.width > 0 && videoSize.height > 0) {
+                            val pixelRatio = if (videoSize.pixelWidthHeightRatio > 0f) videoSize.pixelWidthHeightRatio else 1f
+                            val ratio = (videoSize.width * pixelRatio) / videoSize.height.toFloat()
+                            if (ratio.isFinite() && ratio > 0f) {
+                                videoAspectRatio = ratio.coerceIn(9f / 16f, 21f / 9f)
+                            }
+                        }
+                    }
+
+                    override fun onPlayerError(err: androidx.media3.common.PlaybackException) {
+                        if (isSiteHost && !forceDirect && !useDirectFallback) {
+                            useDirectFallback = true
+                            start(forceDirect = true)
+                        }
+                    }
+                })
                 setMediaItem(MediaItem.Builder().setUri(url).apply { mimeType?.let { setMimeType(it) } }.build())
                 seekTo(position)
             }
@@ -5875,7 +6091,11 @@ private fun InlineMediaCard(url: String, title: String, poster: String? = null, 
             },
     ) {
         if (video) {
-            Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(Color.Black), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier.fillMaxWidth().aspectRatio(videoAspectRatio).background(Color.Black)
+                    .clickable(enabled = player == null) { start() },
+                contentAlignment = Alignment.Center,
+            ) {
                 if (player != null && !fullscreen) {
                     NativePlayerView(player, Modifier.fillMaxSize(), playRequested)
                 } else {
@@ -5946,22 +6166,271 @@ private fun NativePlayerView(player: ExoPlayer, modifier: Modifier, keepScreenOn
     )
 }
 
+private fun isAutoPreviewDemoOnebox(onebox: CookedBlock.Onebox): Boolean {
+    if (parseInternalTopicUrl(onebox.url) != null) return false
+    val uri = runCatching { Uri.parse(onebox.url) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase() ?: return false
+    if (scheme != "http" && scheme != "https") return false
+    val host = uri.host?.lowercase().orEmpty()
+    val path = uri.path?.lowercase().orEmpty()
+    val text = "${onebox.title} ${onebox.description.orEmpty()}".lowercase()
+    val hasVisualDemoKeyword = text.contains("svg") || text.contains("动画") ||
+        text.contains("canvas") || text.contains("webgl") || text.contains("demo")
+    val isHtmlPath = path.endsWith(".html") || path.endsWith(".htm")
+    val isDemoHost = host.contains("pelicanarena") || host.endsWith(".dpdns.org") ||
+        host.endsWith(".github.io") || host.endsWith(".pages.dev") ||
+        host.endsWith(".vercel.app") || host.endsWith(".netlify.app") ||
+        host.contains("codepen.io") || host.contains("jsfiddle.net")
+    return (isHtmlPath && (hasVisualDemoKeyword || isDemoHost)) ||
+        host.contains("pelicanarena") ||
+        text.contains("svg 动画") || text.contains("svg动画")
+}
+
+@Composable
+private fun SandboxedWebPreview(
+    url: String,
+    active: Boolean,
+    allowTouchIntercept: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    var loading by remember(url) { mutableStateOf(true) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var webViewRef by remember(url) { mutableStateOf<WebView?>(null) }
+
+    DisposableEffect(webViewRef, lifecycle) {
+        val wv = webViewRef
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> wv?.onPause()
+                Lifecycle.Event.ON_RESUME -> if (active) wv?.onResume()
+                else -> {}
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(webViewRef, active) {
+        val wv = webViewRef ?: return@LaunchedEffect
+        if (active) {
+            wv.onResume()
+        } else {
+            wv.onPause()
+        }
+    }
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                object : WebView(ctx) {
+                    override fun requestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {
+                        super.requestDisallowInterceptTouchEvent(if (allowTouchIntercept) disallowIntercept else false)
+                    }
+                }.apply {
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    isVerticalScrollBarEnabled = allowTouchIntercept
+                    isHorizontalScrollBarEnabled = allowTouchIntercept
+                    runCatching {
+                        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                    }
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        allowFileAccess = false
+                        allowContentAccess = false
+                        mediaPlaybackRequiresUserGesture = false
+                        loadWithOverviewMode = true
+                        useWideViewPort = true
+                        setSupportZoom(allowTouchIntercept)
+                        builtInZoomControls = allowTouchIntercept
+                        displayZoomControls = false
+                        defaultTextEncodingName = "UTF-8"
+                    }
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: android.webkit.WebResourceRequest?,
+                        ): Boolean {
+                            val reqScheme = request?.url?.scheme?.lowercase()
+                            return reqScheme != "http" && reqScheme != "https"
+                        }
+
+                        override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                            loading = false
+                        }
+                    }
+                    webViewRef = this
+                    loadUrl(url)
+                }
+            },
+            update = { wv ->
+                if (wv.url != url && wv.originalUrl != url) {
+                    loading = true
+                    wv.loadUrl(url)
+                }
+            },
+            onRelease = { wv ->
+                webViewRef = null
+                runCatching {
+                    wv.stopLoading()
+                    wv.loadUrl("about:blank")
+                    wv.onPause()
+                    wv.removeAllViews()
+                    wv.destroy()
+                }
+            },
+        )
+        if (loading) {
+            IosActivityIndicator(diameter = 22.dp)
+        }
+    }
+}
+
 @Composable
 private fun OneboxCard(onebox: CookedBlock.Onebox) {
     val openUrl = LocalOpenExternalUrl.current
+    val view = LocalView.current
+    val pageActive = LocalPostPageActive.current
+    val canPreview = remember(onebox.url) {
+        val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
+        (scheme == "http" || scheme == "https") && parseInternalTopicUrl(onebox.url) == null
+    }
+    var expanded by rememberSaveable(onebox.url) { mutableStateOf(isAutoPreviewDemoOnebox(onebox)) }
+    var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
+    var visible by remember(onebox.url) { mutableStateOf(true) }
+
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
             .background(IosTheme.colors.fieldBackground)
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
+            }
             .clickable { openUrl(onebox.url) }
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        onebox.posterUrl?.let { AsyncImage(it, onebox.title, modifier = Modifier.fillMaxWidth().height(160.dp), contentScale = ContentScale.Crop) }
+        if (expanded && canPreview) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 10f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(IosTheme.colors.card)
+                    .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.2f), RoundedCornerShape(8.dp)),
+            ) {
+                if (!fullscreen) {
+                    SandboxedWebPreview(
+                        url = onebox.url,
+                        active = pageActive && visible,
+                        allowTouchIntercept = false,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+        } else {
+            onebox.posterUrl?.let {
+                AsyncImage(it, onebox.title, modifier = Modifier.fillMaxWidth().height(160.dp), contentScale = ContentScale.Crop)
+            }
+        }
         Text(onebox.title, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label)
         onebox.description?.let {
             Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
-        Text(Uri.parse(onebox.url).host.orEmpty(), style = IosTheme.type.caption, color = IosTheme.colors.accent, maxLines = 1)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                Uri.parse(onebox.url).host.orEmpty(),
+                style = IosTheme.type.caption,
+                color = IosTheme.colors.accent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (canPreview) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (expanded) {
+                        Text(
+                            text = "全屏交互",
+                            style = IosTheme.type.caption,
+                            fontWeight = FontWeight.Medium,
+                            color = IosTheme.colors.accent,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { fullscreen = true }
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
+                    Text(
+                        text = if (expanded) "收起预览" else "▶ 帖内预览",
+                        style = IosTheme.type.caption,
+                        fontWeight = FontWeight.Medium,
+                        color = IosTheme.colors.accent,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { expanded = !expanded }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+            }
+        }
+    }
+
+    if (fullscreen && canPreview) {
+        Dialog(
+            onDismissRequest = { fullscreen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+                SandboxedWebPreview(
+                    url = onebox.url,
+                    active = true,
+                    allowTouchIntercept = true,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "外部打开",
+                        color = Color.White,
+                        style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.48f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable { openUrl(onebox.url) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                    Text(
+                        text = "退出全屏",
+                        color = Color.White,
+                        style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.48f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable { fullscreen = false }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -7061,6 +7530,8 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
     val context = LocalContext.current
     val openTopic = LocalOpenTopic.current
     val updatedOpenTopic by rememberUpdatedState(openTopic)
+    val openPicture = LocalOpenPicture.current
+    val updatedOpenPicture by rememberUpdatedState(openPicture)
     val openExternal = LocalOpenExternalUrl.current
     val updatedOpenExternal by rememberUpdatedState(openExternal)
     val scope = rememberCoroutineScope()
@@ -7097,6 +7568,7 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                             } else {
                                 val internalTarget = parseInternalTopicUrl(link)
                                 val opener = updatedOpenTopic
+                                val pictureOpener = updatedOpenPicture
                                 if (internalTarget != null && opener != null) {
                                     val rawLabel = run.text.trim()
                                     val titleHint = if (rawLabel.isNotBlank() &&
@@ -7108,6 +7580,11 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                         "话题 #${internalTarget.topicId}"
                                     }
                                     opener(internalTarget.topicId, titleHint, internalTarget.postNumber)
+                                } else if (pictureOpener != null && isImageLinkUrl(link)) {
+                                    pictureOpener(
+                                        listOf(ImageViewerItem(url = link, previewUrl = link, description = run.text.trim())),
+                                        0,
+                                    )
                                 } else {
                                     val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
                                     val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()

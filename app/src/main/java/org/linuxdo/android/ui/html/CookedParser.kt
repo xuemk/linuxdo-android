@@ -30,8 +30,16 @@ sealed interface CookedBlock {
         val originalUrl: String = url,
         val width: Int = 0,
         val height: Int = 0,
+        val svgMarkup: String? = null,
     ) : CookedBlock
-    data class Video(val url: String, val posterUrl: String? = null, val title: String = "视频", val mimeType: String? = null) : CookedBlock
+    data class Video(
+        val url: String,
+        val posterUrl: String? = null,
+        val title: String = "视频",
+        val mimeType: String? = null,
+        val width: Int = 0,
+        val height: Int = 0,
+    ) : CookedBlock
     data class Audio(val url: String, val title: String = "音频", val mimeType: String? = null) : CookedBlock
     data class Details(val id: String, val summary: List<InlineText>, val blocks: List<CookedBlock>, val initiallyOpen: Boolean = false) : CookedBlock
     data class ImageGrid(val pictures: List<Picture>, val columns: Int = 2) : CookedBlock
@@ -199,7 +207,12 @@ internal fun segmentCookedBlocks(blocks: List<CookedBlock>, budget: Int = 1400):
 /** Only HTTP(S) links are handed to the image loader or external browser. */
 fun contentUrl(value: String): String? = runCatching {
     if (value.isBlank()) return null
-    URI(Config.BASE_URL + "/").resolve(value.trim()).takeIf {
+    val normalized = value.trim().let { raw ->
+        if (raw.startsWith("upload://", ignoreCase = true)) {
+            "/uploads/short-url/${raw.substring("upload://".length)}"
+        } else raw
+    }
+    URI(Config.BASE_URL + "/").resolve(normalized).takeIf {
         it.scheme?.lowercase() in setOf("http", "https") && !it.host.isNullOrBlank() && it.userInfo == null
     }?.toASCIIString()
 }.getOrNull()
@@ -212,9 +225,15 @@ private val ATTACHMENT_EXTENSIONS = setOf(
     "sh", "bat", "ps1", "py", "jar", "iso", "mp3", "flac", "wav", "mp4", "mkv", "mov",
 )
 
-private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "avif", "heic")
+private val IMAGE_EXTENSIONS = setOf("png", "apng", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "avif", "heic", "heif")
 private val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "mov", "webm", "m3u8")
 private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac")
+
+fun isImageLinkUrl(url: String): Boolean {
+    val uri = runCatching { URI(url) }.getOrNull() ?: return false
+    val ext = uri.path?.substringAfterLast('.', "")?.lowercase().orEmpty()
+    return ext in IMAGE_EXTENSIONS
+}
 
 fun isDownloadableAttachmentUrl(url: String): Boolean {
     val uri = runCatching { URI(url) }.getOrNull() ?: return false
@@ -320,6 +339,27 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         )
     }
 
+    private fun svgBlockOf(svg: Element): CookedBlock.Picture? {
+        if (svg.hasClass("d-icon") || svg.hasClass("svg-icon") || svg.hasClass("fa")) return null
+        val viewBox = svg.attr("viewBox").trim()
+        val wAttr = svg.attr("width").trim().removeSuffix("px").toFloatOrNull()
+        val hAttr = svg.attr("height").trim().removeSuffix("px").toFloatOrNull()
+        if (viewBox.isEmpty() && wAttr == null && hAttr == null) return null
+        val vbParts = viewBox.split(Regex("[\\s,]+")).mapNotNull { it.toFloatOrNull() }
+        val vbW = if (vbParts.size == 4 && vbParts[2] > 0f) vbParts[2] else null
+        val vbH = if (vbParts.size == 4 && vbParts[3] > 0f) vbParts[3] else null
+        val w = (wAttr?.takeIf { it > 0f } ?: vbW ?: 600f).toInt().coerceAtLeast(1)
+        val h = (hAttr?.takeIf { it > 0f } ?: vbH ?: 200f).toInt().coerceAtLeast(1)
+        val markup = svg.outerHtml()
+        return CookedBlock.Picture(
+            url = "inline-svg://${markup.hashCode()}",
+            description = svg.attr("aria-label").ifBlank { "SVG 图形" },
+            width = w,
+            height = h,
+            svgMarkup = markup,
+        )
+    }
+
     private fun pollBlockOf(element: Element): CookedBlock.Poll? {
         val name = element.attr("data-poll-name").ifBlank { "poll" }
         val poll = pollModels.firstOrNull { it.name == name }
@@ -352,9 +392,35 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         )
     }
 
-    private fun oneboxBlockOf(element: Element): CookedBlock.Onebox? {
+    private fun oneboxBlockOf(element: Element): CookedBlock? {
         val rawUrl = element.attr("data-onebox-url").ifBlank { element.selectFirst("a[href]")?.attr("href").orEmpty() }
         val url = contentUrl(rawUrl) ?: return null
+        val videoUrl = mediaLink(url, VIDEO_EXTENSIONS)
+        if (videoUrl != null) {
+            return CookedBlock.Video(
+                url = videoUrl,
+                posterUrl = element.selectFirst("img")?.attr("src")?.let(::contentUrl),
+                title = element.selectFirst(".title, .onebox-body h1, .onebox-body h2, .onebox-body h3")
+                    ?.text()?.takeIf { it.isNotBlank() } ?: "视频",
+            )
+        }
+        val audioUrl = mediaLink(url, AUDIO_EXTENSIONS)
+        if (audioUrl != null) {
+            return CookedBlock.Audio(
+                url = audioUrl,
+                title = element.selectFirst(".title, .onebox-body h1, .onebox-body h2, .onebox-body h3")
+                    ?.text()?.takeIf { it.isNotBlank() } ?: "音频",
+            )
+        }
+        val imageUrl = mediaLink(url, IMAGE_EXTENSIONS)
+        if (imageUrl != null) {
+            return CookedBlock.Picture(
+                url = imageUrl,
+                originalUrl = imageUrl,
+                description = element.selectFirst(".title, .onebox-body h1, .onebox-body h2, .onebox-body h3")
+                    ?.text()?.takeIf { it.isNotBlank() } ?: "帖子图片",
+            )
+        }
         val title = element.selectFirst(".title, .onebox-body h1, .onebox-body h2, .onebox-body h3")
             ?.text()?.takeIf { it.isNotBlank() } ?: runCatching { URI(url).host }.getOrNull().orEmpty()
         val description = element.selectFirst(".description, .onebox-body p")?.text()?.takeIf { it.isNotBlank() }
@@ -375,6 +441,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                 "youtube" -> "https://www.youtube.com/watch?v=$it"
                 "bilibili" -> "https://www.bilibili.com/video/$it"
                 "vimeo" -> "https://vimeo.com/$it"
+                "tiktok" -> "https://www.tiktok.com/embed/v2/$it"
                 else -> null
             }
         }
@@ -458,7 +525,19 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             }
             if (element?.hasClass("onebox") == true) {
                 flush()
-                oneboxBlockOf(element)?.let(output::add)
+                if (element.normalName() == "img") {
+                    pictureBlockOf(element)?.let(output::add)
+                } else if (
+                    element.hasClass("video-onebox") ||
+                    element.hasClass("audio-onebox") ||
+                    element.select("video, audio, .video-placeholder-container, .lazy-video-container").isNotEmpty()
+                ) {
+                    output += blocks(element.childNodes())
+                } else if (element.normalName() != "aside" && element.select(CONTENT_IMAGES).isNotEmpty()) {
+                    element.select(CONTENT_IMAGES).mapNotNullTo(output, ::pictureBlockOf)
+                } else {
+                    oneboxBlockOf(element)?.let(output::add)
+                }
                 continue
             }
             if (element != null && (element.hasClass("lightbox-wrapper") || element.hasClass("lightbox"))) {
@@ -468,13 +547,44 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             }
             when (element?.normalName()) {
                 "script", "style", "noscript" -> Unit
+                "svg" -> {
+                    svgBlockOf(element)?.let {
+                        flush()
+                        output += it
+                    }
+                }
+                "iframe" -> {
+                    flush()
+                    val src = contentUrl(element.attr("src").ifBlank { element.attr("data-src") })
+                    if (src != null) {
+                        val host = runCatching { URI(src).host?.removePrefix("www.") }.getOrNull().orEmpty()
+                        val title = element.attr("title").ifBlank {
+                            when {
+                                host.contains("bilibili.com") -> "Bilibili 嵌入视频"
+                                host.contains("youtube.com") || host.contains("youtube-nocookie.com") -> "YouTube 嵌入视频"
+                                host.contains("vimeo.com") -> "Vimeo 嵌入视频"
+                                else -> "嵌入内容 (${host.ifBlank { "点击打开" }})"
+                            }
+                        }
+                        output += CookedBlock.Onebox(src, title, "点击打开嵌入内容")
+                    }
+                }
                 "video", "audio" -> {
                     flush()
                     val source = if (contentUrl(element.attr("src")) != null) element
                         else element.select("source[src]").firstOrNull { contentUrl(it.attr("src")) != null }
                     val url = source?.attr("src")?.let(::contentUrl)
+                        ?: element.selectFirst("a[href]")?.attr("href")?.let(::contentUrl)
                     if (url != null) {
-                        val mimeType = source.attr("type").takeIf { it.startsWith("audio/") || it.startsWith("video/") || it == "application/x-mpegURL" || it == "application/vnd.apple.mpegurl" }
+                        val rawType = source?.attr("type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                        val ext = runCatching { URI(url).path.substringAfterLast('.', "").lowercase() }.getOrDefault("")
+                        val isProgressiveExt = ext in (VIDEO_EXTENSIONS - "m3u8") || ext in AUDIO_EXTENSIONS
+                        val mimeType = rawType.takeIf {
+                            it.startsWith("audio/") || it.startsWith("video/") ||
+                                (!isProgressiveExt && (it == "application/x-mpegurl" || it == "application/vnd.apple.mpegurl" || it == "application/dash+xml"))
+                        }
+                        val w = element.attr("width").toIntOrNull()?.takeIf { it > 0 } ?: 0
+                        val h = element.attr("height").toIntOrNull()?.takeIf { it > 0 } ?: 0
                         output += if (element.normalName() == "audio") CookedBlock.Audio(
                             url, element.attr("title").ifBlank { "音频" }, mimeType,
                         ) else CookedBlock.Video(
@@ -482,18 +592,31 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                             posterUrl = contentUrl(element.attr("poster")),
                             title = element.attr("title").ifBlank { "视频" },
                             mimeType = mimeType,
+                            width = w,
+                            height = h,
                         )
                     }
                 }
                 "a" -> {
                     val href = mediaLink(element.attr("href"), VIDEO_EXTENSIONS)
                     val audio = mediaLink(element.attr("href"), AUDIO_EXTENSIONS)
-                    if (href != null) {
+                    val image = if (!element.hasClass("attachment") && !element.hasAttr("download")) {
+                        mediaLink(element.attr("href"), IMAGE_EXTENSIONS)
+                    } else null
+                    val innerPictures = element.select(CONTENT_IMAGES).mapNotNull(::pictureBlockOf) +
+                        element.select("svg:not(.d-icon):not(.svg-icon):not(.fa)").mapNotNull(::svgBlockOf)
+                    if (innerPictures.isNotEmpty() && element.text().isBlank()) {
+                        flush()
+                        output += innerPictures
+                    } else if (href != null) {
                         flush()
                         output += CookedBlock.Video(href, title = element.text().ifBlank { "播放视频" })
                     } else if (audio != null) {
                         flush()
                         output += CookedBlock.Audio(audio, element.text().ifBlank { "音频" })
+                    } else if (image != null) {
+                        flush()
+                        output += CookedBlock.Picture(url = image, originalUrl = image, description = element.text().ifBlank { "帖子图片" })
                     } else pending += inline(element)
                 }
                 "details" -> {
@@ -513,7 +636,15 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                 "aside" -> {
                     flush()
                     if (element.hasClass("onebox")) {
-                        oneboxBlockOf(element)?.let(output::add)
+                        if (
+                            element.hasClass("video-onebox") ||
+                            element.hasClass("audio-onebox") ||
+                            element.select("video, audio, .video-placeholder-container, .lazy-video-container").isNotEmpty()
+                        ) {
+                            output += blocks(element.childNodes())
+                        } else {
+                            oneboxBlockOf(element)?.let(output::add)
+                        }
                     } else {
                         val children = blocks(element.childNodes())
                         output += if (element.hasClass("quote")) listOf(CookedBlock.Quote(children)) else children
@@ -553,7 +684,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     output += blocks(element.childNodes())
                 }
                 else -> {
-                    if (element != null && element.select("$CONTENT_IMAGES, video, audio, details, table, .lazy-video-container, .video-placeholder-container, .d-image-grid").isNotEmpty()) {
+                    if (element != null && element.select("$CONTENT_IMAGES, svg:not(.d-icon):not(.svg-icon):not(.fa), iframe, video, audio, details, table, .lazy-video-container, .video-placeholder-container, .d-image-grid").isNotEmpty()) {
                         flush()
                         output += blocks(element.childNodes())
                     } else pending += inline(node)
