@@ -8715,8 +8715,9 @@ private suspend fun saveMediaToPublicStorage(
             val request = Request.Builder().url(url).get().build()
             var response = container.httpClient.newCall(request).execute()
             if (response.code == 403 && response.header("cf-mitigated") != null) {
+                val challengedHost = response.request.url.host
                 response.close()
-                val cleared = container.browser.clearChallenge("download")
+                val cleared = container.browser.clearChallenge("download", requestHost = challengedHost)
                 if (cleared) {
                     response = container.httpClient.newCall(request).execute()
                 } else {

@@ -79,9 +79,14 @@ class App : Application(), ImageLoaderFactory {
                     object : org.linuxdo.android.push.PushSessionProvider {
                         override fun hasSession(): Boolean = store.hasSession()
                         override fun isBackgroundNotificationEnabled(): Boolean = store.isBackgroundNotificationEnabled()
+                        override fun backgroundRequestDelayMs(): Long = maxOf(
+                            org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
+                            if (store.isClearanceRecoveryInProgress() || store.sessionChanging) 1_000L else 0L,
+                        )
                         override fun getCookie(): String = store.storedCookies().entries.joinToString("; ") { "${it.key}=${it.value}" }
                         override fun getUserAgent(): String = container.userAgent
                         override fun getUserId(): Long = store.currentUserId()
+                        override fun getSessionGeneration(): Long = store.sessionGeneration
                         override fun saveUserId(id: Long) = store.saveCurrentUserId(id)
                         override fun getLastSeenNotificationId(): Long = store.getLastSeenNotificationId()
                         override fun setLastSeenNotificationId(id: Long) = store.setLastSeenNotificationId(id)
@@ -103,7 +108,7 @@ class App : Application(), ImageLoaderFactory {
                     }
                 },
                 logger = { key, message, force ->
-                    // container.diagnostics.logThrottled(key, message, force)
+                    container.diagnostics.logThrottled(key, message, force)
                 }
             )
         )

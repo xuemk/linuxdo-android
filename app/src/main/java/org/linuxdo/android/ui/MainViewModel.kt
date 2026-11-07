@@ -1001,6 +1001,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var cdkScoreBackoffUntil: Long = 0L
     private val connectManualRefreshTimestamps = mutableListOf<Long>()
     private var connectSilentBackoffUntil: Long = 0L
+    private var ldcBackoffUntil: Long = 0L
+    private val ldcFetchGate = Mutex()
+    private var ldcLastAttempt: Pair<Long, Result<LdcUserInfo>>? = null
+
+    private fun connectSessionCheck(username: String): () -> Unit {
+        val userId = store.currentUserId()
+        val generation = store.sessionGeneration
+        return {
+            if (store.sessionChanging || store.sessionGeneration != generation ||
+                store.currentUserId() != userId || _state.value.username?.equals(username, ignoreCase = true) != true) {
+                throw CancellationException("账号已切换，取消等级积分更新")
+            }
+        }
+    }
+
+    private fun siteFailureDelayMs(error: Exception): Long = when (error) {
+        is RateLimitException -> error.retryAfterMs.coerceAtLeast(1_000L)
+        is NeedsInteractiveVerification -> Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
+        is HttpStatusException -> if (error.status == 401 || error.status == 403) Config.CONNECT_SILENT_REFRESH_BACKOFF_MS else 30_000L
+        else -> 30_000L
+    }
+
+    private suspend fun <T> readSiteWithAuthorization(
+        checkSession: () -> Unit,
+        read: suspend () -> T,
+        authorize: suspend () -> Boolean,
+    ): T {
+        checkSession()
+        val result = try {
+            repository.readAfterShortCooldown { checkSession(); read() }
+        } catch (error: HttpStatusException) {
+            checkSession()
+            if (error.status != 401) throw error
+            if (!authorize()) throw error
+            checkSession()
+            repository.readAfterShortCooldown { checkSession(); read() }
+        }
+        checkSession()
+        return result
+    }
+
+    private suspend fun fetchAuthorizedLdc(username: String, checkSession: () -> Unit): LdcUserInfo {
+        val queuedAt = SystemClock.elapsedRealtime()
+        return ldcFetchGate.withLock {
+            checkSession()
+            // 同一轮已排队请求共享成功或失败，避免预热失败后手动请求紧接着重复 OAuth。
+            ldcLastAttempt?.takeIf { it.first >= queuedAt }?.let { return@withLock it.second.getOrThrow() }
+            try {
+                val info = readSiteWithAuthorization(checkSession, { repository.fetchLdcUserInfo() }, { repository.authorizeLdc() })
+                check(info.username.equals(username, ignoreCase = true)) { "积分账号与当前账号不一致，请重新授权" }
+                ldcLastAttempt = SystemClock.elapsedRealtime() to Result.success(info)
+                info
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                checkSession()
+                ldcLastAttempt = SystemClock.elapsedRealtime() to Result.failure(error)
+                throw error
+            }
+        }
+    }
 
     private fun checkConnectManualRefreshRateLimit(): Boolean {
         val now = System.currentTimeMillis()
@@ -1033,69 +1094,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun connectFirstFetchLockMessage(remainingMs: Long): String {
         val minutes = ((remainingMs + 59_999L) / 60_000L).coerceAtLeast(1L)
-        return "首次获取需错峰，后台稍后会自动拉取；约 $minutes 分钟后可手动刷新"
+        return "首次获取正在错峰，后台会尝试获取；约 $minutes 分钟后可手动刷新"
     }
 
     private var idleWarmupJob: Job? = null
 
     private fun scheduleIdleConnectWarmup() {
-        idleWarmupJob?.cancel()
-        idleWarmupJob = viewModelScope.launch(Dispatchers.IO) {
+        if (idleWarmupJob?.isActive == true) return
+        val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
+        idleWarmupJob = viewModelScope.launch {
             // 冷启动首轮不早于进程启动 2 分钟，避开首屏请求峰值；之后的触发至少再等 30 秒
             delay(maxOf(
                 Config.CONNECT_IDLE_WARMUP_DELAY_MS,
                 Config.CONNECT_FIRST_WARMUP_AFTER_START_MS - sinceProcessStartMs(),
             ))
-            if (!isActive) return@launch
-            val username = _state.value.username ?: return@launch
-            val now = System.currentTimeMillis()
+            suspend fun awaitQuietWindow() {
+                checkSession()
+                while (!store.isAppInForeground() || store.isClearanceRecoveryInProgress() || repository.isRateLimitCoolingDown()) {
+                    delay(maxOf(5_000L, TopicRepository.rateLimitRemainingMs()))
+                    checkSession()
+                }
+            }
+            repeat(2) { round ->
+                awaitQuietWindow()
+                var retryAfterMs = 0L
+                val now = System.currentTimeMillis()
+                val cachedTrust = repository.getCachedTrustReport(username)
+                if (cachedTrust == null || now - cachedTrust.second >= Config.TRUST_REPORT_CACHE_TTL_MS) {
+                    if (now >= connectSilentBackoffUntil) {
+                        try {
+                            val fresh = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                            checkSession()
+                            if (fresh != null) {
+                                val updateTime = System.currentTimeMillis()
+                                repository.saveCachedTrustReport(username, fresh)
+                                _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null) }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            connectSilentBackoffUntil = System.currentTimeMillis() + pause
+                            if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
+                            diagnostics.log("等级预热暂缓: ${e.message}")
+                        }
+                    }
+                }
 
-            // 1. 检查升级进度是否超过 6 小时
-            val cachedTrust = repository.getCachedTrustReport(username)
-            if (cachedTrust == null || now - cachedTrust.second >= Config.TRUST_REPORT_CACHE_TTL_MS) {
-                if (now >= connectSilentBackoffUntil) {
-                    try {
-                        val fresh = repository.fetchTrustReport()
-                        if (fresh != null) {
+                // 两个接口之间错峰间隔 6 秒，杜绝并发特征
+                delay(6_000L)
+                awaitQuietWindow()
+
+                // 2. 检查等级积分是否超过 6 小时
+                val cachedLdc = repository.getCachedLdcUserInfo(username)
+                if (cachedLdc == null || now - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
+                    if (System.currentTimeMillis() >= ldcBackoffUntil) {
+                        try {
+                            val fresh = fetchAuthorizedLdc(username, checkSession)
+                            checkSession()
                             val updateTime = System.currentTimeMillis()
-                            repository.saveCachedTrustReport(username, fresh)
-                            _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null) }
-                        }
-                    } catch (e: Exception) {
-                        val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                        if (isRisk) {
-                            connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                        }
-                    }
-                }
-            }
-
-            // 两个接口之间错峰间隔 6 秒，杜绝并发特征
-            delay(6_000L)
-            if (!isActive) return@launch
-
-            // 2. 检查等级积分是否超过 6 小时
-            val cachedLdc = repository.getCachedLdcUserInfo(username)
-            if (cachedLdc == null || now - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
-                if (now >= connectSilentBackoffUntil) {
-                    try {
-                        val fresh = repository.fetchLdcUserInfo()
-                        val updateTime = System.currentTimeMillis()
-                        repository.saveCachedLdcUserInfo(username, fresh)
-                        _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
-                    } catch (e: Exception) {
-                        val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                        if (isRisk) {
-                            connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
+                            repository.saveCachedLdcUserInfo(username, fresh)
+                            _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            ldcBackoffUntil = System.currentTimeMillis() + pause
+                            if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
+                            _ldcState.update { it.copy(error = "积分预热暂缓: ${e.message}") }
+                            diagnostics.log("积分预热暂缓: ${e.message}")
                         }
                     }
                 }
-            }
 
-            // 两个接口之间同样错峰 6 秒，再取社区分
-            delay(6_000L)
-            if (!isActive) return@launch
-            loadCdkScore(fromWarmup = true)
+                // 两个接口之间同样错峰 6 秒，再取社区分
+                delay(6_000L)
+                awaitQuietWindow()
+                loadCdkScore(fromWarmup = true)
+                cdkScoreJob?.join()
+                checkSession()
+                val cdkRemaining = cdkScoreBackoffUntil - System.currentTimeMillis()
+                if (cdkRemaining in 1L..60_000L) retryAfterMs = maxOf(retryAfterMs, cdkRemaining)
+                if (round > 0 || retryAfterMs <= 0L) return@launch
+                delay(maxOf(30_000L, retryAfterMs))
+            }
         }
     }
     private val _chat = MutableStateFlow(ChatUiState())
@@ -3718,6 +3803,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadTrustReport(refresh: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val current = _trustReport.value
         val now = System.currentTimeMillis()
 
@@ -3743,6 +3829,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新（首次进入或后台触发）
         if (!refresh) {
             if (current.loading) return
+            if (now < connectSilentBackoffUntil) return
             if (cached != null) {
                 val age = now - cached.second
                 // 若仍在 6 小时缓存有效期内，完全不发网络请求
@@ -3758,11 +3845,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val isSilent = !refresh && cached != null
         viewModelScope.launch {
+            checkSession()
             if (!isSilent) {
                 _trustReport.update { it.copy(loading = true, error = null) }
             }
             try {
-                val report = repository.fetchTrustReport()
+                val report = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                checkSession()
                 if (report != null) {
                     val updateTime = System.currentTimeMillis()
                     repository.saveCachedTrustReport(username, report)
@@ -3773,15 +3862,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                if (isRisk) {
-                    connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                }
+                checkSession()
+                connectSilentBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
                 if (!isSilent) {
                     _trustReport.update { it.copy(loading = false, error = e.message ?: "加载升级进度失败") }
                 }
             } finally {
-                if (!isSilent) {
+                if (!isSilent && runCatching { checkSession() }.isSuccess) {
                     _trustReport.update { it.copy(loading = false) }
                 }
             }
@@ -3793,11 +3880,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      *
      * 只读缓存不发请求；缓存过期(6 小时)才静默联网，且受三道保护：
      * 1. 本地没有缓存时，启动 10 分钟内交给后台预热([fromWarmup])错峰取，前台不抢；
-     * 2. 429/403 进入与 Connect/LDC 共用的熔断；任何失败 30 分钟内不再重试；
+     * 2. 短冷却到期后仅补取一次，真正授权/挑战失败才长期退避；
      * 3. 仅 CDK 返回 401(无会话)才做一次 OAuth 握手，握手结果是 Cookie，平时不重复握手。
      */
     fun loadCdkScore(fromWarmup: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val now = System.currentTimeMillis()
         var current = _cdkScore.value
         if (!current.username.equals(username, ignoreCase = true)) {
@@ -3811,36 +3899,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         if (current.score != null && now - current.cachedAt < Config.CDK_SCORE_CACHE_TTL_MS) return
-        if (now < connectSilentBackoffUntil || now < cdkScoreBackoffUntil) return
+        if (now < cdkScoreBackoffUntil) return
         if (current.score == null && !fromWarmup && connectFirstFetchLockRemainingMs(hasCache = false) > 0L) return
         if (cdkScoreJob?.isActive == true) return
         cdkScoreJob = viewModelScope.launch {
             try {
-                val score = try {
-                    repository.fetchCdkScore()
-                } catch (e: HttpStatusException) {
-                    if (e.status != 401) throw e
-                    diagnostics.log("CDK 社区分返回 401，触发一次应用内静默 OAuth 授权...")
-                    if (!repository.authorizeCdk()) throw e
-                    repository.fetchCdkScore()
-                }
-                if (_state.value.username?.equals(username, ignoreCase = true) != true) return@launch
+                val score = readSiteWithAuthorization(checkSession, { repository.fetchCdkScore() }, { repository.authorizeCdk() })
+                checkSession()
+                cdkScoreBackoffUntil = 0L
                 repository.saveCachedCdkScore(username, score)
                 _cdkScore.value = CdkScoreUiState(username, score, System.currentTimeMillis())
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                val failedAt = System.currentTimeMillis()
-                cdkScoreBackoffUntil = failedAt + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                if (isRisk) connectSilentBackoffUntil = failedAt + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                diagnostics.log("获取 CDK 社区分失败: ${e.message}")
+                checkSession()
+                val pause = siteFailureDelayMs(e)
+                cdkScoreBackoffUntil = System.currentTimeMillis() + pause
+                diagnostics.log("获取 CDK 社区分暂缓(${(pause + 999L) / 1_000L}s): ${e.message}")
             }
         }
     }
 
     fun loadLdcUserInfo(refresh: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val current = _ldcState.value
         val now = System.currentTimeMillis()
 
@@ -3866,12 +3948,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新
         if (!refresh) {
             if (current.loading) return
+            if (now < ldcBackoffUntil) return
             if (cached != null) {
                 val age = now - cached.second
                 // 若仍在 4 小时缓存有效期内（3-6小时区间），完全不发网络请求
                 if (age < Config.LDC_USER_INFO_CACHE_TTL_MS) return
                 // 若处于风控熔断退避期，静默跳过
-                if (now < connectSilentBackoffUntil) return
+                if (now < ldcBackoffUntil) return
             }
         } else {
             // 3. 手动刷新：严格检查 30 分钟内刷新频率（最多 5 次）
@@ -3880,46 +3963,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val isSilent = !refresh && cached != null
+        _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
         viewModelScope.launch {
-            if (!isSilent) {
-                _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
-            }
             try {
-                val info = repository.fetchLdcUserInfo()
+                val info = fetchAuthorizedLdc(username, checkSession)
+                checkSession()
+                ldcBackoffUntil = 0L
                 val updateTime = System.currentTimeMillis()
                 repository.saveCachedLdcUserInfo(username, info)
                 _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isExpired = (e as? HttpStatusException)?.let { it.status == 401 || it.status == 403 } ?: false
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                if (isRisk) {
-                    connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                }
-                if (isExpired && !isSilent) {
-                    diagnostics.log("LDC 积分信息返回 401/403，触发应用内静默 OAuth 授权...")
-                    val authorized = repository.authorizeLdc()
-                    if (authorized) {
-                        try {
-                            val info = repository.fetchLdcUserInfo()
-                            val updateTime = System.currentTimeMillis()
-                            repository.saveCachedLdcUserInfo(username, info)
-                            _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
-                            return@launch
-                        } catch (reErr: CancellationException) {
-                            throw reErr
-                        } catch (reErr: Exception) {
-                            diagnostics.log("LDC 授权后二次拉取失败: ${reErr.message}")
-                        }
-                    }
-                }
+                checkSession()
+                val isExpired = (e as? HttpStatusException)?.status == 401
+                ldcBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
                 if (!isSilent) {
                     val msg = if (isExpired) "积分授权已过期或未登录" else (e.message ?: "加载积分数据失败")
                     _ldcState.update { it.copy(loading = false, error = msg, isExpired = isExpired) }
                 }
             } finally {
-                if (!isSilent) {
+                if (runCatching { checkSession() }.isSuccess) {
                     _ldcState.update { it.copy(loading = false) }
                 }
             }
@@ -3928,26 +3992,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun authorizeLdc() {
         if (_ldcState.value.loading) return
-        val username = _state.value.username ?: return
-        viewModelScope.launch {
-            _ldcState.update { it.copy(loading = true, error = null) }
-            diagnostics.log("用户手动触发 LDC 一键授权...")
-            val ok = repository.authorizeLdc()
-            if (ok) {
-                try {
-                    val info = repository.fetchLdcUserInfo()
-                    val updateTime = System.currentTimeMillis()
-                    repository.saveCachedLdcUserInfo(username, info)
-                    _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    _ldcState.update { it.copy(loading = false, error = "授权成功但拉取积分失败: ${e.message}", isExpired = false) }
-                }
-            } else {
-                _ldcState.update { it.copy(loading = false, error = "一键授权失败，请确认是否已登录论坛", isExpired = true) }
-            }
-        }
+        diagnostics.log("用户手动刷新 LDC，先复核已有授权，仅在 401 时重新授权")
+        loadLdcUserInfo(refresh = true)
     }
 
     fun loadProfile(section: ProfileSection, refresh: Boolean = false, more: Boolean = false) {
@@ -6368,15 +6414,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             canProbeIncomingTopics()
         }
         if (!canProbe() || !store.isAutoRefreshIncomingEnabled() || repository.isRateLimitCoolingDown()) return
-        if (repository.isSilentPrefetchBackingOff()) return
+        if (repository.isSilentPrefetchBackingOff() || store.shouldPauseBackgroundForChallengedClearance()) return
         val probeGen = ++incomingProbeGeneration
         if (!canProbe() || probeGen != incomingProbeGeneration) return
         if (repository.isRateLimitCoolingDown()) return
         scrollBusySignal.awaitIdle()
         if (!canProbe() || probeGen != incomingProbeGeneration) return
-        if (repository.isSilentPrefetchBackingOff()) return
+        if (repository.isSilentPrefetchBackingOff() || store.shouldPauseBackgroundForChallengedClearance()) return
         // 等滚动停下后再申请准入，前台让行窗口才能看到用户刚触发的请求
         if (!ApiQuotaPool.INCOMING_PROBE.tryAcquire()) return
+        fun checkBeforeDispatch() {
+            check(canProbe() && probeGen == incomingProbeGeneration && store.isAutoRefreshIncomingEnabled() &&
+                !repository.isRateLimitCoolingDown() && !repository.isSilentPrefetchBackingOff() &&
+                !store.shouldPauseBackgroundForChallengedClearance()) { "后台新话题探测已暂停" }
+        }
         try {
             if (categoryId != null) {
                 val currentCategoryState = _categoryTopics.value[categoryId] ?: return
@@ -6385,7 +6436,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val slug = category?.slug ?: activeCategory?.takeIf { it.first == categoryId }?.second ?: "c"
                 val sortOrder = _topicSortOrder.value.apiValue
                 val sortAscending = _topicSortAscending.value.takeIf { sortOrder != null }
-                val freshPage = repository.fetchCategoryTopics(slug, categoryId, 0, present = false, order = sortOrder, ascending = sortAscending)
+                val freshPage = repository.fetchCategoryTopics(
+                    slug, categoryId, 0, present = false, order = sortOrder, ascending = sortAscending,
+                    beforeDispatch = ::checkBeforeDispatch,
+                )
                 ApiQuotaPool.INCOMING_PROBE.onSuccess()
                 if (!canProbe() || probeGen != incomingProbeGeneration) return
                 updateListCounters(freshPage.items)
@@ -6414,7 +6468,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (currentFeedState.items.isEmpty()) return
                 val sortOrder = _topicSortOrder.value.apiValue
                 val sortAscending = _topicSortAscending.value.takeIf { sortOrder != null }
-                val freshPage = repository.fetchFeed(feed, 0, awaitCategories = false, present = false, order = sortOrder, ascending = sortAscending)
+                val freshPage = repository.fetchFeed(
+                    feed, 0, awaitCategories = false, present = false, order = sortOrder, ascending = sortAscending,
+                    beforeDispatch = ::checkBeforeDispatch,
+                )
                 ApiQuotaPool.INCOMING_PROBE.onSuccess()
                 if (!canProbe() || probeGen != incomingProbeGeneration) return
                 updateListCounters(freshPage.items)
@@ -7636,6 +7693,10 @@ fun openTopicSearch(topicId: Long, title: String) {
     suspend fun pollVerification() {
         if (verifying) return
         if (_state.value.screen == Screen.Verify) {
+            if (store.currentUserId() != verificationUserId || store.sessionGeneration != verificationSessionGeneration) {
+                cancelVerification()
+                return
+            }
             if (restartVerificationIfNetworkChanged()) return
             if (verificationMismatch) return
             val attempt = verificationAttempt
@@ -7648,32 +7709,52 @@ fun openTopicSearch(topicId: Long, title: String) {
                     return
                 }
                 if (now < verifyCompletionProbeNotBefore) return
-                verifying = true
-                val outcome = try {
-                    repository.probeClearanceAfterVerification(probePath)
-                } finally {
-                    verifying = false
-                }
-                if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
-                if (restartVerificationIfNetworkChanged()) return
-                when (outcome) {
-                    TopicRepository.VerificationProbeOutcome.CLEARED -> {
-                        val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
-                        if (postProbeCooldownMs > 0L) {
-                            verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + postProbeCooldownMs
+                val candidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
+                if (verificationConfirmedCandidateFp != candidateFp) {
+                    verificationConfirmedCandidateFp = null
+                    if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+                        scheduleVerificationConfirmation("本轮复核预算已用完")
+                        return
+                    }
+                    verifying = true
+                    val outcome = try {
+                        repository.probeClearanceAfterVerification(probePath)
+                    } catch (cancelled: CancellationException) {
+                        if (attempt != verificationAttempt || store.sessionGeneration != verificationSessionGeneration ||
+                            store.currentUserId() != verificationUserId) return
+                        throw cancelled
+                    } finally {
+                        if (attempt == verificationAttempt) verifying = false
+                    }
+                    if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+                    if (restartVerificationIfNetworkChanged()) return
+                    if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) verificationProbeAttempts++
+                    val currentCandidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
+                    if (candidateFp != currentCandidateFp) {
+                        scheduleVerificationConfirmation("候选凭据已更新，忽略旧请求结果")
+                        return
+                    }
+                    when (outcome) {
+                        TopicRepository.VerificationProbeOutcome.CLEARED -> {
+                            verificationConfirmedCandidateFp = candidateFp
+                            val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
+                            if (postProbeCooldownMs > 0L) {
+                                verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + postProbeCooldownMs
+                                return
+                            }
+                        }
+                        TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
+                            scheduleVerificationConfirmation("App 请求仍受挑战")
                             return
                         }
-                    }
-                    TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
-                        verificationMismatch = true
-                        browser.logVerifyGeckoEgress()
-                        diagnostics.log("验证页已通过，但 App 请求仍被 Cloudflare 挑战，提示用户切换网络后重试")
-                        return
-                    }
-                    TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
-                        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
-                        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + waitMs
-                        return
+                        TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
+                            scheduleVerificationConfirmation("App 请求暂未确认恢复")
+                            return
+                        }
+                        TopicRepository.VerificationProbeOutcome.DEFERRED -> {
+                            scheduleVerificationConfirmation("等待已有冷却结束")
+                            return
+                        }
                     }
                 }
             } else {
@@ -7695,7 +7776,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                 val outcome = try {
                     repository.probeAppPathDuringVerification(probePath)
                 } finally {
-                    verifying = false
+                    if (attempt == verificationAttempt) verifying = false
                 }
                 if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
                 if (restartVerificationIfNetworkChanged()) return
@@ -7717,8 +7798,11 @@ fun openTopicSearch(topicId: Long, title: String) {
                 diagnostics.log("验证页未收口，但 App 请求通道已不被 Cloudflare 挑战，直接结束验证并恢复操作")
             }
             if (TopicRepository.isRateLimitCoolingDown()) return
+            store.completeVerification()
             verificationProbePath = null
             verifyCompletionProbeNotBefore = 0L
+            verificationProbeAttempts = 0
+            verificationConfirmedCandidateFp = null
             repository.clearCachedCsrfToken()
             unreadChallengeBackoffUntil = 0L
             if (verificationFromReadSync || _readSyncVerifyBanner.value) {
@@ -7726,7 +7810,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                 _readSyncVerifyBanner.value = false
                 readSyncVerificationProbePath = null
                 repository.onManualVerificationCompleted()
-                diagnostics.log("阅读同步手工验证完成，后续阅读进度改走 WebView 网络栈")
+                diagnostics.log("阅读同步手工验证完成，优先尝试可用的 WebView 通道，否则继续使用 App 通道")
             }
             val resume = resumeAfterVerification
             resumeAfterVerification = null
@@ -8195,6 +8279,12 @@ fun openTopicSearch(topicId: Long, title: String) {
         _ldcState.value = LdcUiState()
         connectManualRefreshTimestamps.clear()
         connectSilentBackoffUntil = 0L
+        ldcBackoffUntil = 0L
+        ldcLastAttempt = null
+        cdkScoreJob?.cancel()
+        cdkScoreJob = null
+        cdkScoreBackoffUntil = 0L
+        _cdkScore.value = CdkScoreUiState()
         idleWarmupJob?.cancel()
         idleWarmupJob = null
         autoProbeJob?.cancel()
@@ -8248,6 +8338,11 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     private suspend fun enterWebScreen(screen: Screen, reason: String = "", probePath: String? = null) {
+        if (screen == Screen.Verify) {
+            val accountGeneration = store.sessionGeneration
+            verificationCleanupJob?.join()
+            if (accountGeneration != store.sessionGeneration) return
+        }
         if (screen == Screen.Verify && _state.value.screen == Screen.Verify) return
         if (screen == Screen.Verify) {
             verificationReturnScreen = _state.value.screen
@@ -8256,6 +8351,11 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationProbePath = repository.resolveVerificationProbePath(probePath)
             verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
             verifyCompletionProbeNotBefore = 0L
+            verificationProbeAttempts = 0
+            verificationConfirmedCandidateFp = null
+            verificationUserId = store.currentUserId()
+            verificationSessionGeneration = store.sessionGeneration
+            verifying = false
             verificationAttempt++
             armAppPathProbe()
             store.requireVerification()
@@ -8277,6 +8377,22 @@ fun openTopicSearch(topicId: Long, title: String) {
     private var verificationNetworkGeneration = 0L
     /** 验证完成后复核若遇 0 / 429 / 5xx 暂时无法判断，退避到此时间后再重探。 */
     private var verifyCompletionProbeNotBefore = 0L
+    private var verificationProbeAttempts = 0
+    private var verificationConfirmedCandidateFp: String? = null
+    private var verificationUserId = 0L
+    private var verificationSessionGeneration = 0L
+    private var verificationCleanupJob: Job? = null
+
+    private fun scheduleVerificationConfirmation(reason: String) {
+        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+            verificationMismatch = true
+            diagnostics.log("App 连接复核 ${verificationProbeAttempts} 次仍未确认，停止自动复核，保留手动重试")
+            return
+        }
+        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
+        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + waitMs
+        diagnostics.log("$reason (${verificationProbeAttempts}/$MAX_VERIFICATION_CONFIRMATION_PROBES)，保留候选凭据，${(waitMs + 999L) / 1_000L}s 后复核")
+    }
 
     /**
      * 阅读同步被 CF 风控时的非打断式横幅，表示「阅读同步当前处于受阻状态」，而不是一次性事件：
@@ -8308,7 +8424,7 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
     private var verificationDismissed = false
 
-    /** 验证页已通过但 OkHttp 复核仍被挑战；置位后停止轮询，等用户换网络后点重试。 */
+    /** 有限次数的 App 复核仍未确认恢复；停止自动请求，等待用户重试或返回。 */
     @Volatile private var verificationMismatch = false
 
     /** 每次进入或重试验证递增，丢弃上一轮迟到的复核结果。 */
@@ -8328,10 +8444,13 @@ fun openTopicSearch(topicId: Long, title: String) {
         verificationMismatch = false
         verificationProbePath = null
         verifyCompletionProbeNotBefore = 0L
+        verificationProbeAttempts = 0
+        verificationConfirmedCandidateFp = null
+        verifying = false
         verificationAttempt++
         resumeAfterVerification = null
         _state.update { it.copy(screen = if (verificationReturnScreen == Screen.Boot) Screen.Login else verificationReturnScreen) }
-        viewModelScope.launch {
+        verificationCleanupJob = viewModelScope.launch {
             browser.stopSessionRequests()
             browser.restoreClearanceIfVerificationAbandoned()
         }
@@ -8347,10 +8466,23 @@ fun openTopicSearch(topicId: Long, title: String) {
     fun retryVerification() {
         verificationMismatch = false
         verifyCompletionProbeNotBefore = 0L
+        verificationProbeAttempts = 0
+        verificationConfirmedCandidateFp = null
+        verificationUserId = store.currentUserId()
+        verificationSessionGeneration = store.sessionGeneration
+        verifying = false
+        store.requireVerification()
         verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
         verificationAttempt++
         armAppPathProbe()
-        viewModelScope.launch { browser.beginInteractiveVerification() }
+        val attempt = verificationAttempt
+        viewModelScope.launch {
+            verificationCleanupJob?.join()
+            if (attempt != verificationAttempt || _state.value.screen != Screen.Verify ||
+                store.sessionGeneration != verificationSessionGeneration || store.currentUserId() != verificationUserId) return@launch
+            store.requireVerification()
+            browser.beginInteractiveVerification()
+        }
     }
 
     private fun restartVerificationIfNetworkChanged(): Boolean {
@@ -8498,6 +8630,7 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     private companion object {
+        private const val MAX_VERIFICATION_CONFIRMATION_PROBES = 3
         /** 长帖切倒序时一次拉取的尾部楼层数,与 fetchPosts 的单批上限一致。 */
         const val TAIL_WINDOW = 20
 

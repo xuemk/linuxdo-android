@@ -365,7 +365,7 @@ private fun VerifyLoadingLayer(
         val failure = when (state) {
             BrowserSession.VerifyPageState.STALLED -> "验证未完成" to "验证页面加载失败，请检查网络后重试"
             BrowserSession.VerifyPageState.MISMATCH ->
-                "验证未生效" to "网页验证已通过，但 App 的请求仍被 Cloudflare 拦截。请切换网络（如开关代理或换移动数据/Wi-Fi）后重试"
+                "App 连接尚未恢复" to "请稍后重试。"
             else -> null
         }
         if (failure != null) {
@@ -388,9 +388,13 @@ private fun VerifyLoadingLayer(
         } else {
             IosActivityIndicator(diameter = 28.dp)
             Text(
-                text = "正在连接安全验证服务…",
+                text = if (state == BrowserSession.VerifyPageState.CONFIRMING) {
+                    "网页验证已完成，正在确认 App 连接。\n遇到限流时会等待后复核。"
+                } else "正在连接安全验证服务…",
                 color = IosTheme.colors.secondaryLabel,
                 fontSize = 14.sp,
+                lineHeight = 20.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 modifier = Modifier.padding(top = 12.dp),
             )
         }

@@ -1,5 +1,7 @@
 package org.linuxdo.android.net
 
+import android.net.Uri
+import org.linuxdo.android.Config
 import org.linuxdo.android.data.Diagnostics
 
 /** 路径 B:所有请求在 WebView 内用 fetch() 发出;遇到挑战同样静默重验证并重试一次。 */
@@ -21,7 +23,8 @@ class WebViewFetchTransport(
 
     override suspend fun get(path: String, present: Boolean): TransportResult {
         var result = browser.fetchJson(path, present = present)
-        if (result.challenged && revalidate(path)) {
+        val requestHost = Uri.parse(path).host ?: Config.HOST
+        if (result.challenged && revalidate(path, requestHost = requestHost)) {
             result = browser.fetchJson(path, present = present)
         }
         return result
@@ -30,9 +33,12 @@ class WebViewFetchTransport(
     override suspend fun getWithoutRevalidate(path: String, present: Boolean): TransportResult =
         browser.fetchJson(path, present = present, allowRevalidate = false)
 
-    override suspend fun revalidate(reason: String, failedClearanceFp: String): Boolean {
+    override suspend fun getForVerification(path: String, present: Boolean): TransportResult =
+        getWithoutRevalidate(path, present)
+
+    override suspend fun revalidate(reason: String, failedClearanceFp: String, requestHost: String): Boolean {
         diagnostics.recordSilentRevalidation()
-        return browser.clearChallenge("B: $reason", failedClearanceFp)
+        return browser.clearChallenge("B: $reason", failedClearanceFp, requestHost)
     }
 
     override suspend fun ensureReady(): Boolean = browser.ensureReady()

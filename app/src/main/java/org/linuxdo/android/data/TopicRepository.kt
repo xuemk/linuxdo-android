@@ -4,6 +4,7 @@ import android.os.SystemClock
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -220,7 +221,6 @@ class TopicRepository(
     private val httpClientProvider: (() -> OkHttpClient)? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
-    private val ldcAuthGate = Mutex()
     private val csrfGate = Mutex()
     private val pollingConfigGate = Mutex()
     private var pollingConfigGeneration: Long? = null
@@ -244,6 +244,8 @@ class TopicRepository(
     /** 429 冷却期间，后台任务应直接退让，不能把限流误当作需要过盾。 */
     fun isRateLimitCoolingDown(): Boolean = Companion.isRateLimitCoolingDown()
 
+    fun isNonChallengeRateLimitCoolingDown(): Boolean = Companion.isNonChallengeRateLimitCoolingDown()
+
     /** 后台静默预取（首楼摘要、新话题探测）撞盾后的退避期内，这类请求一律不发。 */
     fun isSilentPrefetchBackingOff(): Boolean =
         SystemClock.elapsedRealtime() < silentPrefetchBackoffUntil
@@ -256,7 +258,8 @@ class TopicRepository(
      */
     fun enterSilentPrefetchBackoff(error: Throwable): Boolean {
         val challenged = error is NeedsInteractiveVerification ||
-            (error is HttpStatusException && error.status == 403)
+            (error is HttpStatusException && error.status == 403) ||
+            (error is RateLimitException && isChallengeOnlyRateLimitCoolingDown())
         if (!challenged) return false
         val wasBackingOff = isSilentPrefetchBackingOff()
         silentPrefetchBackoffUntil = SystemClock.elapsedRealtime() + SILENT_PREFETCH_BACKOFF_MS
@@ -273,6 +276,44 @@ class TopicRepository(
         if (remaining > 0L) throw RateLimitException(remaining)
     }
 
+    private fun requestHost(path: String): String = Config.BASE_URL.toHttpUrl().resolve(path)?.host
+        ?: throw IllegalArgumentException("请求地址无效")
+
+    private fun checkSiteSession(userId: Long?, generation: Long?) {
+        val store = sessionStore ?: return
+        if (store.sessionChanging || store.currentUserId() != userId || store.sessionGeneration != generation) {
+            throw CancellationException("账号已切换，取消子站请求")
+        }
+    }
+
+    private fun throwIfSiteCoolingDown(host: String) {
+        if (host == Config.HOST) return
+        val remaining = synchronized(siteRateLimitedUntil) {
+            ((siteRateLimitedUntil[host] ?: 0L) - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+        if (remaining > 0L) throw RateLimitException(remaining)
+    }
+
+    private fun noteRequestClearanceChallenged(value: String, path: String) {
+        val url = Config.BASE_URL.toHttpUrl().resolve(path) ?: return
+        sessionStore?.noteClearanceChallenged(value, host = url.host, source = "request ${url.host}${url.encodedPath}")
+    }
+
+    /** 授权成功后的数据请求若仅被短暂调度冷却拦住，等待一次即可，无需再次授权。 */
+    suspend fun <T> readAfterShortCooldown(read: suspend () -> T): T {
+        val userId = sessionStore?.currentUserId()
+        val generation = sessionStore?.sessionGeneration
+        checkSiteSession(userId, generation)
+        return try {
+            read().also { checkSiteSession(userId, generation) }
+        } catch (limited: RateLimitException) {
+            if (limited.retryAfterMs !in 1L..15_000L) throw limited
+            delay(limited.retryAfterMs)
+            checkSiteSession(userId, generation)
+            read().also { checkSiteSession(userId, generation) }
+        }
+    }
+
     fun clearTimingsCache() {
         Companion.clearTimingsCache(sessionStore?.currentUserId())
     }
@@ -282,6 +323,18 @@ class TopicRepository(
         retryAfterSeconds: Long? = null,
         cfChallenge: Boolean = false,
     ): RateLimitException {
+        val host = requestHost(path)
+        if (host != Config.HOST) {
+            val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(retryAfterSeconds, RATE_LIMIT_COOLDOWN_MS)
+            val remaining = synchronized(siteRateLimitedUntil) {
+                val now = SystemClock.elapsedRealtime()
+                val until = maxOf(siteRateLimitedUntil[host] ?: 0L, now + cooldownMs)
+                siteRateLimitedUntil[host] = until
+                until - now
+            }
+            diagnostics.log("子站限流(${if (cfChallenge) "CF质询" else "429"}): $host，暂停该站请求 ${(remaining + 999L) / 1_000L}s")
+            return RateLimitException(remaining)
+        }
         val remaining = Companion.enterRateLimitCooldown(path, retryAfterSeconds, sessionStore, cfChallenge)
         val kind = if (cfChallenge) "CF质询" else "429"
         diagnostics.log(
@@ -364,6 +417,7 @@ class TopicRepository(
         present: Boolean = true,
         order: String? = null,
         ascending: Boolean? = null,
+        beforeDispatch: (() -> Unit)? = null,
     ): TopicPage {
         val excludeRead = feed == HomeFeedType.Unread
         val query = buildList {
@@ -372,7 +426,7 @@ class TopicRepository(
             if (ascending != null) add("ascending=$ascending")
         }.joinToString("&")
         val path = "${feed.apiPath}?$query"
-        val body = request(path, burst = page == 0, present = present, retryAllowed = present)
+        val body = request(path, burst = page == 0, present = present, retryAllowed = present, beforeDispatch = beforeDispatch)
         val result = withContext(Dispatchers.Default) {
             toPage(
                 response = json.decodeFromString(body),
@@ -395,6 +449,7 @@ class TopicRepository(
         present: Boolean = true,
         order: String? = null,
         ascending: Boolean? = null,
+        beforeDispatch: (() -> Unit)? = null,
     ): TopicPage {
         val query = buildList {
             add("page=$page")
@@ -406,6 +461,7 @@ class TopicRepository(
             burst = page == 0,
             present = present,
             retryAllowed = present,
+            beforeDispatch = beforeDispatch,
         )
         return withContext(Dispatchers.Default) {
             toPage(
@@ -667,11 +723,13 @@ class TopicRepository(
     }
 
     enum class VerificationProbeOutcome {
+        /** 已有冷却尚未结束，本轮没有发出请求，不计入实际探测次数。 */
+        DEFERRED,
         /** 站点返回明确的非挑战有效响应（2xx..4xx 且非 429），确认当前通道已放行。 */
         CLEARED,
         /** 仍被 Cloudflare 挑战拦截。 */
         CHALLENGED,
-        /** 暂时无法判断：处于 429 冷却期、本次触发 429、网络失败(0)或服务端异常(5xx)。 */
+        /** 已尝试请求但暂无法判断：429、网络失败、超时或服务端异常。 */
         INCONCLUSIVE,
     }
 
@@ -705,6 +763,9 @@ class TopicRepository(
         probePath: String?,
         afterCompletion: Boolean,
     ): VerificationProbeOutcome {
+        val userId = sessionStore?.currentUserId()
+        val generation = sessionStore?.sessionGeneration
+        checkSiteSession(userId, generation)
         val targetPath = resolveVerificationProbePath(probePath)
         val stageLabel = if (afterCompletion) "验证后凭据复核" else "验证页旁路探测"
         if (isRateLimitCoolingDown()) {
@@ -712,22 +773,24 @@ class TopicRepository(
                 "verify-probe-cooldown",
                 "$stageLabel: 429 冷却还剩 ${(rateLimitRemainingMs() + 999L) / 1_000L}s，跳过探测 $targetPath",
             )
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeOutcome.DEFERRED
         }
         val transport = transportProvider()
         val result = try {
             withTimeoutOrNull(VERIFY_PROBE_TIMEOUT_MS) {
-                transport.getWithoutRevalidate(targetPath, present = false)
+                transport.getForVerification(targetPath, present = false)
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
+            checkSiteSession(userId, generation)
             diagnostics.logThrottled(
                 "verify-probe-error",
                 "$stageLabel(${transport.name}): $targetPath 异常(${error.javaClass.simpleName})，暂无法判断",
             )
             return VerificationProbeOutcome.INCONCLUSIVE
         }
+        checkSiteSession(userId, generation)
         if (result == null) {
             diagnostics.logThrottled("verify-probe-timeout", "$stageLabel(${transport.name}): $targetPath 探测超时，继续等待")
             return VerificationProbeOutcome.INCONCLUSIVE
@@ -739,36 +802,15 @@ class TopicRepository(
                 isCfChallengeBody(result.body)
             )
         if (result.status == 429) {
-            if (challenge429) {
-                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
-            }
             enterRateLimitCooldown(targetPath, result.retryAfterSeconds, cfChallenge = challenge429)
-            if (!challenge429) {
-                return VerificationProbeOutcome.INCONCLUSIVE
-            }
+            return VerificationProbeOutcome.INCONCLUSIVE
         } else if (isRateLimitCoolingDown()) {
             // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
             return VerificationProbeOutcome.INCONCLUSIVE
         }
-        if (result.challenged || challenge429) {
-            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+        if (result.challenged) {
             if (afterCompletion) {
                 diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true")
-                val trace = try {
-                    withTimeoutOrNull(VERIFY_PROBE_TIMEOUT_MS) {
-                        transport.getWithoutRevalidate("${Config.BASE_URL}/cdn-cgi/trace", present = false)
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    null
-                }
-                if (trace != null) {
-                    diagnostics.log("[诊断] 出口对照 ${transport.name}: ${NetDiagnostics.egressTraceSummary(trace.body)}")
-                    if (trace.status == 429) {
-                        enterRateLimitCooldown("/cdn-cgi/trace", trace.retryAfterSeconds)
-                    }
-                }
             } else {
                 diagnostics.logThrottled(
                     "verify-app-path-probe",
@@ -1016,7 +1058,7 @@ class TopicRepository(
                 val fallbackHandled = kotlinx.coroutines.coroutineScope {
                     ensureReadingActive()
                     val alreadyReady = fallbackTransport.isReady()
-                    val fallbackReady = alreadyReady || fallbackTransport.revalidate("timings 挑战兜底")
+                    val fallbackReady = alreadyReady || fallbackTransport.revalidate("timings 挑战兜底", requestHost = Config.HOST)
                     ensureReadingActive()
                     diagnostics.log("[诊断] timings 兜底就绪 alreadyReady=$alreadyReady ready=$fallbackReady")
                     if (fallbackReady) {
@@ -2241,10 +2283,10 @@ class TopicRepository(
             }
             if (result.challenged) {
                 cachedCsrfToken = null
-                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                noteRequestClearanceChallenged(result.sentClearanceFp, "/uploads.json")
                 // 对齐 v1.3.1：撞盾先静默过盾，连 CSRF 一起重取后重传一次。
                 if (!revalidated && sessionStore?.sessionChanging != true &&
-                    transportProvider().revalidate("/uploads.json", result.sentClearanceFp)
+                    transportProvider().revalidate("/uploads.json", result.sentClearanceFp, requestHost = Config.HOST)
                 ) {
                     revalidated = true
                     csrfRefreshed = true
@@ -2414,11 +2456,11 @@ class TopicRepository(
             diagnostics.recordStatus(transportProvider().name, result.status, path)
             if (result.status == 429) {
                 val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
-                if (challenge429 && !revalidated && sessionStore?.sessionChanging != true) {
+                if (requestHost(path) == Config.HOST && challenge429 && !revalidated && sessionStore?.sessionChanging != true) {
                     cachedCsrfToken = null
-                    sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                    noteRequestClearanceChallenged(result.sentClearanceFp, path)
                     if (isCarriedClearanceStale(result.sentClearanceFp) ||
-                        transportProvider().revalidate(path, result.sentClearanceFp)
+                        transportProvider().revalidate(path, result.sentClearanceFp, requestHost = requestHost(path))
                     ) {
                         revalidated = true
                         csrfRefreshed = true
@@ -2436,6 +2478,10 @@ class TopicRepository(
                 throw cooldownEx
             }
             if (result.challenged || (result.status == 403 && ChallengeDetector.isChallenge(result.status, "", result.body))) {
+                if (requestHost(path) != Config.HOST) {
+                    noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                    throw HttpStatusException(result.status, "子站安全验证未通过，请稍后重试", result.retryAfterSeconds)
+                }
                 cachedCsrfToken = null
                 if (!revalidated && isCarriedClearanceStale(result.sentClearanceFp)) {
                     diagnostics.log("写请求携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，直接换新值并重取 CSRF 重放: $path")
@@ -2443,12 +2489,12 @@ class TopicRepository(
                     csrfRefreshed = true
                     continue
                 }
-                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                noteRequestClearanceChallenged(result.sentClearanceFp, path)
                 // 对齐 v1.3.1：先静默过盾再连 CSRF 一起重发一次。CF 挑战在边缘拦截，源站没收到，重放安全。
                 // 不能在这里删 cf_clearance：删了之后所有请求都必然撞盾，静默过盾也失去了可续的凭据。
                 // clearChallenge 最长要等 30 秒，绝不能占着 postGate 等。
                 if (!revalidated && sessionStore?.sessionChanging != true &&
-                    transportProvider().revalidate(path, result.sentClearanceFp)
+                    transportProvider().revalidate(path, result.sentClearanceFp, requestHost = requestHost(path))
                 ) {
                     revalidated = true
                     csrfRefreshed = true
@@ -3458,13 +3504,12 @@ class TopicRepository(
         )
     }
 
-    suspend fun fetchTrustReport(): TrustReport? {
-        var html = try {
-            request("https://connect.linux.do/")
-        } catch (error: Exception) {
-            diagnostics.log("拉取 Connect 升级进度失败: ${error.message}")
-            return null
-        }
+    suspend fun fetchTrustReport(present: Boolean = false): TrustReport? {
+        val userId = sessionStore?.currentUserId()
+        val generation = sessionStore?.sessionGeneration
+        val checkSession = { checkSiteSession(userId, generation) }
+        var html = request("https://connect.linux.do/", present = present, beforeDispatch = checkSession)
+        checkSession()
 
         // 检查是否触发 Discourse Connect SSO 回调跳转
         if (html.contains("redirect_url") && html.contains("sso_callback")) {
@@ -3472,24 +3517,19 @@ class TopicRepository(
                 json.parseToJsonElement(html).jsonObject["redirect_url"]?.jsonPrimitive?.contentOrNull
             }.getOrNull()
             if (!redirectUrl.isNullOrBlank()) {
-                diagnostics.log("Connect 触发 SSO 授权，自动完成握手: $redirectUrl")
-                try {
-                    val ssoResp = request(redirectUrl)
-                    html = if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) {
-                        ssoResp
-                    } else {
-                        request("https://connect.linux.do/")
-                    }
-                } catch (error: Exception) {
-                    diagnostics.log("Connect SSO 握手完成或重定向: ${error.message}")
-                    html = try { request("https://connect.linux.do/") } catch (_: Exception) { html }
-                }
+                val redirect = "https://connect.linux.do/".toHttpUrl().resolve(redirectUrl)
+                require(redirect != null && isTrustedOAuthUrl(redirect, "connect.linux.do")) { "Connect SSO 跳转地址不受信任" }
+                diagnostics.log("Connect 触发 SSO 授权，自动完成握手")
+                val ssoResp = request(redirect.toString(), present = false, retryAllowed = false, beforeDispatch = checkSession)
+                checkSession()
+                html = if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) ssoResp
+                    else request("https://connect.linux.do/", present = present, beforeDispatch = checkSession)
             }
         }
-
+        checkSession()
         val report = TrustReport.fromHtml(html)
         if (report == null) {
-            diagnostics.log("Connect 页面解析失败, HTML 长度=${html.length}, 内容: ${html.take(1000)}")
+            diagnostics.log("Connect 页面解析失败, HTML 长度=${html.length}")
         }
         return report
     }
@@ -3554,33 +3594,52 @@ class TopicRepository(
         val body: String,
     )
 
-    private fun sanitizeUrl(url: String?): String {
-        if (url.isNullOrBlank()) return ""
-        return url.replace(Regex("(?i)(code|state|token|client_secret|authenticity_token)=([^&]+)"), "$1=***")
-    }
-
     /**
      * OAuth 请求接入进程级双轨调度器：
      * GET 请求受 [getSemaphore] (2 并发) 与滑动窗口 (4次/3秒) 约束；
      * POST 请求受 [postGate] (1 并发绝对串行) 约束。
-     * 遇到 429 时统一进入全局退让，杜绝旁路超限穿透。
+     * 遇到 429 时按响应站点退让，子站限流不改写主站冷却。
      */
     private suspend fun executeLdcOAuthRequest(
         client: OkHttpClient,
         request: Request,
         label: String,
+        targetHost: String,
+        userId: Long,
+        generation: Long,
     ): LdcOAuthResponse {
+        require(isTrustedOAuthUrl(request.url, targetHost)) { "OAuth 请求地址不受信任" }
+        if (sessionStore?.isClearanceRecoveryInProgress() == true) throw RateLimitException(5_000L)
         val isPost = request.method.equals("POST", ignoreCase = true)
+        require(!isPost || (request.url.host == targetHost && request.url.encodedPath == "/api/v1/oauth/callback") ||
+            (request.url.host == "connect.linux.do" && (request.url.encodedPath == "/oauth2/authorize" ||
+                request.url.encodedPath.startsWith("/oauth2/approve/")))) { "OAuth 表单目标不受信任" }
         val executeCall = suspend {
-            client.newCall(request).execute().use { response ->
+            currentCoroutineContext().ensureActive()
+            checkSiteSession(userId, generation)
+            if (sessionStore?.isClearanceRecoveryInProgress() == true) throw RateLimitException(5_000L)
+            throwIfSiteCoolingDown(request.url.host)
+            if (request.url.host == Config.HOST) throwIfRateLimitCoolingDown()
+            val taggedRequest = request.newBuilder()
+                .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation))
+                .build()
+            client.newCall(taggedRequest).execute().use { response ->
+                currentCoroutineContext().ensureActive()
+                checkSiteSession(userId, generation)
                 val body = response.body?.string().orEmpty()
+                val challenged = ChallengeDetector.isChallenge(response.code, response.header("cf-mitigated"), body) ||
+                    ChallengeDetector.isChallenge429(response.code, response.header("cf-mitigated"), body)
                 if (response.code == 429) {
                     val retryAfter = HttpHeaderUtils.extractRetryAfterSeconds(
                         retryAfterHeader = response.header("Retry-After"),
                         resetHeader = response.header("x-ratelimit-reset") ?: response.header("ratelimit-reset"),
                         body = body,
                     )
-                    throw enterRateLimitCooldown(label, retryAfter)
+                    val responsePath = response.request.url.newBuilder().query(null).fragment(null).build().toString()
+                    throw enterRateLimitCooldown(responsePath, retryAfter, cfChallenge = challenged)
+                }
+                if (challenged) {
+                    throw HttpStatusException(response.code, "$label 遇到安全验证，请稍后重试")
                 }
                 LdcOAuthResponse(
                     status = response.code,
@@ -3606,22 +3665,149 @@ class TopicRepository(
         }
     }
 
+    private fun isTrustedOAuthUrl(url: HttpUrl, targetHost: String): Boolean {
+        if (!url.isHttps || url.port != 443 || url.username.isNotEmpty() || url.password.isNotEmpty()) return false
+        return when (url.host) {
+            Config.HOST -> url.encodedPath == "/session/sso_provider"
+            "connect.linux.do" -> url.encodedPath in setOf("/", "/discourse/sso_callback", "/oauth2/authorize") ||
+                url.encodedPath.startsWith("/oauth2/approve/")
+            targetHost -> url.encodedPath in setOf("/api/v1/oauth/login", "/api/v1/oauth/callback", oauthCallbackPath(targetHost))
+            else -> false
+        }
+    }
+
+    private fun oauthCallbackPath(targetHost: String): String = when (targetHost) {
+        "credit.linux.do" -> "/login"
+        "cdk.linux.do" -> "/callback"
+        else -> throw IllegalArgumentException("未知 OAuth 目标站点")
+    }
+
+    private fun parseTrustedOAuthCallback(location: String?, targetHost: String, expectedState: String): Pair<String, String> {
+        val url = location?.let { runCatching { it.toHttpUrl() }.getOrNull() }
+        require(url != null && isTrustedOAuthUrl(url, targetHost) && url.host == targetHost &&
+            url.encodedPath == oauthCallbackPath(targetHost)) { "OAuth 回调地址不受信任" }
+        val code = url.queryParameter("code")
+        val state = url.queryParameter("state")
+        require(!code.isNullOrBlank() && !state.isNullOrBlank()) { "OAuth 回调缺少 code 或 state" }
+        require(expectedState.isNotBlank() && state == expectedState) { "OAuth 回调状态不匹配" }
+        return code to state
+    }
+
+    /** 所有重定向先验明下一跳；目标站 code/state 回调交给最后的 API POST，不再自动 GET。 */
+    private suspend fun executeTrustedOAuthNavigation(
+        client: OkHttpClient,
+        initialRequest: Request,
+        targetHost: String,
+        label: String,
+        userId: Long,
+        generation: Long,
+    ): LdcOAuthResponse {
+        var request = initialRequest
+        var resumedAuthorization = false
+        repeat(10) {
+            require(isTrustedOAuthUrl(request.url, targetHost)) { "OAuth 跳转地址不受信任" }
+            if (request.url.host == targetHost) {
+                require(request.url.encodedPath == oauthCallbackPath(targetHost) &&
+                    !request.url.queryParameter("code").isNullOrBlank() && !request.url.queryParameter("state").isNullOrBlank()
+                ) { "OAuth 回调缺少有效 code 或 state" }
+                checkSiteSession(userId, generation)
+                return LdcOAuthResponse(302, request.url.toString(), "")
+            }
+            val response = executeLdcOAuthRequest(client, request, label, targetHost, userId, generation)
+            val redirect = if (response.status in 300..399) response.location else if (response.status == 200) {
+                runCatching { json.parseToJsonElement(response.body).jsonObject["redirect_url"]?.jsonPrimitive?.contentOrNull }.getOrNull()
+            } else null
+            if (!redirect.isNullOrBlank()) {
+                val next = request.url.resolve(redirect)
+                require(next != null && isTrustedOAuthUrl(next, targetHost)) { "OAuth 跳转地址不受信任" }
+                request = Request.Builder().url(next).header("Accept", "text/html,application/json").get().build()
+            } else if (response.status == 200 && request.url.host == "connect.linux.do") {
+                val document = Jsoup.parse(response.body)
+                val approveLink = document.select("a[href*=/oauth2/approve/]").firstOrNull()?.attr("href")
+                val form = document.select("form").firstOrNull()
+                val csrf = form?.select("input[name=authenticity_token]")?.firstOrNull()?.attr("value")
+                val nextRequest = when {
+                    !approveLink.isNullOrBlank() -> {
+                        val next = request.url.resolve(approveLink)
+                        require(next != null && isTrustedOAuthUrl(next, targetHost)) { "OAuth 同意地址不受信任" }
+                        Request.Builder().url(next).get().build()
+                    }
+                    form != null && !csrf.isNullOrBlank() -> {
+                        val action = request.url.resolve(form.attr("action").ifBlank { request.url.toString() })
+                        require(action != null && isTrustedOAuthUrl(action, targetHost)) { "OAuth 表单地址不受信任" }
+                        val fields = FormBody.Builder().add("authenticity_token", csrf).add("commit", "Authorize")
+                        form.select("input[type=hidden]").forEach { input ->
+                            val name = input.attr("name")
+                            if (name.isNotBlank() && name != "authenticity_token") fields.add(name, input.attr("value"))
+                        }
+                        Request.Builder().url(action).post(fields.build()).build()
+                    }
+                    request.url.encodedPath in setOf("/", "/discourse/sso_callback") && !resumedAuthorization -> {
+                        resumedAuthorization = true
+                        Request.Builder().url(initialRequest.url).get().build()
+                    }
+                    else -> null
+                }
+                if (nextRequest == null) return response
+                request = nextRequest.newBuilder().header("Accept", "text/html,application/json").build()
+            } else {
+                return response
+            }
+        }
+        throw IOException("OAuth 重定向次数超过限制")
+    }
+
     suspend fun authorizeLdc(): Boolean = authorizeOAuthSite("credit.linux.do", "LDC")
 
     /** CDK 与 LDC 是同一套 OAuth 握手(login -> connect approve -> callback),仅站点不同。 */
     suspend fun authorizeCdk(): Boolean = authorizeOAuthSite("cdk.linux.do", "CDK")
 
-    private suspend fun authorizeOAuthSite(host: String, label: String): Boolean = ldcAuthGate.withLock {
+    private suspend fun authorizeOAuthSite(host: String, label: String): Boolean {
+        val store = sessionStore ?: return false
+        val userId = store.currentUserId()
+        val generation = store.sessionGeneration
+        if (userId <= 0L) return false
+        checkSiteSession(userId, generation)
+        val key = "$host:$userId:$generation"
+        val (flight, owner) = synchronized(oauthFlights) {
+            val succeededAt = oauthSucceededAt[key]
+            if (succeededAt != null && SystemClock.elapsedRealtime() - succeededAt < 10_000L) return true
+            oauthFlights[key]?.let { it to false } ?: (CompletableDeferred<Boolean>().also { oauthFlights[key] = it } to true)
+        }
+        if (!owner) return flight.await().also { checkSiteSession(userId, generation) }
+        try {
+            val result = performOAuthAuthorization(host, label, userId, generation)
+            checkSiteSession(userId, generation)
+            if (result) synchronized(oauthFlights) {
+                val now = SystemClock.elapsedRealtime()
+                oauthSucceededAt.entries.removeAll { now - it.value >= 10_000L }
+                oauthSucceededAt[key] = now
+            }
+            flight.complete(result)
+            return result
+        } catch (error: Throwable) {
+            flight.completeExceptionally(error)
+            throw error
+        } finally {
+            synchronized(oauthFlights) { if (oauthFlights[key] === flight) oauthFlights.remove(key) }
+        }
+    }
+
+    private suspend fun performOAuthAuthorization(host: String, label: String, userId: Long, generation: Long): Boolean =
         withContext(Dispatchers.IO) {
-            val client = httpClientProvider?.invoke() ?: run {
+            val client = httpClientProvider?.invoke()?.newBuilder()?.followRedirects(false)?.followSslRedirects(false)?.build() ?: run {
                 diagnostics.log("authorize$label 失败: 未提供 httpClientProvider")
                 return@withContext false
             }
 
             try {
+                checkSiteSession(userId, generation)
                 // 先同步 WebView Cookie 到 store
                 sessionStore?.let { s ->
-                    withContext(Dispatchers.Main) { s.syncFromWebView() }
+                    withContext(Dispatchers.Main) {
+                        checkSiteSession(userId, generation)
+                        s.syncFromWebView()
+                    }
                 }
 
                 diagnostics.log("开始 $label OAuth 授权流程...")
@@ -3634,7 +3820,7 @@ class TopicRepository(
                     .get()
                     .build()
 
-                val loginResp = executeLdcOAuthRequest(client, loginReq, "$label OAuth login")
+                val loginResp = executeLdcOAuthRequest(client, loginReq, "$label OAuth login", host, userId, generation)
                 if (loginResp.status !in 200..299) {
                     diagnostics.log("$label OAuth login 请求失败: HTTP ${loginResp.status}")
                     return@withContext false
@@ -3646,17 +3832,17 @@ class TopicRepository(
                 }.getOrNull()
 
                 if (authUrl.isNullOrBlank()) {
-                    diagnostics.log("$label OAuth 获取 authUrl 失败: $loginBody")
+                    diagnostics.log("$label OAuth 获取 authUrl 失败，响应长度=${loginBody.length}")
                     return@withContext false
                 }
 
-                diagnostics.log("$label OAuth 获得 authUrl: ${sanitizeUrl(authUrl)}")
-
-                // 创建禁止自动重定向的 client，用于捕获 302 Location
-                val noRedirectClient = client.newBuilder()
-                    .followRedirects(false)
-                    .followSslRedirects(false)
-                    .build()
+                val parsedAuthUrl = runCatching { authUrl.toHttpUrl() }.getOrNull()
+                require(parsedAuthUrl != null && parsedAuthUrl.host == "connect.linux.do" &&
+                    parsedAuthUrl.encodedPath == "/oauth2/authorize" && isTrustedOAuthUrl(parsedAuthUrl, host)
+                ) { "OAuth 授权入口不受信任" }
+                val expectedState = parsedAuthUrl.queryParameter("state")
+                require(!expectedState.isNullOrBlank()) { "OAuth 授权入口缺少 state" }
+                diagnostics.log("$label OAuth 已取得受信任授权入口")
 
                 // 2. GET authUrl
                 val authReq = Request.Builder()
@@ -3665,93 +3851,15 @@ class TopicRepository(
                     .get()
                     .build()
 
-                val authResp = executeLdcOAuthRequest(noRedirectClient, authReq, "$label OAuth authorize")
-                val authCode = authResp.status
-                var code: String? = null
-                var state: String? = null
-
-                if (authCode in 300..399) {
-                    val loc = authResp.location
-                    diagnostics.log("$label OAuth 直接 302 重定向: ${sanitizeUrl(loc)}")
-                    if (!loc.isNullOrBlank()) {
-                        code = extractQueryParam(loc, "code")
-                        state = extractQueryParam(loc, "state")
-                    }
-                } else if (authCode == 200) {
-                    val html = authResp.body
-                    val doc = Jsoup.parse(html)
-                    val approveLink = doc.select("a[href*=/oauth2/approve/]").firstOrNull()?.attr("href")
-                    if (!approveLink.isNullOrBlank()) {
-                        val approveUrl = if (approveLink.startsWith("http")) approveLink else "https://connect.linux.do$approveLink"
-                        // 拟人化延迟：模拟人类用户查看授权页并点击“同意”的自然停顿（600~950ms），消除秒级机器特征
-                        delay(Random.nextLong(600L, 950L))
-                        diagnostics.log("$label OAuth 发起 approve 链接请求: ${sanitizeUrl(approveUrl)}")
-
-                        val approveReq = Request.Builder()
-                            .url(approveUrl)
-                            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                            .get()
-                            .build()
-
-                        val approveResp = executeLdcOAuthRequest(noRedirectClient, approveReq, "$label OAuth approve")
-                        val loc = approveResp.location
-                        diagnostics.log("$label OAuth approve 响应: ${approveResp.status}, Location: ${sanitizeUrl(loc)}")
-                        if (!loc.isNullOrBlank()) {
-                            code = extractQueryParam(loc, "code")
-                            state = extractQueryParam(loc, "state")
-                        }
-                    } else {
-                        // 尝试表单 POST 形式的授权（Rails / Discourse 常见表单）
-                        val form = doc.select("form").firstOrNull()
-                        val csrfToken = doc.select("input[name=authenticity_token]").firstOrNull()?.attr("value")
-                        if (form != null && !csrfToken.isNullOrBlank()) {
-                            val formAction = form.attr("action").ifBlank { authUrl }
-                            val actionUrl = if (formAction.startsWith("http")) formAction else "https://connect.linux.do$formAction"
-                            diagnostics.log("$label OAuth 发起表单 POST 授权: ${sanitizeUrl(actionUrl)}")
-                            val formBodyBuilder = okhttp3.FormBody.Builder()
-                                .add("authenticity_token", csrfToken)
-                                .add("commit", "Authorize")
-                            form.select("input[type=hidden]").forEach { hidden ->
-                                val name = hidden.attr("name")
-                                val value = hidden.attr("value")
-                                if (name.isNotBlank() && name != "authenticity_token") {
-                                    formBodyBuilder.add(name, value)
-                                }
-                            }
-                            val formReq = Request.Builder()
-                                .url(actionUrl)
-                                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                                .post(formBodyBuilder.build())
-                                .build()
-                            val formResp = executeLdcOAuthRequest(noRedirectClient, formReq, "$label OAuth form approve")
-                            val loc = formResp.location
-                            diagnostics.log("$label OAuth 表单授权响应: ${formResp.status}, Location: ${sanitizeUrl(loc)}")
-                            if (!loc.isNullOrBlank()) {
-                                code = extractQueryParam(loc, "code")
-                                state = extractQueryParam(loc, "state")
-                            }
-                        } else {
-                            diagnostics.log("$label OAuth 未在同意页找到 approve 链接或表单, HTML 长度=${html.length}")
-                            return@withContext false
-                        }
-                    }
-                } else {
-                    diagnostics.log("$label OAuth 请求 authUrl 异常状态码: $authCode")
-                    return@withContext false
-                }
-
-                if (code.isNullOrBlank() || state.isNullOrBlank()) {
-                    diagnostics.log("$label OAuth 未能提取到 code 或 state")
-                    return@withContext false
-                }
+                val authResp = executeTrustedOAuthNavigation(client, authReq, host, "$label OAuth authorize", userId, generation)
+                require(authResp.status in 300..399) { "OAuth 未返回有效授权回调" }
+                val (code, state) = parseTrustedOAuthCallback(authResp.location, host, expectedState)
+                checkSiteSession(userId, generation)
 
                 diagnostics.log("$label OAuth 提取到 code 与 state，正在提交 callback...")
-                // 拟人化延迟：模拟浏览器处理 302 重定向并提交回调的自然间隔（500~850ms）
-                delay(Random.nextLong(500L, 850L))
-
                 // 3. POST https://credit.linux.do/api/v1/oauth/callback
                 // 注意：必须携带 X-Requested-With: XMLHttpRequest，否则 credit.linux.do 会触发 CSRF 校验失败 403
-                val callbackJson = """{"code":"$code","state":"$state"}"""
+                val callbackJson = org.json.JSONObject().put("code", code).put("state", state).toString()
                 val callbackReq = Request.Builder()
                     .url("https://$host/api/v1/oauth/callback")
                     .header("X-Requested-With", "XMLHttpRequest")
@@ -3760,46 +3868,36 @@ class TopicRepository(
                     .post(callbackJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
                     .build()
 
-                val callbackResp = executeLdcOAuthRequest(client, callbackReq, "$label OAuth callback")
+                val callbackResp = executeLdcOAuthRequest(client, callbackReq, "$label OAuth callback", host, userId, generation)
                 val callbackBody = callbackResp.body
                 if (callbackResp.status !in 200..299) {
-                    diagnostics.log("$label OAuth callback 失败: HTTP ${callbackResp.status}, $callbackBody")
+                    diagnostics.log("$label OAuth callback 失败: HTTP ${callbackResp.status}")
                     return@withContext false
                 }
 
                 withContext(Dispatchers.Main) {
+                    checkSiteSession(userId, generation)
                     runCatching {
                         android.webkit.CookieManager.getInstance().flush()
                     }
                 }
 
-                diagnostics.log("$label OAuth 授权握手圆满成功: $callbackBody")
+                diagnostics.log("$label OAuth 授权握手成功")
                 true
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: RateLimitException) {
+                throw e
+            } catch (e: HttpStatusException) {
+                throw e
+            } catch (e: IllegalStateException) {
+                throw e
             } catch (e: Exception) {
+                checkSiteSession(userId, generation)
                 diagnostics.log("$label OAuth 流程发生异常: ${e.message}")
                 false
             }
         }
-    }
-
-    private fun extractQueryParam(url: String, key: String): String? {
-        val queryStart = url.indexOf('?')
-        if (queryStart < 0) return null
-        val query = url.substring(queryStart + 1)
-        for (part in query.split('&')) {
-            val kv = part.split('=', limit = 2)
-            if (kv.isNotEmpty()) {
-                val k = runCatching { java.net.URLDecoder.decode(kv[0], "UTF-8") }.getOrDefault(kv[0])
-                if (k == key) {
-                    val v = if (kv.size > 1) kv[1] else ""
-                    return runCatching { java.net.URLDecoder.decode(v, "UTF-8") }.getOrDefault(v)
-                }
-            }
-        }
-        return null
-    }
 
     /**
      * 从服务端拉取自定义侧边栏分区（与 PC 端打通）。
@@ -4286,7 +4384,7 @@ class TopicRepository(
         try {
             return pacedGet(path, burst, present, allow429Challenge = retryAllowed, retryAllowed = retryAllowed, beforeDispatch = beforeDispatch)
         } catch (challenge: NeedsInteractiveVerification) {
-            if (!retryAllowed || !present) throw challenge
+            if (!retryAllowed || !present || requestHost(path) != Config.HOST) throw challenge
             // 对齐 v1.3.1 & P0-1/P0-3：撞盾先在隐藏 WebView 里按当前出口静默重签 cf_clearance（带锁内去重合并），成功再重试一次。
             // 换代理/切直连后凭据与出口不一致时，这一步让第一个被挑战的请求就把凭据换掉，用户无感。
             // 必须在串行闸门外做：静默过盾最长 30 秒，占着闸门会把所有 GET 堵死。
@@ -4351,16 +4449,21 @@ class TopicRepository(
         }
     }
 
-    /** GET 撞盾后的静默过盾；失败后 [GET_REVALIDATE_FAILURE_COOLDOWN_MS] 内不再拉起，避免直连过不了盾时反复空等。 */
+    /**
+     * GET 撞盾后的静默过盾；失败后 [GET_REVALIDATE_FAILURE_COOLDOWN_MS] 内不再拉起，避免直连过不了盾时反复空等。
+     * 仅真实业务 429 限流时阻断静默补签；若冷却仅由 CF 质询型 429 引起（如后台探测刚因缺凭据撞上 429 challenge），
+     * 允许执行一次后台静默补签，避免把本可无感过盾的请求直接短路进全屏验证页。
+     */
     private suspend fun silentRevalidateForGet(path: String, failedClearanceFp: String = "-"): Boolean {
-        if (sessionStore?.sessionChanging == true || isRateLimitCoolingDown()) return false
+        if (requestHost(path) != Config.HOST) return false
+        if (sessionStore?.sessionChanging == true || isNonChallengeRateLimitCoolingDown()) return false
         val now = SystemClock.elapsedRealtime()
         if (now < getRevalidateBlockedUntil) {
             diagnostics.logThrottled("get-revalidate", "GET 撞盾: 静默过盾冷却中，直接交由上层处理")
             return false
         }
         val generation = sessionStore?.sessionGeneration
-        val cleared = transportProvider().revalidate(path, failedClearanceFp)
+        val cleared = transportProvider().revalidate(path, failedClearanceFp, requestHost = requestHost(path))
         if (generation != null && generation != sessionStore?.sessionGeneration) {
             throw CancellationException("会话已切换")
         }
@@ -4382,10 +4485,14 @@ class TopicRepository(
         retryAllowed: Boolean = true,
         beforeDispatch: (() -> Unit)? = null,
     ): String {
+        val host = requestHost(path)
+        val isMainSite = host == Config.HOST
         ensureRequestAllowed()
+        throwIfSiteCoolingDown(host)
         if (!present) throwIfRateLimitCoolingDown()
         return getSemaphore.withPermit {
             ensureRequestAllowed()
+            throwIfSiteCoolingDown(host)
             if (!present) throwIfRateLimitCoolingDown()
             var attempt = 0
             var staleReplayed = false
@@ -4393,18 +4500,28 @@ class TopicRepository(
             while (true) {
                 acquireGetSlot { !present && isRateLimitCoolingDown() }
                 currentCoroutineContext().ensureActive()
+                throwIfSiteCoolingDown(host)
                 if (!present) throwIfRateLimitCoolingDown()
                 // 前台请求发出后，后台计量池在静默窗口内让行，避免与用户操作贴脸叠加
                 if (present) ApiQuotaPool.markForeground()
                 val transport = transportProvider()
                 beforeDispatch?.invoke()
                 val result = try {
-                    if (retryAllowed) transport.get(path, present = present)
+                    if (retryAllowed && isMainSite) transport.get(path, present = present)
                     else transport.getWithoutRevalidate(path, present = present)
                 } finally {
                     // 时间戳已在 acquireGetSlot 记录
                 }
                 diagnostics.recordStatus(transport.name, result.status, path)
+                if (!isMainSite && result.status == 429) {
+                    val challenged = result.challenged || ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
+                    if (challenged) noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                    throw enterRateLimitCooldown(path, result.retryAfterSeconds, cfChallenge = challenged)
+                }
+                if (!isMainSite && result.challenged) {
+                    noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                    throw HttpStatusException(result.status, "子站安全验证未通过，请稍后重试", result.retryAfterSeconds)
+                }
                 when {
                     result.challenged -> {
                         if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
@@ -4412,7 +4529,7 @@ class TopicRepository(
                             diagnostics.log("检测到携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，跳过 WebView 直接换新值重放: $path")
                             continue
                         }
-                        sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                        noteRequestClearanceChallenged(result.sentClearanceFp, path)
                         notify403OrChallenged("request $path challenged")
                         throw NeedsInteractiveVerification(
                             "请求 $path 被 Cloudflare 挑战拦截",
@@ -4428,7 +4545,7 @@ class TopicRepository(
                                 diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
                                 continue
                             }
-                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                            noteRequestClearanceChallenged(result.sentClearanceFp, path)
                             notify403OrChallenged(path, "request $path 429-challenge")
                             throw NeedsInteractiveVerification(
                                 "请求 $path 被 Cloudflare 速率挑战拦截",
@@ -4439,7 +4556,7 @@ class TopicRepository(
                         }
                         val cfChallenge = challenge429 || isCfChallengeBody(result.body)
                         if (cfChallenge) {
-                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                            noteRequestClearanceChallenged(result.sentClearanceFp, path)
                         }
                         val cooldownEx = enterRateLimitCooldown(
                             path, result.retryAfterSeconds, cfChallenge = cfChallenge,
@@ -4456,7 +4573,7 @@ class TopicRepository(
                         }
                     }
                     result.status == 403 -> {
-                        notify403OrChallenged("request $path 403")
+                        if (isMainSite) notify403OrChallenged("request $path 403")
                         throw HttpStatusException(result.status, result.body.take(120))
                     }
                     result.status in 200..299 -> return result.body
@@ -4546,8 +4663,23 @@ class TopicRepository(
         /** 同一应用进程内的所有仓库实例共用一段 429 冷却期。 */
         val rateLimitLock = Any()
         var rateLimitedUntil = 0L
+        /** 当前活跃的 429 冷却是否纯由 Cloudflare 质询型 429（cf-mitigated=challenge）触发。 */
+        var rateLimitedByCfChallenge = false
+        private val siteRateLimitedUntil = mutableMapOf<String, Long>()
+        private val oauthFlights = mutableMapOf<String, CompletableDeferred<Boolean>>()
+        private val oauthSucceededAt = mutableMapOf<String, Long>()
 
         fun isRateLimitCoolingDown(): Boolean = rateLimitRemainingMs() > 0L
+
+        /** 是否处于源站/非挑战类的真实业务 429 限流冷却中。 */
+        fun isNonChallengeRateLimitCoolingDown(): Boolean = synchronized(rateLimitLock) {
+            (rateLimitedUntil - SystemClock.elapsedRealtime()) > 0L && !rateLimitedByCfChallenge
+        }
+
+        /** 当前是否仅处于 CF 质询型 429 冷却中；补签不会提前解除后台冷却。 */
+        fun isChallengeOnlyRateLimitCoolingDown(): Boolean = synchronized(rateLimitLock) {
+            (rateLimitedUntil - SystemClock.elapsedRealtime()) > 0L && rateLimitedByCfChallenge
+        }
 
         fun rateLimitRemainingMs(): Long = synchronized(rateLimitLock) {
             (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
@@ -4563,6 +4695,12 @@ class TopicRepository(
             val nowWall = System.currentTimeMillis()
             val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(retryAfterSeconds, RATE_LIMIT_COOLDOWN_MS)
             val remaining = synchronized(rateLimitLock) {
+                val wasActive = rateLimitedUntil > nowElapsed
+                rateLimitedByCfChallenge = if (wasActive) {
+                    rateLimitedByCfChallenge && cfChallenge
+                } else {
+                    cfChallenge
+                }
                 rateLimitedUntil = maxOf(rateLimitedUntil, nowElapsed + cooldownMs)
                 sessionStore?.setRateLimitedUntil(nowWall + cooldownMs)
                 (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
@@ -4574,6 +4712,7 @@ class TopicRepository(
         fun clearRateLimitCooldown(sessionStore: SessionStore? = null) {
             synchronized(rateLimitLock) {
                 rateLimitedUntil = 0L
+                rateLimitedByCfChallenge = false
                 sessionStore?.setRateLimitedUntil(0L)
             }
         }

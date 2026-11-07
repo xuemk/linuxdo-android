@@ -23,9 +23,12 @@ enum class PushNotificationScope(val rawValue: Int, val label: String) {
 interface PushSessionProvider {
     fun hasSession(): Boolean
     fun isBackgroundNotificationEnabled(): Boolean
+    /** 临时验证或限流只推迟网络请求，不改变登录或后台服务开关。 */
+    fun backgroundRequestDelayMs(): Long = 0L
     fun getCookie(): String
     fun getUserAgent(): String
     fun getUserId(): Long
+    fun getSessionGeneration(): Long = -1L
     fun saveUserId(id: Long)
     fun getLastSeenNotificationId(): Long
     fun setLastSeenNotificationId(id: Long)

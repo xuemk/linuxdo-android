@@ -2,6 +2,7 @@ package org.linuxdo.android.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.SystemClock
 import android.webkit.CookieManager
 import android.os.Looper
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -54,20 +55,42 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     private val challengedClearanceLock = Any()
     private val challengedClearances = LinkedHashSet<String>()
     private val challengedClearanceFps = LinkedHashSet<String>()
+    private var challengedClearancePauseUntil = 0L
+    private val clearanceRecoveryLock = Any()
+    private val clearanceRecoveryIds = mutableSetOf<Long>()
+    private var nextClearanceRecoveryId = 0L
 
     fun requireVerification() { verificationRequired = true }
     fun completeVerification() { verificationRequired = false }
+
+    fun beginClearanceRecovery(): Long = synchronized(clearanceRecoveryLock) {
+        (++nextClearanceRecoveryId).also { clearanceRecoveryIds.add(it) }
+    }
+
+    fun endClearanceRecovery(id: Long) {
+        synchronized(clearanceRecoveryLock) { clearanceRecoveryIds.remove(id) }
+    }
+
+    fun isClearanceRecoveryInProgress(): Boolean = synchronized(clearanceRecoveryLock) {
+        verificationRequired || clearanceRecoveryIds.isNotEmpty()
+    }
 
     /**
      * 登记本会话内已被 Cloudflare 挑战（403/429 challenge）判废的 cf_clearance 值或指纹。
      * 有界保留最近 [MAX_CHALLENGED_CLEARANCES] 枚，供多变体选优与换值重放时排除已知死值。
      */
-    fun noteClearanceChallenged(valueOrFp: String?) {
+    fun noteClearanceChallenged(
+        valueOrFp: String?,
+        host: String = Config.HOST,
+        source: String = "主站请求",
+    ) {
+        if (!host.equals(Config.HOST, ignoreCase = true)) return
         val trimmed = valueOrFp?.trim().orEmpty()
         if (trimmed.isEmpty() || trimmed == "-") return
         val isFingerprint = trimmed.length == 6 && trimmed.all { it in '0'..'9' || it in 'a'..'f' }
         val fp = if (isFingerprint) trimmed else org.linuxdo.android.net.NetDiagnostics.fingerprint(trimmed)
-        synchronized(challengedClearanceLock) {
+        val firstChallenge = synchronized(challengedClearanceLock) {
+            val first = fp != "-" && !challengedClearanceFps.contains(fp)
             if (!isFingerprint) {
                 if (!challengedClearances.contains(trimmed)) {
                     if (challengedClearances.size >= MAX_CHALLENGED_CLEARANCES) {
@@ -81,6 +104,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 }
             }
             if (fp != "-" && !challengedClearanceFps.contains(fp)) {
+                challengedClearancePauseUntil = SystemClock.elapsedRealtime() + CHALLENGED_CLEARANCE_PAUSE_MS
                 if (challengedClearanceFps.size >= MAX_CHALLENGED_CLEARANCES) {
                     val it = challengedClearanceFps.iterator()
                     if (it.hasNext()) {
@@ -90,6 +114,14 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 }
                 challengedClearanceFps.add(fp)
             }
+            first
+        }
+        if (firstChallenge) {
+            val safeSource = source.substringBefore('?').substringBefore('#')
+                .replace('\r', ' ').replace('\n', ' ').take(160)
+            org.linuxdo.android.net.NetDiagnostics.log(
+                "主站 cf_clearance 首次判废: fp=$fp host=${Config.HOST} source=$safeSource",
+            )
         }
     }
 
@@ -123,7 +155,27 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         synchronized(challengedClearanceLock) {
             challengedClearances.clear()
             challengedClearanceFps.clear()
+            challengedClearancePauseUntil = 0L
         }
+    }
+
+    /**
+     * 新凭据刚被挑战且尚无替代值时，后台探测短暂让行。
+     * 同一旧值重复报错不续期；即使后续请求不再需要 clearance，也不会永久停掉探测。
+     */
+    fun shouldPauseBackgroundForChallengedClearance(): Boolean {
+        val isPausing = synchronized(challengedClearanceLock) {
+            SystemClock.elapsedRealtime() < challengedClearancePauseUntil
+        }
+        if (!isPausing) return false
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return true
+        val activeClearances = listOf(manager.getCookie(Config.BASE_URL), manager.getCookie("${Config.BASE_URL}/"))
+            .flatMap { it.orEmpty().split(';') }
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) }
+            .map { it.substringAfter('=', "").trim() }
+            .filter { it.isNotBlank() && !isClearanceChallenged(it) }
+        return activeClearances.isEmpty()
     }
 
     /** 获取当前经选优后的权威 cf_clearance 指纹（无有效值时返回 "-"）。 */
@@ -134,7 +186,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
     fun advanceSessionGeneration(): Long {
         clearChallengedClearances()
-        return synchronized(this) {
+        return synchronized(clearanceRecoveryLock) {
+            clearanceRecoveryIds.clear()
+            verificationRequired = false
             ++sessionGeneration
         }
     }
@@ -549,7 +603,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 setWebCookie(manager, "${cookie.name}=; Max-Age=0; Path=${cookie.path}$domain; Secure", targetUrl)
             } else {
                 // 防止已被挑战判废的 cf_clearance 借响应 Set-Cookie 回写覆盖刚签发的新值
-                if (cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
+                if (requestUrl.toHttpUrl().host == Config.HOST && cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
                     return@forEach
                 }
                 if (requestUrl.toHttpUrl().host == Config.HOST && cookie.matches(Config.BASE_URL.toHttpUrl())) {
@@ -1153,6 +1207,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_APP_IN_FOREGROUND = "app_in_foreground"
         private const val MAX_NOTIFICATION_LEVELS = 1000
         private const val MAX_CHALLENGED_CLEARANCES = 16
+        private const val CHALLENGED_CLEARANCE_PAUSE_MS = 60_000L
 
         // ── DoH 相关偏好 ──────────────────────────────────────────────────────────
         const val KEY_DOH_ENABLED = "doh_enabled"
