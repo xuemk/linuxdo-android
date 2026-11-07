@@ -260,6 +260,14 @@ private class SessionHeaderInterceptor(
         }
         val outgoing = builder.build()
         val response = chain.proceed(outgoing)
+        if (
+            isLinuxDoHost &&
+            !sentClearance.isNullOrBlank() &&
+            (response.code == 403 || response.code == 429 || response.code == 503) &&
+            response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+        ) {
+            store.noteClearanceChallenged(sentClearance)
+        }
         if (shouldTraceCfFlow(encodedPath, response.code)) {
             val webClearance = SessionStore.parseCookieHeader(rawWebCookieHeader)[Config.CF_CLEARANCE_COOKIE]
             val bodyFeatures = if (response.code >= 400) {

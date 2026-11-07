@@ -144,6 +144,9 @@ class GeckoAuthBridge private constructor(
     /** 用 Gecko 自己的网络栈请求 /cdn-cgi/trace，供与 OkHttp 出口对照。 */
     suspend fun readEgressTrace(): String = JSONTokener(request("trace")).nextValue()?.toString().orEmpty()
 
+    /** WebExtension 内容脚本端口是否已与当前同源文档建立连接。 */
+    fun isConnected(): Boolean = !closed && activePort != null
+
     fun close() {
         if (closed) return
         closed = true

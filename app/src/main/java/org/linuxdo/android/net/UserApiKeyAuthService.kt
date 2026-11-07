@@ -245,7 +245,7 @@ class UserApiKeyAuthService(
         checkSession(generation)
         throwIfRateLimitCoolingDown()
         if (!revalidated) {
-            throw NeedsInteractiveVerification("网页授权需要完成安全验证")
+            throw NeedsInteractiveVerification("网页授权需要完成安全验证", readProbePath = "/session/csrf")
         }
         diagnostics.log("CSRF 静默重验证已完成，重放请求")
         return requestCsrf(generation)
@@ -275,7 +275,7 @@ class UserApiKeyAuthService(
             .build()
 
         val response = executeAuthRequest(httpClient, request, "/session/csrf", generation)
-        if (response.challenged) throw NeedsInteractiveVerification("网页授权 CSRF 需要安全验证")
+        if (response.challenged) throw NeedsInteractiveVerification("网页授权 CSRF 需要安全验证", readProbePath = "/session/csrf")
         if (response.status !in 200..299) {
             throw HttpStatusException(response.status, "获取网页登录凭据失败，请稍后重试")
         }

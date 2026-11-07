@@ -99,6 +99,19 @@ object GeckoManager {
         return rt
     }
 
+    /** 当前 GeckoRuntime 生效的 DNS/TRR 与代理让渡摘要，供验证页与静默补签诊断对照。 */
+    fun runtimeNetworkSummary(context: Context): String {
+        val container = (context.applicationContext as? App)?.container
+        val store = container?.sessionStore
+        val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
+        val pauseDoh = container?.networkMonitor?.detect()?.shouldPauseDoh == true
+        val forceOverProxy = store?.isDohForceOverProxyEnabled() == true
+        val useDoh = store?.isDohEnabled() != false && (!pauseDoh || forceOverProxy)
+        val trrLabel = if (useDoh) "ONLY(DoH+ECH)" else "DISABLED(系统/代理)"
+        val dohHost = runCatching { Uri.parse(dohUri).host }.getOrNull() ?: "-"
+        return "TRR=$trrLabel doh=$dohHost pauseDoh=$pauseDoh forceOverProxy=$forceOverProxy"
+    }
+
     /** 验证视图共用 TextureView，并兼容宿主转发的非标准触摸序列。 */
     fun createGeckoView(context: Context): GeckoView {
         return object : GeckoView(context) {
@@ -193,6 +206,7 @@ object GeckoManager {
         onPageFinished: (url: String) -> Unit = {},
         onCanGoBackChanged: (canGoBack: Boolean) -> Unit = {},
         onPageError: (String, WebRequestError) -> Unit = { _, _ -> },
+        onDiagnostic: (String) -> Unit = {},
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
@@ -243,16 +257,30 @@ object GeckoManager {
         }
 
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            private var progressBucket = -1
+
             override fun onPageStart(session: GeckoSession, url: String) {
                 currentUrl = url
                 contentPaintLogged = false
+                progressBucket = -1
                 if (!url.startsWith("https://") && !url.startsWith("http://")) return
                 pageLoadFailed = false
                 Log.d(TAG, "Gecko onPageStart: ${diagnosticUrl(url)}")
+                onDiagnostic("开始加载 ${diagnosticUrl(url)}")
+            }
+
+            override fun onProgressChange(session: GeckoSession, progress: Int) {
+                // 只在 25/50/75/100 四档各记一次：卡在哪一档能区分"连不上"和"子资源迟迟不完"
+                val bucket = progress / 25
+                if (bucket > progressBucket) {
+                    progressBucket = bucket
+                    onDiagnostic("加载进度 $progress%")
+                }
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
                 Log.d(TAG, "Gecko onPageStop, success=$success")
+                onDiagnostic("加载结束 success=$success 失败标记=$pageLoadFailed ${diagnosticUrl(currentUrl)}")
                 if (success && !pageLoadFailed && (currentUrl.startsWith("https://") || currentUrl.startsWith("http://"))) {
                     onPageFinished(currentUrl)
                 }
@@ -263,7 +291,12 @@ object GeckoManager {
                 if (!contentPaintLogged) {
                     contentPaintLogged = true
                     Log.d(TAG, "Gecko 首屏内容已绘制")
+                    onDiagnostic("首屏内容已绘制")
                 }
+            }
+
+            override fun onTitleChange(session: GeckoSession, title: String?) {
+                if (!title.isNullOrBlank()) onDiagnostic("页面标题 ${title.take(40)}")
             }
         }
 
@@ -352,6 +385,21 @@ object GeckoManager {
         excludeClearances: Set<String> = emptySet(),
     ): Map<String, String> {
         val result = mutableMapOf<String, String>()
+        for ((name, value) in readCookiesFromDb(context)) {
+            if (name.equals("cf_clearance", ignoreCase = true) && value in excludeClearances) continue
+            result[name] = value
+        }
+        return result
+    }
+
+    /** 清理异步落盘时可能读回任一旧行，验证基线必须保留所有同名 Cookie，而非最后一行。 */
+    fun cfClearancesFromDb(context: Context): Set<String> = readCookiesFromDb(context)
+        .filter { (name, _) -> name.equals("cf_clearance", ignoreCase = true) }
+        .map { (_, value) -> value }
+        .toSet()
+
+    private fun readCookiesFromDb(context: Context): List<Pair<String, String>> {
+        val result = mutableListOf<Pair<String, String>>()
         val dbFile = findCookiesDbFile(context) ?: return result
 
         try {
@@ -377,10 +425,7 @@ object GeckoManager {
                             val name = c.getString(nameIdx)
                             val value = c.getString(valIdx)
                             if (!name.isNullOrBlank() && !value.isNullOrBlank()) {
-                                if (name.equals("cf_clearance", ignoreCase = true) && value in excludeClearances) {
-                                    continue
-                                }
-                                result[name] = value
+                                result.add(name to value)
                             }
                         }
                     }

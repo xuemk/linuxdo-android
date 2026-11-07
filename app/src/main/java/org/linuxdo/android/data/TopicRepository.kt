@@ -14,6 +14,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlin.random.Random
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.Semaphore
@@ -655,7 +656,7 @@ class TopicRepository(
     @Volatile private var preferWebViewTimings = false
 
     /** timings 被 CF 挑战且静默兜底无果，需要请用户手工过盾（由 ViewModel 展示横幅）。 */
-    var onTimingsVerificationRequired: (() -> Unit)? = null
+    var onTimingsVerificationRequired: ((readProbePath: String?) -> Unit)? = null
 
     /** timings 重新同步成功，横幅可以收起。 */
     var onTimingsRecovered: (() -> Unit)? = null
@@ -665,27 +666,126 @@ class TopicRepository(
         onTimingsRecovered?.invoke()
     }
 
+    enum class VerificationProbeOutcome {
+        /** 站点返回明确的非挑战有效响应（2xx..4xx 且非 429），确认当前通道已放行。 */
+        CLEARED,
+        /** 仍被 Cloudflare 挑战拦截。 */
+        CHALLENGED,
+        /** 暂时无法判断：处于 429 冷却期、本次触发 429、网络失败(0)或服务端异常(5xx)。 */
+        INCONCLUSIVE,
+    }
+
+    fun resolveVerificationProbePath(probePath: String?): String {
+        val candidate = probePath?.trim().orEmpty()
+        return if (candidate.startsWith("/") && !candidate.startsWith("//")) {
+            candidate
+        } else {
+            DEFAULT_VERIFY_PROBE_PATH
+        }
+    }
+
     /**
-     * 验证页收口后，用 App 实际的请求通道发一个不重验的 GET 复核凭据。
+     * 验证页收口后，用 App 实际的请求通道发一个不重验的 GET 复核凭据（优先复核触发本次验证的只读原请求）。
      * 验证页走 Gecko 自己的 DoH/ECH 与 TLS 栈，签发的 cf_clearance 不一定被 CF 认作同一访客；
-     * 仍被挑战时返回 false 并记录出口摘要，由界面如实提示，而不是假装验证成功。
-     * 网络失败（status 0）不算凭据问题，交给后续正常请求报错。
+     * 区分“放行 / 挑战 / 暂时无法判断(0、429、5xx)”，并对 429 落实 Retry-After 与全局限流冷却。
      */
-    suspend fun probeClearanceAfterVerification(): Boolean {
+    suspend fun probeClearanceAfterVerification(probePath: String? = null): VerificationProbeOutcome =
+        probeVerificationTarget(probePath = probePath, afterCompletion = true)
+
+    /**
+     * 验证页打开期间的旁路探测：App 自己的请求通道对目标只读请求是否已经不再被 Cloudflare 挑战。
+     * 用户开了代理 / 切了网络后，出口变化让 CF 直接放行，此时验证页会停在回源 404 或加载失败上，
+     * 不能再依赖页面 DOM 标记或 Gecko 新签发凭据来判定完成。
+     * 严格遵守 429 冷却，且只有拿到明确非挑战的 2xx..4xx（非 429）响应才判为 CLEARED。
+     */
+    suspend fun probeAppPathDuringVerification(probePath: String? = null): VerificationProbeOutcome =
+        probeVerificationTarget(probePath = probePath, afterCompletion = false)
+
+    private suspend fun probeVerificationTarget(
+        probePath: String?,
+        afterCompletion: Boolean,
+    ): VerificationProbeOutcome {
+        val targetPath = resolveVerificationProbePath(probePath)
+        val stageLabel = if (afterCompletion) "验证后凭据复核" else "验证页旁路探测"
+        if (isRateLimitCoolingDown()) {
+            diagnostics.logThrottled(
+                "verify-probe-cooldown",
+                "$stageLabel: 429 冷却还剩 ${(rateLimitRemainingMs() + 999L) / 1_000L}s，跳过探测 $targetPath",
+            )
+            return VerificationProbeOutcome.INCONCLUSIVE
+        }
         val transport = transportProvider()
         val result = try {
-            transport.getWithoutRevalidate("/session/current.json", present = false)
+            withTimeoutOrNull(VERIFY_PROBE_TIMEOUT_MS) {
+                transport.getWithoutRevalidate(targetPath, present = false)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            diagnostics.log("验证后凭据复核异常(${transport.name}): ${error.javaClass.simpleName}，按非凭据问题放行")
-            return true
+            diagnostics.logThrottled(
+                "verify-probe-error",
+                "$stageLabel(${transport.name}): $targetPath 异常(${error.javaClass.simpleName})，暂无法判断",
+            )
+            return VerificationProbeOutcome.INCONCLUSIVE
         }
-        diagnostics.log("验证后凭据复核(${transport.name}): /session/current.json -> ${result.status} challenged=${result.challenged}")
-        if (!result.challenged) return true
-        val trace = transport.getWithoutRevalidate("${Config.BASE_URL}/cdn-cgi/trace", present = false)
-        diagnostics.log("[诊断] 出口对照 ${transport.name}: ${NetDiagnostics.egressTraceSummary(trace.body)}")
-        return false
+        if (result == null) {
+            diagnostics.logThrottled("verify-probe-timeout", "$stageLabel(${transport.name}): $targetPath 探测超时，继续等待")
+            return VerificationProbeOutcome.INCONCLUSIVE
+        }
+        diagnostics.recordStatus(transport.name, result.status, targetPath)
+        val challenge429 = result.status == 429 && (
+            result.challenged ||
+                ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                isCfChallengeBody(result.body)
+            )
+        if (result.status == 429) {
+            if (challenge429) {
+                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+            }
+            enterRateLimitCooldown(targetPath, result.retryAfterSeconds, cfChallenge = challenge429)
+            if (!challenge429) {
+                return VerificationProbeOutcome.INCONCLUSIVE
+            }
+        } else if (isRateLimitCoolingDown()) {
+            // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
+            return VerificationProbeOutcome.INCONCLUSIVE
+        }
+        if (result.challenged || challenge429) {
+            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+            if (afterCompletion) {
+                diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true")
+                val trace = try {
+                    withTimeoutOrNull(VERIFY_PROBE_TIMEOUT_MS) {
+                        transport.getWithoutRevalidate("${Config.BASE_URL}/cdn-cgi/trace", present = false)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (trace != null) {
+                    diagnostics.log("[诊断] 出口对照 ${transport.name}: ${NetDiagnostics.egressTraceSummary(trace.body)}")
+                    if (trace.status == 429) {
+                        enterRateLimitCooldown("/cdn-cgi/trace", trace.retryAfterSeconds)
+                    }
+                }
+            } else {
+                diagnostics.logThrottled(
+                    "verify-app-path-probe",
+                    "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true，继续等待验证页",
+                )
+            }
+            return VerificationProbeOutcome.CHALLENGED
+        }
+        if (result.status in 200..499) {
+            diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status}，已放行")
+            return VerificationProbeOutcome.CLEARED
+        }
+        diagnostics.logThrottled(
+            "verify-probe-inconclusive",
+            "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=false，暂无法判断",
+        )
+        return VerificationProbeOutcome.INCONCLUSIVE
     }
 
     /** 用户手工过盾后调用：解除熔断并让下一次心跳优先走 WebView 网络栈。 */
@@ -800,7 +900,7 @@ class TopicRepository(
                         timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
                         diagnostics.log("阅读进度上报未成功(${fallbackTransport.name} 遭 CF 挑战)，进入 3 分钟熔断冷却，等待用户手工验证")
                         notify403OrChallenged("/topics/timings", "timings B CF挑战")
-                        onTimingsVerificationRequired?.invoke()
+                        onTimingsVerificationRequired?.invoke(null)
                         return false
                     }
                     else -> Unit
@@ -956,7 +1056,7 @@ class TopicRepository(
                 // 仅对确认的 CF 挑战拦截记入 403/挑战事件，避免误伤
                 if (primaryResult.challenged) {
                     notify403OrChallenged("/topics/timings", "timings CF挑战")
-                    onTimingsVerificationRequired?.invoke()
+                    onTimingsVerificationRequired?.invoke(null)
                 }
             } else {
                 diagnostics.log("阅读进度上报网络或临时异常(HTTP ${primaryResult.status})，保留待报批次并按退避周期重试")
@@ -991,9 +1091,9 @@ class TopicRepository(
 
     private suspend fun cachedCsrf(): String? = try { obtainCsrf() }
         catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: NeedsInteractiveVerification) {
+        catch (error: NeedsInteractiveVerification) {
             timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
-            onTimingsVerificationRequired?.invoke()
+            onTimingsVerificationRequired?.invoke(error.readProbePath)
             null
         }
         catch (error: HttpStatusException) {
@@ -2726,7 +2826,7 @@ class TopicRepository(
             if (second != null && now - second.first < 120_000L && second.second != null) {
                 return@withLock second.second
             }
-            val fetched = runCatching { objectRequest("/badges.json") }.getOrNull()
+            val fetched = runCatching { objectRequest("/badges.json", present = false, retryAllowed = false) }.getOrNull()
             if (fetched != null) {
                 cachedAllBadgesRaw = Pair(SystemClock.elapsedRealtime(), fetched)
             }
@@ -2774,7 +2874,7 @@ class TopicRepository(
         val key = username.lowercase().trim().removePrefix("@")
         val userPath = URLEncoder.encode(username, "UTF-8")
         val userBadgesRaw = runCatching {
-            objectRequest("/user-badges/$userPath.json?grouped=true")
+            objectRequest("/user-badges/$userPath.json?grouped=true", present = false, retryAllowed = false)
         }.getOrNull()
 
         val allBadgesRaw = getAllBadgesRaw()
@@ -3103,8 +3203,13 @@ class TopicRepository(
         )
     }
 
-    private suspend fun objectRequest(path: String, burst: Boolean = false): JsonObject =
-        json.parseToJsonElement(request(path, burst)).jsonObject
+    private suspend fun objectRequest(
+        path: String,
+        burst: Boolean = false,
+        present: Boolean = true,
+        retryAllowed: Boolean = true,
+    ): JsonObject =
+        json.parseToJsonElement(request(path, burst = burst, present = present, retryAllowed = retryAllowed)).jsonObject
     private fun JsonObject.text(key: String): String = (get(key) as? JsonPrimitive)?.contentOrNull.orEmpty()
     private fun JsonObject.number(key: String): Long? = (get(key) as? JsonPrimitive)?.longOrNull?.takeIf { it > 0 }
     private fun JsonObject.objects(key: String): List<JsonObject> = (get(key) as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
@@ -3867,7 +3972,9 @@ class TopicRepository(
                 enterRateLimitCooldown("/session.json", loginResult.retryAfterSeconds)
                 throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试")
             }
-            if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
+            if (loginResult.challenged) {
+                throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
+            }
             if (loginResult.status == 403) throw RiskControlException(403, "登录请求触发风控 (403)")
             if (loginResult.status == 0) throw NetworkTimeoutException()
             val responseObj = try {
@@ -3941,7 +4048,9 @@ class TopicRepository(
                 markPostCompleted()
             }
             diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
-            if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
+            if (result.challenged) {
+                throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
+            }
             if (result.status == 429) {
                 enterRateLimitCooldown("/u/email-login.json", result.retryAfterSeconds)
                 throw HttpStatusException(429, "发送登录邮件过于频繁，请稍后再试")
@@ -3958,7 +4067,9 @@ class TopicRepository(
             loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
         }
         diagnostics.recordStatus(transport.name, result.status, "/session/csrf")
-        if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
+        if (result.challenged) {
+            throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截", readProbePath = "/session/csrf.json")
+        }
         if (result.status == 429) {
             enterRateLimitCooldown("/session/csrf.json", result.retryAfterSeconds)
             throw HttpStatusException(429, "获取凭据过于频繁，请稍后再试")
@@ -4008,7 +4119,9 @@ class TopicRepository(
                 enterRateLimitCooldown(path, result.retryAfterSeconds)
                 throw HttpStatusException(429, "验证邮件令牌过于频繁，请稍后再试")
             }
-            if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
+            if (result.challenged) {
+                throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
+            }
             if (result.status == 403) throw RiskControlException(403, "验证码登录触发风控 (403)")
             if (result.status == 0) throw NetworkTimeoutException()
 
@@ -4181,14 +4294,17 @@ class TopicRepository(
                 throw challenge
             }
             return try {
-                pacedGet(path, burst, present, allow429Challenge = false, beforeDispatch = beforeDispatch)
+                pacedGet(path, burst, present, allow429Challenge = true, beforeDispatch = beforeDispatch)
             } catch (retryChallenge: NeedsInteractiveVerification) {
-                // P0-4: CLEARED 后重放立撞 403 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
+                // P0-4: CLEARED 后重放立撞 403/429挑战 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
                 // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
                 getRevalidateBlockedUntil = maxOf(
                     getRevalidateBlockedUntil,
                     SystemClock.elapsedRealtime() + CLEARANCE_MISMATCH_COOLDOWN_MS,
                 )
+                if (retryChallenge.isFrom429) {
+                    enterRateLimitCooldown(path, cfChallenge = true)
+                }
                 diagnostics.log(
                     "静默过盾后重放仍被挑战(sent=${retryChallenge.failedClearanceFp})，判定凭据与 OkHttp 出口不匹配，" +
                         "熔断静默过盾 ${CLEARANCE_MISMATCH_COOLDOWN_MS / 1_000L}s: $path",
@@ -4301,14 +4417,35 @@ class TopicRepository(
                         throw NeedsInteractiveVerification(
                             "请求 $path 被 Cloudflare 挑战拦截",
                             failedClearanceFp = result.sentClearanceFp,
+                            readProbePath = path,
                         )
                     }
                     result.status == 429 -> {
+                        val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
+                        if (challenge429 && allow429Challenge) {
+                            if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
+                                staleReplayed = true
+                                diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
+                                continue
+                            }
+                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                            notify403OrChallenged(path, "request $path 429-challenge")
+                            throw NeedsInteractiveVerification(
+                                "请求 $path 被 Cloudflare 速率挑战拦截",
+                                failedClearanceFp = result.sentClearanceFp,
+                                isFrom429 = true,
+                                readProbePath = path,
+                            )
+                        }
+                        val cfChallenge = challenge429 || isCfChallengeBody(result.body)
+                        if (cfChallenge) {
+                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                        }
                         val cooldownEx = enterRateLimitCooldown(
-                            path, result.retryAfterSeconds, cfChallenge = false,
+                            path, result.retryAfterSeconds, cfChallenge = cfChallenge,
                         )
                         val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
-                        if (retryAllowed && present && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        if (retryAllowed && present && !cfChallenge && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
                             val jitterMs = (200L..800L).random()
                             val totalWaitMs = (waitSec * 1_000L) + jitterMs
                             diagnostics.log("前台请求 429 自动等待 ${totalWaitMs}ms (含抖动 ${jitterMs}ms) 后重试(${attempt + 1}/$MAX_RETRIES): $path")
@@ -4448,6 +4585,9 @@ class TopicRepository(
         }
         const val MAX_RETRIES = 2
         const val BACKOFF_BASE_MS = 1_000L
+        /** 无明确只读触发路径时（如写请求或阅读同步触发验证）回退使用的轻量会话接口。 */
+        const val DEFAULT_VERIFY_PROBE_PATH = "/session/current.json"
+        private const val VERIFY_PROBE_TIMEOUT_MS = 5_000L
         /** 登录前 CF 闸门复用启动后本就要刷新的通知读取请求。 */
         const val LOGIN_CF_GATE_PATH = "/notifications.json?recent=true&limit=50&silent=true"
         /** 前台请求遇到 429 时允许静默自动等待重放的最大秒数（对齐 fluxdo）。 */

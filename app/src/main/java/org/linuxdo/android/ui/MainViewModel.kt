@@ -206,6 +206,8 @@ private const val TOPIC_DETAIL_CACHE_CAPACITY = 20
 private const val TOPIC_DETAIL_CACHE_TTL_MS = 3 * 60 * 1_000L
 private const val SCROLL_IDLE_DELAY_MS = 400L
 private const val UNREAD_CHALLENGE_BACKOFF_MS = 3 * 60 * 1_000L
+private const val APP_PATH_PROBE_FIRST_DELAY_MS = 2_500L
+private const val APP_PATH_PROBE_INTERVAL_MS = 3_000L
 
 data class DetailUiState(
     val topic: TopicDetail? = null,
@@ -2794,7 +2796,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (allowInteractiveVerification) {
                     // 保留本轮授权；验证后重新取 CSRF，避免使用验证前的 _forum_session 配对。
                     resumeAfterVerification = { handleWebAuthCallback(uri, allowInteractiveVerification = false) }
-                    enterWebScreen(Screen.Verify, error.message.orEmpty())
+                    enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
                 }
             } catch (e: Exception) {
                 diagnostics.log("网页授权登录兑换失败: ${e.message}")
@@ -2941,6 +2943,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         container.reading.setSyncReadProgress(enabled)
         if (!enabled) {
             _readSyncVerifyBanner.value = false
+            readSyncVerificationProbePath = null
             readReportJobs.values.forEach { it.cancel() }
             readReportJobs.clear()
             readSendJobs.values.forEach { it.cancel() }
@@ -7165,7 +7168,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         diagnostics.log("浏览页面加载失败: ${error.message}")
         if (error is NeedsInteractiveVerification) {
             resumeAfterVerification = retry
-            enterWebScreen(Screen.Verify, error.message.orEmpty())
+            enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
         }
     }
 
@@ -7175,12 +7178,13 @@ fun openTopicSearch(topicId: Long, title: String) {
         repository.onAutoHealRequested = {
             selfHealNetwork(context = null, silent = true)
         }
-        repository.onTimingsVerificationRequired = {
-            showReadSyncVerifyBanner()
+        repository.onTimingsVerificationRequired = { probePath ->
+            showReadSyncVerifyBanner(probePath)
         }
         repository.onTimingsRecovered = {
             if (_readSyncVerifyBanner.value) diagnostics.log("阅读进度已恢复同步，收起风控提示")
             _readSyncVerifyBanner.value = false
+            readSyncVerificationProbePath = null
         }
         NotificationHelper.ensureNotificationChannels(app)
         if (store.isBackgroundNotificationEnabled()) {
@@ -7310,7 +7314,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
             } catch (error: Exception) {
                 diagnostics.log("启动检查失败: ${error.message}")
                 _state.update {
@@ -7367,7 +7371,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
             } catch (error: Exception) {
                 diagnostics.log("后台会话复核跳过: ${error.javaClass.simpleName}")
             }
@@ -7632,26 +7636,95 @@ fun openTopicSearch(topicId: Long, title: String) {
     suspend fun pollVerification() {
         if (verifying) return
         if (_state.value.screen == Screen.Verify) {
-            if (verificationMismatch || !browser.interactiveVerificationComplete()) return
+            if (restartVerificationIfNetworkChanged()) return
+            if (verificationMismatch) return
             val attempt = verificationAttempt
-            verifying = true
-            val usable = try {
-                repository.probeClearanceAfterVerification()
-            } finally {
-                verifying = false
+            val probePath = verificationProbePath
+            if (browser.interactiveVerificationComplete()) {
+                val now = SystemClock.elapsedRealtime()
+                val rateCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (rateCooldownMs > 0L) {
+                    verifyCompletionProbeNotBefore = maxOf(verifyCompletionProbeNotBefore, now + rateCooldownMs)
+                    return
+                }
+                if (now < verifyCompletionProbeNotBefore) return
+                verifying = true
+                val outcome = try {
+                    repository.probeClearanceAfterVerification(probePath)
+                } finally {
+                    verifying = false
+                }
+                if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+                if (restartVerificationIfNetworkChanged()) return
+                when (outcome) {
+                    TopicRepository.VerificationProbeOutcome.CLEARED -> {
+                        val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
+                        if (postProbeCooldownMs > 0L) {
+                            verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + postProbeCooldownMs
+                            return
+                        }
+                    }
+                    TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
+                        verificationMismatch = true
+                        browser.logVerifyGeckoEgress()
+                        diagnostics.log("验证页已通过，但 App 请求仍被 Cloudflare 挑战，提示用户切换网络后重试")
+                        return
+                    }
+                    TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
+                        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
+                        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + waitMs
+                        return
+                    }
+                }
+            } else {
+                // 验证页尚未收口：用户可能已开代理/换了网络，App 通道不再被挑战，页面却停在 404 或加载失败上。
+                // 正在人工交互挑战组件或处于 429 冷却时不探测，避免对 CF 额外发请求。
+                val now = SystemClock.elapsedRealtime()
+                val rateCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (rateCooldownMs > 0L) {
+                    appPathProbeNotBefore = maxOf(appPathProbeNotBefore, now + rateCooldownMs)
+                    return
+                }
+                if (now < appPathProbeNotBefore) return
+                if (browser.isVerifyChallengeActive()) {
+                    diagnostics.logThrottled("verify-probe-active-challenge", "验证页仍有活跃挑战，暂缓 App 通道探测")
+                    return
+                }
+                appPathProbeNotBefore = now + APP_PATH_PROBE_INTERVAL_MS
+                verifying = true
+                val outcome = try {
+                    repository.probeAppPathDuringVerification(probePath)
+                } finally {
+                    verifying = false
+                }
+                if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+                if (restartVerificationIfNetworkChanged()) return
+                // 从响应结束时退避，慢请求或超时后也不紧接着重探。
+                appPathProbeNotBefore = SystemClock.elapsedRealtime() + APP_PATH_PROBE_INTERVAL_MS
+                val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (postProbeCooldownMs > 0L) {
+                    appPathProbeNotBefore = maxOf(
+                        appPathProbeNotBefore,
+                        SystemClock.elapsedRealtime() + postProbeCooldownMs,
+                    )
+                    return
+                }
+                // 探测在途期间若页面刚刚刷出挑战组件且用户可能正在操作，放弃旁路收口，交由验证页继续处理
+                if (browser.isVerifyChallengeActive()) return
+                if (outcome != TopicRepository.VerificationProbeOutcome.CLEARED) return
+                // Gecko 若已换入新凭据并进入 DONE，留给下一轮完成后复核，不能沿用旧请求的结论。
+                if (!browser.finishVerifyForAppPath()) return
+                diagnostics.log("验证页未收口，但 App 请求通道已不被 Cloudflare 挑战，直接结束验证并恢复操作")
             }
-            if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
-            if (!usable) {
-                verificationMismatch = true
-                browser.logVerifyGeckoEgress()
-                diagnostics.log("验证页已通过，但 App 请求仍被 Cloudflare 挑战，提示用户切换网络后重试")
-                return
-            }
+            if (TopicRepository.isRateLimitCoolingDown()) return
+            verificationProbePath = null
+            verifyCompletionProbeNotBefore = 0L
             repository.clearCachedCsrfToken()
             unreadChallengeBackoffUntil = 0L
             if (verificationFromReadSync || _readSyncVerifyBanner.value) {
                 verificationFromReadSync = false
                 _readSyncVerifyBanner.value = false
+                readSyncVerificationProbePath = null
                 repository.onManualVerificationCompleted()
                 diagnostics.log("阅读同步手工验证完成，后续阅读进度改走 WebView 网络栈")
             }
@@ -7659,7 +7732,6 @@ fun openTopicSearch(topicId: Long, title: String) {
             resumeAfterVerification = null
             _state.update { it.copy(screen = verificationReturnScreen) }
             verificationDismissed = false
-            TopicRepository.clearRateLimitCooldown(store)
             if (resume != null) resume() else if (verificationReturnScreen == Screen.Boot) boot()
             return
         }
@@ -8048,6 +8120,11 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     private fun clearAccountScopedState() {
         accountScopeGeneration += 1
+        verificationAttempt++
+        verificationProbePath = null
+        readSyncVerificationProbePath = null
+        verificationFromReadSync = false
+        _readSyncVerifyBanner.value = false
         searchSequence++
         closeTopicSearch()
         metadataSequence++
@@ -8170,13 +8247,17 @@ fun openTopicSearch(topicId: Long, title: String) {
         }
     }
 
-    private suspend fun enterWebScreen(screen: Screen, reason: String = "") {
+    private suspend fun enterWebScreen(screen: Screen, reason: String = "", probePath: String? = null) {
         if (screen == Screen.Verify && _state.value.screen == Screen.Verify) return
         if (screen == Screen.Verify) {
             verificationReturnScreen = _state.value.screen
             verificationDismissed = false
             verificationMismatch = false
+            verificationProbePath = repository.resolveVerificationProbePath(probePath)
+            verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
+            verifyCompletionProbeNotBefore = 0L
             verificationAttempt++
+            armAppPathProbe()
             store.requireVerification()
         }
         if (screen == Screen.Verify) diagnostics.recordInteractiveRequired(reason.ifBlank { "未知" })
@@ -8191,6 +8272,11 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     private var verificationReturnScreen = Screen.List
+    /** 触发当前轮交互验证的只读原请求路径；为空时复核回退至默认会话接口。 */
+    private var verificationProbePath: String? = null
+    private var verificationNetworkGeneration = 0L
+    /** 验证完成后复核若遇 0 / 429 / 5xx 暂时无法判断，退避到此时间后再重探。 */
+    private var verifyCompletionProbeNotBefore = 0L
 
     /**
      * 阅读同步被 CF 风控时的非打断式横幅，表示「阅读同步当前处于受阻状态」，而不是一次性事件：
@@ -8200,20 +8286,25 @@ fun openTopicSearch(topicId: Long, title: String) {
     private val _readSyncVerifyBanner = MutableStateFlow(false)
     val readSyncVerifyBanner: StateFlow<Boolean> = _readSyncVerifyBanner.asStateFlow()
     private var verificationFromReadSync = false
+    @Volatile private var readSyncVerificationProbePath: String? = null
 
-    private fun showReadSyncVerifyBanner() {
-        if (!_syncReadProgress.value || _readSyncVerifyBanner.value) return
+    private fun showReadSyncVerifyBanner(probePath: String?) {
+        if (!_syncReadProgress.value) return
+        readSyncVerificationProbePath = repository.resolveVerificationProbePath(probePath)
+        if (_readSyncVerifyBanner.value) return
         diagnostics.log("阅读同步触发 CF 风控，提示用户手工验证")
         _readSyncVerifyBanner.value = true
     }
 
     fun dismissReadSyncVerifyBanner() {
         _readSyncVerifyBanner.value = false
+        readSyncVerificationProbePath = null
     }
 
     fun openReadSyncVerification() {
         verificationFromReadSync = true
-        viewModelScope.launch { enterWebScreen(Screen.Verify, "阅读同步 CF 风控") }
+        val probePath = readSyncVerificationProbePath
+        viewModelScope.launch { enterWebScreen(Screen.Verify, "阅读同步 CF 风控", probePath) }
     }
     private var verificationDismissed = false
 
@@ -8223,11 +8314,20 @@ fun openTopicSearch(topicId: Long, title: String) {
     /** 每次进入或重试验证递增，丢弃上一轮迟到的复核结果。 */
     private var verificationAttempt = 0
 
+    /** 验证页打开期间旁路探测 App 请求通道的最早时间（elapsedRealtime），给 Gecko 页面留出首轮收口时间。 */
+    private var appPathProbeNotBefore = 0L
+
+    private fun armAppPathProbe() {
+        appPathProbeNotBefore = SystemClock.elapsedRealtime() + APP_PATH_PROBE_FIRST_DELAY_MS
+    }
+
     fun cancelVerification() {
         // 未通过验证就返回：横幅保持显示，用户可随时再次进入
         verificationFromReadSync = false
         verificationDismissed = true
         verificationMismatch = false
+        verificationProbePath = null
+        verifyCompletionProbeNotBefore = 0L
         verificationAttempt++
         resumeAfterVerification = null
         _state.update { it.copy(screen = if (verificationReturnScreen == Screen.Boot) Screen.Login else verificationReturnScreen) }
@@ -8246,8 +8346,20 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     fun retryVerification() {
         verificationMismatch = false
+        verifyCompletionProbeNotBefore = 0L
+        verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
         verificationAttempt++
+        armAppPathProbe()
         viewModelScope.launch { browser.beginInteractiveVerification() }
+    }
+
+    private fun restartVerificationIfNetworkChanged(): Boolean {
+        val generation = container.dohCoordinator.currentEpoch.get().generation
+        if (generation == verificationNetworkGeneration) return false
+        if (TopicRepository.isRateLimitCoolingDown()) return true
+        diagnostics.log("验证期间网络已切换(gen=$verificationNetworkGeneration->$generation)，保留原请求并重新加载验证页")
+        retryVerification()
+        return true
     }
 
     private suspend fun loadLatest(page: Int, pullRefresh: Boolean) =
@@ -8332,7 +8444,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         } catch (error: NeedsInteractiveVerification) {
             if (requestScopeGeneration != accountScopeGeneration) return
             settleFeedLoading(feed)
-            enterWebScreen(Screen.Verify, error.message.orEmpty())
+            enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
         } catch (error: HttpStatusException) {
             if (requestScopeGeneration != accountScopeGeneration) return
             val msg = if (error.status == 403 && (_state.value.username == null || (feed == HomeFeedType.Unread || feed == HomeFeedType.Posted))) {

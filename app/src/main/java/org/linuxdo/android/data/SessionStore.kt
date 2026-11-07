@@ -104,6 +104,21 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         }
     }
 
+    /** 验证前在主线程记录全部旧值，包含重复 Cookie 与已判废值，不能使用已过滤的有效值作为基线。 */
+    fun cfClearancesForVerification(): Set<String> {
+        val manager = CookieManager.getInstance()
+        val values = listOf(manager.getCookie(Config.BASE_URL), manager.getCookie("${Config.BASE_URL}/"))
+            .flatMap { it.orEmpty().split(';') }
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) }
+            .map { it.substringAfter('=', "").trim() }
+            .filter { it.isNotBlank() }
+            .toMutableSet()
+        storedCookies()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let(values::add)
+        synchronized(challengedClearanceLock) { values.addAll(challengedClearances) }
+        return values
+    }
+
     fun clearChallengedClearances() {
         synchronized(challengedClearanceLock) {
             challengedClearances.clear()

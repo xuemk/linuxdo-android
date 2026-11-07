@@ -83,6 +83,7 @@ class NeedsInteractiveVerification(
     message: String,
     val failedClearanceFp: String = "-",
     val isFrom429: Boolean = false,
+    val readProbePath: String? = null,
 ) : Exception(message)
 
 /**
