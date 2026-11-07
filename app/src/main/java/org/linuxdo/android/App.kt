@@ -75,7 +75,7 @@ class App : Application(), ImageLoaderFactory {
                 baseUrl = Config.BASE_URL,
                 httpClientProvider = { container.httpClient },
                 sessionProvider = { ctx ->
-                    val store = if (ctx === this) container.sessionStore else SessionStore(ctx)
+                    val store = (ctx.applicationContext as? App)?.container?.sessionStore ?: container.sessionStore
                     object : org.linuxdo.android.push.PushSessionProvider {
                         override fun hasSession(): Boolean = store.hasSession()
                         override fun isBackgroundNotificationEnabled(): Boolean = store.isBackgroundNotificationEnabled()
@@ -128,11 +128,25 @@ class AppContainer(context: Context) {
     }
     val sessionStore = SessionStore(context)
     val reading = ReadingStore(context)
-    val accountManager = AccountManager(context)
+    val accountManager = AccountManager(context).also { manager ->
+        sessionStore.accountCookieFallback = { uid ->
+            val account = manager.account(uid)?.takeIf { it.userId == uid }
+            account?.token?.takeIf { it.isNotBlank() }?.let { token ->
+                buildMap {
+                    put(Config.SESSION_COOKIE, token)
+                    account.forumSession?.takeIf { it.isNotBlank() }?.let { put("_forum_session", it) }
+                }
+            }
+        }
+    }
     val draftStore = DraftStore(context)
     val historyStore = HistoryStore(context)
     private val initialUserAgent: String = resolveUserAgent(context, sessionStore)
-    val userAgent: String get() = sessionStore.userAgentOrNull() ?: initialUserAgent
+    val userAgent: String get() = try {
+        sessionStore.userAgentOrNull() ?: initialUserAgent
+    } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+        initialUserAgent
+    }
     val browser = BrowserSession(
         appContext = context,
         userAgent = userAgent,
@@ -342,7 +356,11 @@ class AppContainer(context: Context) {
          * 因为 cf_clearance 与 UA 绑定,UA 漂移会触发重新挑战。
          */
         fun resolveUserAgent(context: Context, store: SessionStore): String {
-            val stored = store.userAgentOrNull()
+            var storageReadable = true
+            val stored = try { store.userAgentOrNull() } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                storageReadable = false
+                null
+            }
             // 旧版本把设备段强行改成固定的 Android 10; K。它会与 WebView 自动
             // 发送的 Client Hints 不一致，CF 可能将同一会话视为指纹漂移。
             if (!stored.isNullOrBlank() && !stored.contains("Android 10; K")) return stored
@@ -352,7 +370,9 @@ class AppContainer(context: Context) {
                 "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             }
             val normalized = normalize(raw)
-            store.saveUserAgent(normalized)
+            try { if (storageReadable) store.saveUserAgent(normalized) } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                // 临时展示默认 UA，不把不可读的旧配置覆盖掉。
+            }
             return normalized
         }
 

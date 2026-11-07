@@ -75,6 +75,7 @@ import org.linuxdo.android.data.ReadReportSchedule
 import org.linuxdo.android.data.TopicReadTracker
 import org.linuxdo.android.data.AccountSession
 import org.linuxdo.android.data.AccountManager
+import org.linuxdo.android.data.SessionStore
 import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.AvatarCache
 import org.linuxdo.android.data.isAnimatedAvatarPath
@@ -879,10 +880,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
     private val _accounts = MutableStateFlow(
-        AccountUiState(
-            accounts = container.accountManager.accounts(),
-            activeUserId = container.accountManager.activeUserId(),
-        ),
+        container.accountManager.snapshot().let { snapshot ->
+            AccountUiState(accounts = snapshot.accounts, activeUserId = snapshot.activeUserId, error = snapshot.error)
+        },
     )
     val accounts: StateFlow<AccountUiState> = _accounts.asStateFlow()
     private var lastAccountSwitchAt: Long? = null
@@ -899,6 +899,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private var bootJob: Job? = null
+    private var sessionStorageNeedsRetry = false
     private var autoJob: Job? = null
     private var reconcileSessionJob: Job? = null
     private var verifying = false
@@ -2515,10 +2516,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when {
                     success -> {
                         diagnostics.log("安全验证与网页登录全流程成功，正在同步会话...")
-                        android.webkit.CookieManager.getInstance().flush()
-                        store.syncFromWebView()
-                        if (u.isNotBlank()) {
-                            store.saveCredentials(u, p, rememberPassword)
+                        try {
+                            android.webkit.CookieManager.getInstance().flush()
+                            store.syncFromWebView()
+                            if (u.isNotBlank()) store.saveCredentials(u, p, rememberPassword)
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _loginUiState.update { it.copy(loading = false, error = error.message) }
+                            return@launch
                         }
                         _loginUiState.update {
                             LoginUiState(
@@ -2694,8 +2698,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when {
                     success -> {
                         diagnostics.log("邮件登录令牌已在应用内完成安全验证与兑换")
-                        android.webkit.CookieManager.getInstance().flush()
-                        store.syncFromWebView()
+                        try {
+                            android.webkit.CookieManager.getInstance().flush()
+                            store.syncFromWebView()
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _loginUiState.update { it.copy(loading = false, error = error.message) }
+                            return@launch
+                        }
                         _loginUiState.update { LoginUiState() }
                         boot()
                     }
@@ -4950,15 +4959,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openComposer(target: ComposerTarget) {
         if (_composer.value.submitting) return
         val needsDraft = target is ComposerTarget.Edit
-        val localDraft = if (needsDraft) null else localDraftKey(target)?.let { key ->
-            container.draftStore.get(store.currentUserId(), key)
+        var storageError: String? = null
+        val localDraft = try {
+            if (needsDraft) null else localDraftKey(target)?.let { key -> container.draftStore.get(store.currentUserId(), key) }
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            storageError = "已有草稿暂时无法读取，请稍后重试，原稿已保留"
+            null
         }
         val draft = if (target is ComposerTarget.ReplyTo && !target.quote.isNullOrBlank()) {
             appendQuoteToDraft(localDraft.orEmpty(), target.username, target.postNumber, target.topicId, target.quote)
         } else localDraft.orEmpty()
-        _composer.value = ComposerUiState(target = target, draft = draft, loadingDraft = needsDraft)
-        if (target is ComposerTarget.ReplyTo && target.quote != null) {
-            localDraftKey(target)?.let { container.draftStore.put(store.currentUserId(), it, draft) }
+        _composer.value = ComposerUiState(target = target, draft = draft, loadingDraft = needsDraft, error = storageError)
+        if (storageError == null && target is ComposerTarget.ReplyTo && target.quote != null) {
+            updateDraft(draft)
         }
         if (target !is ComposerTarget.Edit) return
         pageJobs["draft:${target.postId}"] = viewModelScope.launch {
@@ -4979,10 +4992,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun updateDraft(text: String) {
         val current = _composer.value
         val target = current.target
-        if (target != null) {
-            localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, text) }
-        }
         _composer.update { if (it.open) it.copy(draft = text, error = null) else it }
+        if (target != null) {
+            try {
+                localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, text) }
+            } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _composer.update { if (it.target == target) it.copy(error = "草稿尚未保存，请保持此页面，稍后重试") else it }
+            }
+        }
     }
 
     private fun localDraftKey(target: ComposerTarget): String? = when (target) {
@@ -5142,7 +5159,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         is ComposerTarget.Edit -> applyEditedPost(target.topicId, repository.updatePost(target.postId, raw))
                     }
                 }
-                localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, "") }
+                try {
+                    localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, "") }
+                } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                    diagnostics.log("评论已提交，草稿暂未清除；不重试已成功的提交")
+                }
                 _composer.value = ComposerUiState()
             } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
                 _composer.update { it.copy(submitting = false, error = "提交结果未确认，请刷新楼层检查后再决定是否重试") }
@@ -7297,14 +7318,22 @@ fun openTopicSearch(topicId: Long, title: String) {
         bootJob = viewModelScope.launch {
             verifying = false
             _state.update { it.copy(screen = Screen.Boot, latest = it.latest.copy(error = null)) }
-            store.restoreMissingToWebView()
-            refreshCookieInfo()
-            if (!store.hasSessionCookie()) {
-                enterWebScreen(Screen.Login)
-                return@launch
-            }
             try {
-                val cachedUser = container.preferences.getString("cached_username", null)?.takeIf { it.isNotBlank() }
+                if (store.recoverInterruptedAccountSwitch()) {
+                    container.preferences.edit { remove("cached_username") }
+                    _state.update { it.copy(username = null) }
+                }
+                store.restoreMissingToWebView()
+                refreshCookieInfo()
+                sessionStorageNeedsRetry = false
+                if (!store.hasSessionCookie()) {
+                    enterWebScreen(Screen.Login)
+                    return@launch
+                }
+                val cachedUser = container.preferences.getString("cached_username", null)?.takeIf {
+                    it.isNotBlank() && store.currentUserId() > 0L &&
+                        container.preferences.getLong("cached_username_user_id", 0L) == store.currentUserId()
+                }
                 if (cachedUser != null) {
                     diagnostics.log("命中本地会话缓存($cachedUser),直拉首屏列表并后台复核")
                     val currentId = store.currentUserId()
@@ -7356,7 +7385,10 @@ fun openTopicSearch(topicId: Long, title: String) {
                     container.historyStore.switchUser(currentUser.id)
                     restoreAccountScopedLocalState(currentUser.id)
                     rememberCurrentAccount(currentUser)
-                    container.preferences.edit { putString("cached_username", username) }
+                    container.preferences.edit {
+                        putString("cached_username", username)
+                        putLong("cached_username_user_id", currentUser.id)
+                    }
                     _state.update { it.copy(username = username, screen = Screen.List) }
                     browser.prewarmCfClearanceIfNeeded("登录完成启动")
                     resumeAfterVerification?.also { resumeAfterVerification = null }?.invoke()
@@ -7372,6 +7404,9 @@ fun openTopicSearch(topicId: Long, title: String) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
                 enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                sessionStorageNeedsRetry = true
+                _state.update { it.copy(screen = Screen.List, latest = it.latest.copy(initialLoading = false, error = error.message)) }
             } catch (error: Exception) {
                 diagnostics.log("启动检查失败: ${error.message}")
                 _state.update {
@@ -7413,7 +7448,10 @@ fun openTopicSearch(topicId: Long, title: String) {
                     }
                     realUser.username != cachedUser -> {
                         diagnostics.log("后台复核用户名更新: $cachedUser -> ${realUser.username}")
-                        container.preferences.edit { putString("cached_username", realUser.username) }
+                        container.preferences.edit {
+                            putString("cached_username", realUser.username)
+                            putLong("cached_username_user_id", realUser.id)
+                        }
                         _state.update { it.copy(username = realUser.username) }
                     }
                 }
@@ -7820,7 +7858,12 @@ fun openTopicSearch(topicId: Long, title: String) {
             return
         }
         if (!browser.isPageCleared()) return
-        val cookies = store.syncFromWebView()
+        val cookies = try {
+            store.syncFromWebView()
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _loginUiState.update { it.copy(error = error.message) }
+            return
+        }
         val hasSession = cookies.containsKey(Config.SESSION_COOKIE)
         when (_state.value.screen) {
             Screen.Verify -> when {
@@ -7845,6 +7888,10 @@ fun openTopicSearch(topicId: Long, title: String) {
                 }
             }
             Screen.Login -> if (hasSession && !verifying) {
+                if (store.isSessionRecoveryPending()) {
+                    boot()
+                    return
+                }
                 verifying = true
                 diagnostics.log("检测到登录 Cookie _t，正在校验服务端真实会话...")
                 val verifiedUser = runCatching { repository.fetchCurrentUser() }.getOrNull()
@@ -7863,11 +7910,15 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     fun refreshAccounts() {
         if (_accounts.value.switching || store.sessionChanging) return
-        _state.value.username?.let { username ->
-            val userId = store.currentUserId()
-            if (userId > 0L) container.accountManager.remember(userId, username, store.syncFromWebView())
+        try {
+            _state.value.username?.let { username ->
+                val userId = store.currentUserId()
+                if (userId > 0L) container.accountManager.remember(userId, username, store.syncFromWebView())
+            }
+            publishAccountState()
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _accounts.update { it.copy(error = error.message) }
         }
-        publishAccountState()
     }
 
     private var preAddAccountUserId: Long? = null
@@ -7880,12 +7931,15 @@ fun openTopicSearch(topicId: Long, title: String) {
         _accounts.update { it.copy(switching = true) }
         loginJob = viewModelScope.launch {
             try {
-                refreshAccounts()
+                val previousId = store.currentUserId()
+                val previousName = _state.value.username
+                if (previousId > 0L && !previousName.isNullOrBlank()) {
+                    container.accountManager.remember(previousId, previousName, store.syncFromWebView())
+                }
                 clearAccountScopedState()
                 browser.stopSessionRequests()
                 addAccountPrepared = true
-                store.clearBusinessCookies()
-                store.clearCurrentUserId()
+                store.replaceBusinessCookies(null, null, userId = 0L)
                 repository.clearCachedCsrfToken()
                 container.preferences.edit { remove("cached_username") }
                 _state.update { it.copy(username = null, screen = Screen.Login) }
@@ -7915,7 +7969,12 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (_accounts.value.switching || userId <= 0L) return
         val now = SystemClock.elapsedRealtime()
         if (!force && lastAccountSwitchAt?.let { now - it < 1_500L } == true) return
-        val target = container.accountManager.account(userId) ?: return
+        val target = try {
+            container.accountManager.account(userId)
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _accounts.update { it.copy(error = error.message) }
+            return
+        } ?: return
         if (!force && userId == store.currentUserId()) {
             _accounts.update { it.copy(error = null) }
             return
@@ -7923,14 +7982,25 @@ fun openTopicSearch(topicId: Long, title: String) {
         lastAccountSwitchAt = now
         _accounts.update { it.copy(switching = true, error = null) }
         viewModelScope.launch {
-            val oldCookies = store.syncFromWebView()
-            val oldUserId = store.currentUserId()
-            val oldActiveUserId = container.accountManager.activeUserId()
+            val oldState = _state.value
+            val snapshot = try {
+                val cookies = store.syncFromWebView()
+                val oldId = store.currentUserId()
+                val oldName = _state.value.username
+                if (oldId > 0L && !oldName.isNullOrBlank()) {
+                    container.accountManager.remember(oldId, oldName, cookies)
+                }
+                Triple(cookies, oldId, container.accountManager.activeUserId())
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _accounts.update { it.copy(switching = false, error = error.message) }
+                return@launch
+            }
+            val (oldCookies, oldUserId, oldActiveUserId) = snapshot
             try {
                 // 先结算并清空旧账号的内存态，再替换网络凭据，避免在新会话下处理旧页面。
                 clearAccountScopedState()
                 browser.stopSessionRequests()
-                store.replaceBusinessCookies(target.token, target.forumSession)
+                store.replaceBusinessCookies(target.token, target.forumSession, userId = target.userId)
                 repository.clearCachedCsrfToken()
                 val currentUser = repository.fetchCurrentUserDetails()
                     ?: error("切换后的会话未登录")
@@ -7942,7 +8012,11 @@ fun openTopicSearch(topicId: Long, title: String) {
                 container.reading.switchUser(currentUser.id)
                 container.historyStore.switchUser(currentUser.id)
                 restoreAccountScopedLocalState(currentUser.id)
-                container.preferences.edit { putString("cached_username", currentUser.username) }
+                rememberCurrentAccount(currentUser)
+                container.preferences.edit {
+                    putString("cached_username", currentUser.username)
+                    putLong("cached_username_user_id", currentUser.id)
+                }
                 _state.update {
                     it.copy(
                         username = currentUser.username,
@@ -7951,7 +8025,6 @@ fun openTopicSearch(topicId: Long, title: String) {
                         unreadCount = 0,
                     )
                 }
-                rememberCurrentAccount(currentUser)
                 publishAccountState()
                 loadLatest(page = 0, pullRefresh = false)
                 refreshUnread(force = true)
@@ -7968,6 +8041,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                     store.replaceBusinessCookies(
                         oldCookies[Config.SESSION_COOKIE],
                         oldCookies["_forum_session"],
+                        userId = oldUserId,
                     )
                     if (oldUserId > 0L) {
                         store.saveCurrentUserId(oldUserId)
@@ -7984,6 +8058,12 @@ fun openTopicSearch(topicId: Long, title: String) {
                         container.accountManager.setActive(oldActiveUserId)
                     }
                     repository.clearCachedCsrfToken()
+                    container.preferences.edit {
+                        if (oldState.username == null) remove("cached_username")
+                        else putString("cached_username", oldState.username)
+                        putLong("cached_username_user_id", oldUserId)
+                    }
+                    _state.value = oldState
                     publishAccountState()
                 }.exceptionOrNull()
                 if (rollbackError == null) {
@@ -7993,7 +8073,11 @@ fun openTopicSearch(topicId: Long, title: String) {
                 if (rollbackError != null) {
                     clearAccountScopedState()
                     container.preferences.edit { remove("cached_username") }
-                    _state.update { it.copy(username = null, screen = Screen.Login, unreadCount = 0) }
+                    runCatching { store.requireSessionRecovery() }
+                        .onFailure { diagnostics.log("账号恢复标记暂未落盘，保持当前请求暂停") }
+                    sessionStorageNeedsRetry = true
+                    _state.update { it.copy(username = null, screen = Screen.List, unreadCount = 0,
+                        latest = it.latest.copy(initialLoading = false, error = "账号恢复尚未完成，请稍后重试")) }
                 }
                 _accounts.update {
                     it.copy(
@@ -8001,19 +8085,24 @@ fun openTopicSearch(topicId: Long, title: String) {
                         error = if (rollbackError == null) {
                             failureMessage ?: error.message ?: "账号切换失败"
                         } else {
-                            "账号切换失败，请重新登录"
+                            "账号恢复尚未完成，请稍后重试"
                         },
                     )
                 }
                 return@launch
             }
-            _accounts.update { it.copy(switching = false, error = null) }
+            _accounts.update { it.copy(switching = false) }
         }
     }
 
     fun addAccount() {
         if (_accounts.value.switching) return
         refreshAccounts()
+        val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _accounts.update { it.copy(error = snapshot.error) }
+            return
+        }
         if (_accounts.value.accounts.size >= AccountManager.MAX_ACCOUNTS) {
             Toast.makeText(
                 getApplication(),
@@ -8025,7 +8114,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         preAddAccountState = _state.value
         addAccountPrepared = false
         preAddAccountUserId = store.currentUserId().takeIf { it > 0L }
-            ?: container.accountManager.activeUserId().takeIf { it > 0L }
+            ?: snapshot.activeUserId.takeIf { it > 0L }
         _loginUiState.value = LoginUiState()
         _state.update { it.copy(screen = Screen.Login) }
     }
@@ -8037,7 +8126,6 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (_accounts.value.switching) return
         val previousState = preAddAccountState
         if (previousState != null) {
-            val previous = preAddAccountUserId?.let(container.accountManager::account)
             loginJob?.cancel()
             cancelWebAuth()
             browser.cancelCaptchaLogin()
@@ -8048,6 +8136,12 @@ fun openTopicSearch(topicId: Long, title: String) {
                 _state.value = previousState
                 return
             }
+            val previous = try {
+                preAddAccountUserId?.let(container.accountManager::account)
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _loginUiState.update { it.copy(error = error.message) }
+                return
+            }
             if (previous == null) {
                 _loginUiState.update { it.copy(error = "原账号凭据不可用，请重新登录") }
                 return
@@ -8056,13 +8150,16 @@ fun openTopicSearch(topicId: Long, title: String) {
             viewModelScope.launch {
                 try {
                     browser.stopSessionRequests()
-                    store.replaceBusinessCookies(previous.token, previous.forumSession)
+                    store.replaceBusinessCookies(previous.token, previous.forumSession, userId = previous.userId)
                     store.saveCurrentUserId(previous.userId)
                     container.accountManager.setActive(previous.userId)
                     container.reading.switchUser(previous.userId)
                     container.historyStore.switchUser(previous.userId)
                     restoreAccountScopedLocalState(previous.userId)
-                    container.preferences.edit { putString("cached_username", previous.username) }
+                    container.preferences.edit {
+                        putString("cached_username", previous.username)
+                        putLong("cached_username_user_id", previous.userId)
+                    }
                     repository.clearCachedCsrfToken()
                     preAddAccountState = null
                     preAddAccountUserId = null
@@ -8081,9 +8178,14 @@ fun openTopicSearch(topicId: Long, title: String) {
             }
             return
         }
-        val targetUserId = preAddAccountUserId?.takeIf { container.accountManager.account(it) != null }
-            ?: container.accountManager.activeUserId().takeIf { it > 0L && container.accountManager.account(it) != null }
-            ?: container.accountManager.accounts().firstOrNull()?.userId
+        val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _loginUiState.update { it.copy(error = snapshot.error) }
+            return
+        }
+        val targetUserId = preAddAccountUserId?.takeIf { expected -> snapshot.accounts.any { it.userId == expected } }
+            ?: snapshot.activeUserId.takeIf { expected -> snapshot.accounts.any { it.userId == expected } }
+            ?: snapshot.accounts.firstOrNull()?.userId
         preAddAccountUserId = null
         if (targetUserId != null && targetUserId > 0L) {
             switchAccountInternal(targetUserId, force = true)
@@ -8091,8 +8193,12 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     fun removeAccount(userId: Long) {
-        if (userId <= 0L) return
+        if (userId <= 0L || _accounts.value.switching) return
         val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _accounts.update { it.copy(error = snapshot.error) }
+            return
+        }
         val activeUserId = snapshot.activeUserId
         val isActive = userId == activeUserId
         if (isActive) {
@@ -8102,8 +8208,12 @@ fun openTopicSearch(topicId: Long, title: String) {
                     userId = nextAccount.userId,
                     force = true,
                     onSuccess = {
-                        container.accountManager.remove(userId)
-                        publishAccountState()
+                        try {
+                            container.accountManager.remove(userId)
+                            publishAccountState()
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _accounts.update { it.copy(error = error.message) }
+                        }
                     },
                     failureMessage = "切换至其他账号失败，未移除当前账号",
                 )
@@ -8111,8 +8221,12 @@ fun openTopicSearch(topicId: Long, title: String) {
                 logout()
             }
         } else {
-            container.accountManager.remove(userId)
-            publishAccountState()
+            try {
+                container.accountManager.remove(userId)
+                publishAccountState()
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _accounts.update { it.copy(error = error.message) }
+            }
         }
     }
 
@@ -8185,6 +8299,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             it.copy(
                 accounts = snapshot.accounts,
                 activeUserId = snapshot.activeUserId,
+                error = snapshot.error ?: it.error,
             )
         }
     }
@@ -8296,6 +8411,7 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     fun logout() {
+        if (_accounts.value.switching) return
         preAddAccountState = null
         preAddAccountUserId = null
         addAccountPrepared = false
@@ -8307,33 +8423,45 @@ fun openTopicSearch(topicId: Long, title: String) {
         searchJob?.cancel()
         unreadJob?.cancel()
         resumeAfterVerification = null
-        clearAccountScopedState()
-        container.reading.switchUser(0L)
-        container.historyStore.switchUser(0L)
-        container.preferences.edit { remove("cached_username") }
+        _accounts.update { it.copy(switching = true, error = null) }
         viewModelScope.launch {
-            val currentActiveId = container.accountManager.activeUserId()
-            if (currentActiveId > 0L) {
-                container.accountManager.remove(currentActiveId)
-            } else {
-                container.accountManager.clear()
+            try {
+                val currentUserId = store.currentUserId()
+                val token = store.storedCookies()[Config.SESSION_COOKIE]
+                // 先确认账号库可读，避免退出时误删其它账号或把不可读当成空库。
+                if (currentUserId > 0L) container.accountManager.account(currentUserId)
+                store.noteRejectedAuthToken(SessionStore.authTokenHash(token), currentUserId, store.sessionGeneration)
+                browser.stopSessionRequests()
+                store.replaceBusinessCookies(null, null, userId = 0L)
+                if (currentUserId > 0L) container.accountManager.remove(currentUserId)
+                publishAccountState()
+                clearAccountScopedState()
+                container.reading.switchUser(0L)
+                container.historyStore.switchUser(0L)
+                container.preferences.edit { remove("cached_username") }
+                repository.clearCachedCsrfToken()
+                browser.reset()
+                diagnostics.log("已登出并清除业务 Cookie（保留 Cloudflare 凭证）")
+                _state.update { UiState(path = it.path, userAgent = it.userAgent, homeFeed = initialHomeFeed) }
+                _loginUiState.update {
+                    LoginUiState(
+                        savedLogin = store.savedLogin().orEmpty(),
+                        savedPassword = store.savedPassword().orEmpty(),
+                        rememberPassword = store.isRememberPassword(),
+                    )
+                }
+                enterWebScreen(Screen.Login)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _accounts.update { it.copy(error = "退出未完成：${error.message}") }
+                runCatching { store.requireSessionRecovery() }
+                    .onFailure { diagnostics.log("退出恢复标记暂未落盘，保持当前请求暂停") }
+                sessionStorageNeedsRetry = true
+                _state.update { it.copy(username = null, latest = it.latest.copy(error = "退出未完成，请稍后重试")) }
+            } finally {
+                _accounts.update { it.copy(switching = false) }
             }
-            publishAccountState()
-            browser.stopSessionRequests()
-            store.clearBusinessCookies()
-            store.clearCurrentUserId()
-            repository.clearCachedCsrfToken()
-            browser.reset()
-            diagnostics.log("已登出并清除业务 Cookie（保留 Cloudflare 凭证）")
-            _state.update { UiState(path = it.path, userAgent = it.userAgent, homeFeed = initialHomeFeed) }
-            _loginUiState.update {
-                LoginUiState(
-                    savedLogin = store.savedLogin().orEmpty(),
-                    savedPassword = store.savedPassword().orEmpty(),
-                    rememberPassword = store.isRememberPassword(),
-                )
-            }
-            enterWebScreen(Screen.Login)
         }
     }
 
@@ -8494,8 +8622,13 @@ fun openTopicSearch(topicId: Long, title: String) {
         return true
     }
 
-    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) =
+    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) {
+        if (sessionStorageNeedsRetry) {
+            boot()
+            return
+        }
         loadFeed(_state.value.homeFeed, page, pullRefresh)
+    }
 
     private suspend fun loadFeed(feed: HomeFeedType, page: Int, pullRefresh: Boolean) {
         val requestScopeGeneration = accountScopeGeneration

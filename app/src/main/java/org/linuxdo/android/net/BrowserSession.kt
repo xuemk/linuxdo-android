@@ -224,9 +224,19 @@ class BrowserSession(
         else (view as? GeckoView)?.session?.stop()
     }
 
-    private suspend fun syncBrowserCookies(view: View): Map<String, String> {
+    private suspend fun syncBrowserCookies(
+        view: View,
+        authoritativeAuth: Boolean = false,
+        authorityStillValid: (() -> Boolean)? = null,
+    ): Map<String, String> {
         val bridge = geckoBridges[view]
         val generation = store.sessionGeneration
+        fun checkSyncCurrent() {
+            if (store.sessionChanging || generation != store.sessionGeneration || authorityStillValid?.invoke() == false) {
+                throw CancellationException("浏览器会话已变更")
+            }
+        }
+        checkSyncCurrent()
         val previousCookies = store.syncFromWebView()
         val staleForSync = if (isInCfMode) {
             cfStaleClearances + setOfNotNull(cfClearanceBeforeChallenge).filter { it.isNotBlank() }
@@ -236,6 +246,7 @@ class BrowserSession(
         var bridgeClearance: String? = null
         if (bridge != null) {
             val snapshot = bridge.readCookies()
+            checkSyncCurrent()
             val cookies = (0 until snapshot.length()).mapNotNull { index ->
                 val cookie = snapshot.getJSONObject(index)
                 val domain = cookie.optString("domain").removePrefix(".")
@@ -261,8 +272,23 @@ class BrowserSession(
                     if (cookie.has("expirationDate")) expiresAt((cookie.getDouble("expirationDate") * 1000).toLong())
                 }.build()
             }
-            store.applyResponseCookies(cookies, requestGeneration = generation, sentCookies = previousCookies)
+            if (authoritativeAuth) {
+                val tokens = cookies.filter {
+                    it.name == Config.SESSION_COOKIE && it.domain == Config.HOST && it.path == "/" &&
+                        it.value.isNotBlank() && it.expiresAt > System.currentTimeMillis()
+                }.map { it.value }.distinct()
+                check(tokens.size == 1) { "登录凭据缺失或存在冲突，无法确认登录" }
+            }
+            store.applyResponseCookies(
+                cookies,
+                requestGeneration = generation,
+                sentCookies = previousCookies,
+                authoritativeAuth = authoritativeAuth,
+                authorityStillValid = authorityStillValid,
+                authBrowserSnapshot = view === currentAuthView(),
+            )
         }
+        checkSyncCurrent()
         val geckoClearance = bridgeClearance?.takeIf { it !in staleForSync && !store.isClearanceChallenged(it) }
             ?: if (view is GeckoView) {
                 val context = attachedActivityContext ?: appContext
@@ -270,6 +296,7 @@ class BrowserSession(
                     selectFreshCfClearance(GeckoManager.cfClearancesFromDb(context), staleForSync)
                 }
             } else bridgeClearance
+        checkSyncCurrent()
         if (
             !geckoClearance.isNullOrBlank() &&
             !store.isClearanceChallenged(geckoClearance) &&
@@ -280,11 +307,24 @@ class BrowserSession(
         return store.syncFromWebView()
     }
 
+    private fun cookieSyncGuard(view: View): () -> Boolean {
+        val generation = store.sessionGeneration
+        val submissionGeneration = authSubmissionGeneration
+        val authView = view === currentAuthView()
+        val challengeView = view === currentCfView()
+        return {
+            !store.sessionChanging && generation == store.sessionGeneration &&
+                submissionGeneration == authSubmissionGeneration &&
+                ((authView && view === currentAuthView()) || (challengeView && view === currentCfView()))
+        }
+    }
+
     private fun refreshBrowserCookies(view: View, onComplete: () -> Unit) {
+        val stillCurrent = cookieSyncGuard(view)
         scope.launch(Dispatchers.Main) {
             try {
-                syncBrowserCookies(view)
-                onComplete()
+                syncBrowserCookies(view, authorityStillValid = stillCurrent)
+                if (stillCurrent()) onComplete()
             } catch (_: CancellationException) {
             } catch (error: Exception) {
                 diagnostics.log("浏览器 Cookie 同步失败: ${error.message}")
@@ -305,7 +345,39 @@ class BrowserSession(
         if (currentAuthView() !== view && currentCfView() !== view) return
         val bridge = Bridge()
         when (name) {
-            "onAuthResult" -> refreshBrowserCookies(view) { bridge.onAuthResult(payload) }
+            "onAuthResult" -> {
+                val result = runCatching { JSONObject(payload) }.getOrElse {
+                    diagnostics.log("忽略无法解析的登录回执")
+                    return
+                }
+                val submissionId = result.optString("submissionId")
+                val completion = authSubmitCompletion
+                val generation = store.sessionGeneration
+                val submissionGeneration = authSubmissionGeneration
+                fun stillCurrent(): Boolean =
+                    currentAuthView() === view && !store.sessionChanging && generation == store.sessionGeneration &&
+                        submissionGeneration == authSubmissionGeneration && submissionId.isNotBlank() &&
+                        submissionId == currentSubmissionId && cancelledSubmissionId != submissionId &&
+                        completion != null && authSubmitCompletion === completion && !completion.isCompleted
+                if (!stillCurrent()) {
+                    diagnostics.log("忽略已过期或已取消的登录回执，未同步 Cookie")
+                    return
+                }
+                val authoritativeAuth = isSuccessfulSessionAuthResult(result, !cachedSecondFactor.isNullOrBlank())
+                scope.launch(Dispatchers.Main) {
+                    try {
+                        syncBrowserCookies(view, authoritativeAuth, ::stillCurrent)
+                        if (stillCurrent()) bridge.onAuthResult(payload)
+                    } catch (_: CancellationException) {
+                    } catch (error: Exception) {
+                        diagnostics.log("登录 Cookie 同步失败: ${error.javaClass.simpleName}")
+                        if (stillCurrent()) {
+                            bridge.onAuthResult(result.put("phase", "exception")
+                                .put("body", "登录凭据保存失败，请稍后重试").toString())
+                        }
+                    }
+                }
+            }
             "onHcaptchaPass" -> bridge.onHcaptchaPass(payload)
             "onAuthAborted" -> bridge.onAuthAborted(payload)
             "onDiagnostic" -> {
@@ -325,6 +397,7 @@ class BrowserSession(
 
     fun cancelCaptchaLogin() {
         authSubmissionGeneration += 1L
+        authGeckoInitJob?.cancel()
         val submissionId = currentSubmissionId
         val completion = authSubmitCompletion
         val view = currentAuthView()
@@ -372,9 +445,7 @@ class BrowserSession(
         if (!hasActiveSubmission) {
             currentAuthView()?.let { authView ->
                 evaluateBrowserScript(authView, "if (typeof window.__linuxdoAbortLogin === 'function') window.__linuxdoAbortLogin();")
-                stopBrowserLoading(authView)
-                if (authView is WebView) authView.loadUrl("about:blank")
-                else (authView as? GeckoView)?.session?.loadUri("about:blank")
+                destroyAuthBrowser(authView)
             }
         }
     }
@@ -513,7 +584,7 @@ class BrowserSession(
                         } else if (!error.isNullOrBlank() && user.isNullOrBlank()) {
                             awaitingSecondFactorLogin = false
                             cb(false, error, false)
-                        } else if (status == 200 || !user.isNullOrBlank()) {
+                        } else if (isSuccessfulSessionAuthResult(obj, has2faToken)) {
                             awaitingSecondFactorLogin = false
                             cb(true, null, false)
                         } else {
@@ -630,42 +701,42 @@ class BrowserSession(
     private fun launchCfChallenge() {
         if (loginCfRecoveryId != null) return
         val loginView = currentAuthView() ?: return
-        val recoveryGeneration = store.sessionGeneration
-        val recoverySubmissionGeneration = authSubmissionGeneration
-        fun recoveryStillCurrent(): Boolean = currentAuthView() === loginView && !store.sessionChanging &&
-            store.sessionGeneration == recoveryGeneration && authSubmissionGeneration == recoverySubmissionGeneration
+        val stillCurrent = cookieSyncGuard(loginView)
         isInCfMode = true
         cfProbeScheduled = false
         cfCompletionProbing = false
         cfQuietRounds = 0
         cfSawChallenge = false
         scope.launch(Dispatchers.Main) {
-            if (!isInCfMode || !recoveryStillCurrent() || loginCfRecoveryId != null) return@launch
+            if (!isInCfMode || !stillCurrent() || loginCfRecoveryId != null) return@launch
             val recoveryId = store.beginClearanceRecovery()
             loginCfRecoveryId = recoveryId
             var dialogOwnsRecovery = false
             try {
-                if (!isInCfMode || currentAuthView() !== loginView) return@launch
-                syncBrowserCookies(loginView)
+                if (!isInCfMode || !stillCurrent()) return@launch
+                syncBrowserCookies(loginView, authorityStillValid = stillCurrent)
                 val context = attachedActivityContext ?: appContext
                 val geckoStale = withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(context) }
+                if (!isInCfMode || !stillCurrent()) return@launch
                 cfClearanceBeforeChallenge = currentCfClearance()
                 cfStaleClearances = store.cfClearancesForVerification() + geckoStale + setOfNotNull(cfClearanceBeforeChallenge)
                 geckoBridges[loginView]?.clearCfClearance()
+                if (!isInCfMode || !stillCurrent()) return@launch
                 store.clearCookie(CF_CLEARANCE_COOKIE)
                 CookieManager.getInstance().flush()
-                if (!isInCfMode || currentAuthView() !== loginView) return@launch
+                if (!isInCfMode || !stillCurrent()) return@launch
                 diagnostics.log("保留原 hCaptcha 会话，打开独立 Cloudflare 验证窗口 (排除旧凭据 ${cfStaleClearances.size} 枚)")
                 showCfChallengeDialog()
                 dialogOwnsRecovery = cfDialog?.isShowing == true
             } catch (_: CancellationException) {
             } catch (error: Exception) {
+                if (!stillCurrent()) return@launch
                 isInCfMode = false
                 diagnostics.log("CF 验证会话初始化失败: ${error.message}")
                 dismissCfDialog()
                 onAuthCallback?.invoke(false, "无法初始化安全验证，请重试", false)
             } finally {
-                if (!dialogOwnsRecovery || !recoveryStillCurrent()) endLoginClearanceRecovery(recoveryId)
+                if (!dialogOwnsRecovery || !stillCurrent()) endLoginClearanceRecovery(recoveryId)
             }
         }
     }
@@ -815,6 +886,7 @@ class BrowserSession(
         cfDialog = dialog
         cfGeckoView = geckoView
         cfGeckoSession = geckoSession
+        val stillCurrent = cookieSyncGuard(geckoView)
         dialog.show()
         dialog.window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
@@ -835,27 +907,28 @@ class BrowserSession(
         }, 5_000L)
         cfGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
+                if (!stillCurrent()) return@launch
                 val bridge = GeckoAuthBridge.create(
                     context,
                     geckoSession,
                     onReady = { onCfGeckoReady(geckoView) },
                     onCallback = { name, payload -> onGeckoAuthCallback(geckoView, name, payload) },
                 )
-                if (!isInCfMode || cfGeckoView !== geckoView) {
+                if (!isInCfMode || !stillCurrent()) {
                     bridge.close()
                     return@launch
                 }
                 geckoBridges[geckoView] = bridge
                 geckoSession.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
             } catch (_: CancellationException) {
-                if (isInCfMode && cfGeckoView === geckoView) {
+                if (stillCurrent()) {
                     isInCfMode = false
                     dismissCfDialog()
                     onAuthCallback?.invoke(false, "安全验证初始化已取消，请重试", false)
                 }
             } catch (error: Exception) {
                 diagnostics.log("CF 认证桥初始化失败: ${error.message}")
-                if (cfGeckoView === geckoView) {
+                if (stillCurrent()) {
                     isInCfMode = false
                     dismissCfDialog()
                     onAuthCallback?.invoke(false, "安全验证组件初始化失败，请重试", false)
@@ -961,6 +1034,7 @@ class BrowserSession(
      */
     private fun awaitFreshClearanceThen(view: View, reason: String) {
         if (!isInCfMode || cfCompletionProbing) return
+        val stillCurrent = cookieSyncGuard(view)
         // 已回源：等新凭据期间不露出 Discourse 的 404 页
         view.alpha = 0f
         cfCompletionProbing = true
@@ -970,15 +1044,15 @@ class BrowserSession(
 
         scope.launch(Dispatchers.Main) {
             delay(CF_COOKIE_SETTLE_DELAY_MS)
-            while (isInCfMode && currentCfView() === view && cfDialog?.isShowing == true) {
+            while (isInCfMode && stillCurrent() && cfDialog?.isShowing == true) {
                 try {
-                    syncBrowserCookies(view)
+                    syncBrowserCookies(view, authorityStillValid = stillCurrent)
                 } catch (_: CancellationException) {
                     return@launch
                 } catch (error: Exception) {
                     diagnostics.log("等待 CF 凭据同步: ${error.message}")
                 }
-                if (!isInCfMode || currentCfView() !== view) return@launch
+                if (!isInCfMode || !stillCurrent()) return@launch
                 if (isFreshCfClearance(currentCfClearance())) {
                     cfCompletionProbing = false
                     completeCfChallenge(view, reason)
@@ -2505,8 +2579,10 @@ class BrowserSession(
         authGeckoSession = geckoSession
         authGeckoCookiesPrepared = false
         authGeckoPreparing = false
+        val stillCurrent = cookieSyncGuard(geckoView)
         authGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
+                if (!stillCurrent()) return@launch
                 val browserUserAgent = withTimeoutOrNull(10_000L) {
                     suspendCancellableCoroutine<String?> { continuation ->
                         geckoSession.userAgent.accept(
@@ -2515,7 +2591,7 @@ class BrowserSession(
                         )
                     }
                 }?.takeIf { it.isNotBlank() } ?: error("无法读取认证浏览器标识")
-                if (authGeckoView !== geckoView) return@launch
+                if (!stillCurrent()) return@launch
                 if (store.userAgentOrNull() != browserUserAgent) {
                     store.saveUserAgent(browserUserAgent)
                     webViewInstance?.settings?.userAgentString = browserUserAgent
@@ -2529,7 +2605,7 @@ class BrowserSession(
                     onReady = { url -> onAuthGeckoReady(geckoView, url) },
                     onCallback = { name, payload -> onGeckoAuthCallback(geckoView, name, payload) },
                 )
-                if (authGeckoView !== geckoView) {
+                if (!stillCurrent()) {
                     bridge.close()
                     return@launch
                 }
@@ -2539,7 +2615,7 @@ class BrowserSession(
             } catch (_: CancellationException) {
             } catch (error: Exception) {
                 diagnostics.log("Gecko 认证桥初始化失败: ${error.message}")
-                if (authGeckoView === geckoView) onAuthCallback?.invoke(false, "认证组件初始化失败，请重试", false)
+                if (stillCurrent()) onAuthCallback?.invoke(false, "认证组件初始化失败，请重试", false)
             }
         }
         return geckoView
@@ -2555,10 +2631,12 @@ class BrowserSession(
         }
         if (authGeckoPreparing) return
         authGeckoPreparing = true
+        val stillCurrent = cookieSyncGuard(view)
         scope.launch(Dispatchers.Main) {
             try {
+                if (!stillCurrent()) return@launch
                 bridge.prepareAuthCookies(store.syncFromWebView())
-                if (authGeckoView !== view) return@launch
+                if (!stillCurrent()) return@launch
                 authGeckoCookiesPrepared = true
                 val link = pendingEmailLink
                 if (link != null) view.session?.loadUri(link)
@@ -2566,9 +2644,9 @@ class BrowserSession(
             } catch (_: CancellationException) {
             } catch (error: Exception) {
                 diagnostics.log("Gecko 认证会话准备失败: ${error.message}")
-                if (authGeckoView === view) onAuthCallback?.invoke(false, "认证会话准备失败，请重试", false)
+                if (stillCurrent()) onAuthCallback?.invoke(false, "认证会话准备失败，请重试", false)
             } finally {
-                if (authGeckoView === view) authGeckoPreparing = false
+                if (stillCurrent()) authGeckoPreparing = false
             }
         }
     }
@@ -4050,6 +4128,15 @@ class BrowserSession(
               }
             })();
         """.trimIndent()
+
+        internal fun isSuccessfulSessionAuthResult(result: JSONObject, hasSecondFactorToken: Boolean): Boolean {
+            if (result.optString("phase") != "session" || result.optInt("status") != 200) return false
+            val body = runCatching { JSONObject(result.optString("body")) }.getOrNull() ?: return false
+            val hasError = listOf("error", "errors").any { key ->
+                body.optString(key).let { it.isNotBlank() && it != "[]" && it != "null" }
+            }
+            return !hasError && !isSecondFactorResponse(body, hasSecondFactorToken)
+        }
 
         /**
          * 判断 Discourse 登录响应是否要求提供/重试二步验证（2FA）。

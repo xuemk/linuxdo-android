@@ -209,6 +209,7 @@ class OkHttpTransport(
                                 retryAfterSeconds = retryAfter,
                                 sentClearanceFp = activeTag.sentClearanceFp,
                                 cfMitigated = mitigated,
+                                sentSessionTokenHash = activeTag.sentSessionTokenHash,
                             )
                             if (continuation.isActive) {
                                 continuation.resume(transportResult)

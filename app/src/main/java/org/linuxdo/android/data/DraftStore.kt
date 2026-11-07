@@ -1,8 +1,6 @@
 package org.linuxdo.android.data
 
 import android.content.Context
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
 
 class DraftStore(context: Context) {
     private val preferences = encryptedPreferences(context)
@@ -30,19 +28,7 @@ class DraftStore(context: Context) {
     private companion object {
         const val PREFS_NAME = "composer_drafts_secure"
 
-        fun encryptedPreferences(context: Context) = runCatching {
-            createEncryptedPreferences(context)
-        }.getOrElse {
-            context.deleteSharedPreferences(PREFS_NAME)
-            createEncryptedPreferences(context)
-        }
-
-        private fun createEncryptedPreferences(context: Context) = EncryptedSharedPreferences.create(
-            context,
-            PREFS_NAME,
-            MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        )
+        fun encryptedPreferences(context: Context) =
+            SafeEncryptedPrefs.open(context, PREFS_NAME)
     }
 }

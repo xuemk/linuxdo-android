@@ -4184,7 +4184,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.accent.copy(alpha = 0.12f))
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 val nextBadge = store.incrementLastBadgeCount().coerceAtLeast(1)
                                 store.setBadgeTestHoldUntil(System.currentTimeMillis() + BADGE_TEST_HOLD_MILLIS)
@@ -4210,7 +4211,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.fieldBackground)
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 val nextBadge = (store.getLastBadgeCount() - 1).coerceAtLeast(0)
                                 store.setLastBadgeCount(nextBadge, force = true)
@@ -4230,7 +4232,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(Color(0xFFFF2D55).copy(alpha = 0.12f))
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 store.setLastBadgeCount(99, force = true)
                                 store.setBadgeTestHoldUntil(System.currentTimeMillis() + BADGE_TEST_HOLD_MILLIS)
@@ -4256,7 +4259,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.fieldBackground)
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 // 解除锁定并清掉模拟未读，让下一轮 refreshUnread 立刻校准回真实未读。
                                 store.setBadgeTestHoldUntil(0L)
                                 store.setTestSimulatedUnreadCount(0)

@@ -14,6 +14,8 @@ data class TransportResult(
     val retryAfterSeconds: Long? = null,
     val sentClearanceFp: String = "-",
     val cfMitigated: String? = null,
+    /** null 表示通道未记录；空串表示这次请求明确没有发送 _t。 */
+    val sentSessionTokenHash: String? = null,
 )
 
 interface Transport {

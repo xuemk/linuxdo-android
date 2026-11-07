@@ -166,7 +166,13 @@ private class SessionHeaderInterceptor(
     private val userAgent: String,
     private val transportLabel: String,
 ) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
+    override fun intercept(chain: Interceptor.Chain): Response = try {
+        interceptSession(chain)
+    } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+        throw IOException(error.message, error)
+    }
+
+    private fun interceptSession(chain: Interceptor.Chain): Response {
         val original = chain.request()
         val host = original.url.host
         val isLinuxDoHost = host == Config.HOST || host.endsWith(".${Config.HOST}")
@@ -179,7 +185,7 @@ private class SessionHeaderInterceptor(
             ?: store.sessionGeneration
         val sendCookies = original.tag(ActiveSessionRequest::class.java)?.sendCookies != false
         fun checkSession() {
-            if (generation != store.sessionGeneration || store.sessionChanging) {
+            if (generation != store.sessionGeneration || store.sessionChanging || store.isSessionRecoveryPending()) {
                 throw IOException("会话已切换，请重新操作")
             }
         }
@@ -246,6 +252,8 @@ private class SessionHeaderInterceptor(
         }
         val sentClearance = SessionStore.parseCookieHeader(cookieHeader)[Config.CF_CLEARANCE_COOKIE]
         original.tag(ActiveSessionRequest::class.java)?.sentClearanceFp = NetDiagnostics.fingerprint(sentClearance)
+        original.tag(ActiveSessionRequest::class.java)?.sentSessionTokenHash =
+            SessionStore.authTokenHash(SessionStore.parseCookieHeader(cookieHeader)[Config.SESSION_COOKIE])
         builder.removeHeader("Cookie")
         if (isPublicStaticIcon || !sendCookies) {
             builder.removeHeader("X-CSRF-Token")
@@ -330,6 +338,7 @@ data class ActiveSessionRequest(
     val generation: Long,
     @Volatile var sentClearanceFp: String = "-",
     val sendCookies: Boolean = true,
+    @Volatile var sentSessionTokenHash: String? = null,
     val isClearanceProbe: Boolean = false,
 )
 

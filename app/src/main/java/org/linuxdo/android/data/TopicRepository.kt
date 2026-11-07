@@ -2253,14 +2253,19 @@ class TopicRepository(
      */
     suspend fun uploadFile(fileName: String, mimeType: String, bytes: ByteArray): UploadedFile {
         ensureRequestAllowed()
+        val expectedUserId = sessionStore?.currentUserId()
+        val expectedGeneration = sessionStore?.sessionGeneration
         UploadLimits.rejectReason(fileName, bytes.size.toLong())?.let { throw LoginRejectedException(it) }
         var revalidated = false
         var csrfRefreshed = false
         var rateLimitRetried = false
+        var authRestored = false
         while (true) {
+            checkWriteSession(expectedUserId, expectedGeneration)
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
             val result = postGate.withLock {
                 throttlePost(burst = true)
+                checkWriteSession(expectedUserId, expectedGeneration)
                 val transport = transportProvider()
                 try {
                     transport.upload(
@@ -2269,6 +2274,7 @@ class TopicRepository(
                     )
                 } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
             }
+            checkWriteSession(expectedUserId, expectedGeneration)
             diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
             if (result.status == 429) {
                 val cfChallenge = isCfChallengeBody(result.body)
@@ -2305,6 +2311,17 @@ class TopicRepository(
                 cachedCsrfToken = null
                 csrfRefreshed = true
                 continue
+            }
+            if (result.status == 403 && !authRestored && isNotLoggedIn403(result.body)) {
+                authRestored = true
+                val healed = restoreWriteAuthentication(result, expectedUserId, expectedGeneration)
+                if (healed) {
+                    diagnostics.log("上传遇 403 未登录，已从本地备份补回会话凭据 _t 并重取 CSRF 重放")
+                    cachedCsrfToken = null
+                    csrfRefreshed = true
+                    continue
+                }
+                throw LoginRejectedException("登录状态已失效，请重新登录后再上传")
             }
             val payload = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
             if (result.status !in 200..299) {
@@ -2441,18 +2458,24 @@ class TopicRepository(
         beforeAttempt: () -> Unit = {},
     ): String {
         ensureRequestAllowed()
+        val expectedUserId = sessionStore?.currentUserId()
+        val expectedGeneration = sessionStore?.sessionGeneration
         var revalidated = false
         var csrfRefreshed = false
         var rateLimitRetried = false
+        var authRestored = false
         while (true) {
+            checkWriteSession(expectedUserId, expectedGeneration)
             beforeAttempt()
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
             val result = postGate.withLock {
                 throttlePost(burst = true)
+                checkWriteSession(expectedUserId, expectedGeneration)
                 beforeAttempt()
                 val transport = transportProvider()
                 try { transport.write(path, method, body, csrf, contentType) } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
             }
+            checkWriteSession(expectedUserId, expectedGeneration)
             diagnostics.recordStatus(transportProvider().name, result.status, path)
             if (result.status == 429) {
                 val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
@@ -2511,6 +2534,17 @@ class TopicRepository(
                 csrfRefreshed = true
                 continue
             }
+            if (result.status == 403 && !authRestored && isNotLoggedIn403(result.body)) {
+                authRestored = true
+                val healed = restoreWriteAuthentication(result, expectedUserId, expectedGeneration)
+                if (healed) {
+                    diagnostics.log("写请求遇 403 未登录，已从本地备份补回会话凭据 _t 并重取 CSRF 重放: $path")
+                    cachedCsrfToken = null
+                    csrfRefreshed = true
+                    continue
+                }
+                throw LoginRejectedException("登录状态已失效，请重新登录后再提交，当前内容已保留")
+            }
             if (result.status !in 200..299) {
                 if (result.status == 403) {
                     notify403OrChallenged("mutate $path 403")
@@ -2525,6 +2559,40 @@ class TopicRepository(
             }
             return result.body
         }
+    }
+
+    private fun checkWriteSession(userId: Long?, generation: Long?) {
+        val store = sessionStore ?: return
+        if (store.sessionChanging || store.isSessionRecoveryPending() || store.currentUserId() != userId || store.sessionGeneration != generation) {
+            throw CancellationException("账号已切换，已取消原账号的操作")
+        }
+    }
+
+    private suspend fun restoreWriteAuthentication(result: TransportResult, userId: Long?, generation: Long?): Boolean {
+        val store = sessionStore ?: return false
+        if (userId == null || userId <= 0L || generation == null || result.sentSessionTokenHash == null) return false
+        checkWriteSession(userId, generation)
+        val healed = withContext(Dispatchers.Main) {
+            store.tryHealMissingSessionInWebView(userId, generation, result.sentSessionTokenHash)
+        }
+        checkWriteSession(userId, generation)
+        if (!healed) return false
+        cachedCsrfToken = null
+        val response = transportProvider().get("/session/current.json", present = false)
+        checkWriteSession(userId, generation)
+        if (response.status != 200 || response.challenged) return false
+        val actualUserId = runCatching {
+            json.parseToJsonElement(response.body).jsonObject["current_user"]?.jsonObject
+                ?.get("id")?.jsonPrimitive?.longOrNull
+        }.getOrNull() ?: return false
+        if (actualUserId != userId) {
+            withContext(Dispatchers.Main) {
+                checkWriteSession(userId, generation)
+                store.clearSessionCookie()
+            }
+            throw LoginRejectedException("恢复的登录账号不一致，请重新登录")
+        }
+        return true
     }
 
     suspend fun search(query: String, page: Int, order: SearchOrder = SearchOrder.Relevance): SearchPage {
@@ -4721,6 +4789,18 @@ class TopicRepository(
         fun isCfChallengeBody(body: String): Boolean {
             val head = body.take(4_000)
             return head.contains("challenge-platform") || head.contains("Just a moment", ignoreCase = true)
+        }
+
+        /** Discourse 源站明确返回业务未登录（而非权限不足或风控）。 */
+        private fun isNotLoggedIn403(body: String): Boolean {
+            val payload = runCatching { org.json.JSONObject(body) }.getOrNull() ?: return false
+            if (payload.optString("error_type").equals("not_logged_in", ignoreCase = true)) return true
+            val errors = payload.optJSONArray("errors") ?: return false
+            return (0 until errors.length()).any { index ->
+                val message = errors.optString(index)
+                message.contains("您需要登录才能执行此操作") ||
+                    message.contains("You need to be logged in", ignoreCase = true)
+            }
         }
         const val MAX_RETRIES = 2
         const val BACKOFF_BASE_MS = 1_000L
