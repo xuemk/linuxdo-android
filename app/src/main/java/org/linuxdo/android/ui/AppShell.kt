@@ -658,6 +658,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     var showConnectSheet by rememberSaveable { mutableStateOf(false) }
     var privateMessageRecipient by rememberSaveable { mutableStateOf<String?>(null) }
     var globalBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    var browserAccountId by remember { mutableStateOf(savedTopicsUserId) }
+    LaunchedEffect(savedTopicsUserId, accountState.switching) {
+        if (browserAccountId != savedTopicsUserId || accountState.switching) {
+            globalBrowserUrl = null
+            org.linuxdo.android.ui.screen.MiniAppSessionPool.destroyCurrent()
+        }
+        browserAccountId = savedTopicsUserId
+    }
     val contentObscured = topicCreator.open || composer.open || detailOverlay || showSavedTopics || topicSearch.open || metadataEditor.open ||
         showConnectSheet || globalBrowserUrl != null || privateMessageRecipient != null || accountState.switching ||
         userCard.loading || userCard.user != null || userCard.error != null
@@ -801,6 +809,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                 onNavigateToConnect = { showConnectSheet = true },
                                 onNavigateToChat = { stack.push(Route.Chat) },
+                                onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1084,6 +1093,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
+                                onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1177,6 +1187,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
+                                onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1412,6 +1423,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
+                                onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1681,8 +1693,26 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             }
         }
 
+        val requestedMiniAppUrl = org.linuxdo.android.ui.screen.MiniAppSessionPool.requestedMiniAppUrl
+        LaunchedEffect(requestedMiniAppUrl, browsing) {
+            if (browsing && !requestedMiniAppUrl.isNullOrBlank()) {
+                org.linuxdo.android.ui.screen.MiniAppSessionPool.clearRequest()
+                globalBrowserUrl = requestedMiniAppUrl
+            }
+        }
+
+        // 剪贴板若为 L 站应用链接 (https://linux.do/apps/...)，直接消费并进入对应小程序
+        LaunchedEffect(detectedClipboardTarget, browsing) {
+            val target = detectedClipboardTarget ?: return@LaunchedEffect
+            val miniAppUrl = target.second.miniAppUrl
+            if (browsing && !miniAppUrl.isNullOrBlank()) {
+                viewModel.consumeClipboardTarget(context, target.first)
+                globalBrowserUrl = miniAppUrl
+            }
+        }
+
         androidx.compose.animation.AnimatedVisibility(
-            visible = detectedClipboardTarget != null,
+            visible = detectedClipboardTarget != null && detectedClipboardTarget?.second?.isMiniApp != true,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = if (shouldShowTabBar) 64.dp else 16.dp, start = 16.dp, end = 16.dp)
@@ -1700,18 +1730,22 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                     onView = {
                         val consumed = viewModel.consumeClipboardTarget(context, target.first)
                         val linkToOpen = consumed ?: target.second
-                        selected = MainTab.Latest
-                        val latestStack = stacks.getValue(MainTab.Latest)
-                        val currentRoute = latestStack.current
-                        if (currentRoute is Route.TopicDetail && currentRoute.topicId == linkToOpen.topicId) {
-                            viewModel.loadTopic(
-                                linkToOpen.topicId,
-                                postNumber = linkToOpen.postNumber,
-                                resumePostNumber = viewModel.resolveResumePostNumber(linkToOpen.topicId, linkToOpen.postNumber),
-                                fromNotification = true,
-                            )
+                        if (linkToOpen.isMiniApp) {
+                            globalBrowserUrl = linkToOpen.miniAppUrl
                         } else {
-                            latestStack.push(Route.TopicDetail(linkToOpen.topicId, "", linkToOpen.postNumber))
+                            selected = MainTab.Latest
+                            val latestStack = stacks.getValue(MainTab.Latest)
+                            val currentRoute = latestStack.current
+                            if (currentRoute is Route.TopicDetail && currentRoute.topicId == linkToOpen.topicId) {
+                                viewModel.loadTopic(
+                                    linkToOpen.topicId,
+                                    postNumber = linkToOpen.postNumber,
+                                    resumePostNumber = viewModel.resolveResumePostNumber(linkToOpen.topicId, linkToOpen.postNumber),
+                                    fromNotification = true,
+                                )
+                            } else {
+                                latestStack.push(Route.TopicDetail(linkToOpen.topicId, "", linkToOpen.postNumber))
+                            }
                         }
                     },
                     onDismiss = {
@@ -1720,6 +1754,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                 )
             }
         }
+
+        org.linuxdo.android.ui.screen.MiniAppFloatingPill(
+            onRestore = { url -> globalBrowserUrl = url },
+            modifier = Modifier.zIndex(18f),
+        )
     }
     if (showConnectSheet) {
         ConnectWebSheet(

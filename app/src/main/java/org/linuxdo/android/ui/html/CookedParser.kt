@@ -557,16 +557,22 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     flush()
                     val src = contentUrl(element.attr("src").ifBlank { element.attr("data-src") })
                     if (src != null) {
-                        val host = runCatching { URI(src).host?.removePrefix("www.") }.getOrNull().orEmpty()
+                        val parsedUri = runCatching { URI(src) }.getOrNull()
+                        val host = parsedUri?.host?.removePrefix("www.")?.lowercase().orEmpty()
+                        val path = parsedUri?.path?.lowercase().orEmpty()
+                        val isMiniApp = (host == Config.HOST || host.endsWith(".${Config.HOST}")) &&
+                            (path == "/apps" || path.startsWith("/apps/"))
                         val title = element.attr("title").ifBlank {
                             when {
+                                isMiniApp -> "L 站轻应用"
                                 host.contains("bilibili.com") -> "Bilibili 嵌入视频"
                                 host.contains("youtube.com") || host.contains("youtube-nocookie.com") -> "YouTube 嵌入视频"
                                 host.contains("vimeo.com") -> "Vimeo 嵌入视频"
                                 else -> "嵌入内容 (${host.ifBlank { "点击打开" }})"
                             }
                         }
-                        output += CookedBlock.Onebox(src, title, "点击打开嵌入内容")
+                        val desc = if (isMiniApp) "点击进入微信小程序模式交互体验" else "点击打开嵌入内容"
+                        output += CookedBlock.Onebox(src, title, desc)
                     }
                 }
                 "video", "audio" -> {

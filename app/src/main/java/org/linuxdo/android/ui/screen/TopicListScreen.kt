@@ -57,6 +57,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -225,6 +226,7 @@ fun TopicListScreen(
     onNavigateToHistory: (() -> Unit)? = null,
     onNavigateToConnect: (() -> Unit)? = null,
     onNavigateToChat: (() -> Unit)? = null,
+    onNavigateToApps: (() -> Unit)? = null,
     onNavigateToBookmarks: (() -> Unit)? = null,
     onNavigateToFollowing: (() -> Unit)? = null,
     onNavigateToLikes: (() -> Unit)? = null,
@@ -317,6 +319,23 @@ fun TopicListScreen(
         }
     }
     val pullState = rememberPullToRefreshState()
+    val latestOnOpenMiniApps by rememberUpdatedState(onNavigateToApps)
+    val miniAppsHeaderThreshold = with(LocalDensity.current) { 72.dp.toPx() }
+    val miniAppsHeaderGesture = if (active && currentFeed != null && onNavigateToApps != null) {
+        Modifier.pointerInput(listState, miniAppsHeaderThreshold) {
+            var pullDistance = 0f
+            detectVerticalDragGestures(
+                onDragStart = { pullDistance = 0f },
+                onDragCancel = { pullDistance = 0f },
+                onDragEnd = {
+                    if (pullDistance >= miniAppsHeaderThreshold && !listState.canScrollBackward) latestOnOpenMiniApps?.invoke()
+                },
+                onVerticalDrag = { change, amount ->
+                    if (!listState.canScrollBackward) { pullDistance = (pullDistance + amount).coerceAtLeast(0f); change.consume() }
+                },
+            )
+        }
+    } else Modifier
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
     var noticeToast by remember { mutableStateOf<String?>(null) }
@@ -710,7 +729,13 @@ fun TopicListScreen(
 
     PullToRefreshBox(
         isRefreshing = effectiveState.refreshing,
-        onRefresh = onRefresh,
+        onRefresh = {
+            if (active && currentFeed != null && onNavigateToApps != null && pullState.distanceFraction >= 1.55f) {
+                onNavigateToApps()
+            } else {
+                onRefresh()
+            }
+        },
         state = pullState,
         modifier = modifier
             .onSizeChanged { containerWidthPx = it.width.toFloat() }
@@ -728,7 +753,14 @@ fun TopicListScreen(
                             alpha = if (effectiveState.refreshing) 1f else min(1f, fraction * 1.4f)
                         },
                 ) {
-                    IosActivityIndicator(diameter = 22.dp)
+                    if (currentFeed != null && onNavigateToApps != null && fraction >= 1.55f && !effectiveState.refreshing) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            WeChatThreeDotsLoader()
+                            Text("松开进入小程序", color = IosTheme.colors.secondaryLabel, fontSize = 12.sp)
+                        }
+                    } else {
+                        IosActivityIndicator(diameter = 22.dp)
+                    }
                 }
             }
         },
@@ -763,13 +795,13 @@ fun TopicListScreen(
             customLargeTitle = when {
                 effectiveFeed != null && onFeedSelect != null -> {
                     {
-                        HomeFeedTitleBar(
+                        Box(miniAppsHeaderGesture) { HomeFeedTitleBar(
                             currentFeed = effectiveFeed,
                             targetFeed = incomingFeed,
                             transitionProgress = transitionProgress,
                             onFeedSelect = animateSelectFeed,
                             trailing = trailing,
-                        )
+                        ) }
                     }
                 }
                 hasCategoryDropdown -> {
@@ -788,12 +820,12 @@ fun TopicListScreen(
             customCollapsedTitle = when {
                 effectiveFeed != null && onFeedSelect != null -> {
                     {
-                        HomeFeedCollapsedBar(
+                        Box(miniAppsHeaderGesture) { HomeFeedCollapsedBar(
                             currentFeed = effectiveFeed,
                             targetFeed = incomingFeed,
                             transitionProgress = transitionProgress,
                             onFeedSelect = animateSelectFeed,
-                        )
+                        ) }
                     }
                 }
                 hasCategoryDropdown -> {
@@ -869,6 +901,7 @@ fun TopicListScreen(
                                 FloatingAction.History -> onNavigateToHistory?.invoke()
                                 FloatingAction.Connect -> onNavigateToConnect?.invoke()
                                 FloatingAction.Chat -> onNavigateToChat?.invoke()
+                                FloatingAction.Apps -> onNavigateToApps?.invoke()
                             }
                         },
                         modifier = Modifier.fillMaxSize(),
@@ -4143,6 +4176,7 @@ private fun floatingActionColor(action: FloatingAction): Color = when (action) {
     FloatingAction.History -> Color(0xFF7E57C2)     // 典雅紫罗兰
     FloatingAction.Connect -> Color(0xFF1E88E5)     // LinuxDo 极客蓝
     FloatingAction.Chat -> Color(0xFFE91E63)        // 活力珊瑚粉
+    FloatingAction.Apps -> Color(0xFF07C160)        // 微信小程序绿
 }
 
 /** 辅助悬浮按钮各功能的纯矢量精致手绘图标。 */
@@ -4338,6 +4372,27 @@ private fun FloatingActionIcon(
                     drawCircle(tint, 1.1f, Offset(8.5f, 10f))
                     drawCircle(tint, 1.1f, Offset(12f, 10f))
                     drawCircle(tint, 1.1f, Offset(15.5f, 10f))
+                }
+                FloatingAction.Apps -> {
+                    // 小程序双环徽章
+                    drawArc(
+                        color = tint,
+                        startAngle = 120f,
+                        sweepAngle = 250f,
+                        useCenter = false,
+                        topLeft = Offset(3.5f, 3.5f),
+                        size = Size(11f, 11f),
+                        style = stroke,
+                    )
+                    drawArc(
+                        color = tint,
+                        startAngle = -60f,
+                        sweepAngle = 250f,
+                        useCenter = false,
+                        topLeft = Offset(9.5f, 9.5f),
+                        size = Size(11f, 11f),
+                        style = stroke,
+                    )
                 }
             }
         }

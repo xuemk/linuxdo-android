@@ -6501,7 +6501,9 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
         val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
         (scheme == "http" || scheme == "https") && internalTopic == null
     }
-    var expanded by rememberSaveable(onebox.url) { mutableStateOf(isAutoPreviewDemoOnebox(onebox)) }
+    val isMiniAppOnebox = remember(onebox.url) { isLinuxDoMiniAppUrl(onebox.url) }
+    val isTrustedOnebox = remember(onebox.url) { isTrustedForumUrl(onebox.url) }
+    var expanded by rememberSaveable(onebox.url) { mutableStateOf(!isMiniAppOnebox && isAutoPreviewDemoOnebox(onebox)) }
     var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
     var visible by remember(onebox.url) { mutableStateOf(true) }
 
@@ -6530,7 +6532,7 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (expanded && canPreview) {
+        if (expanded && canPreview && !isMiniAppOnebox) {
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -6553,7 +6555,20 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                 AsyncImage(it, onebox.title, modifier = Modifier.fillMaxWidth().height(160.dp), contentScale = ContentScale.Crop)
             }
         }
-        Text(onebox.title, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (isMiniAppOnebox) {
+                MiniAppTinyEmblem(isMiniApp = true, modifier = Modifier.size(16.dp))
+            }
+            Text(
+                onebox.title,
+                style = IosTheme.type.subheadline,
+                fontWeight = FontWeight.SemiBold,
+                color = IosTheme.colors.label,
+            )
+        }
         onebox.description?.let {
             Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
@@ -6563,9 +6578,9 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                Uri.parse(onebox.url).host.orEmpty(),
+                if (isMiniAppOnebox) "linux.do · 小程序" else Uri.parse(onebox.url).host.orEmpty(),
                 style = IosTheme.type.caption,
-                color = IosTheme.colors.accent,
+                color = if (isMiniAppOnebox) Color(0xFF07C160) else IosTheme.colors.accent,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
@@ -6575,28 +6590,44 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (expanded) {
+                    if (isMiniAppOnebox) {
                         Text(
-                            text = "全屏交互",
+                            text = "进入小程序 ›",
+                            style = IosTheme.type.caption,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF07C160),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color(0xFF07C160).copy(alpha = 0.14f))
+                                .clickable { openUrl(onebox.url) }
+                                .padding(horizontal = 10.dp, vertical = 4.dp),
+                        )
+                    } else {
+                        if (expanded) {
+                            Text(
+                                text = "全屏交互",
+                                style = IosTheme.type.caption,
+                                fontWeight = FontWeight.Medium,
+                                color = IosTheme.colors.accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        if (isTrustedOnebox) openUrl(onebox.url) else fullscreen = true
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                        Text(
+                            text = if (expanded) "收起预览" else "▶ 帖内预览",
                             style = IosTheme.type.caption,
                             fontWeight = FontWeight.Medium,
                             color = IosTheme.colors.accent,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(6.dp))
-                                .clickable { fullscreen = true }
+                                .clickable { expanded = !expanded }
                                 .padding(horizontal = 6.dp, vertical = 2.dp),
                         )
                     }
-                    Text(
-                        text = if (expanded) "收起预览" else "▶ 帖内预览",
-                        style = IosTheme.type.caption,
-                        fontWeight = FontWeight.Medium,
-                        color = IosTheme.colors.accent,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable { expanded = !expanded }
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
                 }
             }
         }

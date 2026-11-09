@@ -246,6 +246,21 @@ class TopicRepository(
 
     fun isNonChallengeRateLimitCoolingDown(): Boolean = Companion.isNonChallengeRateLimitCoolingDown()
 
+    suspend fun fetchMiniApps(query: String = "", page: Int = 0, sort: MiniAppSort = MiniAppSort.Latest): MiniAppDirectoryPage {
+        require(page >= 0)
+        val keyword = URLEncoder.encode(query.trim(), StandardCharsets.UTF_8.name())
+        return MiniAppDirectoryPage.parse(
+            objectRequest("/mini-app-api/apps.json?sort=${sort.apiValue}&q=$keyword&page=$page&favorite=${sort.favorite}"),
+            page,
+        )
+    }
+
+    suspend fun fetchMiniAppInfo(id: String): MiniAppEntry? {
+        require(MiniAppEntry.idFromUrl("${Config.BASE_URL}/apps/$id") == id)
+        val app = objectRequest("/mini-app-api/public/$id/info")["app"] as? JsonObject ?: return null
+        return MiniAppEntry.fromJson(app)?.takeIf { it.id == id }
+    }
+
     /** 后台静默预取（首楼摘要、新话题探测）撞盾后的退避期内，这类请求一律不发。 */
     fun isSilentPrefetchBackingOff(): Boolean =
         SystemClock.elapsedRealtime() < silentPrefetchBackoffUntil

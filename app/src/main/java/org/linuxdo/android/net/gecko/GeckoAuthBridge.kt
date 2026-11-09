@@ -124,6 +124,8 @@ class GeckoAuthBridge private constructor(
 
     suspend fun readCookies(): JSONArray = JSONArray(request("cookies"))
 
+    suspend fun observeInAppPage(): JSONObject = JSONObject(request("observeInAppPage"))
+
     suspend fun prepareAuthCookies(cookies: Map<String, String>) {
         request("prepareAuth", JSONObject().put("cookies", JSONObject(cookies)))
     }

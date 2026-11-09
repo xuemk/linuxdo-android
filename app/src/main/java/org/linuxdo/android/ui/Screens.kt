@@ -10374,6 +10374,7 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
         FloatingAction.History -> Color(0xFF7E57C2).copy(alpha = 0.15f) to Color(0xFF7E57C2)
         FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f) to Color(0xFF1E88E5)
         FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f) to Color(0xFFE91E63)
+        FloatingAction.Apps -> Color(0xFF07C160).copy(alpha = 0.15f) to Color(0xFF07C160)
     }
 
     Box(
@@ -10486,6 +10487,10 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
                         drawCircle(actionTint, 1.1f, Offset(8.5f, 10f))
                         drawCircle(actionTint, 1.1f, Offset(12f, 10f))
                         drawCircle(actionTint, 1.1f, Offset(15.5f, 10f))
+                    }
+                    FloatingAction.Apps -> {
+                        drawArc(color = actionTint, startAngle = 120f, sweepAngle = 250f, useCenter = false, topLeft = Offset(3.5f, 3.5f), size = Size(11f, 11f), style = stroke)
+                        drawArc(color = actionTint, startAngle = -60f, sweepAngle = 250f, useCenter = false, topLeft = Offset(9.5f, 9.5f), size = Size(11f, 11f), style = stroke)
                     }
                 }
             }

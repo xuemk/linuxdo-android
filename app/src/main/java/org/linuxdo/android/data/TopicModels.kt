@@ -14,12 +14,147 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.linuxdo.android.Config
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+private val MINI_APP_ID = Regex("[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
+
+@Serializable
+data class MiniAppEntry(
+    val id: String,
+    val name: String,
+    val iconUrl: String? = null,
+    val ratingAverage: Double? = null,
+    val ratingCount: Long? = null,
+    val usageCount: Long? = null,
+) {
+    val url: String get() = "${Config.BASE_URL}/apps/$id"
+
+    companion object {
+        fun fromJson(data: JsonObject): MiniAppEntry? {
+            val id = (data["app_id"] as? JsonPrimitive)?.contentOrNull ?: return null
+            val name = (data["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+            if (!MINI_APP_ID.matches(id) || name.isBlank()) return null
+            val icon = (data["icon_url"] as? JsonPrimitive)?.contentOrNull?.toHttpUrlOrNull()
+                ?.takeIf { it.isHttps && it.username.isEmpty() && it.password.isEmpty() }
+            val ratingAvg = (data["rating_average"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull()
+                ?.takeIf { it.isFinite() && it in 0.0..5.0 }
+            val ratingCnt = (data["rating_count"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+                ?.takeIf { it >= 0L }
+            val usageCnt = (data["usage_count"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+                ?.takeIf { it >= 0L }
+            return MiniAppEntry(
+                id = id,
+                name = name,
+                iconUrl = icon?.toString(),
+                ratingAverage = ratingAvg,
+                ratingCount = ratingCnt,
+                usageCount = usageCnt,
+            )
+        }
+
+        fun idFromUrl(value: String?): String? {
+            val url = value?.toHttpUrlOrNull() ?: return null
+            if (!url.isHttps || url.host != Config.HOST || url.port != 443 ||
+                url.username.isNotEmpty() || url.password.isNotEmpty()) return null
+            val path = url.pathSegments.dropLastWhile(String::isEmpty)
+            return path.takeIf { it.size == 2 && it[0] == "apps" }?.get(1)?.takeIf(MINI_APP_ID::matches)
+        }
+    }
+}
+
+enum class MiniAppSort(val apiValue: String, val label: String, val favorite: Boolean = false) {
+    Hot("hot", "最热"),
+    Latest("latest", "最新上线"),
+    Rating("rating", "评分最高"),
+    Used("used", "使用最多"),
+    Favorites("latest", "已收藏", favorite = true);
+}
+
+data class MiniAppDirectoryPage(val apps: List<MiniAppEntry>, val hasMore: Boolean) {
+    companion object {
+        fun parse(data: JsonObject, page: Int): MiniAppDirectoryPage {
+            require(page >= 0 && (data["page"] as? JsonPrimitive)?.intOrNull == page) { "小程序目录页码不匹配" }
+            val perPage = (data["per_page"] as? JsonPrimitive)?.intOrNull ?: 0
+            val total = (data["total"] as? JsonPrimitive)?.intOrNull ?: -1
+            require(perPage > 0 && total >= 0) { "小程序目录分页信息无效" }
+            val entries = data["apps"] as? JsonArray ?: error("小程序目录缺少应用列表")
+            return MiniAppDirectoryPage(
+                entries.mapNotNull { (it as? JsonObject)?.let(MiniAppEntry::fromJson) }.distinctBy { it.id },
+                entries.isNotEmpty() && (page + 1L) * perPage < total,
+            )
+        }
+    }
+}
+
+@Serializable
+data class MiniAppLibraryState(
+    val recent: List<MiniAppEntry> = emptyList(),
+    val favorites: List<MiniAppEntry> = emptyList(),
+) {
+    fun visit(app: MiniAppEntry): MiniAppLibraryState = copy(
+        recent = (listOf(app) + recent.filterNot { it.id == app.id }).take(40),
+        favorites = favorites.map { if (it.id == app.id) app else it },
+    )
+
+    fun addFavorite(app: MiniAppEntry): MiniAppLibraryState = copy(
+        favorites = if (favorites.any { it.id == app.id }) {
+            favorites.map { if (it.id == app.id) app else it }
+        } else {
+            favorites + app
+        },
+    )
+
+    fun removeFavorite(id: String): MiniAppLibraryState = copy(
+        favorites = favorites.filterNot { it.id == id },
+    )
+
+    fun removeRecent(id: String): MiniAppLibraryState = copy(
+        recent = recent.filterNot { it.id == id },
+    )
+
+    fun toggleFavorite(app: MiniAppEntry): MiniAppLibraryState = copy(
+        favorites = if (favorites.any { it.id == app.id }) favorites.filterNot { it.id == app.id }
+            else favorites + app,
+    )
+
+    fun moveRecent(id: String, offset: Int): MiniAppLibraryState {
+        val from = recent.indexOfFirst { it.id == id }
+        if (from < 0) return this
+        val target = (from.toLong() + offset).coerceIn(0L, recent.lastIndex.toLong()).toInt()
+        if (target == from) return this
+        return copy(recent = recent.toMutableList().apply { add(target, removeAt(from)) })
+    }
+
+    fun reorderRecent(fromIndex: Int, toIndex: Int): MiniAppLibraryState {
+        if (fromIndex !in recent.indices || toIndex !in recent.indices || fromIndex == toIndex) return this
+        return copy(recent = recent.toMutableList().apply { add(toIndex, removeAt(fromIndex)) })
+    }
+
+    fun moveFavorite(id: String, offset: Int): MiniAppLibraryState {
+        val from = favorites.indexOfFirst { it.id == id }
+        if (from < 0) return this
+        val target = (from.toLong() + offset).coerceIn(0L, favorites.lastIndex.toLong()).toInt()
+        if (target == from) return this
+        return copy(favorites = favorites.toMutableList().apply { add(target, removeAt(from)) })
+    }
+
+    fun reorderFavorite(fromIndex: Int, toIndex: Int): MiniAppLibraryState {
+        if (fromIndex !in favorites.indices || toIndex !in favorites.indices || fromIndex == toIndex) return this
+        return copy(favorites = favorites.toMutableList().apply { add(toIndex, removeAt(fromIndex)) })
+    }
+
+    fun updateEntry(app: MiniAppEntry): MiniAppLibraryState = copy(
+        recent = recent.map { if (it.id == app.id) app else it },
+        favorites = favorites.map { if (it.id == app.id) app else it },
+    )
+}
 
 /** 首页顶部支持切换的 4 个 Feed 类别。默认是 Latest。 */
 enum class HomeFeedType(val label: String, val apiPath: String) {
@@ -68,7 +203,8 @@ enum class FloatingAction(
     Sort("sort", "排序", "排序", "切换话题列表排序"),
     Drafts("drafts", "草稿", "草稿", "查看与编辑草稿"),
     Search("search", "搜索", "搜索", "全站快捷搜索"),
-    Categories("categories", "分类", "分类", "浏览全部话题分类");
+    Categories("categories", "分类", "分类", "浏览全部话题分类"),
+    Apps("apps", "应用广场", "应用", "进入 L 站应用广场小程序");
 
     companion object {
         const val MAX_ACTIONS = 5
@@ -655,16 +791,28 @@ object CustomSectionIconMapper {
 }
 
 data class InternalTopicLink(
-    val topicId: Long,
+    val topicId: Long = 0L,
     val postNumber: Int? = null,
-)
+    val miniAppUrl: String? = null,
+) {
+    val isMiniApp: Boolean get() = !miniAppUrl.isNullOrBlank()
+}
 
 /**
- * ???????????????????????????? linux.do ?????
- * ?? (??? URL, ???? InternalTopicLink)?
+ * 从剪贴板文本中解析 linux.do 轻应用链接 (/apps/...) 或话题链接 (/t/...)。
+ * 返回 (原始 URL, 解析后的 InternalTopicLink)。
  */
 fun parseTopicLinkFromText(text: String?): Pair<String, InternalTopicLink>? {
     if (text.isNullOrBlank()) return null
+    val appRegex = Regex("""https?://(?:[a-zA-Z0-9\-]+\.)?linux\.do/apps(?:/[^\s\r\n"'<>()\[\]\uFF08\uFF09\u3010\u3011\u300A\u300B\u201C\u201D\u2018\u2019\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A,!]*)?""")
+    appRegex.find(text)?.let { match ->
+        var rawAppUrl = match.value.trim()
+        rawAppUrl = rawAppUrl.trimEnd('.', ',', '!', ';', ':', ')', ']', '}', '>', '\u3002', '\uff0c', '\uff01', '\uff1f', '\uff1b', '\uff1a', '\uff09', '\u3011', '\u201d', '\u2019')
+        val validAppUrl = parseInternalMiniAppUrl(rawAppUrl)
+        if (validAppUrl != null) {
+            return Pair(validAppUrl, InternalTopicLink(topicId = 0L, miniAppUrl = validAppUrl))
+        }
+    }
     val regex = Regex("""https?://(?:[a-zA-Z0-9\-]+\.)?linux\.do/t/[^\s\r\n"'<>()\[\]\uFF08\uFF09\u3010\u3011\u300A\u300B\u201C\u201D\u2018\u2019\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A,!?]+""")
     val match = regex.find(text) ?: return null
     var rawUrl = match.value.trim()
@@ -672,6 +820,16 @@ fun parseTopicLinkFromText(text: String?): Pair<String, InternalTopicLink>? {
     val link = parseInternalTopicUrl(rawUrl) ?: return null
     return Pair(rawUrl, link)
 }
+
+fun parseInternalMiniAppUrl(url: String): String? = runCatching {
+    val uri = android.net.Uri.parse(url.trim())
+    val scheme = uri.scheme?.lowercase() ?: return null
+    if (scheme != "http" && scheme != "https") return null
+    val host = uri.host?.lowercase()?.trimEnd('.') ?: return null
+    if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return null
+    val path = uri.path?.lowercase().orEmpty()
+    if (path == "/apps" || path.startsWith("/apps/")) url.trim() else null
+}.getOrNull()
 
 /**
  * ?????linux.do?????????

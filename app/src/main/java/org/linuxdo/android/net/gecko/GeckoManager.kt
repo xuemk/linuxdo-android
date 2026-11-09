@@ -224,6 +224,7 @@ object GeckoManager {
         onExternalRequest: ((uri: String) -> Boolean)? = null,
         returnErrorPageHtml: Boolean = true,
         onDiagnostic: (String) -> Unit = {},
+        onContentPainted: (url: String) -> Unit = {},
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
@@ -242,6 +243,12 @@ object GeckoManager {
             ): GeckoResult<AllowOrDeny>? {
                 Log.d(TAG, "Gecko onLoadRequest: ${diagnosticUrl(request.uri)}")
                 if (onExternalRequest != null && onExternalRequest(request.uri)) {
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
+                }
+                if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW &&
+                    (request.uri.startsWith("https://") || request.uri.startsWith("http://"))
+                ) {
+                    session.loadUri(request.uri)
                     return GeckoResult.fromValue(AllowOrDeny.DENY)
                 }
                 return GeckoResult.fromValue(AllowOrDeny.ALLOW)
@@ -315,6 +322,7 @@ object GeckoManager {
                     contentPaintLogged = true
                     Log.d(TAG, "Gecko 首屏内容已绘制")
                     onDiagnostic("首屏内容已绘制")
+                    onContentPainted(currentUrl)
                 }
             }
 

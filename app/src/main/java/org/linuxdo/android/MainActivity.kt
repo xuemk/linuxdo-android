@@ -156,6 +156,12 @@ class MainActivity : ComponentActivity() {
         val uri = intent?.data ?: return
         val url = uri.toString()
         if (uri.scheme == "discourse" && uri.host == "auth_redirect") return
+        val miniAppUrl = org.linuxdo.android.data.parseInternalMiniAppUrl(url)
+        if (miniAppUrl != null) {
+            intent.data = null
+            org.linuxdo.android.ui.screen.MiniAppSessionPool.requestOpen(miniAppUrl)
+            return
+        }
         val link = org.linuxdo.android.data.parseInternalTopicUrl(url) ?: return
         intent.data = null
         viewModel.navigateToTopicFromNotification(link.topicId, link.postNumber)
