@@ -917,6 +917,9 @@ class TopicRepository(
             // ── 已验证可用时优先路径 B (WebView fetch) ──
             if (preferWebViewTimings && fallbackTransport != null) {
                 val ready = fallbackTransport.isReady()
+                if (!ready) {
+                    preferWebViewTimings = false
+                }
                 val preferred = if (ready) sendViaFallback(fallbackTransport, cachedCsrfToken) else null
                 ensureReadingActive()
                 diagnostics.log(
@@ -960,20 +963,21 @@ class TopicRepository(
 
             val queuedAt = SystemClock.elapsedRealtime()
             var requestStartedAt = 0L
-            val primaryResult = try {
-                postGate.withLock {
-                    ensureReadingActive()
-                    if (isRateLimitCoolingDown()) return@withLock null
-                    throttlePost()
-                    ensureReadingActive()
-                    if (isRateLimitCoolingDown()) return@withLock null
-                    requestStartedAt = SystemClock.elapsedRealtime()
-                    try {
-                        primaryTransport.write("/topics/timings", "POST", form, primaryCsrf, Transport.FORM_CONTENT_TYPE, present = false)
-                    } finally {
-                        markPostCompleted()
-                    }
+            suspend fun sendViaPrimary(csrf: String, burst: Boolean = false): TransportResult? = postGate.withLock {
+                ensureReadingActive()
+                if (isRateLimitCoolingDown()) return@withLock null
+                throttlePost(burst = burst)
+                ensureReadingActive()
+                if (isRateLimitCoolingDown()) return@withLock null
+                requestStartedAt = SystemClock.elapsedRealtime()
+                try {
+                    primaryTransport.write("/topics/timings", "POST", form, csrf, Transport.FORM_CONTENT_TYPE, present = false)
+                } finally {
+                    markPostCompleted()
                 }
+            }
+            val primaryResult = try {
+                sendViaPrimary(primaryCsrf)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1024,16 +1028,7 @@ class TopicRepository(
                 ensureReadingActive()
                 if (newCsrf != null) {
                     val retryResult = try {
-                        postGate.withLock {
-                            if (isRateLimitCoolingDown()) return@withLock null
-                            throttlePost(burst = true)
-                            ensureReadingActive()
-                            try {
-                                primaryTransport.write("/topics/timings", "POST", form, newCsrf, Transport.FORM_CONTENT_TYPE, present = false)
-                            } finally {
-                                markPostCompleted()
-                            }
-                        }
+                        sendViaPrimary(newCsrf, burst = true)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) { null }
@@ -1051,57 +1046,92 @@ class TopicRepository(
                 }
             }
 
-            // 仅当确认遭遇 Cloudflare 挑战拦截时，才转交路径 B (WebView fetch) 进行兜底
-            if (primaryResult.challenged && fallbackTransport != null) {
+            var failureResult = primaryResult
+            if (primaryResult.challenged) {
                 if (isRateLimitCoolingDown()) return false
-                diagnostics.log("阅读进度遭遇 Cloudflare 挑战，转交 ${fallbackTransport.name} 走原生 Chromium 网络栈兜底")
-                val fallbackHandled = kotlinx.coroutines.coroutineScope {
-                    ensureReadingActive()
-                    val alreadyReady = fallbackTransport.isReady()
-                    val fallbackReady = alreadyReady || fallbackTransport.revalidate("timings 挑战兜底", requestHost = Config.HOST)
-                    ensureReadingActive()
-                    diagnostics.log("[诊断] timings 兜底就绪 alreadyReady=$alreadyReady ready=$fallbackReady")
-                    if (fallbackReady) {
-                        val fallbackResult = sendViaFallback(fallbackTransport, primaryCsrf)
-                        ensureReadingActive()
-                        diagnostics.log(
-                            "[诊断] timings 兜底结果 status=${fallbackResult?.status ?: "未发出"} challenged=${fallbackResult?.challenged}" +
-                                " body=${fallbackResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
-                        )
-                        if (fallbackResult != null && fallbackResult.status == 429) {
-                            val cooldown = enterRateLimitCooldown("/topics/timings", fallbackResult.retryAfterSeconds)
-                            timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
-                            return@coroutineScope false
-                        }
-                        if (fallbackResult != null && fallbackResult.status in 200..299) {
-                            timingsCooldownUntil = 0L
-                            markTimingsSynced()
-                            preferWebViewTimings = true
-                            recordTopicPostsReported(currentUserId, topicId, numbers)
-                            diagnostics.log("阅读进度已同步(${fallbackTransport.name} 兜底成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s")
-                            return@coroutineScope true
-                        }
+                // Gecko 补签只更新共享 Cookie，不代表系统 WebView 已具备同源 fetch 环境。
+                val cleared = if (isCarriedClearanceStale(primaryResult.sentClearanceFp)) {
+                    diagnostics.log("阅读进度携带过期 cf_clearance 撞盾(sent=${primaryResult.sentClearanceFp})，直接换新值重试 ${primaryTransport.name}")
+                    true
+                } else {
+                    diagnostics.log("阅读进度遭遇 Cloudflare 挑战，静默补签后重试 ${primaryTransport.name}")
+                    primaryTransport.revalidate("timings 挑战重试", primaryResult.sentClearanceFp, requestHost = Config.HOST).also {
+                        diagnostics.log("[诊断] timings 静默补签结果 ready=$it")
                     }
-                    null
                 }
-                if (fallbackHandled != null) {
-                    return fallbackHandled
+                ensureReadingActive()
+                if (cleared) {
+                    // 补签可能同时更新 _forum_session，必须在写闸门外重新获取与会话匹配的 CSRF。
+                    cachedCsrfToken = null
+                    val retryCsrf = cachedCsrf()
+                    ensureReadingActive()
+                    if (retryCsrf.isNullOrBlank()) return false
+                    val retryResult = try {
+                        sendViaPrimary(retryCsrf, burst = true)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        diagnostics.log("[诊断] timings 静默补签后重试异常 ${error.javaClass.simpleName}: ${error.message.orEmpty().take(60)}")
+                        null
+                    }
+                    ensureReadingActive()
+                    diagnostics.log(
+                        "[诊断] timings 静默补签后重试 status=${retryResult?.status ?: "未发出"} challenged=${retryResult?.challenged}" +
+                            " body=${retryResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
+                    )
+                    if (retryResult == null) return false
+                    diagnostics.recordStatus(primaryTransport.name, retryResult.status, "/topics/timings")
+                    failureResult = retryResult
+                    if (retryResult.status == 429) {
+                        val cooldown = enterRateLimitCooldown("/topics/timings", retryResult.retryAfterSeconds)
+                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        return false
+                    }
+                    if (retryResult.status in 200..299) {
+                        markTimingsSynced()
+                        preferWebViewTimings = false
+                        recordTopicPostsReported(currentUserId, topicId, numbers)
+                        diagnostics.log("阅读进度已同步(${primaryTransport.name} 静默补签后重试成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s")
+                        return true
+                    }
+                }
+
+                if (failureResult.challenged && fallbackTransport != null && fallbackTransport.isReady()) {
+                    val fallbackResult = sendViaFallback(fallbackTransport, cachedCsrfToken ?: primaryCsrf)
+                    ensureReadingActive()
+                    diagnostics.log(
+                        "[诊断] timings 兜底结果 status=${fallbackResult?.status ?: "未发出"} challenged=${fallbackResult?.challenged}" +
+                            " body=${fallbackResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
+                    )
+                    if (fallbackResult != null && fallbackResult.status == 429) {
+                        val cooldown = enterRateLimitCooldown("/topics/timings", fallbackResult.retryAfterSeconds)
+                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        return false
+                    }
+                    if (fallbackResult != null && fallbackResult.status in 200..299) {
+                        markTimingsSynced()
+                        preferWebViewTimings = true
+                        recordTopicPostsReported(currentUserId, topicId, numbers)
+                        diagnostics.log("阅读进度已同步(${fallbackTransport.name} 兜底成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s")
+                        return true
+                    }
+                    if (fallbackResult != null && fallbackResult.status > 0) failureResult = fallbackResult
                 }
             }
 
             // 仅对鉴权/风控拦截（401/403/CF挑战）进入 3 分钟全局熔断冷却；
             // 普通网络抖动（HTTP 0）或服务端临时错误（5xx）不触发全局熔断，交由单话题调度器按 5/10/20/40s 退避并保留待报楼层。
-            if (primaryResult.challenged || primaryResult.status == 401 || primaryResult.status == 403) {
+            if (failureResult.challenged || failureResult.status == 401 || failureResult.status == 403) {
                 timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
-                val reason = if (isBadCsrf) "BAD CSRF" else if (primaryResult.challenged) "CF挑战" else "HTTP ${primaryResult.status}"
+                val reason = if (failureResult.challenged) "CF挑战" else if (isBadCsrf) "BAD CSRF" else "HTTP ${failureResult.status}"
                 diagnostics.log("阅读进度上报未成功($reason)，进入 3 分钟熔断冷却，静默放弃本次同步")
                 // 仅对确认的 CF 挑战拦截记入 403/挑战事件，避免误伤
-                if (primaryResult.challenged) {
+                if (failureResult.challenged) {
                     notify403OrChallenged("/topics/timings", "timings CF挑战")
                     onTimingsVerificationRequired?.invoke(null)
                 }
             } else {
-                diagnostics.log("阅读进度上报网络或临时异常(HTTP ${primaryResult.status})，保留待报批次并按退避周期重试")
+                diagnostics.log("阅读进度上报网络或临时异常(HTTP ${failureResult.status})，保留待报批次并按退避周期重试")
             }
             return false
         } catch (cancelled: CancellationException) {
