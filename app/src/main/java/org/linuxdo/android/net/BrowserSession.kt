@@ -972,6 +972,19 @@ class BrowserSession(
         store.syncFromWebView()
     }
 
+    /**
+     * 内置同域网页 / 帖内预览页面完成时，若 Gecko 持有未判废的新 cf_clearance，同步回 SessionStore。
+     * 只搬未判废的 cf_clearance，不动 _t / _forum_session，防止挑战页或匿名页冲掉主站登录态。
+     */
+    fun syncFreshClearanceFromInAppGecko(candidates: Collection<String>, source: String) {
+        val fresh = candidates.lastOrNull { it.isNotBlank() && !store.isClearanceChallenged(it) } ?: return
+        val current = currentCfClearance()
+        if (fresh != current) {
+            adoptGeckoClearance(fresh)
+            diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+        }
+    }
+
     private fun detectCfChallengeCompletion(challengeView: View, url: String?) {
         if (!isInCfMode) return
         diagnostics.log("Cloudflare 页面已完成一次加载: ${url.orEmpty()}")

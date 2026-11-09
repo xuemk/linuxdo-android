@@ -6193,6 +6193,15 @@ private fun SandboxedWebPreview(
     allowTouchIntercept: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    if (isTrustedForumUrl(url)) {
+        SandboxedGeckoPreview(
+            url = url,
+            active = active,
+            allowTouchIntercept = allowTouchIntercept,
+            modifier = modifier,
+        )
+        return
+    }
     var loading by remember(url) { mutableStateOf(true) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var webViewRef by remember(url) { mutableStateOf<WebView?>(null) }
@@ -6291,13 +6300,206 @@ private fun SandboxedWebPreview(
 }
 
 @Composable
+private fun SandboxedGeckoPreview(
+    url: String,
+    active: Boolean,
+    allowTouchIntercept: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var loading by remember(url) { mutableStateOf(true) }
+    var bootstrapping by remember(url) { mutableStateOf(true) }
+    val geckoView = remember(url, allowTouchIntercept) {
+        org.linuxdo.android.net.gecko.GeckoManager.createGeckoView(
+            context = context,
+            allowTouchInterceptOverride = allowTouchIntercept,
+        )
+    }
+    var sessionRef by remember(url, allowTouchIntercept) {
+        mutableStateOf<org.mozilla.geckoview.GeckoSession?>(null)
+    }
+
+    LaunchedEffect(bootstrapping) {
+        if (bootstrapping) {
+            delay(1_200)
+            if (bootstrapping) {
+                geckoView.alpha = 1f
+            }
+        }
+    }
+
+    DisposableEffect(geckoView, url) {
+        val container = (context.applicationContext as? App)?.container
+        val sessionStore = container?.sessionStore
+        val browserSession = container?.browser
+        val bootstrapUrl = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
+        var disposed = false
+        var bootstrapDone = false
+        var bridgeRef: org.linuxdo.android.net.gecko.GeckoAuthBridge? = null
+
+        fun isBootstrapLocation(raw: String?): Boolean {
+            val parsed = runCatching { Uri.parse(raw.orEmpty()) }.getOrNull() ?: return false
+            return parsed.host?.equals(Config.HOST, ignoreCase = true) == true &&
+                parsed.path == IN_APP_BOOTSTRAP_PATH
+        }
+
+        fun syncClearanceBack(pageUrl: String) {
+            if (disposed || !isTrustedForumUrl(pageUrl)) return
+            scope.launch {
+                val clearances = runCatching { bridgeRef?.readCfClearances() }.getOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: withContext(Dispatchers.IO) {
+                        org.linuxdo.android.net.gecko.GeckoManager.cfClearancesFromDb(context).toList()
+                    }
+                if (!disposed) {
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览")
+                }
+            }
+        }
+
+        val session = org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+            context = context,
+            onLocationChanged = { navUrl ->
+                if (!isBootstrapLocation(navUrl)) {
+                    geckoView.alpha = 1f
+                }
+            },
+            onPageStarted = { startUrl ->
+                if (!isBootstrapLocation(startUrl)) {
+                    geckoView.alpha = 1f
+                }
+            },
+            onPageFinished = { finishedUrl ->
+                if (isBootstrapLocation(finishedUrl) && !bootstrapDone) {
+                    return@createChallengeSession
+                }
+                bootstrapping = false
+                loading = false
+                geckoView.alpha = 1f
+                syncClearanceBack(finishedUrl)
+            },
+            onPageError = { _, _ ->
+                bootstrapping = false
+                loading = false
+                geckoView.alpha = 1f
+            },
+            onExternalRequest = { targetUri ->
+                val scheme = runCatching { Uri.parse(targetUri).scheme?.lowercase() }.getOrNull()
+                scheme != "http" && scheme != "https"
+            },
+        )
+        geckoView.alpha = 0f
+        geckoView.setSession(session)
+        session.setActive(active)
+        sessionRef = session
+
+        val initJob = scope.launch {
+            val bridge = runCatching {
+                org.linuxdo.android.net.gecko.GeckoAuthBridge.create(
+                    context = context,
+                    session = session,
+                    onReady = { readyUrl ->
+                        if (disposed) return@create
+                        if (!bootstrapDone && isBootstrapLocation(readyUrl)) {
+                            bootstrapDone = true
+                            scope.launch {
+                                runCatching {
+                                    val cookies = sessionStore?.syncFromWebView().orEmpty()
+                                    val challenged = sessionStore?.cfClearancesForVerification()
+                                        ?.filterTo(mutableSetOf()) { sessionStore.isClearanceChallenged(it) }
+                                        .orEmpty()
+                                    bridgeRef?.prepareInAppSessionCookies(cookies, challenged)
+                                }
+                                if (!disposed) {
+                                    syncClearanceBack(readyUrl)
+                                    bootstrapping = false
+                                    geckoView.alpha = 1f
+                                    session.loadUri(url)
+                                }
+                            }
+                        } else {
+                            syncClearanceBack(readyUrl)
+                        }
+                    },
+                    onCallback = { _, _ -> },
+                )
+            }.getOrNull()
+            if (disposed) {
+                bridge?.close()
+                return@launch
+            }
+            bridgeRef = bridge
+            if (bridge != null) {
+                session.loadUri(bootstrapUrl)
+                delay(3_500)
+                if (!disposed && !bootstrapDone) {
+                    bootstrapDone = true
+                    bootstrapping = false
+                    geckoView.alpha = 1f
+                    session.loadUri(url)
+                }
+            } else {
+                bootstrapDone = true
+                bootstrapping = false
+                geckoView.alpha = 1f
+                session.loadUri(url)
+            }
+        }
+
+        onDispose {
+            disposed = true
+            initJob.cancel()
+            runCatching { bridgeRef?.close() }
+            bridgeRef = null
+            runCatching { geckoView.releaseSession() }
+            runCatching { session.stop() }
+            runCatching { session.close() }
+            sessionRef = null
+        }
+    }
+
+    DisposableEffect(sessionRef, lifecycle, active) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> sessionRef?.setActive(false)
+                Lifecycle.Event.ON_RESUME -> sessionRef?.setActive(active)
+                else -> {}
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(sessionRef, active) {
+        sessionRef?.setActive(active)
+    }
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { geckoView },
+        )
+        if (loading) {
+            IosActivityIndicator(diameter = 22.dp)
+        }
+    }
+}
+
+@Composable
 private fun OneboxCard(onebox: CookedBlock.Onebox) {
+    val context = LocalContext.current
+    val openTopic = LocalOpenTopic.current
     val openUrl = LocalOpenExternalUrl.current
     val view = LocalView.current
     val pageActive = LocalPostPageActive.current
+    val internalTopic = remember(onebox.url) { parseInternalTopicUrl(onebox.url) }
     val canPreview = remember(onebox.url) {
         val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
-        (scheme == "http" || scheme == "https") && parseInternalTopicUrl(onebox.url) == null
+        (scheme == "http" || scheme == "https") && internalTopic == null
     }
     var expanded by rememberSaveable(onebox.url) { mutableStateOf(isAutoPreviewDemoOnebox(onebox)) }
     var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
@@ -6312,7 +6514,19 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                 val bounds = coordinates.boundsInWindow()
                 visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
             }
-            .clickable { openUrl(onebox.url) }
+            .clickable {
+                if (internalTopic != null && openTopic != null) {
+                    openTopic(
+                        internalTopic.topicId,
+                        onebox.title.ifBlank { "话题 #${internalTopic.topicId}" },
+                        internalTopic.postNumber,
+                    )
+                } else if (isTrustedForumUrl(onebox.url)) {
+                    openUrl(onebox.url)
+                } else {
+                    openExternal(context, onebox.url)
+                }
+            }
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -7588,7 +7802,7 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                 } else {
                                     val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
                                     val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()
-                                    if (host.isNotBlank() && host !in TRUSTED_FORUM_HOSTS) {
+                                    if (host.isNotBlank() && !isTrustedForumHost(host)) {
                                         openExternal(context, link)
                                     } else {
                                         updatedOpenExternal(link)

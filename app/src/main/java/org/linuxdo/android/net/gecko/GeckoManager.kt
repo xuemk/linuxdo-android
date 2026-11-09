@@ -113,14 +113,26 @@ object GeckoManager {
     }
 
     /** 验证视图共用 TextureView，并兼容宿主转发的非标准触摸序列。 */
-    fun createGeckoView(context: Context): GeckoView {
+    fun createGeckoView(
+        context: Context,
+        allowTouchInterceptOverride: Boolean? = null,
+    ): GeckoView {
         return object : GeckoView(context) {
             private var gestureDownTime: Long? = null
             private var touchCorrectionLogged = false
 
+            override fun requestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {
+                super.requestDisallowInterceptTouchEvent(
+                    allowTouchInterceptOverride ?: disallowIntercept,
+                )
+            }
+
             override fun onTouchEvent(event: MotionEvent): Boolean {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
                     gestureDownTime = event.downTime
+                    if (allowTouchInterceptOverride == true) {
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                    }
                 }
                 val expectedDownTime = gestureDownTime
                 // Gecko 135 会丢弃 downTime 与 DOWN 不同的 MOVE/UP，导致页面收不到完整点击。
@@ -198,14 +210,19 @@ object GeckoManager {
     }
 
     /**
-     * 创建专门用于过 Cloudflare 挑战或登录的 GeckoSession
+     * 创建专门用于过 Cloudflare 挑战、登录或同域内置浏览的 GeckoSession
      */
     fun createChallengeSession(
         context: Context,
         onLocationChanged: (url: String) -> Unit = {},
+        onPageStarted: (url: String) -> Unit = {},
+        onProgressChanged: (progress: Int) -> Unit = {},
         onPageFinished: (url: String) -> Unit = {},
+        onTitleChanged: (title: String) -> Unit = {},
         onCanGoBackChanged: (canGoBack: Boolean) -> Unit = {},
         onPageError: (String, WebRequestError) -> Unit = { _, _ -> },
+        onExternalRequest: ((uri: String) -> Boolean)? = null,
+        returnErrorPageHtml: Boolean = true,
         onDiagnostic: (String) -> Unit = {},
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
@@ -224,6 +241,9 @@ object GeckoManager {
                 request: GeckoSession.NavigationDelegate.LoadRequest
             ): GeckoResult<AllowOrDeny>? {
                 Log.d(TAG, "Gecko onLoadRequest: ${diagnosticUrl(request.uri)}")
+                if (onExternalRequest != null && onExternalRequest(request.uri)) {
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
+                }
                 return GeckoResult.fromValue(AllowOrDeny.ALLOW)
             }
 
@@ -251,6 +271,7 @@ object GeckoManager {
                 pageLoadFailed = true
                 Log.e(TAG, "Gecko onLoadError: uri=${diagnosticUrl(uri)}, category=${error.category}, code=${error.code}")
                 onPageError(uri.orEmpty(), error)
+                if (!returnErrorPageHtml) return null
                 // 返回 null 会直接中止导航，首次加载失败时只留下 about:blank。
                 return GeckoResult.fromValue(createErrorPage(uri, error))
             }
@@ -266,10 +287,12 @@ object GeckoManager {
                 if (!url.startsWith("https://") && !url.startsWith("http://")) return
                 pageLoadFailed = false
                 Log.d(TAG, "Gecko onPageStart: ${diagnosticUrl(url)}")
+                onPageStarted(url)
                 onDiagnostic("开始加载 ${diagnosticUrl(url)}")
             }
 
             override fun onProgressChange(session: GeckoSession, progress: Int) {
+                onProgressChanged(progress)
                 // 只在 25/50/75/100 四档各记一次：卡在哪一档能区分"连不上"和"子资源迟迟不完"
                 val bucket = progress / 25
                 if (bucket > progressBucket) {
@@ -296,7 +319,10 @@ object GeckoManager {
             }
 
             override fun onTitleChange(session: GeckoSession, title: String?) {
-                if (!title.isNullOrBlank()) onDiagnostic("页面标题 ${title.take(40)}")
+                if (!title.isNullOrBlank()) {
+                    onTitleChanged(title)
+                    onDiagnostic("页面标题 ${title.take(40)}")
+                }
             }
         }
 

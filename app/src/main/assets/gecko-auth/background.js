@@ -57,6 +57,60 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
       }
       return true;
     }
+    case "prepareInAppSession": {
+      // 内置同域网页/嵌入应用：剔除已判废的旧 cf_clearance，保留有效 cf_clearance，并同步当前账号的登录 Cookie。
+      const challenged = new Set(Array.isArray(request.challengedClearances) ? request.challengedClearances : []);
+      let hasValidCf = false;
+      for (const cookie of cookies) {
+        if (cookie.name === "cf_clearance") {
+          if (challenged.has(cookie.value)) {
+            try { await remove(cookie); } catch (e) {}
+          } else if (cookie.value) {
+            hasValidCf = true;
+          }
+        }
+      }
+      const incoming = request.cookies || {};
+      for (const [name, value] of Object.entries(incoming)) {
+        if (!value) continue;
+        if (name === "cf_clearance") {
+          if (!hasValidCf && !challenged.has(value)) {
+            try {
+              await browser.cookies.set({
+                url: "https://linux.do/",
+                domain: ".linux.do",
+                name: "cf_clearance",
+                value: String(value),
+                path: "/",
+                secure: true,
+                httpOnly: true,
+                ...scope
+              });
+              hasValidCf = true;
+            } catch (e) {}
+          }
+          continue;
+        }
+        if (/^(cf_|__?cf)/i.test(name)) continue;
+        const existingSame = cookies.some(c => c.name === name && c.value === value);
+        if (existingSame) continue;
+        for (const old of cookies.filter(c => c.name === name)) {
+          try { await remove(old); } catch (e) {}
+        }
+        try {
+          await browser.cookies.set({
+            url: "https://linux.do/",
+            name,
+            value: String(value),
+            path: "/",
+            secure: true,
+            httpOnly: name === "_t" || name === "_forum_session",
+            ...scope
+          });
+        } catch (e) {}
+      }
+      return true;
+    }
     default:
       throw new Error("Unknown authentication cookie command");
   }

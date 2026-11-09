@@ -128,6 +128,29 @@ class GeckoAuthBridge private constructor(
         request("prepareAuth", JSONObject().put("cookies", JSONObject(cookies)))
     }
 
+    suspend fun prepareInAppSessionCookies(
+        cookies: Map<String, String>,
+        challengedClearances: Set<String>,
+    ) {
+        val payload = JSONObject()
+            .put("cookies", JSONObject(cookies))
+            .put("challengedClearances", JSONArray(challengedClearances.toList()))
+        request("prepareInAppSession", payload)
+    }
+
+    suspend fun readCfClearances(): List<String> {
+        val array = readCookies()
+        val result = mutableListOf<String>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            if (item.optString("name").equals("cf_clearance", ignoreCase = true)) {
+                val value = item.optString("value").trim()
+                if (value.isNotEmpty()) result.add(value)
+            }
+        }
+        return result
+    }
+
     suspend fun clearCfClearance() {
         request("clearCf")
     }

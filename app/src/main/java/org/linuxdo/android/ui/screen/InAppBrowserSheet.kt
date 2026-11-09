@@ -1,13 +1,12 @@
 package org.linuxdo.android.ui.screen
 
 import android.content.Intent
-import android.webkit.CookieManager
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.core.net.toUri
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.linuxdo.android.App
 import androidx.activity.compose.BackHandler
@@ -36,6 +35,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,7 +51,15 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.graphics.Color
 import org.linuxdo.android.Config
+import org.linuxdo.android.net.BrowserSession
+import org.linuxdo.android.net.gecko.GeckoAuthBridge
+import org.linuxdo.android.net.gecko.GeckoManager
 import org.linuxdo.android.ui.design.IosTheme
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.WebRequestError
+
+internal const val IN_APP_BOOTSTRAP_PATH = "/robots.txt"
+private const val IN_APP_BOOTSTRAP_URL = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -63,35 +71,25 @@ fun InAppBrowserSheet(
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
     var title by remember(url) { mutableStateOf(initialTitle.orEmpty()) }
     var currentUrl by remember(url) { mutableStateOf(url) }
     var progress by remember(url) { mutableFloatStateOf(0f) }
     var canGoBack by remember(url) { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
     val latestUrl by rememberUpdatedState(currentUrl)
-    val webView = remember(url) {
-        WebView(context).also { view ->
-            @Suppress("SetJavaScriptEnabled")
-            view.settings.javaScriptEnabled = true
-            view.settings.domStorageEnabled = true
-            view.settings.loadsImagesAutomatically = true
-            view.settings.mediaPlaybackRequiresUserGesture = true
-            view.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            (context.applicationContext as? App)?.container?.userAgent?.let { userAgent ->
-                view.settings.userAgentString = userAgent
-            }
-            CookieManager.getInstance().apply {
-                setAcceptCookie(true)
-                setAcceptThirdPartyCookies(view, false)
-            }
-        }
+    val geckoView = remember(url) {
+        GeckoManager.createGeckoView(context, allowTouchInterceptOverride = true)
     }
+    var geckoSessionRef by remember(url) { mutableStateOf<GeckoSession?>(null) }
+    var bridgeRef by remember(url) { mutableStateOf<GeckoAuthBridge?>(null) }
+    var bootstrapping by remember(url) { mutableStateOf(true) }
     var mainFrameError by remember(url) { mutableStateOf<String?>(null) }
     var isTimeout by remember(url) { mutableStateOf(false) }
 
     LaunchedEffect(currentUrl, progress, mainFrameError) {
         if (progress < 0.85f && mainFrameError == null) {
-            kotlinx.coroutines.delay(4_000)
+            delay(4_000)
             if (progress < 0.85f && mainFrameError == null) {
                 isTimeout = true
             }
@@ -100,105 +98,192 @@ fun InAppBrowserSheet(
         }
     }
 
-    DisposableEffect(webView) {
-        webView.webViewClient = object : WebViewClient() {
-            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
-                mainFrameError = "网页渲染进程异常终止，请刷新重试"
-                return true
+    // 若同源 bootstrap (/robots.txt) 因遭遇 CF 挑战耗时超过 1.2s，提前显示视图以便用户交互过盾
+    LaunchedEffect(bootstrapping, mainFrameError) {
+        if (bootstrapping && mainFrameError == null) {
+            delay(1_200)
+            if (bootstrapping) {
+                geckoView.alpha = 1f
             }
+        }
+    }
 
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val destination = request.url
-                val scheme = destination.scheme?.lowercase().orEmpty()
-                val host = destination.host?.lowercase()?.trimEnd('.').orEmpty()
-                if (scheme !in setOf("http", "https")) {
-                    openExternal(context, destination.toString())
-                    return true
-                }
-                if (host !in TRUSTED_FORUM_HOSTS) {
-                    openExternal(context, destination.toString())
-                    return true
-                }
-                currentUrl = destination.toString()
-                return false
-            }
+    DisposableEffect(geckoView, url) {
+        val uri = url.toUri()
+        if (uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank()) {
+            Toast.makeText(context, "无法打开此链接", Toast.LENGTH_SHORT).show()
+            onDismiss()
+            return@DisposableEffect onDispose {}
+        }
+        if (!isTrustedForumUrl(url)) {
+            openExternal(context, url)
+            onDismiss()
+            return@DisposableEffect onDispose {}
+        }
 
-            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
-                if (request.isForMainFrame) {
-                    val desc = error.description?.toString()?.takeIf { it.isNotBlank() } ?: "网络连接异常 (${error.errorCode})"
-                    mainFrameError = desc
-                }
-            }
+        val container = (context.applicationContext as? App)?.container
+        val sessionStore = container?.sessionStore
+        val browserSession = container?.browser
+        var disposed = false
+        var bootstrapDone = false
 
-            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: android.webkit.WebResourceResponse) {
-                if (request.isForMainFrame) {
-                    val code = errorResponse.statusCode
-                    if (code in 400..599) {
-                        val reason = errorResponse.reasonPhrase?.takeIf { it.isNotBlank() } ?: "HTTP $code"
-                        mainFrameError = "服务返回异常: $reason ($code)"
-                    }
-                }
-            }
+        fun isBootstrapLocation(raw: String?): Boolean {
+            val parsed = raw?.toUri() ?: return false
+            return parsed.host?.equals(Config.HOST, ignoreCase = true) == true &&
+                parsed.path == IN_APP_BOOTSTRAP_PATH
+        }
 
-            override fun onPageStarted(view: WebView, pageUrl: String?, favicon: android.graphics.Bitmap?) {
-                currentUrl = pageUrl.orEmpty()
-                progress = 0f
-                canGoBack = view.canGoBack()
-                mainFrameError = null
-                isTimeout = false
-            }
-
-            override fun onPageFinished(view: WebView, pageUrl: String?) {
-                currentUrl = pageUrl.orEmpty()
-                title = view.title.orEmpty()
-                canGoBack = view.canGoBack()
-                progress = 1f
-                if (isTrustedForumUrl(pageUrl)) {
-                    val sessionStore = (context.applicationContext as? App)?.container?.sessionStore
-                    sessionStore?.syncFromWebView()
-                    // 403 定位：子站跳转与过盾后，主站/子站的 CF Cookie 作用域是否被改写
+        fun syncClearanceBack(pageUrl: String) {
+            if (disposed || !isTrustedForumUrl(pageUrl)) return
+            scope.launch {
+                val clearances = runCatching { bridgeRef?.readCfClearances() }.getOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(context).toList() }
+                if (!disposed) {
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "内置浏览器")
                     val pageHost = runCatching { android.net.Uri.parse(pageUrl).host }.getOrNull().orEmpty()
                     org.linuxdo.android.net.NetDiagnostics.log(
-                        "内置浏览器页面完成 host=$pageHost title=${view.title.orEmpty().take(30)} Cookie清单: " +
+                        "内置浏览器页面完成(Gecko) host=$pageHost title=${title.take(30)} Cookie清单: " +
                             (sessionStore?.let { runCatching { it.cookieInventory() }.getOrNull() } ?: "-"),
                     )
                 }
+            }
+        }
+
+        val session = GeckoManager.createChallengeSession(
+            context = context,
+            onLocationChanged = { navUrl ->
+                if (!isBootstrapLocation(navUrl)) {
+                    currentUrl = navUrl
+                    geckoView.alpha = 1f
+                }
+            },
+            onPageStarted = { startUrl ->
+                if (!isBootstrapLocation(startUrl)) {
+                    currentUrl = startUrl
+                    geckoView.alpha = 1f
+                }
+                progress = 0.08f
+                mainFrameError = null
+                isTimeout = false
+            },
+            onProgressChanged = { newProgress ->
+                if (!bootstrapping) {
+                    progress = (newProgress / 100f).coerceIn(0.05f, 1f)
+                }
+            },
+            onTitleChanged = { newTitle ->
+                if (!bootstrapping && newTitle.isNotBlank()) {
+                    title = newTitle
+                }
+            },
+            onCanGoBackChanged = { back ->
+                canGoBack = back && !bootstrapping
+            },
+            onPageFinished = { finishedUrl ->
+                if (isBootstrapLocation(finishedUrl) && !bootstrapDone) {
+                    return@createChallengeSession
+                }
+                bootstrapping = false
+                geckoView.alpha = 1f
+                currentUrl = finishedUrl
+                progress = 1f
+                syncClearanceBack(finishedUrl)
                 injectCss?.let { css ->
                     val encodedCss = JSONObject.quote(css)
-                    view.evaluateJavascript(
+                    bridgeRef?.evaluateJavascript(
                         "(function(){var s=document.getElementById('linuxdo-native-websheet-style');if(!s){s=document.createElement('style');s.id='linuxdo-native-websheet-style';document.head.appendChild(s);}s.textContent=$encodedCss;})();",
-                        null,
                     )
                 }
+            },
+            onPageError = { failedUrl, error ->
+                bootstrapping = false
+                geckoView.alpha = 1f
+                if (!isBootstrapLocation(failedUrl)) currentUrl = failedUrl.ifBlank { currentUrl }
+                mainFrameError = describeGeckoLoadError(error)
+            },
+            onExternalRequest = { targetUri ->
+                val target = targetUri.toUri()
+                val scheme = target.scheme?.lowercase().orEmpty()
+                if (scheme !in setOf("http", "https")) {
+                    openExternal(context, targetUri)
+                    true
+                } else {
+                    false
+                }
+            },
+            returnErrorPageHtml = false,
+        )
+        geckoView.alpha = 0f
+        geckoView.setSession(session)
+        geckoSessionRef = session
+
+        val initJob = scope.launch {
+            val bridge = runCatching {
+                GeckoAuthBridge.create(
+                    context = context,
+                    session = session,
+                    onReady = { readyUrl ->
+                        if (disposed) return@create
+                        if (!bootstrapDone && isBootstrapLocation(readyUrl)) {
+                            bootstrapDone = true
+                            scope.launch {
+                                runCatching {
+                                    val cookies = sessionStore?.syncFromWebView().orEmpty()
+                                    val challenged = sessionStore?.cfClearancesForVerification()
+                                        ?.filterTo(mutableSetOf()) { sessionStore.isClearanceChallenged(it) }
+                                        .orEmpty()
+                                    bridgeRef?.prepareInAppSessionCookies(cookies, challenged)
+                                }
+                                if (!disposed) {
+                                    syncClearanceBack(readyUrl)
+                                    bootstrapping = false
+                                    geckoView.alpha = 1f
+                                    session.loadUri(url)
+                                }
+                            }
+                        } else {
+                            syncClearanceBack(readyUrl)
+                        }
+                    },
+                    onCallback = { _, _ -> },
+                )
+            }.getOrNull()
+            if (disposed) {
+                bridge?.close()
+                return@launch
             }
-        }
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView, newProgress: Int) {
-                progress = (newProgress / 100f).coerceIn(0f, 1f)
-                title = view.title.orEmpty().ifBlank { title }
-                canGoBack = view.canGoBack()
-            }
-        }
-        onDispose {
-            webView.stopLoading()
-            webView.destroy()
-        }
-    }
-    LaunchedEffect(webView, url) {
-        val uri = url.toUri()
-        val host = uri.host?.lowercase()?.trimEnd('.').orEmpty()
-        if (uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank()) {
-            if (host !in TRUSTED_FORUM_HOSTS) {
-                openExternal(context, url)
-                onDismiss()
+            bridgeRef = bridge
+            if (bridge != null) {
+                session.loadUri(IN_APP_BOOTSTRAP_URL)
+                // 兜底：若 /robots.txt 在 3.5 秒内未完成且未报错，直接跳转目标链接并展示页面（如挑战页）
+                delay(3_500)
+                if (!disposed && !bootstrapDone && mainFrameError == null) {
+                    bootstrapDone = true
+                    bootstrapping = false
+                    geckoView.alpha = 1f
+                    session.loadUri(url)
+                }
             } else {
-                webView.loadUrl(url)
+                bootstrapDone = true
+                bootstrapping = false
+                geckoView.alpha = 1f
+                session.loadUri(url)
             }
-        } else {
-            Toast.makeText(context, "无法打开此链接", Toast.LENGTH_SHORT).show()
-            onDismiss()
+        }
+
+        onDispose {
+            disposed = true
+            initJob.cancel()
+            runCatching { bridgeRef?.close() }
+            bridgeRef = null
+            runCatching { geckoView.releaseSession() }
+            runCatching { session.stop() }
+            runCatching { session.close() }
+            geckoSessionRef = null
         }
     }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -208,7 +293,7 @@ fun InAppBrowserSheet(
     ) {
         BackHandler {
             if (canGoBack) {
-                webView.goBack()
+                geckoSessionRef?.goBack()
             } else {
                 onDismiss()
             }
@@ -243,7 +328,7 @@ fun InAppBrowserSheet(
                     )
                 }
                 TextButton(
-                    onClick = { if (canGoBack) webView.goBack() },
+                    onClick = { if (canGoBack) geckoSessionRef?.goBack() },
                     enabled = canGoBack,
                 ) {
                     Text(
@@ -251,7 +336,12 @@ fun InAppBrowserSheet(
                         color = if (canGoBack) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel,
                     )
                 }
-                TextButton(onClick = { webView.reload() }) { Text("刷新", color = IosTheme.colors.accent) }
+                TextButton(
+                    onClick = {
+                        mainFrameError = null
+                        geckoSessionRef?.reload()
+                    },
+                ) { Text("刷新", color = IosTheme.colors.accent) }
                 Box {
                     TextButton(onClick = { menuExpanded = true }) { Text("更多", color = IosTheme.colors.accent) }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
@@ -295,7 +385,7 @@ fun InAppBrowserSheet(
                         fontSize = 12.sp,
                         modifier = Modifier.weight(1f),
                     )
-                    TextButton(onClick = { webView.reload() }) {
+                    TextButton(onClick = { geckoSessionRef?.reload() }) {
                         Text("刷新", fontSize = 12.sp, color = Color(0xFFB45309))
                     }
                     TextButton(onClick = { openExternal(context, currentUrl) }) {
@@ -331,7 +421,7 @@ fun InAppBrowserSheet(
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             TextButton(onClick = {
                                 mainFrameError = null
-                                webView.reload()
+                                geckoSessionRef?.loadUri(currentUrl.ifBlank { url })
                             }) {
                                 Text("重新加载", color = IosTheme.colors.accent)
                             }
@@ -343,12 +433,22 @@ fun InAppBrowserSheet(
                 }
             } else {
                 AndroidView(
-                    factory = { webView },
+                    factory = { geckoView },
                     modifier = Modifier.fillMaxWidth().weight(1f),
                 )
             }
         }
     }
+}
+
+internal fun describeGeckoLoadError(error: WebRequestError): String = when (error.code) {
+    WebRequestError.ERROR_UNKNOWN_HOST -> "域名解析失败，请检查网络连接 (${error.code})"
+    WebRequestError.ERROR_NET_TIMEOUT -> "网络连接超时，请刷新重试 (${error.code})"
+    WebRequestError.ERROR_OFFLINE -> "当前网络已断开 (${error.code})"
+    WebRequestError.ERROR_NET_RESET, WebRequestError.ERROR_NET_INTERRUPT -> "连接被意外中断，请刷新重试 (${error.code})"
+    WebRequestError.ERROR_SECURITY_SSL, WebRequestError.ERROR_SECURITY_BAD_CERT,
+    WebRequestError.ERROR_BAD_HSTS_CERT -> "安全连接握手失败 (${error.code})"
+    else -> "网络连接异常 (${error.category}/${error.code})"
 }
 
 fun openExternal(context: android.content.Context, url: String) {
@@ -362,8 +462,13 @@ fun openExternal(context: android.content.Context, url: String) {
 
 val TRUSTED_FORUM_HOSTS = setOf(Config.HOST, "www.${Config.HOST}")
 
+fun isTrustedForumHost(rawHost: String?): Boolean {
+    val host = rawHost?.lowercase()?.trimEnd('.') ?: return false
+    return host == Config.HOST || host.endsWith(".${Config.HOST}")
+}
+
 fun isTrustedForumUrl(rawUrl: String?): Boolean {
-    val host = rawUrl?.toUri()?.host?.lowercase()?.trimEnd('.') ?: return false
-    return host in TRUSTED_FORUM_HOSTS
+    val host = rawUrl?.toUri()?.host ?: return false
+    return isTrustedForumHost(host)
 }
 
