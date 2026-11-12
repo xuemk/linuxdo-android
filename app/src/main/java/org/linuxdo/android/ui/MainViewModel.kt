@@ -3929,6 +3929,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private var ldcGamificationRefreshJob: Job? = null
+    private var lastLdcGamificationFetchAt: Long = 0L
+
+    private fun refreshLdcGamificationScoreIfNeeded(
+        username: String,
+        checkSession: () -> Unit,
+        forceIfMissing: Boolean,
+        missingTodayIncome: Boolean = false,
+    ) {
+        if (ldcGamificationRefreshJob?.isActive == true) return
+        if (repository.isRateLimitCoolingDown()) return
+        val now = System.currentTimeMillis()
+        if (!forceIfMissing && now - lastLdcGamificationFetchAt < 120_000L) return
+        ldcGamificationRefreshJob = viewModelScope.launch {
+            try {
+                checkSession()
+                val score = repository.fetchGamificationScore(username, present = false)
+                checkSession()
+                val income = if (missingTodayIncome) {
+                    runCatching {
+                        readSiteWithAuthorization(
+                            checkSession,
+                            { repository.fetchLdcTodayIncome(username, throwOnUnauthorized = true) },
+                            { repository.authorizeLdc() },
+                        )
+                    }.getOrNull() ?: repository.getCachedLdcTodayIncome(username)
+                } else {
+                    repository.fetchLdcTodayIncome(username, throwOnUnauthorized = false)
+                }
+                checkSession()
+                if (score != null || income != null) {
+                    lastLdcGamificationFetchAt = System.currentTimeMillis()
+                    _ldcState.update { state ->
+                        val info = state.userInfo ?: return@update state
+                        val updated = info.copy(
+                            gamificationScore = score ?: info.gamificationScore,
+                            todayIncome = income ?: info.todayIncome,
+                        )
+                        if (updated == info) state else state.copy(userInfo = updated)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     fun loadLdcUserInfo(refresh: Boolean = false) {
         val username = _state.value.username ?: return
         val checkSession = connectSessionCheck(username)
@@ -3936,7 +3984,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val now = System.currentTimeMillis()
 
         // 1. 若内存中尚无数据，优先从磁盘持久化缓存读取（0ms 秒开直出）
-        var cached = current.userInfo?.let { it to current.cachedAt }
+        var cached = current.userInfo?.let { info ->
+            val fallbackScore = if (info.gamificationScore == null) repository.getCachedGamificationScore(username) else null
+            val fallbackIncome = repository.getCachedLdcTodayIncome(username)
+            val patched = info.copy(
+                gamificationScore = info.gamificationScore ?: fallbackScore,
+                todayIncome = fallbackIncome ?: info.todayIncome,
+            )
+            if (patched != info) {
+                _ldcState.update { it.copy(userInfo = patched) }
+            }
+            patched to current.cachedAt
+        }
         if (cached == null) {
             val fromDisk = repository.getCachedLdcUserInfo(username)
             if (fromDisk != null) {
@@ -3959,6 +4018,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (current.loading) return
             if (now < ldcBackoffUntil) return
             if (cached != null) {
+                val missingIncome = cached.first.todayIncome == null
+                refreshLdcGamificationScoreIfNeeded(
+                    username = username,
+                    checkSession = checkSession,
+                    forceIfMissing = cached.first.gamificationScore == null || missingIncome,
+                    missingTodayIncome = missingIncome,
+                )
                 val age = now - cached.second
                 // 若仍在 4 小时缓存有效期内（3-6小时区间），完全不发网络请求
                 if (age < Config.LDC_USER_INFO_CACHE_TTL_MS) return
@@ -3979,6 +4045,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 checkSession()
                 ldcBackoffUntil = 0L
                 val updateTime = System.currentTimeMillis()
+                if (info.gamificationScore != null) {
+                    lastLdcGamificationFetchAt = updateTime
+                }
                 repository.saveCachedLdcUserInfo(username, info)
                 _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
             } catch (e: CancellationException) {

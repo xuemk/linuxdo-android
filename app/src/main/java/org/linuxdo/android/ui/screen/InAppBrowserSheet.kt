@@ -135,6 +135,7 @@ import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.linuxdo.android.ui.design.IosTheme
 import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.WebRequestError
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
@@ -181,6 +182,37 @@ private fun rememberMiniAppLibrary(): MiniAppLibrary {
         onDispose { preferences.unregisterOnSharedPreferenceChangeListener(library.listener) }
     }
     return library
+}
+
+@Composable
+internal fun rememberMiniAppName(url: String): String? {
+    if (isAppsPlazaUrl(url)) return "应用广场"
+    val id = remember(url) { MiniAppEntry.idFromUrl(url) } ?: return null
+    val app = LocalContext.current.applicationContext as App
+    val store = app.container.sessionStore
+    val accountId = store.currentUserId()
+    val generation = store.sessionGeneration
+    val library = rememberMiniAppLibrary()
+    val cachedName = (library.state.recent + library.state.favorites)
+        .firstOrNull { it.id == id && it.name.isNotBlank() && it.name != "小程序" }?.name
+    var fetchedName by remember(id, accountId, generation) { mutableStateOf<String?>(null) }
+    LaunchedEffect(id, accountId, generation) {
+        val repository = app.container.topicRepository
+        if (cachedName != null || repository.isRateLimitCoolingDown() || repository.isSilentPrefetchBackingOff()) {
+            return@LaunchedEffect
+        }
+        try {
+            val info = withContext(Dispatchers.IO) { repository.fetchMiniAppInfo(id, present = false) }
+            if (store.currentUserId() == accountId && store.sessionGeneration == generation) {
+                fetchedName = info?.name
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // 名称仅用于提示，查询失败时保留链接，不打断用户或启动小程序。
+        }
+    }
+    return fetchedName ?: cachedName
 }
 
 private enum class MiniAppSection(val title: String) {
@@ -1176,7 +1208,24 @@ object MiniAppSessionPool {
         var appInfo by mutableStateOf<MiniAppEntry?>(null)
         var mainFrameError by mutableStateOf<String?>(null)
         var customNavMode by mutableStateOf(false)
+        var desktopMode by mutableStateOf(false)
+            private set
         var injectCss: String? = null
+
+        fun toggleDesktopMode() {
+            val useDesktop = !desktopMode
+            session.settings.userAgentMode = if (useDesktop) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
+                else GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+            session.settings.viewportMode = if (useDesktop) GeckoSessionSettings.VIEWPORT_MODE_DESKTOP
+                else GeckoSessionSettings.VIEWPORT_MODE_MOBILE
+            desktopMode = useDesktop
+            // 初始化尚未完成时，目标页面会直接采用新模式，避免重载打断 Cookie 准备。
+            if (bootstrapDone) {
+                mainFrameError = null
+                progress = 0.08f
+                session.reload()
+            }
+        }
     }
 
     var activeHolder by mutableStateOf<HeldSession?>(null)
@@ -1892,8 +1941,8 @@ fun InAppBrowserSheet(
                     currentUrl = holder.currentUrl,
                     isFloating = MiniAppSessionPool.isFloating,
                     customNavMode = holder.customNavMode,
+                    desktopMode = holder.desktopMode,
                     canGoBack = holder.canGoBack,
-                    isAtPlaza = holder.currentUrl.toUri().path?.trimEnd('/') == "/apps",
                     isFavorite = library.state.favorites.any { it.id == holder.appInfo?.id },
                     onToggleFavorite = holder.appInfo?.let { info ->
                         { library.update { it.toggleFavorite(info) }; actionSheetVisible = false }
@@ -1914,14 +1963,13 @@ fun InAppBrowserSheet(
                         actionSheetVisible = false
                         MiniAppSessionPool.relaunchCurrent(holder.currentUrl)
                     },
-                    onOpenAppsPlaza = {
-                        actionSheetVisible = false
-                        returnToLauncher = true
-                        activeTargetUrl = LINUXDO_APPS_PLAZA_URL
-                    },
                     onToggleCustomNav = {
                         actionSheetVisible = false
                         holder.customNavMode = !holder.customNavMode
+                    },
+                    onToggleDesktopMode = {
+                        actionSheetVisible = false
+                        holder.toggleDesktopMode()
                     },
                     onGoBack = {
                         actionSheetVisible = false
@@ -2134,14 +2182,14 @@ private fun MiniAppActionSheet(
     currentUrl: String,
     isFloating: Boolean,
     customNavMode: Boolean,
+    desktopMode: Boolean,
     canGoBack: Boolean,
-    isAtPlaza: Boolean,
     isFavorite: Boolean,
     onToggleFavorite: (() -> Unit)?,
     onToggleFloat: () -> Unit,
     onRelaunch: () -> Unit,
-    onOpenAppsPlaza: () -> Unit,
     onToggleCustomNav: () -> Unit,
+    onToggleDesktopMode: () -> Unit,
     onGoBack: () -> Unit,
     onCopyLink: () -> Unit,
     onShare: () -> Unit,
@@ -2219,7 +2267,7 @@ private fun MiniAppActionSheet(
 
         Box(Modifier.fillMaxWidth().height(0.5.dp).background(dividerColor))
 
-        // 第一排：核心容器操作（浮窗、重新进入、应用广场、沉浸导航、后退）
+        // 第一排：核心容器操作（浮窗、沉浸全屏、电脑手机模式切换、重新进入、移出我的）
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2227,14 +2275,6 @@ private fun MiniAppActionSheet(
                 .padding(horizontal = 16.dp, vertical = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            if (onToggleFavorite != null) {
-                ActionSheetItem(
-                    label = if (isFavorite) "移出我的" else "添加到我的",
-                    iconBg = cardBg,
-                    badgeColor = if (isFavorite) Color(0xFF07C160) else null,
-                    onClick = onToggleFavorite,
-                ) { Text(if (isFavorite) "✓" else "+", color = Color(0xFF07C160), fontSize = 28.sp) }
-            }
             ActionSheetItem(
                 label = if (isFloating) "取消浮窗" else "浮窗",
                 iconBg = cardBg,
@@ -2245,6 +2285,25 @@ private fun MiniAppActionSheet(
             }
 
             ActionSheetItem(
+                label = if (customNavMode) "标准顶栏" else "沉浸全屏",
+                iconBg = cardBg,
+                badgeColor = if (customNavMode) Color(0xFF0284C7) else null,
+                onClick = onToggleCustomNav,
+            ) {
+                MiniActionIconFullscreen(tint = if (customNavMode) Color(0xFF0284C7) else IosTheme.colors.label)
+            }
+
+            ActionSheetItem(
+                label = if (desktopMode) "访问手机版" else "访问电脑版",
+                iconBg = cardBg,
+                badgeColor = if (desktopMode) Color(0xFF0284C7) else null,
+                onClick = onToggleDesktopMode,
+                itemWidth = 80.dp,
+            ) {
+                MiniActionIconDevice(desktop = !desktopMode, tint = IosTheme.colors.label)
+            }
+
+            ActionSheetItem(
                 label = "重新进入",
                 iconBg = cardBg,
                 onClick = onRelaunch,
@@ -2252,23 +2311,13 @@ private fun MiniAppActionSheet(
                 MiniActionIconRefresh(tint = IosTheme.colors.label)
             }
 
-            if (!isAtPlaza) {
+            if (onToggleFavorite != null) {
                 ActionSheetItem(
-                    label = "小程序",
+                    label = if (isFavorite) "移出我的" else "添加到我的",
                     iconBg = cardBg,
-                    onClick = onOpenAppsPlaza,
-                ) {
-                    MiniAppTinyEmblem(isMiniApp = true, modifier = Modifier.size(24.dp))
-                }
-            }
-
-            ActionSheetItem(
-                label = if (customNavMode) "标准顶栏" else "沉浸全屏",
-                iconBg = cardBg,
-                badgeColor = if (customNavMode) Color(0xFF0284C7) else null,
-                onClick = onToggleCustomNav,
-            ) {
-                MiniActionIconFullscreen(tint = if (customNavMode) Color(0xFF0284C7) else IosTheme.colors.label)
+                    badgeColor = if (isFavorite) Color(0xFF07C160) else null,
+                    onClick = onToggleFavorite,
+                ) { Text(if (isFavorite) "✓" else "+", color = Color(0xFF07C160), fontSize = 28.sp) }
             }
 
             if (canGoBack) {
@@ -2352,12 +2401,13 @@ private fun ActionSheetItem(
     iconBg: Color,
     badgeColor: Color? = null,
     onClick: () -> Unit,
+    itemWidth: androidx.compose.ui.unit.Dp = 64.dp,
     icon: @Composable () -> Unit,
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .width(64.dp)
+            .width(itemWidth)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -2685,6 +2735,26 @@ private fun MiniActionIconRefresh(tint: Color, modifier: Modifier = Modifier.siz
             lineTo(size.width * 0.66f, size.height * 0.38f)
         }
         drawPath(arrow, tint, style = stroke)
+    }
+}
+
+@Composable
+private fun MiniActionIconDevice(desktop: Boolean, tint: Color) {
+    Canvas(Modifier.size(24.dp)) {
+        val stroke = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(size.width * if (desktop) 0.08f else 0.28f, size.height * 0.12f),
+            size = Size(size.width * if (desktop) 0.84f else 0.44f, size.height * if (desktop) 0.58f else 0.76f),
+            cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx()),
+            style = stroke,
+        )
+        if (desktop) {
+            drawLine(tint, Offset(size.width * 0.5f, size.height * 0.70f), Offset(size.width * 0.5f, size.height * 0.88f), stroke.width)
+            drawLine(tint, Offset(size.width * 0.32f, size.height * 0.88f), Offset(size.width * 0.68f, size.height * 0.88f), stroke.width)
+        } else {
+            drawCircle(tint, 1.dp.toPx(), Offset(size.width * 0.5f, size.height * 0.77f))
+        }
     }
 }
 

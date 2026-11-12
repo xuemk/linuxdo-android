@@ -255,9 +255,9 @@ class TopicRepository(
         )
     }
 
-    suspend fun fetchMiniAppInfo(id: String): MiniAppEntry? {
+    suspend fun fetchMiniAppInfo(id: String, present: Boolean = true): MiniAppEntry? {
         require(MiniAppEntry.idFromUrl("${Config.BASE_URL}/apps/$id") == id)
-        val app = objectRequest("/mini-app-api/public/$id/info")["app"] as? JsonObject ?: return null
+        val app = objectRequest("/mini-app-api/public/$id/info", present = present)["app"] as? JsonObject ?: return null
         return MiniAppEntry.fromJson(app)?.takeIf { it.id == id }
     }
 
@@ -1444,6 +1444,9 @@ class TopicRepository(
         val fromUser = runCatching {
             val uJson = objectRequest("/u/${encode(cleanUser)}.json")
             val uUser = uJson["user"] as? JsonObject ?: uJson
+            (uUser["gamification_score"] as? JsonPrimitive)?.intOrNull?.let { score ->
+                saveCachedGamificationScore(cleanUser, score)
+            }
             val candidate = uUser.text("animated_avatar")
             candidate.takeIf(::isAnimatedAvatarPath)
         }.getOrNull()
@@ -1490,6 +1493,7 @@ class TopicRepository(
         val root = objectRequest("/u/${encode(username)}/card.json", burst = true)
         val user = root["user"] as? JsonObject ?: root
         val card = json.decodeFromJsonElement<UserCardData>(user)
+        saveCachedGamificationScore(card.username.ifBlank { username }, card.gamificationScore)
         val isFollowedInJson = (user["is_followed"] as? JsonPrimitive)?.booleanOrNull
             ?: (user["followed"] as? JsonPrimitive)?.booleanOrNull
             ?: (user["following"] as? JsonPrimitive)?.booleanOrNull
@@ -1526,6 +1530,9 @@ class TopicRepository(
         return try {
             val raw = objectRequest("/u/$userPath.json", burst = true)
             val userObj = raw["user"] as? JsonObject ?: raw
+            (userObj["gamification_score"] as? JsonPrimitive)?.intOrNull?.let { score ->
+                saveCachedGamificationScore(cleanUser, score)
+            }
             val statObj = userObj["user_stat"] as? JsonObject
             val badgesList = userObj.objects("badges").ifEmpty { raw.objects("badges") }.map { b ->
                 SummaryBadgeItem(
@@ -1732,22 +1739,115 @@ class TopicRepository(
         }
     }
 
+    private val gamificationScoreMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val ldcTodayIncomeMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+
+    private fun currentLocalDateStr(): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+
+    fun getCachedGamificationScore(username: String): Int? {
+        val key = username.lowercase().trim().removePrefix("@")
+        if (key.isEmpty()) return null
+        gamificationScoreMemoryCache[key]?.let { return it }
+        val saved = sessionStore?.getString("gamification_score_$key")?.toIntOrNull() ?: return null
+        gamificationScoreMemoryCache[key] = saved
+        return saved
+    }
+
+    fun saveCachedGamificationScore(username: String, score: Int?) {
+        if (score == null) return
+        val key = username.lowercase().trim().removePrefix("@")
+        if (key.isEmpty()) return
+        gamificationScoreMemoryCache[key] = score
+        runCatching {
+            sessionStore?.putString("gamification_score_$key", score.toString())
+        }
+        ldcUserInfoMemoryCache[key]?.let { (cachedInfo, cachedTime) ->
+            if (cachedInfo.gamificationScore != score) {
+                val updated = cachedInfo.copy(gamificationScore = score)
+                ldcUserInfoMemoryCache[key] = updated to cachedTime
+                runCatching {
+                    sessionStore?.putString("ldc_user_info_$key", json.encodeToString(updated))
+                }
+            }
+        }
+    }
+
+    fun getCachedLdcTodayIncome(username: String): String? {
+        val key = username.lowercase().trim().removePrefix("@")
+        if (key.isEmpty()) return null
+        val today = currentLocalDateStr()
+        ldcTodayIncomeMemoryCache[key]?.let { (date, income) ->
+            if (date == today) return income
+        }
+        val raw = sessionStore?.getString("ldc_today_income_$key") ?: return null
+        val sep = raw.indexOf('|')
+        if (sep <= 0) return null
+        val savedDate = raw.substring(0, sep)
+        val savedIncome = raw.substring(sep + 1).takeIf { it.isNotBlank() } ?: return null
+        if (savedDate != today) return null
+        ldcTodayIncomeMemoryCache[key] = savedDate to savedIncome
+        return savedIncome
+    }
+
+    fun saveCachedLdcTodayIncome(username: String, income: String?, dateStr: String? = null) {
+        val cleanIncome = income?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val key = username.lowercase().trim().removePrefix("@")
+        if (key.isEmpty()) return
+        val effectiveDate = dateStr?.trim()?.takeIf { it.isNotEmpty() } ?: currentLocalDateStr()
+        ldcTodayIncomeMemoryCache[key] = effectiveDate to cleanIncome
+        runCatching {
+            sessionStore?.putString("ldc_today_income_$key", "$effectiveDate|$cleanIncome")
+        }
+        ldcUserInfoMemoryCache[key]?.let { (cachedInfo, cachedTime) ->
+            if (cachedInfo.todayIncome != cleanIncome) {
+                val updated = cachedInfo.copy(todayIncome = cleanIncome)
+                ldcUserInfoMemoryCache[key] = updated to cachedTime
+                runCatching {
+                    sessionStore?.putString("ldc_user_info_$key", json.encodeToString(updated))
+                }
+            }
+        }
+    }
+
     fun getCachedLdcUserInfo(username: String): Pair<LdcUserInfo, Long>? {
         val key = username.lowercase().trim().removePrefix("@")
-        ldcUserInfoMemoryCache[key]?.let { return it }
+        val fallbackScore = getCachedGamificationScore(key)
+        val fallbackIncome = getCachedLdcTodayIncome(key)
+        ldcUserInfoMemoryCache[key]?.let { (info, time) ->
+            val patched = info.copy(
+                gamificationScore = info.gamificationScore ?: fallbackScore,
+                todayIncome = fallbackIncome ?: info.todayIncome,
+            )
+            return patched to time
+        }
         val raw = sessionStore?.getString("ldc_user_info_$key") ?: return null
         val time = sessionStore?.getString("ldc_user_info_time_$key")?.toLongOrNull() ?: 0L
         return runCatching { json.decodeFromString<LdcUserInfo>(raw) }.getOrNull()?.let { info ->
-            (info to time).also { ldcUserInfoMemoryCache[key] = it }
+            val patched = info.copy(
+                gamificationScore = info.gamificationScore ?: fallbackScore,
+                todayIncome = fallbackIncome,
+            )
+            (patched to time).also { ldcUserInfoMemoryCache[key] = it }
         }
     }
 
     fun saveCachedLdcUserInfo(username: String, info: LdcUserInfo) {
         val key = username.lowercase().trim().removePrefix("@")
+        if (info.gamificationScore != null) {
+            saveCachedGamificationScore(key, info.gamificationScore)
+        }
+        if (info.todayIncome != null) {
+            saveCachedLdcTodayIncome(key, info.todayIncome)
+        }
+        val effectiveInfo = info.copy(
+            gamificationScore = info.gamificationScore ?: getCachedGamificationScore(key),
+            todayIncome = info.todayIncome ?: getCachedLdcTodayIncome(key),
+        )
         val now = System.currentTimeMillis()
-        ldcUserInfoMemoryCache[key] = info to now
+        ldcUserInfoMemoryCache[key] = effectiveInfo to now
         runCatching {
-            sessionStore?.putString("ldc_user_info_$key", json.encodeToString(info))
+            sessionStore?.putString("ldc_user_info_$key", json.encodeToString(effectiveInfo))
             sessionStore?.putString("ldc_user_info_time_$key", now.toString())
         }
     }
@@ -2780,6 +2880,9 @@ class TopicRepository(
             }
             ProfileSection.Account -> {
                 val user = objectRequest("/u/$userPath.json")["user"] as? JsonObject ?: error("账号信息格式不正确")
+                (user["gamification_score"] as? JsonPrimitive)?.intOrNull?.let { score ->
+                    saveCachedGamificationScore(username, score)
+                }
                 // 固定只有这两个请求,第二个走突发间隔。并发没有意义 —— gate 是全局串行锁,
                 // async 出去也只会卡在同一把锁上,真正的开销是锁后的节流等待。
                 val emails = objectRequest("/u/$userPath/emails.json", burst = true)
@@ -3598,6 +3701,9 @@ class TopicRepository(
         val id = user["id"]?.jsonPrimitive?.longOrNull ?: 0L
         val username = user["username"]?.jsonPrimitive?.contentOrNull ?: return null
         if (id <= 0L || username.isBlank()) throw IllegalStateException("会话响应格式不正确")
+        user["gamification_score"]?.jsonPrimitive?.intOrNull?.let { score ->
+            saveCachedGamificationScore(username, score)
+        }
         if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
         if (generation != null) withContext(Dispatchers.Main) { sessionStore?.normalizeVerifiedAuthCookies(generation) }
         val animatedFromSession = user["animated_avatar"]?.jsonPrimitive?.contentOrNull?.takeIf(::isAnimatedAvatarPath)
@@ -3648,6 +3754,65 @@ class TopicRepository(
     }
 
     /**
+     * 获取主站用户的实时 gamification_score（用于计算昨日到今日增长的 LDC）。
+     * 优先走轻量的 /u/{username}/card.json 接口并写入缓存。
+     */
+    suspend fun fetchGamificationScore(username: String, present: Boolean = false): Int? {
+        val cleanUser = username.trim().removePrefix("@")
+        if (cleanUser.isBlank()) return null
+        val score = runCatching {
+            val root = objectRequest("/u/${encode(cleanUser)}/card.json", burst = true, present = present, retryAllowed = false)
+            val user = root["user"] as? JsonObject ?: root
+            (user["gamification_score"] as? JsonPrimitive)?.intOrNull
+        }.getOrNull() ?: runCatching {
+            val root = objectRequest("/u/${encode(cleanUser)}.json", burst = true, present = present, retryAllowed = false)
+            val user = root["user"] as? JsonObject ?: root
+            (user["gamification_score"] as? JsonPrimitive)?.intOrNull
+        }.getOrNull()
+        if (score != null) {
+            saveCachedGamificationScore(cleanUser, score)
+        }
+        return score ?: getCachedGamificationScore(cleanUser)
+    }
+
+    /**
+     * 获取 LINUX DO Credit 今日已结算入账金额（来自 GET https://credit.linux.do/api/v1/dashboard/stats/daily?days=1）。
+     */
+    suspend fun fetchLdcTodayIncome(username: String, throwOnUnauthorized: Boolean = false): String? {
+        val cleanUser = username.trim().removePrefix("@")
+        val parsed = try {
+            val raw = request("https://credit.linux.do/api/v1/dashboard/stats/daily?days=1", present = false, retryAllowed = false)
+            val root = json.parseToJsonElement(raw).jsonObject
+            val dataArr = root["data"] as? JsonArray
+            val lastItem = dataArr?.lastOrNull() as? JsonObject
+            val incomeStr = (lastItem?.get("income") as? JsonPrimitive)?.contentOrNull?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            if (incomeStr != null) {
+                val dateStr = (lastItem["date"] as? JsonPrimitive)?.contentOrNull?.trim()
+                val normalized = runCatching {
+                    val bd = java.math.BigDecimal(incomeStr)
+                    if (bd.compareTo(java.math.BigDecimal.ZERO) == 0) "0" else bd.stripTrailingZeros().toPlainString()
+                }.getOrDefault(incomeStr)
+                normalized to dateStr
+            } else {
+                null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: HttpStatusException) {
+            if (throwOnUnauthorized && e.status == 401) throw e
+            null
+        } catch (_: Exception) {
+            null
+        }
+        if (parsed != null) {
+            saveCachedLdcTodayIncome(cleanUser, parsed.first, parsed.second)
+            return parsed.first
+        }
+        return getCachedLdcTodayIncome(cleanUser)
+    }
+
+    /**
      * 获取 LINUX DO Credit 用户积分信息。
      * GET https://credit.linux.do/api/v1/oauth/user-info
      */
@@ -3659,9 +3824,12 @@ class TopicRepository(
         fun readInt(key: String): Int = (dataElem[key] as? JsonPrimitive)?.intOrNull ?: (readStr(key).toIntOrNull() ?: 0)
         fun readLong(key: String): Long = (dataElem[key] as? JsonPrimitive)?.longOrNull ?: (readStr(key).toLongOrNull() ?: 0L)
         fun readBool(key: String): Boolean = (dataElem[key] as? JsonPrimitive)?.booleanOrNull ?: (readStr(key).toBooleanStrictOrNull() ?: false)
+        val ldcUsername = readStr("username")
+        val todayIncome = fetchLdcTodayIncome(ldcUsername)
+        val gamificationScore = fetchGamificationScore(ldcUsername, present = false)
         return LdcUserInfo(
             id = readLong("id"),
-            username = readStr("username"),
+            username = ldcUsername,
             nickname = readStr("nickname"),
             trustLevel = readInt("trust_level"),
             avatarUrl = readStr("avatar_url"),
@@ -3677,6 +3845,8 @@ class TopicRepository(
             remainQuota = readStr("remain_quota").ifBlank { "0" },
             payLevel = readInt("pay_level"),
             dailyLimit = readInt("daily_limit"),
+            gamificationScore = gamificationScore,
+            todayIncome = todayIncome,
         )
     }
 

@@ -1116,6 +1116,7 @@ data class UserCardData(
     @SerialName("topic_post_count") val rawTopicPostCount: JsonElement? = null,
     @SerialName("can_follow") val canFollow: Boolean = false,
     val following: Boolean = false,
+    @SerialName("gamification_score") val gamificationScore: Int? = null,
     val badges: List<SummaryBadgeItem> = emptyList(),
 ) {
     /** 与 FluxDO 一致：优先个人主页背景，其次资料卡背景。 */
@@ -2068,4 +2069,28 @@ data class LdcUserInfo(
     @SerialName("remain_quota") val remainQuota: String = "0",
     @SerialName("pay_level") val payLevel: Int = 0,
     @SerialName("daily_limit") val dailyLimit: Int = 0,
-)
+    @SerialName("gamification_score") val gamificationScore: Int? = null,
+    @SerialName("today_income") val todayIncome: String? = null,
+) {
+    /**
+     * 今日已结算入账的 LDC（来自 /api/v1/dashboard/stats/daily 当日 income）。
+     */
+    val todayIncomeDisplay: String?
+        get() {
+            val raw = todayIncome?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return runCatching {
+                val bd = java.math.BigDecimal(raw)
+                if (bd.compareTo(java.math.BigDecimal.ZERO) == 0) "0" else bd.stripTrailingZeros().toPlainString()
+            }.getOrDefault(raw)
+        }
+
+    /**
+     * 今日实时新增、待明日凌晨结算的 LDC（= 主站实时 gamification_score - 积分站已结算 community_balance）。
+     */
+    val dailyGrowthLdc: Int?
+        get() {
+            val score = gamificationScore ?: return null
+            val settled = communityBalance.toDoubleOrNull() ?: 0.0
+            return kotlin.math.round(score - settled).toInt()
+        }
+}

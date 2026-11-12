@@ -1701,18 +1701,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             }
         }
 
-        // 剪贴板若为 L 站应用链接 (https://linux.do/apps/...)，直接消费并进入对应小程序
-        LaunchedEffect(detectedClipboardTarget, browsing) {
-            val target = detectedClipboardTarget ?: return@LaunchedEffect
-            val miniAppUrl = target.second.miniAppUrl
-            if (browsing && !miniAppUrl.isNullOrBlank()) {
-                viewModel.consumeClipboardTarget(context, target.first)
-                globalBrowserUrl = miniAppUrl
-            }
-        }
-
         androidx.compose.animation.AnimatedVisibility(
-            visible = detectedClipboardTarget != null && detectedClipboardTarget?.second?.isMiniApp != true,
+            visible = detectedClipboardTarget != null,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = if (shouldShowTabBar) 64.dp else 16.dp, start = 16.dp, end = 16.dp)
@@ -1724,7 +1714,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         ) {
             val target = detectedClipboardTarget
             if (target != null) {
-                ClipboardTopicDetectionCard(
+                ClipboardLinkDetectionCard(
                     rawUrl = target.first,
                     link = target.second,
                     onView = {
@@ -1822,7 +1812,7 @@ private fun BootScreen() {
 }
 
 @Composable
-private fun ClipboardTopicDetectionCard(
+private fun ClipboardLinkDetectionCard(
     rawUrl: String,
     link: InternalTopicLink,
     onView: () -> Unit,
@@ -1830,6 +1820,7 @@ private fun ClipboardTopicDetectionCard(
     modifier: Modifier = Modifier,
 ) {
     val accentColor = IosTheme.colors.accent
+    val miniAppName = link.miniAppUrl?.let { org.linuxdo.android.ui.screen.rememberMiniAppName(it) }
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -1873,18 +1864,20 @@ private fun ClipboardTopicDetectionCard(
                 verticalArrangement = Arrangement.Center,
             ) {
                 Text(
-                    text = "检测到剪贴板帖子链接",
+                    text = if (link.isMiniApp) "检测到小程序链接" else "检测到剪贴板帖子链接",
                     style = IosTheme.type.footnote.copy(fontWeight = FontWeight.SemiBold, fontSize = 13.5.sp),
                     color = IosTheme.colors.label,
                     maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.height(2.dp))
                 val floorText = if (link.postNumber != null) " · #${link.postNumber}楼" else ""
                 Text(
-                    text = "话题 #${link.topicId}$floorText",
+                    text = if (link.isMiniApp) miniAppName ?: rawUrl else "话题 #${link.topicId}$floorText",
                     style = IosTheme.type.caption.copy(fontSize = 12.sp),
                     color = IosTheme.colors.secondaryLabel,
                     maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
             }
 
