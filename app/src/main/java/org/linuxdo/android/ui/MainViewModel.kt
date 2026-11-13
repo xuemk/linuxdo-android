@@ -25,6 +25,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.core.content.edit
 import androidx.lifecycle.viewModelScope
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.Collections
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -162,6 +163,8 @@ data class UpdateUiState(
     /** 总字节数；[ApkUpdateInstaller.TOTAL_UNKNOWN] 表示服务端没给 Content-Length。 */
     val apkTotalBytes: Long = 0L,
     val apkError: String? = null,
+    /** PackageInstaller.Session 产出的用户确认 Intent，由前台界面安全拉起。 */
+    val pendingInstallConfirmIntent: Intent? = null,
 )
 
 data class LoginUiState(
@@ -2039,6 +2042,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val updateState: StateFlow<UpdateUiState> = _updateState.asStateFlow()
 
     private var apkUpdateJob: Job? = null
+    private var pendingApkFile: File? = null
 
     fun dismissUpdateDialog(ignoreThisVersion: Boolean = false) {
         val current = _updateState.value
@@ -2068,18 +2072,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 「安装未知应用」是 Android 8.0 起的特殊权限,Manifest 声明不等于已授予。
         if (!ApkUpdateInstaller.canInstall(context)) {
             _updateState.update {
-                it.copy(apkStage = ApkUpdateStage.AwaitingPermission, apkError = null)
+                it.copy(
+                    apkStage = ApkUpdateStage.AwaitingPermission,
+                    apkError = null,
+                    pendingInstallConfirmIntent = null,
+                )
             }
             return
         }
 
         apkUpdateJob = viewModelScope.launch {
+            pendingApkFile = null
+            ApkUpdateInstaller.abandonActiveSession(context)
             _updateState.update {
                 it.copy(
                     apkStage = ApkUpdateStage.Downloading,
                     apkDownloadedBytes = 0L,
                     apkTotalBytes = 0L,
                     apkError = null,
+                    pendingInstallConfirmIntent = null,
                 )
             }
             val result = ApkUpdateInstaller.download(
@@ -2099,40 +2110,178 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             when (result) {
                 is ApkUpdateInstaller.Result.Success -> {
-                    _updateState.update { it.copy(apkStage = ApkUpdateStage.Installing, apkError = null) }
-                    if (!ApkUpdateInstaller.install(context, result.file)) {
-                        _updateState.update {
-                            it.copy(
-                                apkStage = ApkUpdateStage.Failed,
-                                apkError = "无法拉起安装程序，请改用浏览器下载。",
-                            )
-                        }
-                    }
+                    installDownloadedApk(result.file)
                 }
                 is ApkUpdateInstaller.Result.Failure -> {
                     _updateState.update {
-                        it.copy(apkStage = ApkUpdateStage.Failed, apkError = result.message)
+                        it.copy(
+                            apkStage = ApkUpdateStage.Failed,
+                            apkError = result.message,
+                            pendingInstallConfirmIntent = null,
+                        )
                     }
                 }
             }
         }
     }
 
+    /** 若本地已有校验过的安装包则直接重新走安装流程，否则重新下载。 */
+    fun retryApkInstallOrDownload() {
+        if (apkUpdateJob?.isActive == true) return
+        val existing = pendingApkFile?.takeIf { it.exists() && it.length() > 0L }
+        if (existing == null) {
+            startApkUpdate()
+            return
+        }
+        val context = getApplication<Application>()
+        if (!ApkUpdateInstaller.canInstall(context)) {
+            _updateState.update {
+                it.copy(
+                    apkStage = ApkUpdateStage.AwaitingPermission,
+                    apkError = null,
+                    pendingInstallConfirmIntent = null,
+                )
+            }
+            return
+        }
+        apkUpdateJob = viewModelScope.launch {
+            installDownloadedApk(existing)
+        }
+    }
+
+    private suspend fun installDownloadedApk(file: File) {
+        val context = getApplication<Application>()
+        pendingApkFile = file
+        _updateState.update {
+            it.copy(
+                apkStage = ApkUpdateStage.Installing,
+                apkError = null,
+                pendingInstallConfirmIntent = null,
+            )
+        }
+        when (ApkUpdateInstaller.install(context, file)) {
+            is ApkUpdateInstaller.InstallStartResult.SessionCommitted,
+            ApkUpdateInstaller.InstallStartResult.FallbackActivityStarted -> Unit
+            ApkUpdateInstaller.InstallStartResult.FailedToStart -> {
+                _updateState.update {
+                    it.copy(
+                        apkStage = ApkUpdateStage.Failed,
+                        apkError = "无法拉起安装程序，请改用浏览器下载。",
+                        pendingInstallConfirmIntent = null,
+                    )
+                }
+            }
+        }
+    }
+
+    fun consumeInstallConfirmIntent() {
+        _updateState.update { it.copy(pendingInstallConfirmIntent = null) }
+    }
+
+    fun onInstallConfirmLaunchFailed() {
+        fallbackToActionViewInstall("系统安装确认窗拉起失败")
+    }
+
+    private fun handleApkInstallEvent(event: ApkUpdateInstaller.InstallEvent) {
+        when (event) {
+            is ApkUpdateInstaller.InstallEvent.PendingUserAction -> {
+                _updateState.update {
+                    it.copy(
+                        apkStage = ApkUpdateStage.Installing,
+                        apkError = null,
+                        pendingInstallConfirmIntent = event.confirmIntent,
+                    )
+                }
+            }
+
+            is ApkUpdateInstaller.InstallEvent.MissingConfirmIntent -> {
+                fallbackToActionViewInstall("系统未返回安装确认窗口")
+            }
+
+            is ApkUpdateInstaller.InstallEvent.Succeeded -> {
+                pendingApkFile = null
+                _updateState.update {
+                    it.copy(
+                        apkStage = ApkUpdateStage.Idle,
+                        apkDownloadedBytes = 0L,
+                        apkTotalBytes = 0L,
+                        apkError = null,
+                        pendingInstallConfirmIntent = null,
+                        showDialog = false,
+                    )
+                }
+            }
+
+            is ApkUpdateInstaller.InstallEvent.Aborted -> {
+                _updateState.update {
+                    it.copy(
+                        apkStage = ApkUpdateStage.Failed,
+                        apkError = "系统安装已取消，可点击重试或改用浏览器下载。",
+                        pendingInstallConfirmIntent = null,
+                    )
+                }
+            }
+
+            is ApkUpdateInstaller.InstallEvent.Failed -> {
+                _updateState.update {
+                    it.copy(
+                        apkStage = ApkUpdateStage.Failed,
+                        apkError = ApkUpdateInstaller.formatInstallFailureMessage(event.status, event.message),
+                        pendingInstallConfirmIntent = null,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun fallbackToActionViewInstall(reason: String) {
+        val context = getApplication<Application>()
+        diagnostics.log("[应用内更新] $reason，回退 ACTION_VIEW")
+        ApkUpdateInstaller.abandonActiveSession(context)
+        val file = pendingApkFile
+        if (file != null && ApkUpdateInstaller.installViaActionView(context, file)) {
+            _updateState.update {
+                it.copy(
+                    apkStage = ApkUpdateStage.Installing,
+                    apkError = null,
+                    pendingInstallConfirmIntent = null,
+                )
+            }
+        } else {
+            _updateState.update {
+                it.copy(
+                    apkStage = ApkUpdateStage.Failed,
+                    apkError = "无法拉起系统安装界面，请改用浏览器下载。",
+                    pendingInstallConfirmIntent = null,
+                )
+            }
+        }
+    }
+
     /** 用户返回授权页后重新发起;权限仍未授予时会再次回到等待授权态。 */
     fun retryApkUpdateAfterPermission() {
-        _updateState.update { it.copy(apkStage = ApkUpdateStage.Idle, apkError = null) }
+        _updateState.update {
+            it.copy(
+                apkStage = ApkUpdateStage.Idle,
+                apkError = null,
+                pendingInstallConfirmIntent = null,
+            )
+        }
         startApkUpdate()
     }
 
     fun cancelApkUpdate() {
         apkUpdateJob?.cancel()
         apkUpdateJob = null
+        pendingApkFile = null
+        ApkUpdateInstaller.abandonActiveSession(getApplication())
         _updateState.update {
             it.copy(
                 apkStage = ApkUpdateStage.Idle,
                 apkDownloadedBytes = 0L,
                 apkTotalBytes = 0L,
                 apkError = null,
+                pendingInstallConfirmIntent = null,
             )
         }
     }
@@ -7355,6 +7504,11 @@ fun openTopicSearch(topicId: Long, title: String) {
             _smartDirectLatency.value = directMs.takeIf { it >= 0 }
             _smartDohLatency.value = dohMs.takeIf { it >= 0 }
             _smartRouteSummary.value = summary
+        }
+        viewModelScope.launch {
+            ApkUpdateInstaller.installEvents.collect { event ->
+                handleApkInstallEvent(event)
+            }
         }
         boot()
         restartAutoProbeLoop()

@@ -1,6 +1,8 @@
 package org.linuxdo.android.ui
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
@@ -4748,16 +4750,36 @@ fun UpdateDialog(
     downloadedBytes: Long,
     totalBytes: Long,
     errorMessage: String?,
+    pendingConfirmIntent: Intent? = null,
+    onConfirmIntentLaunched: () -> Unit = {},
+    onConfirmIntentLaunchFailed: () -> Unit = {},
     onStartDownload: () -> Unit,
+    onRetryInstall: () -> Unit = onStartDownload,
     onRetryAfterPermission: () -> Unit,
     onCancelDownload: () -> Unit,
     onDismiss: (ignoreThisVersion: Boolean) -> Unit,
 ) {
     val context = LocalContext.current
-    // 下载或安装进行中就不让点外部/返回键关掉，避免把进度丢掉。
+    LaunchedEffect(pendingConfirmIntent) {
+        val confirmIntent = pendingConfirmIntent ?: return@LaunchedEffect
+        onConfirmIntentLaunched()
+        val hostActivity = context.findHostActivity()
+        val launched = runCatching {
+            if (hostActivity != null) {
+                hostActivity.startActivity(confirmIntent)
+            } else {
+                val flagged = Intent(confirmIntent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(flagged)
+            }
+            true
+        }.getOrDefault(false)
+        if (!launched) {
+            onConfirmIntentLaunchFailed()
+        }
+    }
+    // 仅在下载或校验阶段锁定对话框，避免因系统安装确认页被划掉而卡死界面。
     val busy = stage == ApkUpdateStage.Downloading ||
-        stage == ApkUpdateStage.Verifying ||
-        stage == ApkUpdateStage.Installing
+        stage == ApkUpdateStage.Verifying
     val closable = !info.mandatory && !busy
     Dialog(
         onDismissRequest = { if (closable) onDismiss(false) },
@@ -4896,14 +4918,16 @@ fun UpdateDialog(
 
                 ApkUpdateStage.Installing -> {
                     Text(
-                        text = "已唤起系统安装程序，请在系统弹窗中确认安装。",
+                        text = "已提交系统安装程序，请在系统弹窗中确认安装。",
                         style = IosTheme.type.footnote,
                         color = IosTheme.colors.secondaryLabel,
                     )
-                    Spacer(Modifier.height(12.dp))
-                    UpdateSecondaryAction(text = "改用浏览器下载") {
-                        openInDefaultBrowser(context, info.downloadUrl)
+                    Spacer(Modifier.height(10.dp))
+                    UpdateSecondaryAction(text = "未弹出安装窗？点击重试安装") {
+                        onRetryInstall()
                     }
+                    Spacer(Modifier.height(8.dp))
+                    UpdateBrowserFallbackSection(info = info, context = context)
                 }
 
                 ApkUpdateStage.AwaitingPermission -> {
@@ -4923,9 +4947,7 @@ fun UpdateDialog(
                         }
                     }
                     Spacer(Modifier.height(10.dp))
-                    UpdateSecondaryAction(text = "改用浏览器下载") {
-                        openInDefaultBrowser(context, info.downloadUrl)
-                    }
+                    UpdateBrowserFallbackSection(info = info, context = context)
                 }
 
                 else -> {
@@ -4947,9 +4969,7 @@ fun UpdateDialog(
                     )
                     if (stage == ApkUpdateStage.Failed) {
                         Spacer(Modifier.height(10.dp))
-                        UpdateSecondaryAction(text = "改用浏览器下载") {
-                            openInDefaultBrowser(context, info.downloadUrl)
-                        }
+                        UpdateBrowserFallbackSection(info = info, context = context)
                     }
                 }
             }
@@ -5016,15 +5036,19 @@ private fun UpdatePrimaryAction(text: String, onClick: () -> Unit) {
     }
 }
 
-/** 升级对话框的次要操作，用于浏览器兜底这类退路。 */
+/** 升级对话框的次要操作，用于浏览器兜底或重新唤起安装等退路。 */
 @Composable
-private fun UpdateSecondaryAction(text: String, onClick: () -> Unit) {
+private fun UpdateSecondaryAction(
+    text: String,
+    modifier: Modifier = Modifier.fillMaxWidth(),
+    onClick: () -> Unit,
+) {
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
+        modifier = modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(IosTheme.colors.fieldBackground)
             .clickable(onClick = onClick)
-            .padding(vertical = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
@@ -5033,6 +5057,44 @@ private fun UpdateSecondaryAction(text: String, onClick: () -> Unit) {
             color = IosTheme.colors.accent,
         )
     }
+}
+
+/** 浏览器兜底与 Release 页面入口，并提示部分机型浏览器直装限制的解决办法。 */
+@Composable
+private fun UpdateBrowserFallbackSection(
+    info: UpdateInfo,
+    context: Context,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        UpdateSecondaryAction(
+            text = "改用浏览器下载",
+            modifier = Modifier.weight(1f),
+        ) {
+            openInDefaultBrowser(context, info.downloadUrl)
+        }
+        UpdateSecondaryAction(
+            text = "前往 Release 页面",
+            modifier = Modifier.weight(1f),
+        ) {
+            openInDefaultBrowser(context, info.releasePageUrl)
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+    Text(
+        text = "浏览器内直接安装提示「缺乏开发者证书」，请打开系统「文件管理」→「下载」找到安装包安装。",
+        style = IosTheme.type.caption,
+        color = IosTheme.colors.secondaryLabel,
+        lineHeight = 17.sp,
+    )
+}
+
+private tailrec fun Context.findHostActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findHostActivity()
+    else -> null
 }
 
 /** 下载进度用的字节展示：不足 1 MB 时用 KB，避免一直停在 0.0 MB。 */

@@ -79,6 +79,11 @@
             android:exported="false" />
 
         <receiver
+            android:name=".service.ApkInstallResultReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <receiver
             android:name=".service.BootCompletedReceiver"
             android:enabled="true"
             android:exported="true">
