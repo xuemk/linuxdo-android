@@ -5053,7 +5053,8 @@ private fun UpdateSecondaryAction(
     ) {
         Text(
             text = text,
-            style = IosTheme.type.subheadline,
+            style = IosTheme.type.footnote,
+            fontWeight = FontWeight.Medium,
             color = IosTheme.colors.accent,
         )
     }
