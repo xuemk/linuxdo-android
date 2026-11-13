@@ -19,6 +19,7 @@ import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.StorageController
 import org.mozilla.geckoview.WebRequestError
 import java.io.File
 import java.io.Closeable
@@ -26,13 +27,16 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 object GeckoManager {
     private const val TAG = "GeckoManager"
@@ -58,6 +62,8 @@ object GeckoManager {
 
         val configFile = File(context.filesDir, "geckoview-config.yaml")
         // prefs 的键是原始 Gecko 参数名；类型由 YAML 值决定，不追加类型后缀。
+        // disableIPv6：OkHttp 直连只走 Anycast IPv4，双栈网络下 Gecko 走 IPv6 过盾拿到的 cf_clearance 交给 OkHttp 会被判为另一访客。
+        // 该配置只在创建 GeckoRuntime 时读取，改动需重启进程生效。
         val configContent = """
             prefs:
               network.proxy.type: 5
@@ -66,6 +72,7 @@ object GeckoManager {
               network.dns.echconfig.enabled: true
               network.dns.http3_echconfig.enabled: true
               network.dns.use_https_rr_as_altsvc: true
+              network.dns.disableIPv6: true
         """.trimIndent()
 
         configFile.writeText(configContent, Charsets.UTF_8)
@@ -79,21 +86,53 @@ object GeckoManager {
             .debugLogging(false)
             .build()
 
+        if (org.mozilla.gecko.util.ThreadUtils.sGeckoHandler == null) {
+            // GeckoRuntime.init 在 ProcessLifecycleOwner 已处于 RESUMED 时会同步回调 LifecycleListener.onResume()
+            // 并调用 ThreadUtils.sGeckoHandler.post(...)，而此时新启动的 GeckoThread 可能尚未完成 sGeckoHandler 赋值。
+            // 先预置主线程 Handler 兜底，待 GeckoThread.run() 启动后会自动覆盖为 Gecko 线程自身的 Handler。
+            org.mozilla.gecko.util.ThreadUtils.sGeckoHandler = Handler(Looper.getMainLooper())
+        }
+
         val rt = GeckoRuntime.create(context.applicationContext, settings)
         runtime = rt
         Log.d(TAG, "GeckoRuntime 已启用 ECH，TRR mode=$trrMode，DoH host=${Uri.parse(dohUri).host}")
         return rt
     }
 
+    /** 当前 GeckoRuntime 生效的 DNS/TRR 与代理让渡摘要，供验证页与静默补签诊断对照。 */
+    fun runtimeNetworkSummary(context: Context): String {
+        val container = (context.applicationContext as? App)?.container
+        val store = container?.sessionStore
+        val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
+        val pauseDoh = container?.networkMonitor?.detect()?.shouldPauseDoh == true
+        val forceOverProxy = store?.isDohForceOverProxyEnabled() == true
+        val useDoh = store?.isDohEnabled() != false && (!pauseDoh || forceOverProxy)
+        val trrLabel = if (useDoh) "ONLY(DoH+ECH)" else "DISABLED(系统/代理)"
+        val dohHost = runCatching { Uri.parse(dohUri).host }.getOrNull() ?: "-"
+        return "TRR=$trrLabel doh=$dohHost pauseDoh=$pauseDoh forceOverProxy=$forceOverProxy"
+    }
+
     /** 验证视图共用 TextureView，并兼容宿主转发的非标准触摸序列。 */
-    fun createGeckoView(context: Context): GeckoView {
+    fun createGeckoView(
+        context: Context,
+        allowTouchInterceptOverride: Boolean? = null,
+    ): GeckoView {
         return object : GeckoView(context) {
             private var gestureDownTime: Long? = null
             private var touchCorrectionLogged = false
 
+            override fun requestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {
+                super.requestDisallowInterceptTouchEvent(
+                    allowTouchInterceptOverride ?: disallowIntercept,
+                )
+            }
+
             override fun onTouchEvent(event: MotionEvent): Boolean {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
                     gestureDownTime = event.downTime
+                    if (allowTouchInterceptOverride == true) {
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                    }
                 }
                 val expectedDownTime = gestureDownTime
                 // Gecko 135 会丢弃 downTime 与 DOWN 不同的 MOVE/UP，导致页面收不到完整点击。
@@ -171,14 +210,21 @@ object GeckoManager {
     }
 
     /**
-     * 创建专门用于过 Cloudflare 挑战或登录的 GeckoSession
+     * 创建专门用于过 Cloudflare 挑战、登录或同域内置浏览的 GeckoSession
      */
     fun createChallengeSession(
         context: Context,
         onLocationChanged: (url: String) -> Unit = {},
+        onPageStarted: (url: String) -> Unit = {},
+        onProgressChanged: (progress: Int) -> Unit = {},
         onPageFinished: (url: String) -> Unit = {},
+        onTitleChanged: (title: String) -> Unit = {},
         onCanGoBackChanged: (canGoBack: Boolean) -> Unit = {},
         onPageError: (String, WebRequestError) -> Unit = { _, _ -> },
+        onExternalRequest: ((uri: String) -> Boolean)? = null,
+        returnErrorPageHtml: Boolean = true,
+        onDiagnostic: (String) -> Unit = {},
+        onContentPainted: (url: String) -> Unit = {},
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
@@ -196,6 +242,15 @@ object GeckoManager {
                 request: GeckoSession.NavigationDelegate.LoadRequest
             ): GeckoResult<AllowOrDeny>? {
                 Log.d(TAG, "Gecko onLoadRequest: ${diagnosticUrl(request.uri)}")
+                if (onExternalRequest != null && onExternalRequest(request.uri)) {
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
+                }
+                if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW &&
+                    (request.uri.startsWith("https://") || request.uri.startsWith("http://"))
+                ) {
+                    session.loadUri(request.uri)
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
+                }
                 return GeckoResult.fromValue(AllowOrDeny.ALLOW)
             }
 
@@ -223,22 +278,39 @@ object GeckoManager {
                 pageLoadFailed = true
                 Log.e(TAG, "Gecko onLoadError: uri=${diagnosticUrl(uri)}, category=${error.category}, code=${error.code}")
                 onPageError(uri.orEmpty(), error)
+                if (!returnErrorPageHtml) return null
                 // 返回 null 会直接中止导航，首次加载失败时只留下 about:blank。
                 return GeckoResult.fromValue(createErrorPage(uri, error))
             }
         }
 
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            private var progressBucket = -1
+
             override fun onPageStart(session: GeckoSession, url: String) {
                 currentUrl = url
                 contentPaintLogged = false
+                progressBucket = -1
                 if (!url.startsWith("https://") && !url.startsWith("http://")) return
                 pageLoadFailed = false
                 Log.d(TAG, "Gecko onPageStart: ${diagnosticUrl(url)}")
+                onPageStarted(url)
+                onDiagnostic("开始加载 ${diagnosticUrl(url)}")
+            }
+
+            override fun onProgressChange(session: GeckoSession, progress: Int) {
+                onProgressChanged(progress)
+                // 只在 25/50/75/100 四档各记一次：卡在哪一档能区分"连不上"和"子资源迟迟不完"
+                val bucket = progress / 25
+                if (bucket > progressBucket) {
+                    progressBucket = bucket
+                    onDiagnostic("加载进度 $progress%")
+                }
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
                 Log.d(TAG, "Gecko onPageStop, success=$success")
+                onDiagnostic("加载结束 success=$success 失败标记=$pageLoadFailed ${diagnosticUrl(currentUrl)}")
                 if (success && !pageLoadFailed && (currentUrl.startsWith("https://") || currentUrl.startsWith("http://"))) {
                     onPageFinished(currentUrl)
                 }
@@ -249,6 +321,15 @@ object GeckoManager {
                 if (!contentPaintLogged) {
                     contentPaintLogged = true
                     Log.d(TAG, "Gecko 首屏内容已绘制")
+                    onDiagnostic("首屏内容已绘制")
+                    onContentPainted(currentUrl)
+                }
+            }
+
+            override fun onTitleChange(session: GeckoSession, title: String?) {
+                if (!title.isNullOrBlank()) {
+                    onTitleChanged(title)
+                    onDiagnostic("页面标题 ${title.take(40)}")
                 }
             }
         }
@@ -310,37 +391,66 @@ object GeckoManager {
     }
 
     /**
-     * 清理 GeckoView 数据库中的旧 cf_clearance，避免二次验证时命中旧值导致误判
+     * 经 Gecko 自身的 StorageController 清掉主站（含 .linux.do 域 Cookie）的全部 Cookie，迫使 CF 重新挑战并签发新凭据。
+     * 不能直接改 cookies.sqlite：Gecko 以内存中的 Cookie 为准，删库后旧值仍会被发出并写回。
+     * 会一并清掉 Gecko 侧的 _t/_forum_session，登录流程每次都会重建，验证页不依赖它们。
      */
-    fun clearCfClearanceFromDb(context: Context) {
-        val dbFile = findCookiesDbFile(context) ?: return
-        try {
-            val flags = SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.NO_LOCALIZED_COLLATORS
-            val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, flags)
-            db.use {
-                it.execSQL("DELETE FROM moz_cookies WHERE host LIKE '%linux.do%' AND name = 'cf_clearance'")
-                Log.d(TAG, "已从 GeckoView cookies.sqlite 中清除旧 cf_clearance")
+    suspend fun clearSiteCookies(context: Context): Boolean = withContext(Dispatchers.Main) {
+        val result = getOrCreateRuntime(context).storageController
+            .clearDataFromHost(Config.HOST, StorageController.ClearFlags.COOKIES)
+        withTimeoutOrNull(5_000L) {
+            suspendCancellableCoroutine<Boolean> { continuation ->
+                result.accept(
+                    { if (continuation.isActive) continuation.resume(true) },
+                    { error ->
+                        Log.w(TAG, "清理 Gecko 站点 Cookie 失败: ${error?.message}")
+                        if (continuation.isActive) continuation.resume(false)
+                    },
+                )
             }
-        } catch (e: Throwable) {
-            Log.w(TAG, "清理 GeckoView cf_clearance 异常: ${e.message}")
-        }
+        } ?: false
     }
 
     /**
      * 从 GeckoView 的 moz_cookies SQLite 数据库中提取 linux.do 的凭据 (如 cf_clearance, _t, _forum_session)
      */
-    fun extractCookiesFromDb(context: Context): Map<String, String> {
+    fun extractCookiesFromDb(
+        context: Context,
+        excludeClearances: Set<String> = emptySet(),
+    ): Map<String, String> {
         val result = mutableMapOf<String, String>()
+        for ((name, value) in readCookiesFromDb(context)) {
+            if (name.equals("cf_clearance", ignoreCase = true) && value in excludeClearances) continue
+            result[name] = value
+        }
+        return result
+    }
+
+    /** 清理异步落盘时可能读回任一旧行，验证基线必须保留所有同名 Cookie，而非最后一行。 */
+    fun cfClearancesFromDb(context: Context): Set<String> = readCookiesFromDb(context)
+        .filter { (name, _) -> name.equals("cf_clearance", ignoreCase = true) }
+        .map { (_, value) -> value }
+        .toSet()
+
+    private fun readCookiesFromDb(context: Context): List<Pair<String, String>> {
+        val result = mutableListOf<Pair<String, String>>()
         val dbFile = findCookiesDbFile(context) ?: return result
 
         try {
             val flags = SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS
             val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, flags)
             db.use {
-                val cursor = it.rawQuery(
-                    "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
-                    null
-                )
+                val cursor = try {
+                    it.rawQuery(
+                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%' ORDER BY lastAccessed ASC, expiry ASC",
+                        null
+                    )
+                } catch (_: Throwable) {
+                    it.rawQuery(
+                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
+                        null
+                    )
+                }
                 cursor.use { c ->
                     val nameIdx = c.getColumnIndex("name")
                     val valIdx = c.getColumnIndex("value")
@@ -349,7 +459,7 @@ object GeckoManager {
                             val name = c.getString(nameIdx)
                             val value = c.getString(valIdx)
                             if (!name.isNullOrBlank() && !value.isNullOrBlank()) {
-                                result[name] = value
+                                result.add(name to value)
                             }
                         }
                     }

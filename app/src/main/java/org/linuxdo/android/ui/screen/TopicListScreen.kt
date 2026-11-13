@@ -1,5 +1,13 @@
 package org.linuxdo.android.ui.screen
 
+import org.linuxdo.android.ui.html.CookedParser
+
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import org.linuxdo.android.data.avatarUrlOf
+
 import org.linuxdo.android.data.TopicPage
 import org.linuxdo.android.data.TopicNotificationLevel
 import org.linuxdo.android.data.PostFlagReason
@@ -49,6 +57,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -167,6 +176,7 @@ data class TopicListUiState(
     val pendingPage: TopicPage? = null,
     val incomingTopicIds: Set<Long> = emptySet(),
     val highlightedTopicIds: Set<Long> = emptySet(),
+    val needsRefresh: Boolean = false,
 )
 
 /** "最新"与"某分类下的帖子"用同一个列表页,只是标题与数据源不同。 */
@@ -178,6 +188,8 @@ fun TopicListScreen(
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     onOpenTopic: (Topic) -> Unit,
+    onOpenItem: ((TopicListItem) -> Unit)? = null,
+    onRemoveBookmark: ((TopicListItem, (String) -> Unit) -> Unit)? = null,
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
     onBack: (() -> Unit)? = null,
@@ -198,6 +210,7 @@ fun TopicListScreen(
     onCreateTopic: (() -> Unit)? = null,
     onBookmarkTopic: ((Topic, (String) -> Unit) -> Unit)? = null,
     onFlagTopic: ((Topic, Int, String?, () -> Unit, (String) -> Unit) -> Unit)? = null,
+    onSaveTopic: ((Topic) -> Unit)? = null,
     sortOrder: TopicSortOrder = TopicSortOrder.Default,
     sortAscending: Boolean = false,
     onSortChange: (TopicSortOrder) -> Unit = {},
@@ -213,6 +226,7 @@ fun TopicListScreen(
     onNavigateToHistory: (() -> Unit)? = null,
     onNavigateToConnect: (() -> Unit)? = null,
     onNavigateToChat: (() -> Unit)? = null,
+    onNavigateToApps: (() -> Unit)? = null,
     onNavigateToBookmarks: (() -> Unit)? = null,
     onNavigateToFollowing: (() -> Unit)? = null,
     onNavigateToLikes: (() -> Unit)? = null,
@@ -228,7 +242,15 @@ fun TopicListScreen(
     barsVisible: Boolean = true,
     blockedUsernames: Set<String> = emptySet(),
 ) {
-    val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
+    // 每个 feed 的滚动位置用 rememberLazyListState（内部走 rememberSaveable），
+    // 确保在 recomposition 或临时移出组合树后仍能还原 firstVisibleItemIndex + scrollOffset。
+    // 旧方案 remember { mutableMapOf() } + LazyListState() 不走 saveable，回复后
+    // refreshTopic silent 触发大量 state 更新时极易丢失位置。
+    // HomeFeedType 枚举顺序：Latest(0)、Unread(1)、Hot(2)、Posted(3)
+    val feedStateLatest = rememberLazyListState()
+    val feedStateUnread = rememberLazyListState()
+    val feedStateHot = rememberLazyListState()
+    val feedStatePosted = rememberLazyListState()
     val categoryListStates = remember { mutableMapOf<Int, LazyListState>() }
     val defaultListState = rememberLazyListState()
     var pendingSettledFeed by remember { mutableStateOf<HomeFeedType?>(null) }
@@ -243,8 +265,20 @@ fun TopicListScreen(
     } else {
         state
     }
+    // 将各 feed 的 rememberLazyListState 对象放入一个普通 Map，供统一访问。
+    // 不用 getOrPut 动态创建，每个已知 feed 提前声明好对应的 saveable state。
+    val feedListStates: Map<HomeFeedType, LazyListState> = remember(
+        feedStateLatest, feedStateUnread, feedStateHot, feedStatePosted
+    ) {
+        mapOf(
+            HomeFeedType.Latest to feedStateLatest,
+            HomeFeedType.Unread to feedStateUnread,
+            HomeFeedType.Hot to feedStateHot,
+            HomeFeedType.Posted to feedStatePosted,
+        )
+    }
     val listState = when {
-        effectiveFeed != null -> feedListStates.getOrPut(effectiveFeed) { LazyListState() }
+        effectiveFeed != null -> feedListStates[effectiveFeed] ?: feedStateLatest
         currentCategoryId != null -> categoryListStates.getOrPut(currentCategoryId) { LazyListState() }
         else -> defaultListState
     }
@@ -285,6 +319,23 @@ fun TopicListScreen(
         }
     }
     val pullState = rememberPullToRefreshState()
+    val latestOnOpenMiniApps by rememberUpdatedState(onNavigateToApps)
+    val miniAppsHeaderThreshold = with(LocalDensity.current) { 72.dp.toPx() }
+    val miniAppsHeaderGesture = if (active && currentFeed != null && onNavigateToApps != null) {
+        Modifier.pointerInput(listState, miniAppsHeaderThreshold) {
+            var pullDistance = 0f
+            detectVerticalDragGestures(
+                onDragStart = { pullDistance = 0f },
+                onDragCancel = { pullDistance = 0f },
+                onDragEnd = {
+                    if (pullDistance >= miniAppsHeaderThreshold && !listState.canScrollBackward) latestOnOpenMiniApps?.invoke()
+                },
+                onVerticalDrag = { change, amount ->
+                    if (!listState.canScrollBackward) { pullDistance = (pullDistance + amount).coerceAtLeast(0f); change.consume() }
+                },
+            )
+        }
+    } else Modifier
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
     var noticeToast by remember { mutableStateOf<String?>(null) }
@@ -349,7 +400,7 @@ fun TopicListScreen(
     val (pinnedGroups, plainItems) = remember(filteredItems) { pinnedPrefixGroups(filteredItems) }
     val previewKeyPrefix = effectiveFeed?.name ?: currentCategoryId ?: "topic"
     val previewTopicsByKey = remember(plainItems, previewKeyPrefix) {
-        plainItems.associate { "${previewKeyPrefix}_${it.topic.id}" to it.topic }
+        plainItems.associate { "${previewKeyPrefix}_${it.listKey}" to it.topic }
     }
     val visiblePreviewTopics by remember(listState, previewTopicsByKey) {
         derivedStateOf {
@@ -421,7 +472,7 @@ fun TopicListScreen(
         (abs(feedDragOffsetPx.value) / containerWidthPx).coerceIn(0f, 1f)
     } else 0f
 
-    val secondaryListState = incomingFeed?.let { feedListStates.getOrPut(it) { LazyListState() } }
+    val secondaryListState = incomingFeed?.let { feedListStates[it] ?: feedStateLatest }
     val incomingFeedState = incomingFeed?.let { feedStates[it] ?: TopicListUiState(initialLoading = true) }
     val incomingFilteredItems = remember(incomingFeedState?.items, blockedUsernames) {
         val raw = incomingFeedState?.items.orEmpty()
@@ -589,6 +640,7 @@ fun TopicListScreen(
                     onCopyLink = copyTopicLink,
                     onBookmark = bookmarkTopicAction,
                     onFlag = flagTopicAction,
+                    onSave = onSaveTopic,
                     showTopicUnreadDot = showTopicUnreadDot,
                     topicUnreadDotPosition = topicUnreadDotPosition,
                 )
@@ -607,7 +659,7 @@ fun TopicListScreen(
 
         itemsIndexed(
             items = pagePlainItems,
-            key = { _, item -> "${keyPrefix}_${item.topic.id}" },
+            key = { _, item -> "${keyPrefix}_${item.listKey}" },
             contentType = { _, item ->
                 when {
                     feedDisplayMode == "graphic" -> "topic-graphic"
@@ -621,6 +673,21 @@ fun TopicListScreen(
             val isGraphic = feedDisplayMode == "graphic"
             val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
             Column(modifier = Modifier.fillMaxWidth()) {
+                if (item.bookmarkId != null) {
+                    var removing by remember(item.bookmarkId) { mutableStateOf(false) }
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(item.targetPostNumber?.let { "收藏于第 $it 楼" } ?: "话题书签",
+                            style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                        Spacer(Modifier.weight(1f))
+                        if (onRemoveBookmark != null) androidx.compose.material3.TextButton(
+                            enabled = !removing,
+                            onClick = {
+                                removing = true
+                                onRemoveBookmark(item) { message -> removing = false; showNotice(message) }
+                            },
+                        ) { Text(if (removing) "处理中…" else "取消收藏", style = IosTheme.type.caption) }
+                    }
+                }
                 TopicRow(
                     item = item,
                     isHighlighted = isHighlighted,
@@ -632,8 +699,9 @@ fun TopicListScreen(
                     onCopyLink = { copyTopicLink(item.topic) },
                     onBookmark = bookmarkTopicAction?.let { fn -> { fn(item.topic) } },
                     onFlag = flagTopicAction?.let { fn -> { fn(item.topic) } },
+                    onSave = onSaveTopic?.let { fn -> { fn(item.topic) } },
                     onOpenUser = onOpenUser,
-                    onClick = { onOpenTopic(item.topic) },
+                    onClick = { if (onOpenItem != null) onOpenItem(item) else onOpenTopic(item.topic) },
                     feedGraphicMode = isGraphic,
                     feedDisplayMode = feedDisplayMode,
                     showTopicUnreadDot = showTopicUnreadDot,
@@ -661,7 +729,13 @@ fun TopicListScreen(
 
     PullToRefreshBox(
         isRefreshing = effectiveState.refreshing,
-        onRefresh = onRefresh,
+        onRefresh = {
+            if (active && currentFeed != null && onNavigateToApps != null && pullState.distanceFraction >= 1.55f) {
+                onNavigateToApps()
+            } else {
+                onRefresh()
+            }
+        },
         state = pullState,
         modifier = modifier
             .onSizeChanged { containerWidthPx = it.width.toFloat() }
@@ -679,7 +753,14 @@ fun TopicListScreen(
                             alpha = if (effectiveState.refreshing) 1f else min(1f, fraction * 1.4f)
                         },
                 ) {
-                    IosActivityIndicator(diameter = 22.dp)
+                    if (currentFeed != null && onNavigateToApps != null && fraction >= 1.55f && !effectiveState.refreshing) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            WeChatThreeDotsLoader()
+                            Text("松开进入小程序", color = IosTheme.colors.secondaryLabel, fontSize = 12.sp)
+                        }
+                    } else {
+                        IosActivityIndicator(diameter = 22.dp)
+                    }
                 }
             }
         },
@@ -714,13 +795,13 @@ fun TopicListScreen(
             customLargeTitle = when {
                 effectiveFeed != null && onFeedSelect != null -> {
                     {
-                        HomeFeedTitleBar(
+                        Box(miniAppsHeaderGesture) { HomeFeedTitleBar(
                             currentFeed = effectiveFeed,
                             targetFeed = incomingFeed,
                             transitionProgress = transitionProgress,
                             onFeedSelect = animateSelectFeed,
                             trailing = trailing,
-                        )
+                        ) }
                     }
                 }
                 hasCategoryDropdown -> {
@@ -739,12 +820,12 @@ fun TopicListScreen(
             customCollapsedTitle = when {
                 effectiveFeed != null && onFeedSelect != null -> {
                     {
-                        HomeFeedCollapsedBar(
+                        Box(miniAppsHeaderGesture) { HomeFeedCollapsedBar(
                             currentFeed = effectiveFeed,
                             targetFeed = incomingFeed,
                             transitionProgress = transitionProgress,
                             onFeedSelect = animateSelectFeed,
-                        )
+                        ) }
                     }
                 }
                 hasCategoryDropdown -> {
@@ -820,6 +901,7 @@ fun TopicListScreen(
                                 FloatingAction.History -> onNavigateToHistory?.invoke()
                                 FloatingAction.Connect -> onNavigateToConnect?.invoke()
                                 FloatingAction.Chat -> onNavigateToChat?.invoke()
+                                FloatingAction.Apps -> onNavigateToApps?.invoke()
                             }
                         },
                         modifier = Modifier.fillMaxSize(),
@@ -1233,8 +1315,18 @@ private fun NotificationLevelMenu(
     onCopyLink: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
     onFlag: (() -> Unit)? = null,
+    onSave: (() -> Unit)? = null,
+    previewTopic: Topic? = null,
+    previewCategory: Category? = null,
+    onOpenTopic: (() -> Unit)? = null,
 ) {
     if (!expanded) return
+    val previewLoader = org.linuxdo.android.ui.LocalTopicPreviewLoader.current
+    if (previewTopic != null && onOpenTopic != null && previewLoader != null) {
+        TopicPreviewDialog(previewTopic, previewCategory, previewLoader, onDismiss, onOpenTopic,
+            currentLevel, updating, onPick, onCopyLink, onBookmark, onFlag, onSave)
+        return
+    }
     DropdownMenu(
         expanded = true,
         onDismissRequest = onDismiss,
@@ -1269,9 +1361,26 @@ private fun NotificationLevelMenu(
                 )
             }
         }
-        val hasExtraActions = onCopyLink != null || onBookmark != null || onFlag != null
+        val hasExtraActions = onSave != null || onCopyLink != null || onBookmark != null || onFlag != null
         if (onPick != null && hasExtraActions) {
             IosDivider()
+        }
+        if (onSave != null) {
+            DropdownMenuItem(
+                text = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(17.dp), contentAlignment = Alignment.Center) {
+                            Text("▱", color = IosTheme.colors.secondaryLabel, fontSize = 15.sp)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("添加暂存", color = IosTheme.colors.label)
+                    }
+                },
+                onClick = {
+                    onDismiss()
+                    onSave()
+                },
+            )
         }
         if (onCopyLink != null) {
             DropdownMenuItem(
@@ -1317,6 +1426,398 @@ private fun NotificationLevelMenu(
                     onFlag()
                 },
             )
+        }
+    }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun TopicPreviewDialog(
+    topic: Topic,
+    category: Category?,
+    loader: suspend (Long) -> org.linuxdo.android.data.TopicDetail,
+    onDismiss: () -> Unit,
+    onOpen: () -> Unit,
+    notificationLevel: TopicNotificationLevel?,
+    updating: Boolean,
+    onPick: ((TopicNotificationLevel) -> Unit)?,
+    onCopy: (() -> Unit)?,
+    onBookmark: (() -> Unit)?,
+    onFlag: (() -> Unit)?,
+    onSave: (() -> Unit)?,
+) {
+    var detail by remember(topic.id) { mutableStateOf<org.linuxdo.android.data.TopicDetail?>(null) }
+    var loading by remember(topic.id) { mutableStateOf(true) }
+    var failed by remember(topic.id) { mutableStateOf(false) }
+    var retry by remember(topic.id) { mutableIntStateOf(0) }
+    var sharePost by remember { mutableStateOf<org.linuxdo.android.data.Post?>(null) }
+
+    LaunchedEffect(topic.id, retry) {
+        loading = true
+        failed = false
+        try { detail = loader(topic.id) }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { failed = true }
+        finally { loading = false }
+    }
+    val first = detail?.postStream?.posts?.firstOrNull { it.postNumber == 1 }
+    val cookedBlocks = remember(first?.cooked) {
+        val cookedHtml = first?.cooked
+        if (!cookedHtml.isNullOrBlank()) {
+            CookedParser.parseCached(cookedHtml)
+        } else emptyList()
+    }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            Modifier
+                .padding(horizontal = 16.dp, vertical = 24.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(0.86f)
+                .clip(RoundedCornerShape(24.dp))
+                .background(IosTheme.colors.card)
+        ) {
+            LazyColumn(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // 1. 大标题 (单击也可跳转) 与 右上角“暂存话题”胶囊按钮
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Text(
+                            text = detail?.title ?: topic.title,
+                            style = IosTheme.type.title3.copy(fontWeight = FontWeight.Bold, fontSize = 21.sp),
+                            color = IosTheme.colors.label,
+                            lineHeight = 28.sp,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 10.dp)
+                                .clickable { onDismiss(); onOpen() }
+                        )
+                        if (onSave != null) {
+                            var localSaved by remember(topic.id) { mutableStateOf(false) }
+                            val saveBg = if (localSaved) IosTheme.colors.accent.copy(alpha = 0.22f)
+                                else IosTheme.colors.accent.copy(alpha = if (IosTheme.colors.isDark) 0.16f else 0.08f)
+                            Row(
+                                modifier = Modifier
+                                    .padding(top = 2.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(saveBg)
+                                    .clickable {
+                                        localSaved = !localSaved
+                                        onSave()
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                PostActionIcon(
+                                    action = PostAction.Bookmark,
+                                    selected = localSaved,
+                                    tint = IosTheme.colors.accent,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = if (localSaved) "已暂存" else "暂存话题",
+                                    style = IosTheme.type.caption,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = IosTheme.colors.accent
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 2. 作者信息行 (头像 · 名字 · 分类色块 · 分类名 · 时间)
+                item {
+                    val firstPosterUser = topic.posters.firstOrNull()?.user
+                    val posterName = first?.displayName?.takeIf { it.isNotBlank() }
+                        ?: firstPosterUser?.name?.takeIf { it.isNotBlank() }
+                        ?: firstPosterUser?.username?.takeIf { it.isNotBlank() }
+                        ?: "社区用户"
+                    val posterAvatar = first?.avatarTemplate ?: firstPosterUser?.avatarTemplate
+                    val effectiveCategory = category
+                    val catColor = effectiveCategory?.color?.let { parseCategoryColor(it) } ?: IosTheme.colors.accent
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (!posterAvatar.isNullOrBlank()) {
+                            AsyncImage(
+                                avatarUrlOf(posterAvatar),
+                                posterName,
+                                modifier = Modifier.size(24.dp).clip(CircleShape)
+                            )
+                        }
+                        Text(
+                            text = posterName,
+                            style = IosTheme.type.footnote,
+                            fontWeight = FontWeight.Medium,
+                            color = IosTheme.colors.label
+                        )
+                        Text("·", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        if (effectiveCategory != null) {
+                            Box(
+                                Modifier
+                                    .size(8.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(catColor)
+                            )
+                            Text(
+                                text = effectiveCategory.name,
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel
+                            )
+                            Text("·", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        }
+                        Text(
+                            text = RelativeTime.format(first?.createdAt ?: topic.createdAt),
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                }
+
+                // 3. 标签列表 (#快问快答 #人工智能)
+                val tags = detail?.tags ?: topic.tags
+                if (tags.isNotEmpty()) {
+                    item {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.horizontalScroll(rememberScrollState())
+                        ) {
+                            tags.forEach { tag ->
+                                Text(
+                                    text = "#$tag",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.secondaryLabel
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 4. 正文富文本与图片渲染
+                if (loading) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(vertical = 32.dp), contentAlignment = Alignment.Center) {
+                            IosActivityIndicator(diameter = 24.dp)
+                        }
+                    }
+                } else if (cookedBlocks.isNotEmpty()) {
+                    item {
+                        CookedContent(
+                            blocks = cookedBlocks,
+                            onPicture = { _, _ -> },
+                            compact = true,
+                        )
+                    }
+                } else if (!topic.excerpt.isNullOrBlank()) {
+                    item {
+                        Text(
+                            text = topic.excerpt!!,
+                            style = IosTheme.type.body,
+                            color = IosTheme.colors.label,
+                            lineHeight = 24.sp
+                        )
+                    }
+                }
+
+                // 5. 失败重试提示
+                if (failed && cookedBlocks.isEmpty()) {
+                    item {
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(IosTheme.colors.groupedBackground)
+                                .padding(14.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text("详情暂未加载完整，可直接打开话题查看", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                            Spacer(Modifier.height(6.dp))
+                            androidx.compose.material3.TextButton(onClick = { retry++ }) {
+                                Text("重试加载", color = IosTheme.colors.accent)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. 话题提醒设置 (按图设计分段选择器，靠下独立展示，不贴着正文)
+            if (onPick != null) {
+                var currentSelectedLevel by remember(notificationLevel, topic.notificationLevel) {
+                    mutableStateOf(notificationLevel ?: TopicNotificationLevel.entries.firstOrNull { it.code == topic.notificationLevel } ?: TopicNotificationLevel.Regular)
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "话题提醒设置",
+                        style = IosTheme.type.caption,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier.padding(bottom = 6.dp, start = 2.dp)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(13.dp))
+                            .background(IosTheme.colors.groupedBackground)
+                            .padding(3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        val levels = listOf(
+                            TopicNotificationLevel.Watching to "关注",
+                            TopicNotificationLevel.Tracking to "跟踪",
+                            TopicNotificationLevel.Regular to "常规",
+                            TopicNotificationLevel.Muted to "免打扰"
+                        )
+                        levels.forEach { (level, title) ->
+                            val isSelected = level == currentSelectedLevel
+                            val itemBg = if (isSelected) IosTheme.colors.accent else Color.Transparent
+                            val itemTextColor = if (isSelected) Color.White else IosTheme.colors.label
+
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(itemBg)
+                                    .clickable(enabled = !updating) {
+                                        currentSelectedLevel = level
+                                        onPick(level)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    if (isSelected) {
+                                        Text("✓ ", style = IosTheme.type.caption.copy(fontWeight = FontWeight.Bold), color = itemTextColor)
+                                    } else {
+                                        TopicNotificationIcon(level, modifier = Modifier.size(13.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                    }
+                                    Text(
+                                        text = title,
+                                        style = IosTheme.type.caption.copy(fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal),
+                                        color = itemTextColor,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 7. 优雅卡片底栏 (左侧统计数据 💬🤍👁 + 右侧 分享按钮 & 查看详情胶囊)
+            IosDivider()
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 回复数
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("💬", fontSize = 13.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Text("${topic.totalReplies}", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                }
+                Spacer(Modifier.width(14.dp))
+                // 点赞数
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("🤍", fontSize = 13.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Text("${topic.likeCount}", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                }
+                Spacer(Modifier.width(14.dp))
+                // 浏览数
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("👁", fontSize = 13.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Text("${topic.views}", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                }
+
+                Spacer(Modifier.weight(1f))
+
+                // 分享卡片按钮（即使详情正文尚在加载，也可先用话题基础信息秒开链接分享）
+                val fallbackSharePost = remember(topic.id, topic.title, topic.createdAt, topic.excerpt) {
+                    val firstPosterUser = topic.posters.firstOrNull()?.user
+                    org.linuxdo.android.data.Post(
+                        id = -topic.id,
+                        username = firstPosterUser?.username.orEmpty(),
+                        name = firstPosterUser?.name?.takeIf { it.isNotBlank() } ?: firstPosterUser?.username ?: "社区用户",
+                        avatarTemplate = firstPosterUser?.avatarTemplate,
+                        postNumber = 1,
+                        createdAt = topic.createdAt,
+                        cooked = getTopicRealExcerpt(topic).orEmpty(),
+                        topicId = topic.id,
+                        blurb = topic.excerpt.orEmpty(),
+                    )
+                }
+                val shareTarget = first ?: fallbackSharePost
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(CircleShape)
+                        .background(IosTheme.colors.groupedBackground)
+                        .clickable {
+                            sharePost = shareTarget
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    PostActionIcon(
+                        PostAction.Share,
+                        false,
+                        tint = IosTheme.colors.label,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                Spacer(Modifier.width(10.dp))
+
+                // “查看详情”胶囊按钮
+                androidx.compose.material3.Button(
+                    onClick = { onDismiss(); onOpen() },
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = IosTheme.colors.accent,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                    modifier = Modifier.height(38.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        PostActionIcon(PostAction.Reply, false, tint = Color.White, modifier = Modifier.size(13.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("查看详情", style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+
+    // 预览弹窗内部可直接弹出长图分享 Sheet
+    sharePost?.let { post ->
+        PostShareSheet(post, detail?.title ?: topic.title, topic.id) {
+            sharePost = null
         }
     }
 }
@@ -1369,6 +1870,7 @@ fun PinnedGroupCard(
     onCopyLink: ((Topic) -> Unit)? = null,
     onBookmark: ((Topic) -> Unit)? = null,
     onFlag: ((Topic) -> Unit)? = null,
+    onSave: ((Topic) -> Unit)? = null,
     isHighlighted: Boolean = false,
     showTopicUnreadDot: Boolean = true,
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
@@ -1376,7 +1878,8 @@ fun PinnedGroupCard(
     val head = items.firstOrNull() ?: return
     val rowBackground = topicRowBackground(isHighlighted)
     var menuTopicId by remember { mutableStateOf<Long?>(null) }
-    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
+    val hasAnyLongPress = org.linuxdo.android.ui.LocalTopicPreviewLoader.current != null ||
+        onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null || onSave != null
     Column(
         Modifier
             .fillMaxWidth()
@@ -1454,11 +1957,15 @@ fun PinnedGroupCard(
                     expanded = menuTopicId == entry.topic.id && hasAnyLongPress,
                     currentLevel = entry.notificationLevel,
                     updating = entry.notificationLevelUpdating,
+                    previewTopic = entry.topic,
+                    previewCategory = entry.category,
+                    onOpenTopic = { onOpenTopic(entry.topic) },
                     onDismiss = { menuTopicId = null },
                     onPick = onSetNotificationLevel?.let { fn -> { level -> fn(entry.topic, level) } },
                     onCopyLink = onCopyLink?.let { fn -> { fn(entry.topic) } },
                     onBookmark = onBookmark?.let { fn -> { fn(entry.topic) } },
                     onFlag = onFlag?.let { fn -> { fn(entry.topic) } },
+                    onSave = onSave?.let { fn -> { fn(entry.topic) } },
                 )
             }
         }
@@ -1695,6 +2202,7 @@ fun TopicRow(
     onCopyLink: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
     onFlag: (() -> Unit)? = null,
+    onSave: (() -> Unit)? = null,
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onClick: () -> Unit,
     feedGraphicMode: Boolean = true,
@@ -1703,7 +2211,9 @@ fun TopicRow(
     topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
 ) {
     var showLevelMenu by remember { mutableStateOf(false) }
-    val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
+    var showShareSheet by remember { mutableStateOf(false) }
+    val hasAnyLongPress = org.linuxdo.android.ui.LocalTopicPreviewLoader.current != null ||
+        onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null || onSave != null
     val topic = item.topic
     // 首次组合查一次本地库；之后改读内存态，详情页或预取记下封面时这一行会随之刷新。
     val storedCoverUrl = remember(topic.id) { ExcerptCache.getCoverImage(topic.id) }
@@ -1720,7 +2230,11 @@ fun TopicRow(
     val accent = IosTheme.colors.accent
 
     // 观察响应式真实正文（一旦预取成功或点开详情，立即自动重组刷新）
-    val realExcerpt = if (feedDisplayMode == "no_excerpt") null else getTopicRealExcerpt(topic)
+    val realExcerpt = when {
+        feedDisplayMode == "no_excerpt" -> null
+        query != null || item.bookmarkId != null -> topic.excerpt
+        else -> getTopicRealExcerpt(topic)
+    }
 
     val excerpt = remember(realExcerpt, needle, accent) {
         val raw = realExcerpt
@@ -1829,11 +2343,15 @@ fun TopicRow(
                     expanded = showLevelMenu && hasAnyLongPress,
                     currentLevel = item.notificationLevel,
                     updating = item.notificationLevelUpdating,
+                    previewTopic = topic,
+                    previewCategory = item.category,
+                    onOpenTopic = onClick,
                     onDismiss = { showLevelMenu = false },
                     onPick = onSetNotificationLevel,
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 // 2. 标题（紧随作者行，精致克制主标题，契合主流App信息流）
@@ -1878,45 +2396,12 @@ fun TopicRow(
                     Spacer(Modifier.height(11.dp))
                 }
 
-                // 4. 底部三等分互动栏（评论 / 浏览 / 活跃时间，舒展透气）
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                    horizontalArrangement = Arrangement.SpaceAround,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // 1. 评论 (细线气泡)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ReplyGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            formatCount(topic.totalReplies),
-                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontFeatureSettings = "tnum"),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                    // 2. 浏览 (细线眼睛图标)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ViewGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            formatCount(topic.views),
-                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontFeatureSettings = "tnum"),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                    // 3. 活跃时间 (细线时钟)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ClockGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
-                            style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                }
+                // 4. 底部互动栏（左侧：评论 / 浏览 / 活跃时间；右侧：快捷分享）
+                TopicCardMetaBar(
+                    topic = topic,
+                    onShare = { showShareSheet = true },
+                    compact = false,
+                )
             } else if (isGraphic) {
                 // ── 图文模式：标题置顶（知乎级粗体大标题，首字平齐无毛刺） ──
                 Text(
@@ -2002,11 +2487,15 @@ fun TopicRow(
                     expanded = showLevelMenu && hasAnyLongPress,
                     currentLevel = item.notificationLevel,
                     updating = item.notificationLevelUpdating,
+                    previewTopic = topic,
+                    previewCategory = item.category,
+                    onOpenTopic = onClick,
                     onDismiss = { showLevelMenu = false },
                     onPick = onSetNotificationLevel,
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 // 3. 正文两行摘录 (严格保证两行知乎排版结构，固定最小高度防抖)
@@ -2072,44 +2561,13 @@ fun TopicRow(
                     )
                 }
 
-                // 5. 底部均匀互动栏 (评论 / 浏览 / 发布时间) - 居中平衡三等分对齐（微博/贴吧主流模式，视觉配重更稳）
+                // 5. 底部互动栏（左侧：评论 / 浏览 / 发布时间；右侧：快捷分享）
                 Spacer(Modifier.height(10.dp))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceAround,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // 1. 评论 (细线气泡)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ReplyGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(4.5.dp))
-                        Text(
-                            formatCount(topic.totalReplies),
-                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontFeatureSettings = "tnum"),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                    // 2. 浏览 (细线眼睛图标)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ViewGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(4.5.dp))
-                        Text(
-                            formatCount(topic.views),
-                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontFeatureSettings = "tnum"),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                    // 3. 发布时间 (细线时钟)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ClockGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(4.5.dp))
-                        Text(
-                            RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
-                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
-                            color = IosTheme.colors.secondaryLabel
-                        )
-                    }
-                }
+                TopicCardMetaBar(
+                    topic = topic,
+                    onShare = { showShareSheet = true },
+                    compact = false,
+                )
             } else {
                 // ── 小图与纯文模式: 统一知乎结构 (大标题置顶 -> 作者行 -> 2行正文摘要 -> 底部操作行) ──
                 // 1. 标题置顶 (大一号半粗)
@@ -2199,11 +2657,15 @@ fun TopicRow(
                     expanded = showLevelMenu && hasAnyLongPress,
                     currentLevel = item.notificationLevel,
                     updating = item.notificationLevelUpdating,
+                    previewTopic = topic,
+                    previewCategory = item.category,
+                    onOpenTopic = onClick,
                     onDismiss = { showLevelMenu = false },
                     onPick = onSetNotificationLevel,
                     onCopyLink = onCopyLink,
                     onBookmark = onBookmark,
                     onFlag = onFlag,
+                    onSave = onSave,
                 )
 
                 Spacer(Modifier.height(6.dp))
@@ -2288,32 +2750,37 @@ fun TopicRow(
 
                 Spacer(Modifier.height(7.dp))
 
-                // 4. 底部紧凑互动行
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    MetaStat(formatCount(topic.totalReplies), textWidth = 30.dp) { ReplyGlyph(it) }
-                    if (topic.views > 0) {
-                        Spacer(Modifier.width(10.dp))
-                        MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ClockGlyph(IosTheme.colors.tertiaryLabel)
-                        Spacer(Modifier.width(3.dp))
-                        Text(
-                            text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
-                            style = IosTheme.type.caption,
-                            color = IosTheme.colors.secondaryLabel,
-                            maxLines = 1,
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    topic.tags.take(2).forEach { tag ->
-                        Spacer(Modifier.width(4.dp))
-                        TagChip(tag)
-                    }
-                }
+                // 4. 底部紧凑互动行（左侧：评论 / 浏览 / 时间；右侧：标签与快捷分享）
+                TopicCardMetaBar(
+                    topic = topic,
+                    onShare = { showShareSheet = true },
+                    compact = true,
+                    trailingTags = topic.tags.take(2),
+                )
             }
         }
+    }
+
+    if (showShareSheet) {
+        val sharePost = remember(topic.id, item.authorUsername, item.authorName, item.displayName, item.avatarUrl, item.staticAvatarUrl, realExcerpt) {
+            org.linuxdo.android.data.Post(
+                id = -topic.id,
+                username = item.authorUsername.orEmpty(),
+                name = item.authorName?.takeIf { it.isNotBlank() } ?: item.displayName,
+                avatarTemplate = item.avatarUrl ?: item.staticAvatarUrl,
+                postNumber = item.targetPostNumber ?: 1,
+                createdAt = topic.createdAt,
+                cooked = (realExcerpt ?: getTopicRealExcerpt(topic)).orEmpty(),
+                topicId = topic.id,
+                blurb = topic.excerpt.orEmpty(),
+            )
+        }
+        PostShareSheet(
+            post = sharePost,
+            title = topic.title,
+            topicId = topic.id,
+            onDismiss = { showShareSheet = false },
+        )
     }
 }
 
@@ -2435,68 +2902,192 @@ private fun TagChip(tag: String) {
 }
 
 /**
- * 底栏的一项统计。数字区**定宽**:回复数从 1 位变 3 位,整条底栏后面的浏览量和时间就会
- * 跟着左右平移,上下相邻卡片对不成竖线。同时开 `tnum` 等宽数字 —— 比例字体里 "1" 比 "8" 窄,
- * 不然即使容器定宽,数字本身也仍然参差。
+ * 列表卡片统一底部互动栏：
+ * - 左侧定宽槽位显示：评论数、浏览数、活跃时间（每个指标使用定宽容器 + `tnum` 等宽数字，
+ *   确保不管数字是 1 位还是 4 位，上下相邻卡片的三个图标永远严格垂直对齐在同一直线上，且间距舒展不拥挤）；
+ * - 右侧居右显示：空心圆润转发分享按钮（带防误触热区，右边缘与卡片右上角分类胶囊平齐）。
  */
 @Composable
-private fun MetaStat(value: String, textWidth: Dp, glyph: @Composable (Color) -> Unit) {
-    val color = IosTheme.colors.tertiaryLabel
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        glyph(color)
-        Spacer(Modifier.width(3.dp))
-        Text(
-            text = value,
-            style = IosTheme.type.caption.copy(fontFeatureSettings = "tnum"),
-            color = IosTheme.colors.secondaryLabel,
-            maxLines = 1,
-            modifier = Modifier.width(textWidth),
-        )
-    }
-}
+private fun TopicCardMetaBar(
+    topic: Topic,
+    onShare: () -> Unit,
+    compact: Boolean = false,
+    trailingTags: List<String> = emptyList(),
+) {
+    val iconColor = IosTheme.colors.secondaryLabel.copy(alpha = 0.78f)
+    val textColor = IosTheme.colors.secondaryLabel
+    val iconSize = if (compact) 12.5.dp else 14.dp
+    val fontSize = if (compact) 11.5.sp else 12.2.sp
+    val textStyle = IosTheme.type.caption.copy(
+        fontSize = fontSize,
+        lineHeight = fontSize,
+        fontFeatureSettings = "tnum",
+    )
+    val replySlotWidth = if (compact) 58.dp else 68.dp
+    val viewSlotWidth = if (compact) 66.dp else 76.dp
+    val iconTextGap = if (compact) 4.5.dp else 5.5.dp
 
-/** 回复气泡。自己画而不用 emoji —— 各机型的 emoji 字体会让这一行的高度和配色乱掉。 */
-@Composable
-private fun ReplyGlyph(color: Color) {
-    Canvas(Modifier.size(11.dp)) {
-        val bubbleHeight = size.height * 0.74f
-        drawRoundRect(
-            color = color,
-            size = Size(size.width, bubbleHeight),
-            cornerRadius = CornerRadius(size.width * 0.24f),
-            style = Stroke(size.width * 0.12f),
-        )
-        val tail = Path().apply {
-            moveTo(size.width * 0.26f, bubbleHeight * 0.92f)
-            lineTo(size.width * 0.3f, size.height)
-            lineTo(size.width * 0.54f, bubbleHeight * 0.92f)
-            close()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 1.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // 1. 评论数（固定槽位宽度，确保下一列“浏览图标”在所有卡片中严格上下对齐）
+        Row(
+            modifier = Modifier.width(replySlotWidth),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ReplyGlyph(iconColor, iconSize = iconSize)
+            Spacer(Modifier.width(iconTextGap))
+            Text(
+                text = formatCount(topic.totalReplies),
+                style = textStyle,
+                color = textColor,
+                maxLines = 1,
+            )
         }
-        drawPath(tail, color)
+
+        // 2. 浏览数（固定槽位宽度，确保下一列“时钟图标”在所有卡片中严格上下对齐）
+        Row(
+            modifier = Modifier.width(viewSlotWidth),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ViewGlyph(iconColor, iconSize = iconSize)
+            Spacer(Modifier.width(iconTextGap))
+            Text(
+                text = formatCount(topic.views),
+                style = textStyle,
+                color = textColor,
+                maxLines = 1,
+            )
+        }
+
+        // 3. 活跃时间
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ClockGlyph(iconColor, iconSize = iconSize)
+            Spacer(Modifier.width(iconTextGap))
+            Text(
+                text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
+                style = textStyle,
+                color = textColor,
+                maxLines = 1,
+            )
+        }
+
+        Spacer(Modifier.weight(1f))
+
+        if (trailingTags.isNotEmpty()) {
+            trailingTags.forEach { tag ->
+                TagChip(tag)
+                Spacer(Modifier.width(6.dp))
+            }
+        }
+
+        // 4. 居右快捷分享按钮
+        Box(
+            modifier = Modifier
+                .offset(x = 5.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onShare)
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            TopicShareGlyph(
+                color = iconColor,
+                iconSize = if (compact) 15.dp else 16.5.dp,
+            )
+        }
     }
 }
 
+/** 回复气泡（一体化空心圆角对话框 + 左下角微折角，垂直重心校准在 Y=12f）。 */
 @Composable
-private fun ViewGlyph(color: Color) {
-    Canvas(Modifier.size(11.dp)) {
-        drawOval(
-            color = color,
-            topLeft = Offset(0f, size.height * 0.18f),
-            size = Size(size.width, size.height * 0.64f),
-            style = Stroke(size.width * 0.11f),
-        )
-        drawCircle(color, size.width * 0.16f, Offset(size.width / 2f, size.height / 2f))
-    }
-}
-
-/** 小钟表图标。与气泡、眼睛保持相同的 11.dp 紧凑比例。 */
-@Composable
-private fun ClockGlyph(color: Color) {
-    Canvas(Modifier.size(11.dp)) {
+private fun ReplyGlyph(color: Color, iconSize: Dp = 13.5.dp) {
+    Canvas(Modifier.size(iconSize)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            drawCircle(color, radius = 9f, center = Offset(12f, 12f), style = Stroke(2.2f))
-            drawLine(color, Offset(12f, 7.5f), Offset(12f, 12f), strokeWidth = 2.2f, cap = StrokeCap.Round)
-            drawLine(color, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.2f, cap = StrokeCap.Round)
+            val path = Path().apply {
+                moveTo(6.2f, 4.8f)
+                lineTo(17.8f, 4.8f)
+                quadraticTo(21f, 4.8f, 21f, 8.0f)
+                lineTo(21f, 14.6f)
+                quadraticTo(21f, 17.8f, 17.8f, 17.8f)
+                lineTo(11.2f, 17.8f)
+                lineTo(7.2f, 21.0f)
+                lineTo(7.2f, 17.8f)
+                lineTo(6.2f, 17.8f)
+                quadraticTo(3f, 17.8f, 3f, 14.6f)
+                lineTo(3f, 8.0f)
+                quadraticTo(3f, 4.8f, 6.2f, 4.8f)
+                close()
+            }
+            drawPath(
+                path = path,
+                color = color,
+                style = Stroke(width = 2.0f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+        }
+    }
+}
+
+/** 浏览眼睛图标（杏仁形轮廓 + 空心瞳孔）。 */
+@Composable
+private fun ViewGlyph(color: Color, iconSize: Dp = 13.5.dp) {
+    Canvas(Modifier.size(iconSize)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val eye = Path().apply {
+                moveTo(2.2f, 12f)
+                cubicTo(6f, 5.5f, 18f, 5.5f, 21.8f, 12f)
+                cubicTo(18f, 18.5f, 6f, 18.5f, 2.2f, 12f)
+                close()
+            }
+            drawPath(
+                path = eye,
+                color = color,
+                style = Stroke(width = 2.0f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+            drawCircle(
+                color = color,
+                radius = 2.7f,
+                center = Offset(12f, 12f),
+                style = Stroke(width = 2.0f),
+            )
+        }
+    }
+}
+
+/** 活跃时间小钟表图标。 */
+@Composable
+private fun ClockGlyph(color: Color, iconSize: Dp = 13.5.dp) {
+    Canvas(Modifier.size(iconSize)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            drawCircle(color, radius = 9f, center = Offset(12f, 12f), style = Stroke(2.0f))
+            drawLine(color, Offset(12f, 7.5f), Offset(12f, 12f), strokeWidth = 2.0f, cap = StrokeCap.Round)
+            drawLine(color, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.0f, cap = StrokeCap.Round)
+        }
+    }
+}
+
+/** 列表居右分享图标（空心圆润右弯转发箭头，契合主流社区 App 卡片底栏风格）。 */
+@Composable
+private fun TopicShareGlyph(color: Color, iconSize: Dp = 16.dp) {
+    Canvas(Modifier.size(iconSize)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val path = Path().apply {
+                moveTo(3.5f, 19.5f)
+                cubicTo(4.2f, 11.5f, 7.8f, 8.2f, 13.5f, 8.2f)
+                lineTo(13.5f, 4.2f)
+                lineTo(20.8f, 11.2f)
+                lineTo(13.5f, 18.2f)
+                lineTo(13.5f, 14.0f)
+                cubicTo(9.2f, 14.0f, 6.2f, 15.6f, 3.5f, 19.5f)
+                close()
+            }
+            drawPath(
+                path = path,
+                color = color,
+                style = Stroke(width = 1.9f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
         }
     }
 }
@@ -3585,6 +4176,7 @@ private fun floatingActionColor(action: FloatingAction): Color = when (action) {
     FloatingAction.History -> Color(0xFF7E57C2)     // 典雅紫罗兰
     FloatingAction.Connect -> Color(0xFF1E88E5)     // LinuxDo 极客蓝
     FloatingAction.Chat -> Color(0xFFE91E63)        // 活力珊瑚粉
+    FloatingAction.Apps -> Color(0xFF07C160)        // 微信小程序绿
 }
 
 /** 辅助悬浮按钮各功能的纯矢量精致手绘图标。 */
@@ -3780,6 +4372,27 @@ private fun FloatingActionIcon(
                     drawCircle(tint, 1.1f, Offset(8.5f, 10f))
                     drawCircle(tint, 1.1f, Offset(12f, 10f))
                     drawCircle(tint, 1.1f, Offset(15.5f, 10f))
+                }
+                FloatingAction.Apps -> {
+                    // 小程序双环徽章
+                    drawArc(
+                        color = tint,
+                        startAngle = 120f,
+                        sweepAngle = 250f,
+                        useCenter = false,
+                        topLeft = Offset(3.5f, 3.5f),
+                        size = Size(11f, 11f),
+                        style = stroke,
+                    )
+                    drawArc(
+                        color = tint,
+                        startAngle = -60f,
+                        sweepAngle = 250f,
+                        useCenter = false,
+                        topLeft = Offset(9.5f, 9.5f),
+                        size = Size(11f, 11f),
+                        style = stroke,
+                    )
                 }
             }
         }

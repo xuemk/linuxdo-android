@@ -2,8 +2,10 @@ package org.linuxdo.android.data
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.webkit.CookieManager
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.webkit.CookieManager
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import okhttp3.Cookie
@@ -13,11 +15,159 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CancellationException
 import androidx.webkit.CookieManagerCompat
 import androidx.webkit.WebViewFeature
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlinx.serialization.json.Json
 import org.linuxdo.android.Config
+
+class EncryptedStorageUnavailableException(cause: Throwable? = null) :
+    IllegalStateException("安全存储暂时不可用，原有数据已保留，请稍后重试", cause)
+
+internal object SafeEncryptedPrefs {
+    private const val TAG = "SafeEncryptedPrefs"
+    private const val RETRY_INTERVAL_MILLIS = 1_000L
+    private val cache = mutableMapOf<String, SharedPreferences>()
+
+    @Synchronized
+    fun open(context: Context, prefsName: String): SharedPreferences = cache.getOrPut(prefsName) {
+        RecoverablePreferences(context.applicationContext ?: context, prefsName)
+    }
+
+    private class RecoverablePreferences(
+        private val context: Context,
+        private val prefsName: String,
+    ) : SharedPreferences {
+        private var delegate: SharedPreferences? = null
+        private var lastFailure: EncryptedStorageUnavailableException? = null
+        private var retryAtMillis = 0L
+        private var unconfirmedWrite: Map<String, *>? = null
+        private val listeners = mutableSetOf<SharedPreferences.OnSharedPreferenceChangeListener>()
+        private val changeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            val snapshot = synchronized(this) { listeners.toList() }
+            snapshot.forEach { it.onSharedPreferenceChanged(this, key) }
+        }
+
+        @Synchronized
+        private fun <T> access(action: (SharedPreferences) -> T): T {
+            lastFailure?.let { if (SystemClock.elapsedRealtime() < retryAtMillis) throw it }
+            try {
+                val current = delegate ?: build().also {
+                    // 完整验证已有值后才允许写入，读取失败不能被当成空库覆盖。
+                    it.all
+                    it.registerOnSharedPreferenceChangeListener(changeListener)
+                    delegate = it
+                }
+                unconfirmedWrite?.let { snapshot ->
+                    val editor = current.edit().clear()
+                    snapshot.forEach { (key, value) ->
+                        when (value) {
+                            null -> Unit
+                            is String -> editor.putString(key, value)
+                            is Boolean -> editor.putBoolean(key, value)
+                            is Int -> editor.putInt(key, value)
+                            is Long -> editor.putLong(key, value)
+                            is Float -> editor.putFloat(key, value)
+                            is Set<*> -> {
+                                check(value.all { it is String }) { "加密存储集合类型无效" }
+                                editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+                            }
+                            else -> error("加密存储值类型无效")
+                        }
+                    }
+                    if (!editor.commit()) throw EncryptedStorageUnavailableException()
+                    unconfirmedWrite = null
+                }
+                val result = action(current)
+                if (lastFailure != null) {
+                    org.linuxdo.android.net.NetDiagnostics.log("加密存储已恢复($prefsName)，继续使用原有数据")
+                }
+                lastFailure = null
+                return result
+            } catch (error: Exception) {
+                delegate?.unregisterOnSharedPreferenceChangeListener(changeListener)
+                delegate = null
+                val failure = error as? EncryptedStorageUnavailableException
+                    ?: EncryptedStorageUnavailableException(error)
+                lastFailure = failure
+                retryAtMillis = SystemClock.elapsedRealtime() + RETRY_INTERVAL_MILLIS
+                Log.e(TAG, "加密存储访问失败($prefsName)，保留原文件并等待重试", error)
+                org.linuxdo.android.net.NetDiagnostics.log(
+                    "加密存储暂不可用($prefsName): ${error.javaClass.simpleName}，未删除或覆盖原数据",
+                )
+                throw failure
+            }
+        }
+
+        private fun build(): SharedPreferences = EncryptedSharedPreferences.create(
+            context,
+            prefsName,
+            MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+
+        override fun getAll(): MutableMap<String, *> = access { HashMap(it.all) }
+        override fun getString(key: String?, defValue: String?): String? = access { it.getString(key, defValue) }
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            access { it.getStringSet(key, defValues)?.toMutableSet() }
+        override fun getInt(key: String?, defValue: Int): Int = access { it.getInt(key, defValue) }
+        override fun getLong(key: String?, defValue: Long): Long = access { it.getLong(key, defValue) }
+        override fun getFloat(key: String?, defValue: Float): Float = access { it.getFloat(key, defValue) }
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = access { it.getBoolean(key, defValue) }
+        override fun contains(key: String?): Boolean = access { it.contains(key) }
+
+        override fun edit(): SharedPreferences.Editor {
+            access { Unit }
+            return object : SharedPreferences.Editor {
+                private val updates = mutableListOf<(SharedPreferences.Editor) -> Unit>()
+                override fun putString(key: String?, value: String?): SharedPreferences.Editor = apply {
+                    updates += { it.putString(key, value) }
+                }
+                override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = apply {
+                    val copy = values?.toSet()
+                    updates += { it.putStringSet(key, copy) }
+                }
+                override fun putInt(key: String?, value: Int): SharedPreferences.Editor = apply { updates += { it.putInt(key, value) } }
+                override fun putLong(key: String?, value: Long): SharedPreferences.Editor = apply { updates += { it.putLong(key, value) } }
+                override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = apply { updates += { it.putFloat(key, value) } }
+                override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = apply { updates += { it.putBoolean(key, value) } }
+                override fun remove(key: String?): SharedPreferences.Editor = apply { updates += { it.remove(key) } }
+                override fun clear(): SharedPreferences.Editor = apply { updates += { it.clear() } }
+                override fun commit(): Boolean = access { preferences ->
+                    val editor = preferences.edit()
+                    updates.forEach { it(editor) }
+                    if (!editor.commit()) {
+                        // commit 失败时 Android 内存已经更新；确认重写前不能把这些值当作已落盘数据。
+                        unconfirmedWrite = preferences.all.mapValues { (_, value) ->
+                            if (value is Set<*>) value.toSet() else value
+                        }
+                        throw EncryptedStorageUnavailableException()
+                    }
+                    true
+                }
+                override fun apply() {
+                    access { preferences ->
+                        val editor = preferences.edit()
+                        updates.forEach { it(editor) }
+                        editor.apply()
+                    }
+                }
+            }
+        }
+
+        @Synchronized
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
+            if (listener != null) listeners.add(listener)
+        }
+
+        @Synchronized
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
+            if (listener != null) listeners.remove(listener)
+        }
+    }
+}
 
 internal object NoExcerptModeMigration {
     private const val KEY_APPLIED = "feed_no_excerpt_default_v1"
@@ -42,6 +192,8 @@ internal object NoExcerptModeMigration {
  */
 class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider {
     private val prefs: SharedPreferences = createPrefs(context)
+    /** 当前活跃账号的备份凭据回退提供者（由容器注入，在加密库或 WebView 意外丢失 _t 时兜底恢复）。 */
+    var accountCookieFallback: ((expectedUserId: Long) -> Map<String, String>?)? = null
     @Volatile var cookieVersion: Long = 0L
         private set
     @Volatile var sessionGeneration: Long = 1L
@@ -54,20 +206,42 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     private val challengedClearanceLock = Any()
     private val challengedClearances = LinkedHashSet<String>()
     private val challengedClearanceFps = LinkedHashSet<String>()
+    private var challengedClearancePauseUntil = 0L
+    private val clearanceRecoveryLock = Any()
+    private val clearanceRecoveryIds = mutableSetOf<Long>()
+    private var nextClearanceRecoveryId = 0L
 
     fun requireVerification() { verificationRequired = true }
     fun completeVerification() { verificationRequired = false }
+
+    fun beginClearanceRecovery(): Long = synchronized(clearanceRecoveryLock) {
+        (++nextClearanceRecoveryId).also { clearanceRecoveryIds.add(it) }
+    }
+
+    fun endClearanceRecovery(id: Long) {
+        synchronized(clearanceRecoveryLock) { clearanceRecoveryIds.remove(id) }
+    }
+
+    fun isClearanceRecoveryInProgress(): Boolean = synchronized(clearanceRecoveryLock) {
+        verificationRequired || clearanceRecoveryIds.isNotEmpty()
+    }
 
     /**
      * 登记本会话内已被 Cloudflare 挑战（403/429 challenge）判废的 cf_clearance 值或指纹。
      * 有界保留最近 [MAX_CHALLENGED_CLEARANCES] 枚，供多变体选优与换值重放时排除已知死值。
      */
-    fun noteClearanceChallenged(valueOrFp: String?) {
+    fun noteClearanceChallenged(
+        valueOrFp: String?,
+        host: String = Config.HOST,
+        source: String = "主站请求",
+    ) {
+        if (!host.equals(Config.HOST, ignoreCase = true)) return
         val trimmed = valueOrFp?.trim().orEmpty()
         if (trimmed.isEmpty() || trimmed == "-") return
         val isFingerprint = trimmed.length == 6 && trimmed.all { it in '0'..'9' || it in 'a'..'f' }
         val fp = if (isFingerprint) trimmed else org.linuxdo.android.net.NetDiagnostics.fingerprint(trimmed)
-        synchronized(challengedClearanceLock) {
+        val firstChallenge = synchronized(challengedClearanceLock) {
+            val first = fp != "-" && !challengedClearanceFps.contains(fp)
             if (!isFingerprint) {
                 if (!challengedClearances.contains(trimmed)) {
                     if (challengedClearances.size >= MAX_CHALLENGED_CLEARANCES) {
@@ -81,6 +255,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 }
             }
             if (fp != "-" && !challengedClearanceFps.contains(fp)) {
+                challengedClearancePauseUntil = SystemClock.elapsedRealtime() + CHALLENGED_CLEARANCE_PAUSE_MS
                 if (challengedClearanceFps.size >= MAX_CHALLENGED_CLEARANCES) {
                     val it = challengedClearanceFps.iterator()
                     if (it.hasNext()) {
@@ -90,6 +265,14 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 }
                 challengedClearanceFps.add(fp)
             }
+            first
+        }
+        if (firstChallenge) {
+            val safeSource = source.substringBefore('?').substringBefore('#')
+                .replace('\r', ' ').replace('\n', ' ').take(160)
+            org.linuxdo.android.net.NetDiagnostics.log(
+                "主站 cf_clearance 首次判废: fp=$fp host=${Config.HOST} source=$safeSource",
+            )
         }
     }
 
@@ -104,11 +287,46 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         }
     }
 
+    /** 验证前在主线程记录全部旧值，包含重复 Cookie 与已判废值，不能使用已过滤的有效值作为基线。 */
+    fun cfClearancesForVerification(): Set<String> {
+        val manager = CookieManager.getInstance()
+        val values = listOf(manager.getCookie(Config.BASE_URL), manager.getCookie("${Config.BASE_URL}/"))
+            .flatMap { it.orEmpty().split(';') }
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) }
+            .map { it.substringAfter('=', "").trim() }
+            .filter { it.isNotBlank() }
+            .toMutableSet()
+        storedCookies()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let(values::add)
+        synchronized(challengedClearanceLock) { values.addAll(challengedClearances) }
+        return values
+    }
+
     fun clearChallengedClearances() {
         synchronized(challengedClearanceLock) {
             challengedClearances.clear()
             challengedClearanceFps.clear()
+            challengedClearancePauseUntil = 0L
         }
+    }
+
+    /**
+     * 新凭据刚被挑战且尚无替代值时，后台探测短暂让行。
+     * 同一旧值重复报错不续期；即使后续请求不再需要 clearance，也不会永久停掉探测。
+     */
+    fun shouldPauseBackgroundForChallengedClearance(): Boolean {
+        val isPausing = synchronized(challengedClearanceLock) {
+            SystemClock.elapsedRealtime() < challengedClearancePauseUntil
+        }
+        if (!isPausing) return false
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return true
+        val activeClearances = listOf(manager.getCookie(Config.BASE_URL), manager.getCookie("${Config.BASE_URL}/"))
+            .flatMap { it.orEmpty().split(';') }
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) }
+            .map { it.substringAfter('=', "").trim() }
+            .filter { it.isNotBlank() && !isClearanceChallenged(it) }
+        return activeClearances.isEmpty()
     }
 
     /** 获取当前经选优后的权威 cf_clearance 指纹（无有效值时返回 "-"）。 */
@@ -119,17 +337,36 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
     fun advanceSessionGeneration(): Long {
         clearChallengedClearances()
-        return synchronized(this) {
+        return synchronized(clearanceRecoveryLock) {
+            clearanceRecoveryIds.clear()
+            verificationRequired = false
             ++sessionGeneration
         }
     }
 
     fun storedCookies(): Map<String, String> {
         val raw = prefs.getString(KEY_COOKIES, null) ?: return emptyMap()
-        return runCatching {
+        val cookies = try {
             val json = JSONObject(raw)
             json.keys().asSequence().associateWith { json.getString(it) }
-        }.getOrDefault(emptyMap())
+        } catch (error: Exception) {
+            throw EncryptedStorageUnavailableException(error)
+        }
+        return if (isRejectedAuthToken(cookies[Config.SESSION_COOKIE], prefs.getLong(KEY_COOKIE_OWNER, currentUserId()))) {
+            cookies - Config.SESSION_COOKIE - FORUM_SESSION_COOKIE
+        } else cookies
+    }
+
+    private fun isRejectedAuthToken(token: String?, userId: Long = currentUserId()): Boolean =
+        !token.isNullOrBlank() && plainPrefs.getStringSet("rejected_auth_$userId", emptySet()).orEmpty().contains(authTokenHash(token))
+
+    fun noteRejectedAuthToken(hash: String?, userId: Long, generation: Long) {
+        if (hash.isNullOrBlank() || userId <= 0L || generation != sessionGeneration || userId != currentUserId()) return
+        val key = "rejected_auth_$userId"
+        val rejected = plainPrefs.getStringSet(key, emptySet()).orEmpty().toMutableSet()
+        if (rejected.add(hash) && !plainPrefs.edit().putStringSet(key, rejected).commit()) {
+            throw EncryptedStorageUnavailableException()
+        }
     }
 
     fun savedAtMillis(): Long = prefs.getLong(KEY_SAVED_AT, 0L)
@@ -159,7 +396,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         val stored = storedCookies().filterKeys {
             !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !it.startsWith("__cf") && !it.startsWith("_cf")
         }
-        if (sessionChanging) return stored
+        if (sessionChanging || isSessionRecoveryPending()) return stored
         val manager = CookieManager.getInstance()
         val rawHeader = manager.getCookie(Config.BASE_URL).orEmpty()
         val web = parseCookieHeader(rawHeader).toMutableMap()
@@ -181,6 +418,10 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 rawValues.size > 1 -> web.remove(name)
             }
         }
+        if (isRejectedAuthToken(web[Config.SESSION_COOKIE])) {
+            web.remove(Config.SESSION_COOKIE)
+            web.remove(FORUM_SESSION_COOKIE)
+        }
         // 对齐 Fluxdo BoundarySync + CfClearanceAuthority：
         // 当存在多个同名 cf_clearance 变体（如 .linux.do / linux.do / CHIPS Partitioned）时，
         // 排除已过期和本会话已被撞死的变体，按 expiresAt 最晚 + hostOnly + path 长度选出唯一权威值，
@@ -200,7 +441,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             val bestClearance = structuredClearances
                 .filter { it.expiresAt > now && !isClearanceChallenged(it.value) }
                 .sortedWith(
-                    compareByDescending<Cookie> { it.expiresAt }
+                    // 优先选择正常有效期内（<=7天）的新凭据，防止历史超长效僵尸副本（如 2027 年过期）在重启后压过正常凭据
+                    compareByDescending<Cookie> { (it.expiresAt - now) <= MAX_REASONABLE_CF_CLEARANCE_TTL_MS }
+                        .thenByDescending { it.expiresAt }
                         .thenByDescending { it.hostOnly }
                         .thenByDescending { it.path.length }
                 )
@@ -271,9 +514,24 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 一枚失效的旧 _t 被灌回去,会让 Discourse 在已有会话状态下处理 /session.json。
      */
     fun restoreMissingToWebView(exclude: Set<String> = emptySet()) {
+        if (sessionChanging) return
         val manager = CookieManager.getInstance()
         manager.setAcceptCookie(true)
-        val stored = storedCookies()
+        var stored = storedCookies()
+        if (!stored.containsKey(Config.SESSION_COOKIE) && Config.SESSION_COOKIE !in exclude) {
+            val userId = currentUserId()
+            val fallback = if (userId > 0L) accountCookieFallback?.invoke(userId).orEmpty() else emptyMap()
+            val fallbackToken = fallback[Config.SESSION_COOKIE]?.takeIf { it.isNotBlank() && !isRejectedAuthToken(it, userId) }
+            if (fallbackToken != null) {
+                val recovered = stored.toMutableMap().apply {
+                    put(Config.SESSION_COOKIE, fallbackToken)
+                    fallback[FORUM_SESSION_COOKIE]?.takeIf { it.isNotBlank() }?.let { put(FORUM_SESSION_COOKIE, it) }
+                }
+                save(recovered, durable = true)
+                stored = recovered
+                org.linuxdo.android.net.NetDiagnostics.log("会话自愈: 从账号槽位恢复丢失的登录凭据 _t (uid=$userId)")
+            }
+        }
         if (stored.isEmpty()) return
         val web = parseCookieHeader(manager.getCookie(Config.BASE_URL))
         val missing = stored.filterKeys { key ->
@@ -293,6 +551,48 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         manager.flush()
     }
 
+    /** 只恢复同一会话中尚未发送且未被撤销的凭据；调用方还须复核源站账号后才可重放写操作。 */
+    suspend fun tryHealMissingSessionInWebView(
+        expectedUserId: Long,
+        expectedGeneration: Long,
+        sentTokenHash: String?,
+    ): Boolean = cookieMutationGate.withLock {
+        fun checkSession() {
+            if (sessionChanging || expectedGeneration != sessionGeneration || expectedUserId != currentUserId()) {
+                throw CancellationException("账号已切换，已取消凭据恢复")
+            }
+        }
+        checkSession()
+        if (expectedUserId <= 0L || sentTokenHash == null) return@withLock false
+        noteRejectedAuthToken(sentTokenHash, expectedUserId, expectedGeneration)
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return@withLock false
+        val current = syncFromWebView()
+        val source = if (!current[Config.SESSION_COOKIE].isNullOrBlank()) current
+            else accountCookieFallback?.invoke(expectedUserId).orEmpty()
+        val token = source[Config.SESSION_COOKIE]?.takeIf {
+            it.isNotBlank() && authTokenHash(it) != sentTokenHash && !isRejectedAuthToken(it, expectedUserId)
+        } ?: return@withLock false
+        for (name in listOf(Config.SESSION_COOKIE, FORUM_SESSION_COOKIE)) {
+            for (domain in listOf("", "; Domain=${Config.HOST}", "; Domain=.${Config.HOST}")) {
+                checkSession()
+                check(setWebCookie(manager, "$name=; Max-Age=0; Path=/$domain; Secure; HttpOnly"))
+            }
+            checkSession()
+            val value = if (name == Config.SESSION_COOKIE) token else source[name]
+            if (!value.isNullOrBlank()) {
+                check(setWebCookie(manager, "$name=$value; Path=/; Secure; HttpOnly; SameSite=Lax"))
+            }
+        }
+        checkSession()
+        manager.flush()
+        if (parseCookieHeader(manager.getCookie(Config.BASE_URL))[Config.SESSION_COOKIE] != token) return@withLock false
+        val restored = (storedCookies() - FORUM_SESSION_COOKIE).toMutableMap()
+        restored[Config.SESSION_COOKIE] = token
+        source[FORUM_SESSION_COOKIE]?.let { restored[FORUM_SESSION_COOKIE] = it }
+        save(restored, durable = true)
+        true
+    }
+
     /**
      * 只丢掉会话凭据,保留 CF 等其他 Cookie。
      *
@@ -300,8 +600,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 拿这个已经失效的 token 白跑一次 /session/current,还可能被重新塞回 WebView。
      */
     fun clearSessionCookie() {
+        noteRejectedAuthToken(authTokenHash(storedCookies()[Config.SESSION_COOKIE]), currentUserId(), sessionGeneration)
         advanceSessionGeneration()
-        save(storedCookies() - Config.SESSION_COOKIE)
+        save(storedCookies() - Config.SESSION_COOKIE - FORUM_SESSION_COOKIE, durable = true)
         val manager = CookieManager.getInstance()
         val deletionHeaders = listOf(
             "${Config.SESSION_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly",
@@ -425,15 +726,19 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         return parseCookieHeader(manager.getCookie(Config.BASE_URL))[Config.SESSION_COOKIE] == token
     }
 
-    suspend fun replaceBusinessCookies(token: String?, forumSession: String?) {
+    suspend fun replaceBusinessCookies(token: String?, forumSession: String?, userId: Long? = null) {
         check(Looper.myLooper() == Looper.getMainLooper()) { "CookieManager updates must run on the main thread" }
         val cookies = syncFromWebView().toMutableMap()
         advanceSessionGeneration()
         sessionChanging = true
         try {
             cookieMutationGate.withLock {
+                if (!plainPrefs.edit().putBoolean(KEY_SESSION_SWITCH_PENDING, true).commit()) {
+                    throw EncryptedStorageUnavailableException()
+                }
                 withTimeout(5_000L) {
                     val manager = CookieManager.getInstance()
+                    cookies.keys.removeAll(clearSubsiteAuthCookies(manager))
                     val replacements = mapOf(
                         Config.SESSION_COOKIE to token?.takeIf(String::isNotBlank),
                         FORUM_SESSION_COOKIE to forumSession?.takeIf(String::isNotBlank),
@@ -454,17 +759,92 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                         }
                     }
                     manager.flush()
-                    save(cookies)
+                    save(cookies, durable = true, ownerUserId = userId ?: currentUserId())
+                    if (userId != null) {
+                        if (userId > 0L) saveCurrentUserId(userId) else clearCurrentUserId()
+                    }
+                    if (!plainPrefs.edit().remove(KEY_SESSION_SWITCH_PENDING).commit()) {
+                        throw EncryptedStorageUnavailableException()
+                    }
                 }
             }
+        } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+            throw IllegalStateException("账号凭据写入超时，请重试", error)
         } finally {
             sessionChanging = false
         }
     }
 
+    private suspend fun clearSubsiteAuthCookies(manager: CookieManager): Set<String> {
+        val sites = mapOf(
+            "auth.session-token" to "connect.linux.do",
+            "linux_do_credit_session_id" to "credit.linux.do",
+            "linux_do_cdk_session_id" to "cdk.linux.do",
+        )
+        val deletions = linkedSetOf<Pair<String, String>>()
+        val readbackUrls = linkedSetOf<String>()
+        val structuredSupported = WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)
+        for ((name, host) in sites) {
+            val origins = listOf(Config.BASE_URL, "https://$host")
+            val requestUrl = if (host == "connect.linux.do") "https://$host/oauth2/authorize"
+                else "https://$host/api/v1/oauth/user-info"
+            val urls = origins + requestUrl
+            readbackUrls.addAll(urls)
+            for (origin in origins) {
+                val domains = if (origin == Config.BASE_URL) listOf(null, Config.HOST, ".${Config.HOST}")
+                    else listOf(null, Config.HOST, ".${Config.HOST}", host, ".$host")
+                for (domain in domains) {
+                    val domainPart = domain?.let { "; Domain=$it" }.orEmpty()
+                    deletions.add(origin to "$name=; Max-Age=0; Path=/$domainPart; Secure; HttpOnly")
+                }
+            }
+            if (structuredSupported) {
+                for (url in urls) {
+                    for (raw in CookieManagerCompat.getCookieInfo(manager, url)) {
+                        val cookie = Cookie.parse(url.toHttpUrl(), raw) ?: continue
+                        if (cookie.name != name) continue
+                        val domainPart = if (cookie.hostOnly) "" else "; Domain=${cookie.domain}"
+                        val partitioned = raw.split(';').any { it.trim().equals("Partitioned", ignoreCase = true) }
+                        val partitionPart = if (partitioned) "; SameSite=None; Partitioned" else ""
+                        deletions.add(url to "$name=; Max-Age=0; Path=${cookie.path}$domainPart; Secure; HttpOnly$partitionPart")
+                    }
+                }
+            }
+        }
+        for ((url, header) in deletions) {
+            check(setWebCookie(manager, header, url)) { "旧账号子站会话清理失败，请重试" }
+        }
+        manager.flush()
+        for (url in readbackUrls) {
+            val remaining = parseCookieHeader(manager.getCookie(url)).keys.intersect(sites.keys)
+            check(remaining.isEmpty()) { "旧账号子站会话仍未清除，请重试" }
+        }
+        return sites.keys
+    }
+
     suspend fun clearBusinessCookies() = replaceBusinessCookies(token = null, forumSession = null)
+
+    fun isSessionRecoveryPending(): Boolean = plainPrefs.getBoolean(KEY_SESSION_SWITCH_PENDING, false) ||
+        prefs.getLong(KEY_COOKIE_OWNER, currentUserId()) != currentUserId()
+
+    fun requireSessionRecovery() {
+        if (!plainPrefs.edit().putBoolean(KEY_SESSION_SWITCH_PENDING, true).commit()) throw EncryptedStorageUnavailableException()
+    }
+
+    /** 进程在换号中途结束时，以同一笔加密提交里的 Cookie 和账号 ID 恢复，不采纳半写入的 WebView。 */
+    suspend fun recoverInterruptedAccountSwitch(): Boolean {
+        if (!isSessionRecoveryPending()) return false
+        val cookies = storedCookies()
+        val owner = prefs.getLong(KEY_COOKIE_OWNER, currentUserId())
+        replaceBusinessCookies(cookies[Config.SESSION_COOKIE], cookies[FORUM_SESSION_COOKIE], owner)
+        return true
+    }
     /** 判断当前是否已登录社区凭据。 */
-    fun hasSession(): Boolean = storedCookies().containsKey(Config.SESSION_COOKIE)
+    fun hasSession(): Boolean = try {
+        !isSessionRecoveryPending() && !storedCookies()[Config.SESSION_COOKIE].isNullOrBlank()
+    } catch (_: EncryptedStorageUnavailableException) {
+        false
+    }
 
     /**
      * 清除一个指定 Cookie，供 CF 重新验证前淘汰可能失效的 clearance 使用。
@@ -479,73 +859,159 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     fun clearCookie(name: String): Boolean {
         save(storedCookies() - name)
         val manager = CookieManager.getInstance()
-        // CF 可能以 host-only、linux.do 或 .linux.do 三种形式写入 Cookie,
-        // 每种形式又要覆盖上述四类属性组合。
+        val expiry = "Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        // 1. 结构化逐条删除：按 WebView 里每个同名副本的真实 Domain/Path/Secure/HttpOnly/SameSite/Partitioned 精确覆盖，
+        //    这是唯一能可靠清掉历史长效残留（如 2027 年过期、带 HttpOnly 的旧副本）的方式。
+        val structured = runCatching {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)) return@runCatching emptyList()
+            val baseUrl = Config.BASE_URL.toHttpUrl()
+            CookieManagerCompat.getCookieInfo(manager, Config.BASE_URL).flatMap { raw ->
+                val cookie = Cookie.parse(baseUrl, raw)?.takeIf { it.name == name } ?: return@flatMap emptyList()
+                val flags = raw.split(';').map { it.trim().lowercase() }
+                val domainVariants = if (cookie.hostOnly) listOf(null) else listOf(cookie.domain, ".${cookie.domain.trimStart('.')}")
+                val sameSiteRaw = flags.firstOrNull { it.startsWith("samesite=") }?.substringAfter('=')
+                val sameSiteVariants = if (sameSiteRaw == null) listOf(null) else listOf(
+                    sameSiteRaw,
+                    sameSiteRaw.replaceFirstChar { it.uppercase() },
+                ).distinct()
+                domainVariants.flatMap { dom ->
+                    sameSiteVariants.map { sameSite ->
+                        buildString {
+                            append("$name=; $expiry; Path=${cookie.path}")
+                            if (dom != null) append("; Domain=$dom")
+                            if (cookie.secure) append("; Secure")
+                            if (cookie.httpOnly) append("; HttpOnly")
+                            if (sameSite != null) append("; SameSite=$sameSite")
+                            if ("partitioned" in flags) append("; Partitioned")
+                        }
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+        structured.distinct().forEach { manager.setCookie(Config.BASE_URL, it) }
+        // 2. 兜底穷举：不支持 GET_COOKIE_INFO 的 WebView 上，覆盖 host-only / linux.do / .linux.do 三种域
+        //    与常见属性组合（含 HttpOnly 变体）。
         val domains = listOf(null, Config.HOST, ".${Config.HOST}")
         val attributes = listOf(
             "",
             "; Secure",
+            "; Secure; HttpOnly",
             "; Secure; SameSite=None",
+            "; Secure; HttpOnly; SameSite=None",
+            "; Secure; SameSite=Lax",
+            "; Secure; HttpOnly; SameSite=Lax",
             "; Secure; SameSite=None; Partitioned",
+            "; Secure; HttpOnly; SameSite=None; Partitioned",
         )
         domains.forEach { domain ->
             val domainPart = domain?.let { "; Domain=$it" }.orEmpty()
             attributes.forEach { attribute ->
-                manager.setCookie(
-                    Config.BASE_URL,
-                    "$name=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/$domainPart$attribute",
-                )
+                manager.setCookie(Config.BASE_URL, "$name=; $expiry; Path=/$domainPart$attribute")
             }
         }
         manager.flush()
-        return parseCookieHeader(manager.getCookie(Config.BASE_URL))[name].isNullOrBlank()
+        val diagnostics = org.linuxdo.android.net.NetDiagnostics
+        val remaining = diagnostics.cookieFingerprints(manager.getCookie(Config.BASE_URL).orEmpty(), name)
+        if (remaining.isNotEmpty()) {
+            if (name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true)) {
+                remaining.forEach { fp -> noteClearanceChallenged(fp, source = "clearCookie残留淘汰") }
+            }
+            diagnostics.log("Cookie $name 清除后仍残留 ${remaining.size} 份(fp=${remaining.joinToString(",")})，已拉黑残留指纹(结构化指令 ${structured.size} 条)")
+        }
+        return remaining.isEmpty()
     }
 
-    /** 应用 OkHttp 响应里的 Set-Cookie,同时写入加密存储与 WebView,保证两边一致。 */
+    /** 应用 OkHttp 或认证浏览器响应里的 Set-Cookie,同时写入加密存储与 WebView,保证两边一致。 */
     suspend fun applyResponseCookies(
         cookies: List<Cookie>,
         requestUrl: String = Config.BASE_URL,
         expectedCookieVersion: Long? = null,
         requestGeneration: Long? = null,
         sentCookies: Map<String, String> = emptyMap(),
+        authoritativeAuth: Boolean = false,
+        authorityStillValid: (() -> Boolean)? = null,
+        authBrowserSnapshot: Boolean = false,
     ) = cookieMutationGate.withLock {
+        fun checkAuthority() {
+            if (authorityStillValid != null && (!authorityStillValid() || sessionChanging ||
+                    (requestGeneration != null && requestGeneration != sessionGeneration))) {
+                throw CancellationException("登录或会话已变更，忽略旧凭据")
+            }
+        }
+        checkAuthority()
         if (cookies.isEmpty() || sessionChanging) return@withLock
         if (requestGeneration != null && requestGeneration != sessionGeneration) return@withLock
         if (expectedCookieVersion != null && expectedCookieVersion != cookieVersion) return@withLock
         val manager = CookieManager.getInstance()
         val merged = syncFromWebView().toMutableMap()
         val now = System.currentTimeMillis()
-        cookies.forEach { cookie ->
+        val cookiesToApply = if (authoritativeAuth) {
+            check(authorityStillValid != null) { "登录凭据缺少提交校验" }
+            val authNames = setOf(Config.SESSION_COOKIE, FORUM_SESSION_COOKIE)
+            val chosen = authNames.mapNotNull { name ->
+                val candidates = cookies.filter {
+                    it.name == name && it.domain == Config.HOST && it.path == "/" &&
+                        it.expiresAt > now && it.value.isNotBlank()
+                }
+                check(candidates.map { it.value }.distinct().size <= 1) { "登录凭据存在冲突，请重新登录" }
+                candidates.firstOrNull { it.hostOnly } ?: candidates.firstOrNull()
+            }
+            check(chosen.any { it.name == Config.SESSION_COOKIE }) { "登录未取得有效凭据，请重试" }
+            cookies.filterNot { it.name in authNames } + chosen
+        } else cookies
+        cookiesToApply.forEach { cookie ->
+            checkAuthority()
             if ((requestGeneration != null && requestGeneration != sessionGeneration) || sessionChanging) return@withLock
             val targetUrl = requestUrl
             val auth = cookie.name == Config.SESSION_COOKIE || cookie.name == FORUM_SESSION_COOKIE
             val mainAuth = auth && requestUrl.toHttpUrl().host == Config.HOST && cookie.domain == Config.HOST
-            // A 的旧 token 被撤销，不表示同账号刚轮换得到的 B 也被撤销。
-            if (mainAuth && sentCookies[cookie.name] != merged[cookie.name]) return@forEach
+            // A 的旧 token 被撤销，不表示同账号刚轮换得到的 B 也被撤销；但认证浏览器明确完成登录同步时必须覆盖落盘。
+            if (mainAuth && !authoritativeAuth && sentCookies[cookie.name] != merged[cookie.name]) return@forEach
+            if (mainAuth && cookie.name == Config.SESSION_COOKIE && cookie.expiresAt >= now && isRejectedAuthToken(cookie.value)) {
+                if (authoritativeAuth) error("登录凭据已失效，请重新登录")
+                return@forEach
+            }
             if (mainAuth) {
                 listOf("; Domain=${Config.HOST}", "; Domain=.${Config.HOST}").forEach { domain ->
+                    checkAuthority()
                     setWebCookie(manager, "${cookie.name}=; Max-Age=0; Path=/$domain; Secure; HttpOnly")
+                    checkAuthority()
                 }
             }
             if ((requestGeneration != null && requestGeneration != sessionGeneration) || sessionChanging) return@withLock
             if (cookie.expiresAt < now) {
+                if (mainAuth && cookie.name == Config.SESSION_COOKIE) {
+                    noteRejectedAuthToken(authTokenHash(sentCookies[cookie.name]), currentUserId(), sessionGeneration)
+                }
                 if (requestUrl.toHttpUrl().host == Config.HOST) merged.remove(cookie.name)
                 val domain = if (mainAuth || cookie.hostOnly) "" else "; Domain=${cookie.domain}"
                 setWebCookie(manager, "${cookie.name}=; Max-Age=0; Path=${cookie.path}$domain; Secure", targetUrl)
             } else {
                 // 防止已被挑战判废的 cf_clearance 借响应 Set-Cookie 回写覆盖刚签发的新值
-                if (cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
+                if (requestUrl.toHttpUrl().host == Config.HOST && cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
                     return@forEach
                 }
                 if (requestUrl.toHttpUrl().host == Config.HOST && cookie.matches(Config.BASE_URL.toHttpUrl())) {
                     merged[cookie.name] = cookie.value
                 }
                 val normalized = if (mainAuth) cookie.toString().replace(Regex("; domain=[^;]+", RegexOption.IGNORE_CASE), "") else cookie.toString()
-                setWebCookie(manager, normalized, targetUrl)
+                val accepted = setWebCookie(manager, normalized, targetUrl)
+                if (authoritativeAuth && mainAuth) check(accepted) { "登录凭据保存失败，请重试" }
             }
+            checkAuthority()
         }
         manager.flush()
-        if (!sessionChanging && (requestGeneration == null || requestGeneration == sessionGeneration)) save(merged)
+        checkAuthority()
+        if (!sessionChanging && (requestGeneration == null || requestGeneration == sessionGeneration)) {
+            if (authoritativeAuth) {
+                check(parseCookieHeader(manager.getCookie(Config.BASE_URL))[Config.SESSION_COOKIE] == merged[Config.SESSION_COOKIE]) {
+                    "登录凭据读回不一致，请重试"
+                }
+            }
+            // 新登录的身份由后续 /session/current 确认，不能继承登录前残留的旧账号 ID。
+            val newLoginToken = authBrowserSnapshot && merged[Config.SESSION_COOKIE] != sentCookies[Config.SESSION_COOKIE]
+            save(merged, durable = authoritativeAuth || newLoginToken, ownerUserId = if (authoritativeAuth || newLoginToken) 0L else currentUserId())
+        }
     }
 
     fun hasSessionCookie(): Boolean = syncFromWebView().containsKey(Config.SESSION_COOKIE)
@@ -561,32 +1027,54 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         manager.flush()
     }
 
-    private fun save(cookies: Map<String, String>) {
-        cookieVersion++
-        prefs.edit()
-            .putString(KEY_COOKIES, JSONObject(cookies as Map<*, *>).toString())
+    private fun save(cookies: Map<String, String>, durable: Boolean = false, ownerUserId: Long = currentUserId()) {
+        val persisted = cookies.filterKeys { key ->
+            !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) &&
+                !key.startsWith("__cf", ignoreCase = true) &&
+                !key.startsWith("_cf", ignoreCase = true)
+        }
+        val editor = prefs.edit()
+            .putString(KEY_COOKIES, JSONObject(persisted as Map<*, *>).toString())
             .putLong(KEY_SAVED_AT, System.currentTimeMillis())
-            .apply()
+            .putLong(KEY_COOKIE_OWNER, ownerUserId)
+        if (durable) {
+            if (!editor.commit()) throw EncryptedStorageUnavailableException()
+        } else editor.apply()
+        cookieVersion++
     }
 
-    fun homeFeed(): String? = prefs.getString(KEY_HOME_FEED, null)
+    private fun <T> readDisplayPreference(default: T, read: () -> T): T = try {
+        read()
+    } catch (_: EncryptedStorageUnavailableException) {
+        default
+    }
+
+    private fun saveDisplayPreference(key: String, write: () -> Unit) {
+        try {
+            write()
+        } catch (_: EncryptedStorageUnavailableException) {
+            org.linuxdo.android.net.NetDiagnostics.log("偏好设置尚未保存($key)：安全存储暂不可用，请恢复后重新设置")
+        }
+    }
+
+    fun homeFeed(): String? = readDisplayPreference(null) { prefs.getString(KEY_HOME_FEED, null) }
 
     fun saveHomeFeed(feed: String) {
-        prefs.edit().putString(KEY_HOME_FEED, feed).apply()
+        saveDisplayPreference(KEY_HOME_FEED) { prefs.edit().putString(KEY_HOME_FEED, feed).apply() }
     }
 
     fun getTopicSortOrder(): TopicSortOrder =
-        TopicSortOrder.fromName(prefs.getString(KEY_TOPIC_SORT_ORDER, null))
+        TopicSortOrder.fromName(readDisplayPreference(null) { prefs.getString(KEY_TOPIC_SORT_ORDER, null) })
 
     fun setTopicSortOrder(order: TopicSortOrder) {
-        prefs.edit().putString(KEY_TOPIC_SORT_ORDER, order.name).apply()
+        saveDisplayPreference(KEY_TOPIC_SORT_ORDER) { prefs.edit().putString(KEY_TOPIC_SORT_ORDER, order.name).apply() }
     }
 
     fun getTopicSortAscending(): Boolean =
-        prefs.getBoolean(KEY_TOPIC_SORT_ASCENDING, false)
+        readDisplayPreference(false) { prefs.getBoolean(KEY_TOPIC_SORT_ASCENDING, false) }
 
     fun setTopicSortAscending(ascending: Boolean) {
-        prefs.edit().putBoolean(KEY_TOPIC_SORT_ASCENDING, ascending).apply()
+        saveDisplayPreference(KEY_TOPIC_SORT_ASCENDING) { prefs.edit().putBoolean(KEY_TOPIC_SORT_ASCENDING, ascending).apply() }
     }
 
     fun isFloatingBallEnabled(): Boolean =
@@ -680,11 +1168,13 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         plainPrefs.edit().putBoolean(KEY_FLOATING_BALL_ON_RIGHT, onRight).apply()
     }
 
-    fun savedLogin(): String? = prefs.getString(KEY_SAVED_LOGIN, null)
+    fun savedLogin(): String? = readDisplayPreference(null) { prefs.getString(KEY_SAVED_LOGIN, null) }
 
-    fun savedPassword(): String? = if (isRememberPassword()) prefs.getString(KEY_SAVED_PASSWORD, null) else null
+    fun savedPassword(): String? = readDisplayPreference(null) {
+        if (prefs.getBoolean(KEY_REMEMBER_PASSWORD, false)) prefs.getString(KEY_SAVED_PASSWORD, null) else null
+    }
 
-    fun isRememberPassword(): Boolean = prefs.getBoolean(KEY_REMEMBER_PASSWORD, false)
+    fun isRememberPassword(): Boolean = readDisplayPreference(false) { prefs.getBoolean(KEY_REMEMBER_PASSWORD, false) }
 
     fun saveCredentials(login: String, password: String, remember: Boolean) {
         val editor = prefs.edit()
@@ -867,11 +1357,13 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     fun currentUserId(): Long = plainPrefs.getLong(KEY_CURRENT_USER_ID, 0L)
 
     fun saveCurrentUserId(id: Long) {
-        plainPrefs.edit().putLong(KEY_CURRENT_USER_ID, id).apply()
+        if (!prefs.edit().putLong(KEY_COOKIE_OWNER, id).commit() ||
+            !plainPrefs.edit().putLong(KEY_CURRENT_USER_ID, id).commit()) throw EncryptedStorageUnavailableException()
     }
 
     fun clearCurrentUserId() {
-        plainPrefs.edit().remove(KEY_CURRENT_USER_ID).apply()
+        if (!prefs.edit().putLong(KEY_COOKIE_OWNER, 0L).commit() ||
+            !plainPrefs.edit().remove(KEY_CURRENT_USER_ID).commit()) throw EncryptedStorageUnavailableException()
     }
 
     fun hasAutoPromptedBatteryWhitelist(): Boolean =
@@ -1102,6 +1594,8 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_CURRENT_USER_ID = "current_user_id"
         private const val FORUM_SESSION_COOKIE = "_forum_session"
         private const val KEY_COOKIES = "cookies"
+        private const val KEY_COOKIE_OWNER = "cookie_owner_user_id"
+        private const val KEY_SESSION_SWITCH_PENDING = "session_switch_pending"
         private const val KEY_SAVED_AT = "saved_at"
         private const val KEY_USER_AGENT = "user_agent"
         private const val KEY_HOME_FEED = "home_feed"
@@ -1138,6 +1632,8 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_APP_IN_FOREGROUND = "app_in_foreground"
         private const val MAX_NOTIFICATION_LEVELS = 1000
         private const val MAX_CHALLENGED_CLEARANCES = 16
+        private const val CHALLENGED_CLEARANCE_PAUSE_MS = 60_000L
+        private const val MAX_REASONABLE_CF_CLEARANCE_TTL_MS = 7 * 86_400_000L
 
         // ── DoH 相关偏好 ──────────────────────────────────────────────────────────
         const val KEY_DOH_ENABLED = "doh_enabled"
@@ -1162,27 +1658,12 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         fun toCookieHeader(cookies: Map<String, String>): String =
             cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-        private fun createPrefs(context: Context): SharedPreferences {
-            fun build(): SharedPreferences {
-                val masterKey = MasterKey.Builder(context)
-                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                    .build()
-                return EncryptedSharedPreferences.create(
-                    context,
-                    PREFS_NAME,
-                    masterKey,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-                )
-            }
-            return try {
-                build()
-            } catch (error: Exception) {
-                // Keystore 密钥失效(如恢复备份/重装)会导致无法解密,清掉旧文件重新开始
-                context.deleteSharedPreferences(PREFS_NAME)
-                build()
-            }
-        }
+        fun authTokenHash(token: String?): String = if (token.isNullOrBlank()) "" else
+            java.security.MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+        private fun createPrefs(context: Context): SharedPreferences =
+            SafeEncryptedPrefs.open(context, PREFS_NAME)
 
         private suspend fun setWebCookie(manager: CookieManager, value: String, url: String = Config.BASE_URL): Boolean =
             withTimeout(3_000L) {

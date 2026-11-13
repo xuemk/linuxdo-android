@@ -1003,15 +1003,10 @@ private fun UserSummaryView(
                             .clickable {
                                 if (link.topicId != null) {
                                     onOpenTopic(link.topicId, link.topicTitle ?: link.title ?: "", link.postNumber)
+                                } else if (isTrustedForumUrl(link.url)) {
+                                    MiniAppSessionPool.requestOpen(link.url)
                                 } else {
-                                    runCatching {
-                                        context.startActivity(
-                                            android.content.Intent(
-                                                android.content.Intent.ACTION_VIEW,
-                                                android.net.Uri.parse(link.url)
-                                            )
-                                        )
-                                    }
+                                    openExternal(context, link.url)
                                 }
                             }
                             .padding(vertical = 4.dp),

@@ -14,12 +14,147 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.linuxdo.android.Config
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+private val MINI_APP_ID = Regex("[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
+
+@Serializable
+data class MiniAppEntry(
+    val id: String,
+    val name: String,
+    val iconUrl: String? = null,
+    val ratingAverage: Double? = null,
+    val ratingCount: Long? = null,
+    val usageCount: Long? = null,
+) {
+    val url: String get() = "${Config.BASE_URL}/apps/$id"
+
+    companion object {
+        fun fromJson(data: JsonObject): MiniAppEntry? {
+            val id = (data["app_id"] as? JsonPrimitive)?.contentOrNull ?: return null
+            val name = (data["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+            if (!MINI_APP_ID.matches(id) || name.isBlank()) return null
+            val icon = (data["icon_url"] as? JsonPrimitive)?.contentOrNull?.toHttpUrlOrNull()
+                ?.takeIf { it.isHttps && it.username.isEmpty() && it.password.isEmpty() }
+            val ratingAvg = (data["rating_average"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull()
+                ?.takeIf { it.isFinite() && it in 0.0..5.0 }
+            val ratingCnt = (data["rating_count"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+                ?.takeIf { it >= 0L }
+            val usageCnt = (data["usage_count"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+                ?.takeIf { it >= 0L }
+            return MiniAppEntry(
+                id = id,
+                name = name,
+                iconUrl = icon?.toString(),
+                ratingAverage = ratingAvg,
+                ratingCount = ratingCnt,
+                usageCount = usageCnt,
+            )
+        }
+
+        fun idFromUrl(value: String?): String? {
+            val url = value?.toHttpUrlOrNull() ?: return null
+            if (!url.isHttps || url.host != Config.HOST || url.port != 443 ||
+                url.username.isNotEmpty() || url.password.isNotEmpty()) return null
+            val path = url.pathSegments.dropLastWhile(String::isEmpty)
+            return path.takeIf { it.size == 2 && it[0] == "apps" }?.get(1)?.takeIf(MINI_APP_ID::matches)
+        }
+    }
+}
+
+enum class MiniAppSort(val apiValue: String, val label: String, val favorite: Boolean = false) {
+    Hot("hot", "最热"),
+    Latest("latest", "最新上线"),
+    Rating("rating", "评分最高"),
+    Used("used", "使用最多"),
+    Favorites("latest", "已收藏", favorite = true);
+}
+
+data class MiniAppDirectoryPage(val apps: List<MiniAppEntry>, val hasMore: Boolean) {
+    companion object {
+        fun parse(data: JsonObject, page: Int): MiniAppDirectoryPage {
+            require(page >= 0 && (data["page"] as? JsonPrimitive)?.intOrNull == page) { "小程序目录页码不匹配" }
+            val perPage = (data["per_page"] as? JsonPrimitive)?.intOrNull ?: 0
+            val total = (data["total"] as? JsonPrimitive)?.intOrNull ?: -1
+            require(perPage > 0 && total >= 0) { "小程序目录分页信息无效" }
+            val entries = data["apps"] as? JsonArray ?: error("小程序目录缺少应用列表")
+            return MiniAppDirectoryPage(
+                entries.mapNotNull { (it as? JsonObject)?.let(MiniAppEntry::fromJson) }.distinctBy { it.id },
+                entries.isNotEmpty() && (page + 1L) * perPage < total,
+            )
+        }
+    }
+}
+
+@Serializable
+data class MiniAppLibraryState(
+    val recent: List<MiniAppEntry> = emptyList(),
+    val favorites: List<MiniAppEntry> = emptyList(),
+) {
+    fun visit(app: MiniAppEntry): MiniAppLibraryState = copy(
+        recent = (listOf(app) + recent.filterNot { it.id == app.id }).take(40),
+        favorites = favorites.map { if (it.id == app.id) app else it },
+    )
+
+    fun addFavorite(app: MiniAppEntry): MiniAppLibraryState = copy(
+        favorites = if (favorites.any { it.id == app.id }) {
+            favorites.map { if (it.id == app.id) app else it }
+        } else {
+            favorites + app
+        },
+    )
+
+    fun removeFavorite(id: String): MiniAppLibraryState = copy(
+        favorites = favorites.filterNot { it.id == id },
+    )
+
+    fun removeRecent(id: String): MiniAppLibraryState = copy(
+        recent = recent.filterNot { it.id == id },
+    )
+
+    fun toggleFavorite(app: MiniAppEntry): MiniAppLibraryState = copy(
+        favorites = if (favorites.any { it.id == app.id }) favorites.filterNot { it.id == app.id }
+            else favorites + app,
+    )
+
+    fun moveRecent(id: String, offset: Int): MiniAppLibraryState {
+        val from = recent.indexOfFirst { it.id == id }
+        if (from < 0) return this
+        val target = (from.toLong() + offset).coerceIn(0L, recent.lastIndex.toLong()).toInt()
+        if (target == from) return this
+        return copy(recent = recent.toMutableList().apply { add(target, removeAt(from)) })
+    }
+
+    fun reorderRecent(fromIndex: Int, toIndex: Int): MiniAppLibraryState {
+        if (fromIndex !in recent.indices || toIndex !in recent.indices || fromIndex == toIndex) return this
+        return copy(recent = recent.toMutableList().apply { add(toIndex, removeAt(fromIndex)) })
+    }
+
+    fun moveFavorite(id: String, offset: Int): MiniAppLibraryState {
+        val from = favorites.indexOfFirst { it.id == id }
+        if (from < 0) return this
+        val target = (from.toLong() + offset).coerceIn(0L, favorites.lastIndex.toLong()).toInt()
+        if (target == from) return this
+        return copy(favorites = favorites.toMutableList().apply { add(target, removeAt(from)) })
+    }
+
+    fun reorderFavorite(fromIndex: Int, toIndex: Int): MiniAppLibraryState {
+        if (fromIndex !in favorites.indices || toIndex !in favorites.indices || fromIndex == toIndex) return this
+        return copy(favorites = favorites.toMutableList().apply { add(toIndex, removeAt(fromIndex)) })
+    }
+
+    fun updateEntry(app: MiniAppEntry): MiniAppLibraryState = copy(
+        recent = recent.map { if (it.id == app.id) app else it },
+        favorites = favorites.map { if (it.id == app.id) app else it },
+    )
+}
 
 /** 首页顶部支持切换的 4 个 Feed 类别。默认是 Latest。 */
 enum class HomeFeedType(val label: String, val apiPath: String) {
@@ -68,7 +203,8 @@ enum class FloatingAction(
     Sort("sort", "排序", "排序", "切换话题列表排序"),
     Drafts("drafts", "草稿", "草稿", "查看与编辑草稿"),
     Search("search", "搜索", "搜索", "全站快捷搜索"),
-    Categories("categories", "分类", "分类", "浏览全部话题分类");
+    Categories("categories", "分类", "分类", "浏览全部话题分类"),
+    Apps("apps", "应用广场", "应用", "进入 L 站应用广场小程序");
 
     companion object {
         const val MAX_ACTIONS = 5
@@ -384,7 +520,93 @@ data class Category(
     @SerialName("subcategory_list") val subcategoryList: List<Category> = emptyList(),
     @SerialName("allowed_tags") val allowedTags: List<String> = emptyList(),
     @SerialName("read_restricted") val readRestricted: Boolean = false,
+    val permission: Int? = null,
+    @SerialName("minimum_required_tags") val minimumRequiredTags: Int = 0,
+    @SerialName("required_tag_groups") val requiredTagGroups: List<RequiredTopicTagGroup> = emptyList(),
+    @SerialName("allowed_tag_groups") val allowedTagGroups: List<String> = emptyList(),
+    @SerialName("allow_global_tags") val allowGlobalTags: Boolean = true,
+) {
+    /**
+     * 当前用户是否可在该分类下创建话题（对齐 FluxDO `Category.canCreateTopic` 与 Discourse 权限定义）：
+     * - 排除默认“未分类”（`id != uncategorizedId`）
+     * - `permission <= 1`（0 = full, 1 = create/reply；2 = reply only、3 = see 或 null 均不可发帖）
+     */
+    fun canCreateTopic(uncategorizedId: Int = 1): Boolean =
+        id != uncategorizedId && permission != null && permission <= 1
+}
+
+@Serializable
+data class RequiredTopicTagGroup(val name: String = "", @SerialName("min_count") val minCount: Int = 1)
+
+data class TopicMetadata(
+    val topicId: Long,
+    val title: String,
+    val categoryId: Int?,
+    val tags: List<String>,
+    val canEdit: Boolean,
+    val privateMessage: Boolean = false,
 )
+
+data class TopicEditRules(
+    val categories: List<Category> = emptyList(),
+    val canTagTopics: Boolean = false,
+    val minTitleLength: Int = 15,
+    val minPmTitleLength: Int = 2,
+    val uncategorizedId: Int = 1,
+) {
+    val selectableCategories: List<Category>
+        get() = creatableCategories(categories, uncategorizedId)
+}
+
+data class TopicMetadataPatch(val title: String? = null, val categoryId: Int? = null, val tags: List<String>? = null) {
+    val changed: Boolean get() = title != null || categoryId != null || tags != null
+
+    fun applyTo(original: TopicMetadata): TopicMetadata = original.copy(
+        title = title ?: original.title, categoryId = categoryId ?: original.categoryId, tags = tags ?: original.tags,
+    )
+
+    fun formBody(): String {
+        fun encode(value: String) = java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8.name())
+        val fields = mutableListOf<Pair<String, String>>()
+        title?.let { fields += "title" to it }
+        categoryId?.let { fields += "category_id" to it.toString() }
+        tags?.let { values ->
+            if (values.isEmpty()) fields += "tags[]" to ""
+            else values.forEach { fields += "tags[]" to it }
+        }
+        return fields.joinToString("&") { (key, value) -> "${encode(key)}=${encode(value)}" }
+    }
+}
+
+internal fun topicMetadataPatch(original: TopicMetadata, title: String, categoryId: Int?, tags: List<String>, canTag: Boolean): TopicMetadataPatch {
+    val cleaned = tags.map(String::trim).filter(String::isNotEmpty).distinct()
+    return TopicMetadataPatch(
+        title.trim().takeIf { it != original.title.trim() },
+        categoryId?.takeIf { !original.privateMessage && it != original.categoryId },
+        cleaned.takeIf { !original.privateMessage && canTag && it.sorted() != original.tags.distinct().sorted() },
+    )
+}
+
+internal fun validateTopicMetadata(original: TopicMetadata, rules: TopicEditRules, patch: TopicMetadataPatch): String? {
+    if (!original.canEdit) return "当前账号无权编辑此话题"
+    val result = patch.applyTo(original)
+    if (patch.title != null) {
+        val title = patch.title.trim()
+        val minimum = if (original.privateMessage) rules.minPmTitleLength else rules.minTitleLength
+        if (title.isBlank()) return "请输入话题标题"
+        if (title.length < minimum) return "标题至少需要 $minimum 个字符"
+        if (title.length > 200) return "标题最多 200 个字符"
+    }
+    if (original.privateMessage && (patch.categoryId != null || patch.tags != null)) return "私信不支持修改分类和标签"
+    if (patch.categoryId != null && rules.selectableCategories.none { it.id == patch.categoryId }) return "当前账号不能使用这个分类"
+    if (patch.tags != null && !rules.canTagTopics) return "当前账号不能修改标签"
+    if (patch.tags != null && patch.tags.size > 5) return "最多选择 5 个标签"
+    if (!original.privateMessage) {
+        val category = rules.categories.firstOrNull { it.id == result.categoryId } ?: return "请选择有效分类"
+        if (result.tags.size < category.minimumRequiredTags) return "该分类至少需要 ${category.minimumRequiredTags} 个标签"
+    }
+    return null
+}
 
 /** 获取该分类支持的固定标签列表；不同分类可能不同，不可自定义随意输入。 */
 fun fixedTagsForCategory(category: Category?): List<String> {
@@ -403,9 +625,27 @@ fun fixedTagsForCategory(category: Category?): List<String> {
     }
 }
 
-/** 把嵌套的分类树摊平成一维,便于按 id 查找。 */
+/** 把嵌套的分类树摊平成一维,便于按 id 查找。展开时补齐子分类的 parentCategoryId。 */
 fun flattenCategories(categories: List<Category>): List<Category> =
-    categories.flatMap { listOf(it) + flattenCategories(it.subcategoryList) }
+    categories.flatMap { parent ->
+        listOf(parent) + flattenCategories(
+            parent.subcategoryList.map { sub ->
+                if (sub.parentCategoryId == null) sub.copy(parentCategoryId = parent.id) else sub
+            },
+        )
+    }
+
+/**
+ * 提取可用于创建/移入话题的平铺分类列表（排除“未分类”与无发帖权限分类，对齐 FluxDO）。
+ * 同时清空 `subcategoryList`，防止后续 [compactCategoryGroups] 再次展开父分类时将已过滤掉的只读子分类带回。
+ */
+fun creatableCategories(categories: List<Category>, uncategorizedId: Int = 1): List<Category> {
+    val all = flattenCategories(categories).distinctBy { it.id }
+    val hasPermissionInfo = all.any { it.permission != null }
+    return all
+        .filter { if (hasPermissionInfo) it.canCreateTopic(uncategorizedId) else it.id != uncategorizedId }
+        .map { it.copy(subcategoryList = emptyList()) }
+}
 
 /** 只有与父模块同名的 Lv 子分类合并,具名子模块保留独立入口。 */
 fun compactCategoryGroups(categories: List<Category>): List<Pair<Category, List<Category>>> {
@@ -551,16 +791,28 @@ object CustomSectionIconMapper {
 }
 
 data class InternalTopicLink(
-    val topicId: Long,
+    val topicId: Long = 0L,
     val postNumber: Int? = null,
-)
+    val miniAppUrl: String? = null,
+) {
+    val isMiniApp: Boolean get() = !miniAppUrl.isNullOrBlank()
+}
 
 /**
- * ???????????????????????????? linux.do ?????
- * ?? (??? URL, ???? InternalTopicLink)?
+ * 从剪贴板文本中解析 linux.do 轻应用链接 (/apps/...) 或话题链接 (/t/...)。
+ * 返回 (原始 URL, 解析后的 InternalTopicLink)。
  */
 fun parseTopicLinkFromText(text: String?): Pair<String, InternalTopicLink>? {
     if (text.isNullOrBlank()) return null
+    val appRegex = Regex("""https?://(?:[a-zA-Z0-9\-]+\.)?linux\.do/apps(?:/[^\s\r\n"'<>()\[\]\uFF08\uFF09\u3010\u3011\u300A\u300B\u201C\u201D\u2018\u2019\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A,!]*)?""")
+    appRegex.find(text)?.let { match ->
+        var rawAppUrl = match.value.trim()
+        rawAppUrl = rawAppUrl.trimEnd('.', ',', '!', ';', ':', ')', ']', '}', '>', '\u3002', '\uff0c', '\uff01', '\uff1f', '\uff1b', '\uff1a', '\uff09', '\u3011', '\u201d', '\u2019')
+        val validAppUrl = parseInternalMiniAppUrl(rawAppUrl)
+        if (validAppUrl != null) {
+            return Pair(validAppUrl, InternalTopicLink(topicId = 0L, miniAppUrl = validAppUrl))
+        }
+    }
     val regex = Regex("""https?://(?:[a-zA-Z0-9\-]+\.)?linux\.do/t/[^\s\r\n"'<>()\[\]\uFF08\uFF09\u3010\u3011\u300A\u300B\u201C\u201D\u2018\u2019\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A,!?]+""")
     val match = regex.find(text) ?: return null
     var rawUrl = match.value.trim()
@@ -568,6 +820,16 @@ fun parseTopicLinkFromText(text: String?): Pair<String, InternalTopicLink>? {
     val link = parseInternalTopicUrl(rawUrl) ?: return null
     return Pair(rawUrl, link)
 }
+
+fun parseInternalMiniAppUrl(url: String): String? = runCatching {
+    val uri = android.net.Uri.parse(url.trim())
+    val scheme = uri.scheme?.lowercase() ?: return null
+    if (scheme != "http" && scheme != "https") return null
+    val host = uri.host?.lowercase()?.trimEnd('.') ?: return null
+    if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return null
+    val path = uri.path?.lowercase().orEmpty()
+    if (path == "/apps" || path.startsWith("/apps/")) url.trim() else null
+}.getOrNull()
 
 /**
  * ?????linux.do?????????
@@ -654,7 +916,15 @@ data class TopicListItem(
     val trustLevel: Int? = null,
     val notificationLevel: TopicNotificationLevel? = null,
     val notificationLevelUpdating: Boolean = false,
+    /** 搜索命中或书签指向的楼层；为空时按普通进入话题处理。 */
+    val targetPostNumber: Int? = null,
+    /** 书签列表条目的独立书签 ID；同一话题可有多条。 */
+    val bookmarkId: Long? = null,
 ) {
+    /** 列表 key：书签按书签 ID 区分，其余按话题 ID。 */
+    val listKey: String get() = bookmarkId?.let { "bm$it" }
+        ?: targetPostNumber?.let { "${topic.id}:$it" } ?: topic.id.toString()
+
     /** 优先展示论坛昵称（如“用户已注销”），无昵称则回退到用户名（如“NullUser”），对齐 fluxdo */
     val displayName: String
         get() = authorName?.trim()?.takeIf { it.isNotEmpty() } ?: authorUsername.orEmpty()
@@ -751,6 +1021,8 @@ data class Post(
     @SerialName("accepted_answer") val acceptedAnswer: Boolean = false,
     @SerialName("can_edit") val canEdit: Boolean = false,
     @SerialName("can_delete") val canDelete: Boolean = false,
+    val version: Int = 1,
+    @SerialName("can_view_edit_history") val canViewEditHistory: Boolean = false,
     @SerialName("bookmarked") val bookmarked: Boolean = false,
     @SerialName("bookmark_id") val bookmarkId: Long? = null,
     /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
@@ -760,6 +1032,38 @@ data class Post(
     val displayName: String
         get() = name?.trim()?.takeIf { it.isNotEmpty() } ?: username
 }
+
+data class EditorSuggestion(
+    val insertion: String,
+    val label: String,
+    val description: String = "",
+    val avatarUrl: String? = null,
+)
+
+data class EditorCompletionRequest(val marker: Char, val term: String, val topicId: Long? = null, val categoryId: Int? = null)
+
+@Serializable
+data class PostRevision(
+    @SerialName("current_revision") val currentRevision: Int = 1,
+    @SerialName("previous_revision") val previousRevision: Int = 1,
+    @SerialName("next_revision") val nextRevision: Int? = null,
+    @SerialName("last_revision") val lastRevision: Int = 1,
+    val username: String = "",
+    @SerialName("display_username") val displayUsername: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("edit_reason") val editReason: String? = null,
+    @SerialName("current_hidden") val currentHidden: Boolean = false,
+    @SerialName("previous_hidden") val previousHidden: Boolean = false,
+    @SerialName("diff_error") val diffError: Boolean = false,
+    @SerialName("body_changes") val bodyChanges: RevisionBodyChanges? = null,
+    @SerialName("title_changes") val titleChanges: JsonElement? = null,
+)
+
+@Serializable
+data class RevisionBodyChanges(
+    @SerialName("inline") val inlineHtml: String? = null,
+    @SerialName("side_by_side_markdown") val markdownHtml: String? = null,
+)
 
 @Serializable
 data class DiscoursePollOption(
@@ -812,6 +1116,7 @@ data class UserCardData(
     @SerialName("topic_post_count") val rawTopicPostCount: JsonElement? = null,
     @SerialName("can_follow") val canFollow: Boolean = false,
     val following: Boolean = false,
+    @SerialName("gamification_score") val gamificationScore: Int? = null,
     val badges: List<SummaryBadgeItem> = emptyList(),
 ) {
     /** 与 FluxDO 一致：优先个人主页背景，其次资料卡背景。 */
@@ -893,6 +1198,30 @@ data class ChatMembership(
     @SerialName("last_read_message_id") val lastReadMessageId: Long? = null,
 )
 
+/** 聊天消息中的上传附件（图片或文件） */
+@Serializable
+data class ChatUpload(
+    val id: Long = 0L,
+    val url: String = "",
+    @SerialName("original_filename") val originalFilename: String = "",
+    val width: Int? = null,
+    val height: Int? = null,
+    @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
+    val extension: String? = null,
+    val filesize: Long = 0L,
+) {
+    /** 判断是否为图片类型 */
+    val isImage: Boolean
+        get() = extension?.lowercase() in setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp")
+
+    /** 补全相对路径为完整 URL */
+    fun absoluteUrl(base: String): String = if (url.startsWith("http")) url else "$base$url"
+
+    /** 获取缩略图完整 URL，若无则退回原图 */
+    fun absoluteThumbnailUrl(base: String): String =
+        thumbnailUrl?.let { if (it.startsWith("http")) it else "$base$it" } ?: absoluteUrl(base)
+}
+
 @Serializable
 data class ChatMessageSummary(
     val id: Long,
@@ -901,6 +1230,8 @@ data class ChatMessageSummary(
     val cooked: String = "",
     @SerialName("created_at") val createdAt: String? = null,
     val user: ChatUserSummary? = null,
+    /** PC 端发送图片时携带的附件列表，移动端通过此字段渲染图片 */
+    val uploads: List<ChatUpload> = emptyList(),
 )
 
 @Serializable
@@ -1295,6 +1626,8 @@ data class PostStream(
 /** 话题级权限。没有 can_create_post 字段的旧响应按"可回复"处理,由服务端最终裁决。 */
 @Serializable
 data class TopicDetails(
+    /** 话题标题/分类/标签的编辑权限，对齐 FluxDO：缺失按 false，等级与身份由服务端判定。 */
+    @SerialName("can_edit") val canEdit: Boolean = false,
     @SerialName("can_create_post") val canCreatePost: Boolean = true,
     @SerialName("notification_level") val notificationLevel: Int = 1,
 )
@@ -1313,8 +1646,11 @@ data class TopicDetail(
     val details: TopicDetails = TopicDetails(),
     @SerialName("message_bus_last_id") val messageBusLastId: Long? = null,
     @SerialName("highest_post_number") val highestPostNumber: Int? = null,
+    val tags: List<@Serializable(with = TagNameSerializer::class) String> = emptyList(),
+    val archetype: String = "regular",
 ) {
     val canReply: Boolean get() = details.canCreatePost && !closed && !archived
+    val isPrivateMessage: Boolean get() = archetype == "private_message"
 }
 
 data class SearchPage(
@@ -1322,6 +1658,18 @@ data class SearchPage(
     val excerpts: Map<Long, String>,
     val hasMore: Boolean,
 )
+
+/** 帖内搜索的单条命中。 */
+data class TopicSearchHit(
+    val postId: Long,
+    val postNumber: Int,
+    val username: String,
+    val avatarUrl: String?,
+    val createdAt: String?,
+    val blurb: String,
+)
+
+data class TopicSearchPage(val hits: List<TopicSearchHit>, val hasMore: Boolean)
 
 enum class SearchOrder(val label: String, val key: String) {
     Relevance("相关性", ""), Latest("最新帖子", "latest"), Likes("赞最多", "likes"),
@@ -1721,4 +2069,28 @@ data class LdcUserInfo(
     @SerialName("remain_quota") val remainQuota: String = "0",
     @SerialName("pay_level") val payLevel: Int = 0,
     @SerialName("daily_limit") val dailyLimit: Int = 0,
-)
+    @SerialName("gamification_score") val gamificationScore: Int? = null,
+    @SerialName("today_income") val todayIncome: String? = null,
+) {
+    /**
+     * 今日已结算入账的 LDC（来自 /api/v1/dashboard/stats/daily 当日 income）。
+     */
+    val todayIncomeDisplay: String?
+        get() {
+            val raw = todayIncome?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return runCatching {
+                val bd = java.math.BigDecimal(raw)
+                if (bd.compareTo(java.math.BigDecimal.ZERO) == 0) "0" else bd.stripTrailingZeros().toPlainString()
+            }.getOrDefault(raw)
+        }
+
+    /**
+     * 今日实时新增、待明日凌晨结算的 LDC（= 主站实时 gamification_score - 积分站已结算 community_balance）。
+     */
+    val dailyGrowthLdc: Int?
+        get() {
+            val score = gamificationScore ?: return null
+            val settled = communityBalance.toDoubleOrNull() ?: 0.0
+            return kotlin.math.round(score - settled).toInt()
+        }
+}

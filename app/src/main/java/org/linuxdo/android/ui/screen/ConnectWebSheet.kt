@@ -375,18 +375,61 @@ private fun NativeCreditBalanceCard(
                 )
             }
 
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    text = "可用余额",
-                    fontSize = 13.sp,
-                    color = Color.White.copy(alpha = 0.75f),
-                )
-                Text(
-                    text = userInfo.availableBalance,
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "可用余额",
+                        fontSize = 13.sp,
+                        color = Color.White.copy(alpha = 0.75f),
+                    )
+                    Text(
+                        text = userInfo.availableBalance,
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                    )
+                }
+                val todayIncome = userInfo.todayIncomeDisplay
+                val dailyGrowth = userInfo.dailyGrowthLdc
+                if (todayIncome != null || dailyGrowth != null) {
+                    Column(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.White.copy(alpha = 0.18f))
+                            .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 11.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "今日: ${todayIncome ?: "--"}LDC",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White,
+                            )
+                            CreditGrowthArrow()
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "待结: ${dailyGrowth?.toString() ?: "--"}LDC",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White,
+                            )
+                            CreditGrowthArrow()
+                        }
+                    }
+                }
             }
 
             Row(
@@ -412,6 +455,39 @@ private fun NativeCreditBalanceCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CreditGrowthArrow(
+    modifier: Modifier = Modifier.size(13.dp),
+    color: Color = Color(0xFF6EE7B7),
+) {
+    Canvas(modifier = modifier) {
+        val stroke = 2.dp.toPx()
+        val w = size.width
+        val h = size.height
+        drawLine(
+            color = color,
+            start = androidx.compose.ui.geometry.Offset(w * 0.2f, h * 0.8f),
+            end = androidx.compose.ui.geometry.Offset(w * 0.8f, h * 0.2f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = androidx.compose.ui.geometry.Offset(w * 0.38f, h * 0.2f),
+            end = androidx.compose.ui.geometry.Offset(w * 0.8f, h * 0.2f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = androidx.compose.ui.geometry.Offset(w * 0.8f, h * 0.2f),
+            end = androidx.compose.ui.geometry.Offset(w * 0.8f, h * 0.62f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
     }
 }
 

@@ -1,5 +1,7 @@
 package org.linuxdo.android.net
 
+import org.linuxdo.android.Config
+
 enum class NetworkPath(val label: String) {
     OKHTTP("A: OkHttp"),
     WEBVIEW("B: WebView fetch"),
@@ -12,6 +14,8 @@ data class TransportResult(
     val retryAfterSeconds: Long? = null,
     val sentClearanceFp: String = "-",
     val cfMitigated: String? = null,
+    /** null 表示通道未记录；空串表示这次请求明确没有发送 _t。 */
+    val sentSessionTokenHash: String? = null,
 )
 
 interface Transport {
@@ -22,6 +26,10 @@ interface Transport {
     /** 单次无重验 GET 请求（供 P0-4 切栈兜底使用，前置检查未通过时直接失败不循环重验）。 */
     suspend fun getWithoutRevalidate(path: String, present: Boolean = true): TransportResult =
         get(path, present)
+
+    /** 验证期间的只读复核，不自动求解挑战，也不将候选凭据立即判废。 */
+    suspend fun getForVerification(path: String, present: Boolean = false): TransportResult =
+        getWithoutRevalidate(path, present)
 
     /**
      * 发写请求。[contentType] 默认 JSON；少数 Discourse 端点(如 `/topics/timings`)
@@ -55,7 +63,7 @@ interface Transport {
      * 必须连 token 一起重取才能重发。
      * [failedClearanceFp] 本次被挑战拦截时请求实际携带的 cf_clearance 指纹，用于锁内去重合并。
      */
-    suspend fun revalidate(reason: String, failedClearanceFp: String = "-"): Boolean
+    suspend fun revalidate(reason: String, failedClearanceFp: String = "-", requestHost: String = Config.HOST): Boolean
 
     /**
      * 确保传输层环境就绪并处于有效会话状态。
@@ -83,6 +91,7 @@ class NeedsInteractiveVerification(
     message: String,
     val failedClearanceFp: String = "-",
     val isFrom429: Boolean = false,
+    val readProbePath: String? = null,
 ) : Exception(message)
 
 /**

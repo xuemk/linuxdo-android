@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.SystemClock
+import android.os.Looper
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -15,16 +16,19 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.linuxdo.android.push.LinuxDoPushSdk
 import org.linuxdo.android.push.NativePushCore
 import org.linuxdo.android.push.PushNotificationScope
 import org.linuxdo.android.push.PushSessionProvider
+import org.linuxdo.android.net.HttpHeaderUtils
 
 class NotificationWorker(
     private val context: Context,
@@ -46,6 +50,68 @@ class NotificationWorker(
         private const val POLL_LIMIT = 30
 
         private val pollMutex = Mutex()
+        @Volatile private var serverRetryUntil = 0L
+
+        private class PollSessionChangedException : IllegalStateException("后台轮询所属账号已切换")
+
+        private class PollSessionProvider(private val delegate: PushSessionProvider) : PushSessionProvider by delegate {
+            private val userId = delegate.getUserId()
+            private val generation = delegate.getSessionGeneration()
+
+            private fun isCurrent(): Boolean = delegate.getUserId() == userId &&
+                delegate.getSessionGeneration() == generation
+
+            fun checkCurrent() {
+                if (!isCurrent()) throw PollSessionChangedException()
+            }
+
+            fun <T> commit(action: () -> T): T {
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    checkCurrent()
+                    return action()
+                }
+                return runBlocking(Dispatchers.Main) {
+                    checkCurrent()
+                    action()
+                }
+            }
+
+            override fun backgroundRequestDelayMs(): Long =
+                if (isCurrent()) delegate.backgroundRequestDelayMs() else 1_000L
+
+            override fun saveUserId(id: Long) = commit { delegate.saveUserId(id) }
+            override fun setLastSeenNotificationId(id: Long) = commit { delegate.setLastSeenNotificationId(id) }
+            override fun setLastBadgeCount(count: Int, force: Boolean) = commit { delegate.setLastBadgeCount(count, force) }
+            override fun setBadgeTestHoldUntil(timestamp: Long) = commit { delegate.setBadgeTestHoldUntil(timestamp) }
+            override fun setPendingTestReplayTag(tag: String?) = commit { delegate.setPendingTestReplayTag(tag) }
+        }
+
+        private fun shouldDeferPoll(context: Context, sessionStore: PushSessionProvider): Boolean {
+            val remaining = maxOf(
+                serverRetryUntil - SystemClock.elapsedRealtime(),
+                sessionStore.backgroundRequestDelayMs(),
+                0L,
+            )
+            if (remaining <= 0L) return false
+            NotificationHelper.logDiagnostic(context, "push.defer", "[后台拉取] 等待安全验证或限流结束，暂缓本轮")
+            return true
+        }
+
+        private fun deferAfterResponse(context: Context, response: Response): Boolean {
+            val challenged = response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+            if (response.code != 429 && !(challenged && response.code in listOf(403, 503))) return false
+            val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(
+                HttpHeaderUtils.parseRetryAfter(response.header("Retry-After")),
+                if (challenged) 60_000L else 10_000L,
+            )
+            serverRetryUntil = maxOf(serverRetryUntil, SystemClock.elapsedRealtime() + cooldownMs)
+            NotificationHelper.logDiagnostic(
+                context, "push.cooldown",
+                "[后台拉取] HTTP=${response.code} challenged=$challenged，退避 ${cooldownMs / 1_000L}s，不做即时重试",
+            )
+            return true
+        }
+
         private data class PushJsonKeys(
             val notifications: String,
             val id: String,
@@ -91,6 +157,8 @@ class NotificationWorker(
 
         suspend fun pollOnceWithLagRetry(context: Context, sessionStore: PushSessionProvider) = withContext(Dispatchers.IO) {
             if (!sessionStore.hasSession()) return@withContext
+            val pollingSession = PollSessionProvider(sessionStore)
+            if (shouldDeferPoll(context, pollingSession)) return@withContext
             NotificationHelper.recordPushState(context, "后台拉取")
             var waitCount = 0
             while (!isNetworkConnected(context) && waitCount < 5) {
@@ -100,15 +168,19 @@ class NotificationWorker(
             if (waitCount > 0) {
                 NotificationHelper.logDiagnostic(context, "push.network.wait", "[后台拉取] 等待网络=${waitCount * 400}ms 联网能力=${isNetworkConnected(context)}")
             }
-            val firstOk = pollOnce(context, sessionStore, isFinalAttempt = false)
+            val firstOk = pollOnce(context, pollingSession, isFinalAttempt = false)
             if (!firstOk) {
+                if (shouldDeferPoll(context, pollingSession)) return@withContext
                 NotificationHelper.logDiagnostic(context, "push.retry", "[后台拉取] 首次失败，1.5秒后重试一次")
                 delay(1500L)
-                pollOnce(context, sessionStore, isFinalAttempt = true)
+                if (shouldDeferPoll(context, pollingSession)) return@withContext
+                pollOnce(context, pollingSession, isFinalAttempt = true)
             }
         }
 
         private fun fetchPostExcerpt(
+            context: Context,
+            sessionStore: PollSessionProvider,
             httpClient: OkHttpClient,
             baseUrl: String,
             topicId: Long,
@@ -116,6 +188,7 @@ class NotificationWorker(
             keys: PushJsonKeys,
         ): String? {
             return try {
+                if (shouldDeferPoll(context, sessionStore)) return null
                 val fastClient = httpClient.newBuilder()
                     .connectTimeout(5000, TimeUnit.MILLISECONDS)
                     .readTimeout(5000, TimeUnit.MILLISECONDS)
@@ -123,12 +196,17 @@ class NotificationWorker(
                 val url = "$baseUrl${NativePushCore.postsByNumberPath()}$topicId/$postNumber.json"
                 val req = Request.Builder()
                     .url(url)
+                    .tag(PushSessionProvider::class.java, sessionStore)
                     .header("Accept", "application/json")
                     .header("X-Requested-With", "XMLHttpRequest")
                     .build()
+                if (shouldDeferPoll(context, sessionStore)) return null
                 fastClient.newCall(req).execute().use { resp ->
+                    sessionStore.checkCurrent()
+                    if (deferAfterResponse(context, resp)) return null
                     if (!resp.isSuccessful) return null
                     val body = resp.body?.string() ?: return null
+                    sessionStore.checkCurrent()
                     if (body.trimStart().startsWith("<")) return null
                     val postObj = JSONObject(body)
                     val rawCooked = postObj.optString(keys.cooked)
@@ -137,6 +215,8 @@ class NotificationWorker(
                     if (rawCooked.isBlank()) return null
                     NativePushCore.sanitizeContent(rawCooked).takeIf { it.isNotBlank() }
                 }
+            } catch (error: PollSessionChangedException) {
+                throw error
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -157,7 +237,8 @@ class NotificationWorker(
                 return true
             }
             return try {
-                pollOnceExclusive(context, sessionStore, isFinalAttempt)
+                val pollingSession = sessionStore as? PollSessionProvider ?: PollSessionProvider(sessionStore)
+                pollOnceExclusive(context, pollingSession, isFinalAttempt)
             } catch (ce: CancellationException) {
                 NotificationHelper.logDiagnostic(
                     context, "push.cancelled",
@@ -188,10 +269,11 @@ class NotificationWorker(
 
         private fun pollOnceExclusive(
             context: Context,
-            sessionStore: PushSessionProvider,
+            sessionStore: PollSessionProvider,
             isFinalAttempt: Boolean,
         ): Boolean {
             if (!sessionStore.hasSession()) return true
+            if (shouldDeferPoll(context, sessionStore)) return true
             val config = LinuxDoPushSdk.getConfig()
             val httpClient = config.httpClientProvider()
             val baseUrl = config.baseUrl
@@ -201,27 +283,31 @@ class NotificationWorker(
                 val url = "$baseUrl${NativePushCore.notificationsPath()}"
                 val request = Request.Builder()
                     .url(url)
+                    .tag(PushSessionProvider::class.java, sessionStore)
                     .header("Accept", "application/json")
                     .header("X-Requested-With", "XMLHttpRequest")
                     .build()
 
+                if (shouldDeferPoll(context, sessionStore)) return true
                 httpClient.newCall(request).execute().use { response ->
+                    sessionStore.checkCurrent()
                     NotificationHelper.logDiagnostic(
                         context, "push.http",
                         "[后台拉取] 通知接口 HTTP=${response.code} 最后尝试=$isFinalAttempt",
                     )
+                    if (deferAfterResponse(context, response)) return true
                     if (response.code in listOf(401, 403, 503)) {
                         val isLast = isFinalAttempt || response.code == 401
                         val blockedTag = if (isLast) sessionStore.getPendingTestReplayTag() else null
                         if (!blockedTag.isNullOrBlank()) {
                             sessionStore.setPendingTestReplayTag(null)
                             val reason = if (response.code == 401) "（会话失效）" else "（安全挑战）"
-                            NotificationHelper.showNotification(
+                            sessionStore.commit { NotificationHelper.showNotification(
                                 context = context,
                                 notificationId = System.currentTimeMillis() % 1_000_000L,
                                 title = "[$blockedTag] 后台拉取被拦截",
                                 content = "服务端返回 HTTP ${response.code}$reason",
-                            )
+                            ) }
                         }
                         return response.code == 401
                     }
@@ -230,6 +316,7 @@ class NotificationWorker(
                         NotificationHelper.logDiagnostic(context, "push.response", "[后台拉取] 响应体为空，未更新通知")
                         return true
                     }
+                    sessionStore.checkCurrent()
                     if (body.trimStart().startsWith("<")) {
                         NotificationHelper.logDiagnostic(context, "push.response", "[后台拉取] 收到HTML而非JSON，可能需要安全验证；未更新通知")
                         return true
@@ -275,7 +362,7 @@ class NotificationWorker(
                             val topicId = candidate.optLong(keys.topicId, 0L).takeIf { it > 0L }
                             val postNumber = candidate.optInt(keys.postNumber, 0).takeIf { it > 0 }
                             val fetchedExcerpt = if (topicId != null && postNumber != null) {
-                                fetchPostExcerpt(httpClient, baseUrl, topicId, postNumber, keys)
+                                fetchPostExcerpt(context, sessionStore, httpClient, baseUrl, topicId, postNumber, keys)
                             } else null
                             val dataExcerpt = fetchedExcerpt
                                 ?: dataObj?.optString(keys.originalText)
@@ -287,7 +374,7 @@ class NotificationWorker(
                                 topicTitle = topicTitle,
                                 dataExcerpt = dataExcerpt,
                             )
-                            NotificationHelper.showNotification(
+                            sessionStore.commit { NotificationHelper.showNotification(
                                 context = context,
                                 notificationId = id,
                                 title = "[$replayTag] $formattedTitle",
@@ -296,15 +383,15 @@ class NotificationWorker(
                                 postNumber = postNumber,
                                 notificationType = type,
                                 badgeCount = targetBadge,
-                            )
+                            ) }
                         } else {
-                            NotificationHelper.showNotification(
+                            sessionStore.commit { NotificationHelper.showNotification(
                                 context = context,
                                 notificationId = System.currentTimeMillis() % 1_000_000L,
                                 title = "[$replayTag] LINUX DO 实测通知",
                                 content = "后台网络拉取成功",
                                 badgeCount = targetBadge,
-                            )
+                            ) }
                         }
                         return true
                     }
@@ -322,7 +409,7 @@ class NotificationWorker(
                         }
                         if (!sessionStore.isBadgeTestHolding()) {
                             sessionStore.setLastBadgeCount(unreadTotal)
-                            NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台基线")
+                            sessionStore.commit { NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台基线") }
                         }
                         NotificationHelper.logDiagnostic(context, "push.summary", "[后台拉取] 建立基线 条目=${notifications.length()} 未读=$unreadTotal，未发送历史通知")
                         return true
@@ -358,7 +445,7 @@ class NotificationWorker(
                     if (pageMaxId > 0L && lastSeenId > pageMaxId) {
                         if (!sessionStore.isBadgeTestHolding()) {
                             sessionStore.setLastBadgeCount(unreadTotal)
-                            NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台轮询")
+                            sessionStore.commit { NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台轮询") }
                         }
                         sessionStore.setLastSeenNotificationId(pageMaxId)
                         NotificationHelper.logDiagnostic(
@@ -440,7 +527,7 @@ class NotificationWorker(
                                     topicId != null && postNumber != null &&
                                     NativePushCore.shouldFetchExcerpt(types[index])
                                 ) {
-                                    fetchPostExcerpt(httpClient, baseUrl, topicId, postNumber, keys)
+                                    fetchPostExcerpt(context, sessionStore, httpClient, baseUrl, topicId, postNumber, keys)
                                 } else {
                                     null
                                 }
@@ -453,16 +540,23 @@ class NotificationWorker(
                                 val badge = (sessionStore.getLastBadgeCount() + 1).coerceAtLeast(1)
 
                                 // notify 成功前不改变游标或 Native 去重状态；取消后下一轮自然补发。
-                                val posted = NotificationHelper.showNotification(
-                                    context = context,
-                                    notificationId = id,
-                                    title = title,
-                                    content = content,
-                                    topicId = topicId,
-                                    postNumber = postNumber,
-                                    notificationType = types[index],
-                                    badgeCount = badge,
-                                )
+                                val posted = sessionStore.commit {
+                                    NotificationHelper.showNotification(
+                                        context = context,
+                                        notificationId = id,
+                                        title = title,
+                                        content = content,
+                                        topicId = topicId,
+                                        postNumber = postNumber,
+                                        notificationType = types[index],
+                                        badgeCount = badge,
+                                    ).also { deliveredNow ->
+                                        if (deliveredNow) {
+                                            NativePushCore.markDelivered(id, topicIds[index], postNumbers[index])
+                                            sessionStore.setLastBadgeCount(badge)
+                                        }
+                                    }
+                                }
                                 if (!posted) {
                                     NotificationHelper.logDiagnostic(
                                         context,
@@ -472,8 +566,6 @@ class NotificationWorker(
                                     )
                                     continue
                                 }
-                                NativePushCore.markDelivered(id, topicIds[index], postNumbers[index])
-                                sessionStore.setLastBadgeCount(badge)
                                 delivered[index] = true
                                 pushed++
                                 NotificationHelper.logDiagnostic(
@@ -488,7 +580,7 @@ class NotificationWorker(
 
                     if (!sessionStore.isBadgeTestHolding()) {
                         sessionStore.setLastBadgeCount(unreadTotal)
-                        NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台轮询")
+                        sessionStore.commit { NotificationHelper.updateBadgeCount(context, unreadTotal, source = "后台轮询") }
                     }
 
                     val cursorTarget = NativePushCore.finalizeCursor(
@@ -526,6 +618,9 @@ class NotificationWorker(
                     }
                     return true
                 }
+            } catch (error: PollSessionChangedException) {
+                NotificationHelper.logDiagnostic(context, "push.session.changed", "[后台拉取] 账号已切换，丢弃旧轮次结果")
+                return true
             } catch (error: CancellationException) {
                 NotificationHelper.logDiagnostic(
                     context,

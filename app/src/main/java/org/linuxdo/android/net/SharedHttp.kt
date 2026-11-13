@@ -80,7 +80,7 @@ fun buildSharedHttpClient(
                 ?: ActiveSessionRequest(store.sessionGeneration)
             chain.proceed(request.newBuilder().tag(ActiveSessionRequest::class.java, session).build())
         }
-        .addInterceptor(SiteImageGateInterceptor)
+        .addInterceptor { chain -> SiteImageGateInterceptor.intercept(chain, store) }
         .addNetworkInterceptor(
             SessionHeaderInterceptor(
                 store,
@@ -166,7 +166,13 @@ private class SessionHeaderInterceptor(
     private val userAgent: String,
     private val transportLabel: String,
 ) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
+    override fun intercept(chain: Interceptor.Chain): Response = try {
+        interceptSession(chain)
+    } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+        throw IOException(error.message, error)
+    }
+
+    private fun interceptSession(chain: Interceptor.Chain): Response {
         val original = chain.request()
         val host = original.url.host
         val isLinuxDoHost = host == Config.HOST || host.endsWith(".${Config.HOST}")
@@ -179,7 +185,7 @@ private class SessionHeaderInterceptor(
             ?: store.sessionGeneration
         val sendCookies = original.tag(ActiveSessionRequest::class.java)?.sendCookies != false
         fun checkSession() {
-            if (generation != store.sessionGeneration || store.sessionChanging) {
+            if (generation != store.sessionGeneration || store.sessionChanging || store.isSessionRecoveryPending()) {
                 throw IOException("会话已切换，请重新操作")
             }
         }
@@ -202,12 +208,7 @@ private class SessionHeaderInterceptor(
             builder.header("Referer", "${Config.BASE_URL}/")
         }
         val encodedPath = original.url.encodedPath
-        val isPublicStaticIcon = isLinuxDoHost && (
-            encodedPath.startsWith("/user_avatar/") ||
-                encodedPath.startsWith("/letter_avatar") ||
-                encodedPath.startsWith("/images/emoji/") ||
-                encodedPath.startsWith("/svg-sprite/")
-            )
+        val isPublicStaticIcon = isPublicStaticIconUrl(original.url)
         var rawWebCookieHeader = ""
         val cookieHeader = if (!sendCookies) {
             ""
@@ -226,14 +227,14 @@ private class SessionHeaderInterceptor(
                 .map { it.substringAfter('=').trim() }
                 .filter { it.isNotBlank() }
                 .distinct()
-            if (rawClearances.size > 1) {
+            if (host == Config.HOST && rawClearances.size > 1) {
                 val bestRaw = rawClearances.lastOrNull { !store.isClearanceChallenged(it) }
                 if (bestRaw != null) {
                     webCookies[clearanceName] = bestRaw
                 } else {
                     webCookies.remove(clearanceName)
                 }
-            } else if (rawClearances.size == 1 && store.isClearanceChallenged(rawClearances.single())) {
+            } else if (host == Config.HOST && rawClearances.size == 1 && store.isClearanceChallenged(rawClearances.single())) {
                 webCookies.remove(clearanceName)
             }
             val publicCookies = webCookies.filterKeys { key ->
@@ -251,6 +252,8 @@ private class SessionHeaderInterceptor(
         }
         val sentClearance = SessionStore.parseCookieHeader(cookieHeader)[Config.CF_CLEARANCE_COOKIE]
         original.tag(ActiveSessionRequest::class.java)?.sentClearanceFp = NetDiagnostics.fingerprint(sentClearance)
+        original.tag(ActiveSessionRequest::class.java)?.sentSessionTokenHash =
+            SessionStore.authTokenHash(SessionStore.parseCookieHeader(cookieHeader)[Config.SESSION_COOKIE])
         builder.removeHeader("Cookie")
         if (isPublicStaticIcon || !sendCookies) {
             builder.removeHeader("X-CSRF-Token")
@@ -259,7 +262,21 @@ private class SessionHeaderInterceptor(
             builder.header("Cookie", cookieHeader)
         }
         val outgoing = builder.build()
+        SiteImageGateInterceptor.checkRecovery(outgoing.url, store)
+        if ((original.tag(org.linuxdo.android.push.PushSessionProvider::class.java)
+                ?.backgroundRequestDelayMs() ?: 0L) > 0L) {
+            throw IOException("后台通知请求暂缓，等待验证或限流结束")
+        }
         val response = chain.proceed(outgoing)
+        if (
+            !sentClearance.isNullOrBlank() &&
+            shouldInvalidateClearance(outgoing, response.code, response.header("cf-mitigated"))
+        ) {
+            store.noteClearanceChallenged(
+                sentClearance, host = host,
+                source = "${original.method} ${original.url.encodedPath} -> ${response.code}",
+            )
+        }
         if (shouldTraceCfFlow(encodedPath, response.code)) {
             val webClearance = SessionStore.parseCookieHeader(rawWebCookieHeader)[Config.CF_CLEARANCE_COOKIE]
             val bodyFeatures = if (response.code >= 400) {
@@ -271,6 +288,8 @@ private class SessionHeaderInterceptor(
                 CF_TRACE_TAG,
                 "HTTP ${original.method} $encodedPath -> ${response.code}" +
                     " sentCf=${NetDiagnostics.fingerprint(sentClearance)}" +
+                    " purpose=${clearanceRequestPurpose(outgoing)}" +
+                    " candidateFp=${outgoing.tag(ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"}" +
                     " webCf=${NetDiagnostics.fingerprint(webClearance)}" +
                     " mitigated=${response.header("cf-mitigated") ?: "-"}" +
                     " ray=${response.header("cf-ray") ?: "-"}" +
@@ -319,7 +338,34 @@ data class ActiveSessionRequest(
     val generation: Long,
     @Volatile var sentClearanceFp: String = "-",
     val sendCookies: Boolean = true,
+    @Volatile var sentSessionTokenHash: String? = null,
+    val isClearanceProbe: Boolean = false,
 )
+
+internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
+    (url.host == Config.HOST || url.host.endsWith(".${Config.HOST}")) && (
+        url.encodedPath.startsWith("/user_avatar/") ||
+            url.encodedPath.startsWith("/letter_avatar") ||
+            url.encodedPath.startsWith("/images/emoji/") ||
+            url.encodedPath.startsWith("/svg-sprite/")
+        )
+
+/**
+ * 公开图片和验证探针的单次挑战不等同于主站 API 凭据失效。
+ * 429 + cf-mitigated=challenge 是 WAF 速率规则，凭据本身仍有效，拉黑它只会让后续请求 0 份凭据裸奔撞盾，
+ * 因此只有 403 / 503 交互挑战才判废。
+ */
+internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cfMitigated: String?): Boolean =
+    request.url.isHttps && request.url.host == Config.HOST &&
+        !isPublicStaticIconUrl(request.url) &&
+        request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe != true &&
+        status in setOf(403, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
+
+private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
+    request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
+    isPublicStaticIconUrl(request.url) -> "公开图片"
+    else -> "普通API"
+}
 
 /**
  * 图片失败是否值得稍后自动重试：门禁拒绝、网络抖动、429/408/5xx。
@@ -336,9 +382,11 @@ fun isTransientImageError(error: Throwable?): Boolean = when (error) {
  * 避免一屏失败的图在同一刻集体重发，重新把 Cloudflare 计数打满。
  */
 suspend fun awaitImageRetrySlot(attempt: Int) {
+    SiteImageGateInterceptor.awaitClearanceRecovery()
     val backoffMs = 2_000L shl attempt.coerceIn(0, 3)
     val jitterMs = kotlin.random.Random.nextLong(400L, 1_800L)
     kotlinx.coroutines.delay(maxOf(SiteImageGateInterceptor.cooldownRemainingMs(), backoffMs) + jitterMs)
+    SiteImageGateInterceptor.awaitClearanceRecovery()
 }
 
 /** 每张图自动重试的上限，超过后停在占位，等用户手动重载或重新进入页面。 */
@@ -349,21 +397,23 @@ const val IMAGE_AUTO_RETRY_LIMIT = 2
  *
  * 对齐 fluxdo DioHttpClient 三通道并发隔离：
  * - EMOJI 通道 12 槽（KB 级极小图，RTT 主导）
- * - AVATAR 通道 6 槽（对齐 fluxdo contentSemaphore = 6，避免十几张头像瞬时齐发冲破 CF 边缘速率阈值）
+ * - AVATAR 通道 3 槽（刷长帖时头像与主站 API 共享同一出口的 CF 速率额度，6 槽实测会把正文请求挤进 429 挑战）
  * - MEDIA 通道 4 槽（正文上传大图/附件，独立槽位避免饿死头像）
+ *
+ * 主站 [org.linuxdo.android.data.TopicRepository] 处于 429 冷却时，图片与其自动重试同步暂缓，不单独冲锋。
  */
-internal object SiteImageGateInterceptor : Interceptor {
+internal object SiteImageGateInterceptor {
     /** 门禁主动拒绝（排队超时 / 冷却中）。界面据此判定为瞬时失败，冷却后再重试，而不是降级或放弃。 */
     class ThrottledException(message: String) : IOException(message)
 
     private const val EMOJI_CONCURRENT = 12
-    private const val AVATAR_CONCURRENT = 6
+    private const val AVATAR_CONCURRENT = 3
     private const val MEDIA_CONCURRENT = 4
     private const val ACQUIRE_TIMEOUT_MS = 15_000L
     private const val DEFAULT_COOLDOWN_MS = 4_000L
-    private const val MAX_COOLDOWN_MS = 10_000L
 
     private const val EMOJI_PREFIX = "/images/emoji/"
+    private const val SVG_PREFIX = "/svg-sprite/"
     private val avatarPrefixes = listOf("/user_avatar/", "/letter_avatar")
     private const val UPLOADS_PREFIX = "/uploads/"
 
@@ -371,6 +421,7 @@ internal object SiteImageGateInterceptor : Interceptor {
     private val avatarPermits = java.util.concurrent.Semaphore(AVATAR_CONCURRENT, true)
     private val mediaPermits = java.util.concurrent.Semaphore(MEDIA_CONCURRENT, true)
     @Volatile private var cooldownUntil = 0L
+    @Volatile private var recoveryStore: SessionStore? = null
 
     private enum class ImageCategory {
         NONE, EMOJI, AVATAR, MEDIA
@@ -381,17 +432,32 @@ internal object SiteImageGateInterceptor : Interceptor {
         if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return ImageCategory.NONE
         val path = url.encodedPath
         return when {
-            path.startsWith(EMOJI_PREFIX) -> ImageCategory.EMOJI
+            path.startsWith(EMOJI_PREFIX) || path.startsWith(SVG_PREFIX) -> ImageCategory.EMOJI
             avatarPrefixes.any { path.startsWith(it) } -> ImageCategory.AVATAR
             path.startsWith(UPLOADS_PREFIX) -> ImageCategory.MEDIA
             else -> ImageCategory.NONE
         }
     }
 
-    override fun intercept(chain: Interceptor.Chain): Response {
+    fun checkRecovery(url: okhttp3.HttpUrl, store: SessionStore) {
+        if (categorize(url) == ImageCategory.NONE) return
+        recoveryStore = store
+        if (store.isClearanceRecoveryInProgress()) {
+            throw ThrottledException("站内图片暂缓，等待安全验证完成")
+        }
+    }
+
+    suspend fun awaitClearanceRecovery() {
+        while (recoveryStore?.isClearanceRecoveryInProgress() == true) {
+            kotlinx.coroutines.delay(250L)
+        }
+    }
+
+    fun intercept(chain: Interceptor.Chain, store: SessionStore): Response {
         val request = chain.request()
         val category = categorize(request.url)
         if (category == ImageCategory.NONE) return chain.proceed(request)
+        checkRecovery(request.url, store)
         checkCooldown()
         val semaphore = when (category) {
             ImageCategory.EMOJI -> emojiPermits
@@ -404,30 +470,42 @@ internal object SiteImageGateInterceptor : Interceptor {
         }
         val response = try {
             if (chain.call().isCanceled()) throw IOException("Canceled")
+            checkRecovery(request.url, store)
             checkCooldown()
             chain.proceed(request)
         } finally {
             // 头部到达即释放：读 body 不占着并发名额
             semaphore.release()
         }
-        if (response.code == 429) enterCooldown(response)
+        if (response.code == 429 || (
+                response.code in setOf(403, 503) &&
+                    response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+                )) enterCooldown(response)
         return response
     }
 
-    fun cooldownRemainingMs(): Long =
-        (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+    /** 图片自身冷却与主站全局 429 冷却取较长者；[retryImageAfterDelay] 的自动重试也据此等待。 */
+    fun cooldownRemainingMs(): Long = maxOf(
+        (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+        org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
+    )
 
     private fun checkCooldown() {
         val remaining = cooldownRemainingMs()
         if (remaining > 0L) throw ThrottledException("站内图片限流冷却中，还剩 ${remaining / 1_000L}s")
     }
 
-    private fun enterCooldown(response: Response) {
+    internal fun responseCooldownMs(response: Response): Long {
         val cfChallenge = response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
-        val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(
+        return HttpHeaderUtils.rateLimitCooldownMs(
             HttpHeaderUtils.parseRetryAfter(response.header("Retry-After")),
             if (cfChallenge) DEFAULT_COOLDOWN_MS * 2 else DEFAULT_COOLDOWN_MS,
-        ).coerceAtMost(MAX_COOLDOWN_MS)
+        )
+    }
+
+    private fun enterCooldown(response: Response) {
+        val cfChallenge = response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+        val cooldownMs = responseCooldownMs(response)
         val now = android.os.SystemClock.elapsedRealtime()
         val first = synchronized(this) {
             val wasCooling = now < cooldownUntil
@@ -492,11 +570,32 @@ object NetDiagnostics {
         sink?.log("[诊断] $message")
     }
 
-    /** 同一类 GET 失败 60 秒内只记一次，写请求每次都记。 */
-    private fun shouldTrace(method: String, path: String, status: Int): Boolean {
-        if (method != "GET") return true
-        if (status < 400) return false
-        val key = "$method $path $status"
+    /**
+     * 把 /cdn-cgi/trace 的 key=value 文本压成一行出口摘要，IP 只保留前段，诊断日志会被用户转发。
+     * 不是 trace 格式（被挑战页、错误页）时只给出正文特征。
+     */
+    fun egressTraceSummary(body: String): String {
+        val fields = body.lineSequence()
+            .mapNotNull { line -> line.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0].trim() to it[1].trim() } }
+            .toMap()
+        if (!fields.containsKey("colo")) return "非trace响应 ${bodyFeatures(body)}"
+        val ip = fields["ip"].orEmpty()
+        val maskedIp = when {
+            ip.contains(':') -> "v6 " + ip.split(':').take(2).joinToString(":") + ":*"
+            ip.isNotBlank() -> "v4 " + ip.split('.').take(2).joinToString(".") + ".*.*"
+            else -> "-"
+        }
+        return "ip=$maskedIp colo=${fields["colo"]} loc=${fields["loc"] ?: "-"} http=${fields["http"] ?: "-"}" +
+            " tls=${fields["tls"] ?: "-"} sni=${fields["sni"] ?: "-"} warp=${fields["warp"] ?: "-"}"
+    }
+
+    /** 同一用途和候选凭据的 GET 诊断节流；探针成功也留证，避免新凭据被旧请求的日志节流隐藏。 */
+    private fun shouldTrace(request: okhttp3.Request, status: Int): Boolean {
+        if (request.method != "GET") return true
+        val session = request.tag(ActiveSessionRequest::class.java)
+        if (status < 400 && session?.isClearanceProbe != true) return false
+        val key = "${request.method} ${request.url.host}${request.url.encodedPath} $status " +
+            "${clearanceRequestPurpose(request)} ${session?.sentClearanceFp ?: "-"}"
         val now = android.os.SystemClock.elapsedRealtime()
         val last = throttle[key]
         if (last != null && now - last < 60_000L) return false
@@ -515,7 +614,7 @@ object NetDiagnostics {
     ) {
         if (sink == null) return
         val path = request.url.encodedPath
-        if (!shouldTrace(request.method, path, response.code)) return
+        if (!shouldTrace(request, response.code)) return
         val connection = chain.connection()
         val route = connection?.route()
         val proxyType = route?.proxy?.type()?.name ?: "?"
@@ -531,6 +630,8 @@ object NetDiagnostics {
         val sentToken = cookieFingerprints(sentCookieHeader, Config.SESSION_COOKIE)
         log(
             "A ${request.method} ${request.url.host}$path -> ${response.code}" +
+                " | purpose=${clearanceRequestPurpose(request)}" +
+                " candidateFp=${request.tag(ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"}" +
                 " | cf-mitigated=${response.header("cf-mitigated") ?: "-"}" +
                 " cf-ray=${response.header("cf-ray") ?: "-"}" +
                 " server=${response.header("server") ?: "-"}" +

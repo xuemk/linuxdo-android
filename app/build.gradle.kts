@@ -13,8 +13,8 @@ android {
         applicationId = "org.linuxdo.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "1.5.0"
+        versionCode = 18
+        versionName = "1.6.0"
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -62,6 +62,12 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // DoH (DNS over HTTPS) 支持：纯 Kotlin 实现，无本地库，增量 < 30KB
     implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
+
+    val media3Version = "1.5.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
+    implementation("androidx.media3:media3-datasource-okhttp:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")

@@ -2,9 +2,6 @@ package org.linuxdo.android.data
 
 import android.content.Context
 import android.content.SharedPreferences
-import androidx.core.content.edit
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -42,15 +39,28 @@ class AccountManager(context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     @Volatile
     private var memoryCache: StoredAccounts? = null
+    private var storageFailure: EncryptedStorageUnavailableException? = null
 
     data class AccountSnapshot(
         val accounts: List<AccountSession>,
         val activeUserId: Long,
+        val storageAvailable: Boolean = true,
+        val error: String? = null,
     )
 
     @Synchronized
     fun snapshot(): AccountSnapshot {
-        val current = read()
+        val current = try {
+            read()
+        } catch (error: EncryptedStorageUnavailableException) {
+            val previous = memoryCache
+            return AccountSnapshot(
+                accounts = previous?.accounts.orEmpty().sortedByDescending { it.lastActiveAt },
+                activeUserId = previous?.activeUserId ?: 0L,
+                storageAvailable = false,
+                error = error.message,
+            )
+        }
         return AccountSnapshot(
             accounts = current.accounts.sortedByDescending { it.lastActiveAt },
             activeUserId = current.activeUserId,
@@ -58,7 +68,7 @@ class AccountManager(context: Context) {
     }
 
     @Synchronized
-    fun accounts(): List<AccountSession> = snapshot().accounts
+    fun accounts(): List<AccountSession> = read().accounts.sortedByDescending { it.lastActiveAt }
 
     @Synchronized
     fun activeUserId(): Long = read().activeUserId
@@ -159,8 +169,8 @@ class AccountManager(context: Context) {
 
     @Synchronized
     fun clear() {
-        memoryCache = StoredAccounts()
-        preferences.edit { remove(KEY_ACCOUNTS) }
+        read()
+        write(StoredAccounts())
     }
 
     @Synchronized
@@ -184,23 +194,37 @@ class AccountManager(context: Context) {
     }
 
     private fun read(): StoredAccounts {
-        memoryCache?.let { return it }
-        val loaded = runCatching {
-            json.decodeFromString<StoredAccounts>(preferences.getString(KEY_ACCOUNTS, null).orEmpty()).also { stored ->
-                stored.accounts.forEach { acc ->
-                    if (!acc.animatedAvatar.isNullOrBlank() && isAnimatedAvatarPath(acc.animatedAvatar)) {
-                        AvatarCache.record(acc.username, acc.animatedAvatar)
-                    }
+        if (storageFailure == null) memoryCache?.let { return it }
+        try {
+            val raw = preferences.getString(KEY_ACCOUNTS, null)
+            val loaded = if (raw == null) StoredAccounts() else json.decodeFromString<StoredAccounts>(raw)
+            loaded.accounts.forEach { account ->
+                if (!account.animatedAvatar.isNullOrBlank() && isAnimatedAvatarPath(account.animatedAvatar)) {
+                    AvatarCache.record(account.username, account.animatedAvatar)
                 }
             }
-        }.getOrDefault(StoredAccounts())
-        memoryCache = loaded
-        return loaded
+            memoryCache = loaded
+            storageFailure = null
+            return loaded
+        } catch (error: Exception) {
+            val failure = error as? EncryptedStorageUnavailableException ?: EncryptedStorageUnavailableException(error)
+            storageFailure = failure
+            throw failure
+        }
     }
 
     private fun write(value: StoredAccounts) {
-        memoryCache = value
-        preferences.edit { putString(KEY_ACCOUNTS, json.encodeToString(value)) }
+        try {
+            if (!preferences.edit().putString(KEY_ACCOUNTS, json.encodeToString(value)).commit()) {
+                throw EncryptedStorageUnavailableException()
+            }
+            memoryCache = value
+            storageFailure = null
+        } catch (error: Exception) {
+            val failure = error as? EncryptedStorageUnavailableException ?: EncryptedStorageUnavailableException(error)
+            storageFailure = failure
+            throw failure
+        }
     }
 
     companion object {
@@ -209,18 +233,7 @@ class AccountManager(context: Context) {
         private const val KEY_ACCOUNTS = "accounts"
         private const val FORUM_SESSION_COOKIE = "_forum_session"
 
-        fun encryptedPreferences(context: Context): SharedPreferences {
-            fun create() = EncryptedSharedPreferences.create(
-                context,
-                PREFS_NAME,
-                MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
-            return runCatching { create() }.getOrElse {
-                context.deleteSharedPreferences(PREFS_NAME)
-                create()
-            }
-        }
+        fun encryptedPreferences(context: Context): SharedPreferences =
+            SafeEncryptedPrefs.open(context, PREFS_NAME)
     }
 }

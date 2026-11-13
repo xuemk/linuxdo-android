@@ -9,7 +9,12 @@ import java.io.Serializable
 /** 第一期的全部路由。密封类便于后续从 URL 解析(通知跳转、深链)时集中扩展。 */
 sealed interface Route : Serializable {
     data object TopicList : Route
-    data class TopicDetail(val topicId: Long, val title: String, val postNumber: Int? = null) : Route
+    data class TopicDetail(
+        val topicId: Long,
+        val title: String,
+        val postNumber: Int? = null,
+        val savedPosition: org.linuxdo.android.data.TopicReadingPosition? = null,
+    ) : Route
     data object CategoryList : Route
     data class CategoryTopics(val categoryId: Int, val slug: String, val name: String) : Route
     data class TagTopics(val tag: String) : Route
@@ -82,6 +87,19 @@ class NavStack(root: Route) {
             listOf(NavEntry(nextId++, route))
         } else {
             entries.dropLast(1) + entries.last().copy(route = route)
+        }
+    }
+
+    fun switchSavedTopic(route: Route.TopicDetail) {
+        // 新条目 id 隔离 Compose 保存状态；切换暂存不会无限累积返回栈。
+        if (current is Route.TopicDetail) entries = entries.dropLast(1) + NavEntry(nextId++, route)
+        else push(route)
+    }
+
+    fun updateTopicTitle(topicId: Long, title: String) {
+        entries = entries.map { entry ->
+            val route = entry.route
+            if (route is Route.TopicDetail && route.topicId == topicId) entry.copy(route = route.copy(title = title)) else entry
         }
     }
 

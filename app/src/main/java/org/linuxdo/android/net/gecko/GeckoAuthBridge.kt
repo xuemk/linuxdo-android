@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.linuxdo.android.Config
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoSession
@@ -123,13 +124,53 @@ class GeckoAuthBridge private constructor(
 
     suspend fun readCookies(): JSONArray = JSONArray(request("cookies"))
 
+    suspend fun observeInAppPage(): JSONObject = JSONObject(request("observeInAppPage"))
+
     suspend fun prepareAuthCookies(cookies: Map<String, String>) {
         request("prepareAuth", JSONObject().put("cookies", JSONObject(cookies)))
+    }
+
+    suspend fun prepareInAppSessionCookies(
+        cookies: Map<String, String>,
+        challengedClearances: Set<String>,
+    ) {
+        val payload = JSONObject()
+            .put("cookies", JSONObject(cookies))
+            .put("challengedClearances", JSONArray(challengedClearances.toList()))
+        request("prepareInAppSession", payload)
+    }
+
+    suspend fun readCfClearances(): List<String> {
+        val array = readCookies()
+        val result = mutableListOf<String>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            if (item.optString("name").equals("cf_clearance", ignoreCase = true)) {
+                val value = item.optString("value").trim()
+                if (value.isNotEmpty()) result.add(value)
+            }
+        }
+        return result
     }
 
     suspend fun clearCfClearance() {
         request("clearCf")
     }
+
+    /** 当前文档是否命中各组标记词，返回 组名 -> 是否命中。 */
+    suspend fun probeMarkers(groups: Map<String, List<String>>): Map<String, Boolean> {
+        val payload = JSONObject()
+        groups.forEach { (name, words) -> payload.put(name, JSONArray(words)) }
+        val raw = request("markers", JSONObject().put("groups", payload))
+        val result = JSONObject(raw)
+        return groups.keys.associateWith { result.optBoolean(it) }
+    }
+
+    /** 用 Gecko 自己的网络栈请求 /cdn-cgi/trace，供与 OkHttp 出口对照。 */
+    suspend fun readEgressTrace(): String = JSONTokener(request("trace")).nextValue()?.toString().orEmpty()
+
+    /** WebExtension 内容脚本端口是否已与当前同源文档建立连接。 */
+    fun isConnected(): Boolean = !closed && activePort != null
 
     fun close() {
         if (closed) return

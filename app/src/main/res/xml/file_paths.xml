@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <!--
-      只暴露 cacheDir/apk/ 这一个子目录：更新包下完即装、装完可弃，
-      放缓存目录系统能在空间紧张时自行回收，也省掉任何存储权限。
+      仅开放安装包与用户主动生成的分享图片；文件位于缓存目录，
+      分享时通过临时只读 URI 授权交给目标应用。
     -->
     <cache-path name="apk" path="apk/" />
+    <cache-path name="shared_posts" path="shared-posts/" />
 </paths>

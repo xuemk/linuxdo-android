@@ -76,7 +76,13 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
+import coil.compose.SubcomposeAsyncImage
+import org.linuxdo.android.Config
+import org.linuxdo.android.data.ChatUpload
 import kotlinx.coroutines.delay
 import org.linuxdo.android.data.ChatChannelSummary
 import org.linuxdo.android.data.ChatMessageSummary
@@ -858,6 +864,37 @@ private fun ChatMessageBubble(
         renderEmojiShortcodes(raw, keepUnknown = true).orEmpty()
     }
     val timeStr = remember(message.createdAt) { RelativeTime.format(message.createdAt) }
+    // 图片附件与文件附件分类
+    val imageUploads = remember(message.uploads) { message.uploads.filter { it.isImage } }
+    val fileUploads = remember(message.uploads) { message.uploads.filter { !it.isImage } }
+    // 全屏预览状态
+    var fullscreenImage by remember { mutableStateOf<ChatUpload?>(null) }
+
+    // 全屏图片预览 Dialog
+    fullscreenImage?.let { upload ->
+        Dialog(
+            onDismissRequest = { fullscreenImage = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { fullscreenImage = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                SubcomposeAsyncImage(
+                    model = upload.absoluteUrl(Config.BASE_URL),
+                    contentDescription = upload.originalFilename,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+        }
+    }
 
     if (isMe) {
         // 我方发送的消息靠右展示
@@ -879,10 +916,33 @@ private fun ChatMessageBubble(
                     .background(IosTheme.colors.accent)
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             ) {
-                Text(
-                    text = textContent,
-                    style = TextStyle(fontSize = 15.sp, color = Color.White, lineHeight = 21.sp),
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (textContent.isNotBlank()) {
+                        Text(
+                            text = textContent,
+                            style = TextStyle(fontSize = 15.sp, color = Color.White, lineHeight = 21.sp),
+                        )
+                    }
+                    // 渲染图片附件（缩略图点击可全屏查看）
+                    imageUploads.forEach { upload ->
+                        AsyncImage(
+                            model = upload.absoluteThumbnailUrl(Config.BASE_URL),
+                            contentDescription = upload.originalFilename,
+                            modifier = Modifier
+                                .widthIn(max = 200.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { fullscreenImage = upload },
+                            contentScale = ContentScale.FillWidth,
+                        )
+                    }
+                    // 渲染非图片文件附件
+                    fileUploads.forEach { upload ->
+                        Text(
+                            text = "📎 ${upload.originalFilename}",
+                            style = TextStyle(fontSize = 13.sp, color = Color.White.copy(alpha = 0.85f)),
+                        )
+                    }
+                }
             }
         }
     } else {
@@ -939,10 +999,33 @@ private fun ChatMessageBubble(
                         )
                         .padding(horizontal = 14.dp, vertical = 9.dp),
                 ) {
-                    Text(
-                        text = textContent,
-                        style = TextStyle(fontSize = 15.sp, color = IosTheme.colors.label, lineHeight = 21.sp),
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (textContent.isNotBlank()) {
+                            Text(
+                                text = textContent,
+                                style = TextStyle(fontSize = 15.sp, color = IosTheme.colors.label, lineHeight = 21.sp),
+                            )
+                        }
+                        // 渲染图片附件（缩略图点击可全屏查看）
+                        imageUploads.forEach { upload ->
+                            AsyncImage(
+                                model = upload.absoluteThumbnailUrl(Config.BASE_URL),
+                                contentDescription = upload.originalFilename,
+                                modifier = Modifier
+                                    .widthIn(max = 200.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { fullscreenImage = upload },
+                                contentScale = ContentScale.FillWidth,
+                            )
+                        }
+                        // 渲染非图片文件附件
+                        fileUploads.forEach { upload ->
+                            Text(
+                                text = "📎 ${upload.originalFilename}",
+                                style = TextStyle(fontSize = 13.sp, color = IosTheme.colors.secondaryLabel),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -964,6 +1047,7 @@ private fun ChatComposerBottomSheet(
     onSend: (String, List<Long>) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val completionSource = org.linuxdo.android.ui.LocalEditorSuggestionSource.current
     var isFullScreen by rememberSaveable { mutableStateOf(false) }
     var showSheetEmojiPicker by rememberSaveable { mutableStateOf(false) }
     var editorView by remember { mutableStateOf<RichMarkdownEditorView?>(null) }
@@ -1075,6 +1159,7 @@ private fun ChatComposerBottomSheet(
                             factory = { ctx ->
                                 RichMarkdownEditorView(ctx).apply {
                                     updateThemeColors(textColorInt, hintColorInt)
+                                    setCompletionSource(completionSource)
                                     setInitialMarkdown(draft, pendingAttachments)
                                     setOnMarkdownChangeListener { newRaw -> onDraftChange(newRaw) }
                                     setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
@@ -1083,6 +1168,7 @@ private fun ChatComposerBottomSheet(
                             },
                             update = { view ->
                                 view.updateThemeColors(textColorInt, hintColorInt)
+                                view.setCompletionSource(completionSource)
                             },
                         )
                     }

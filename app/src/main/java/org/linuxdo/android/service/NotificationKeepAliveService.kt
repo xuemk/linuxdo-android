@@ -1,6 +1,7 @@
 package org.linuxdo.android.service
 
 import android.app.AlarmManager
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
@@ -37,6 +38,7 @@ class NotificationKeepAliveService : Service() {
     private var pollJob: Job? = null
     private var quickPollJob: Job? = null
     private var graceOffJob: Job? = null
+    private var isStopping = false
 
     private fun logService(message: String) {
         NotificationHelper.logDiagnostic(this, "push.service", "[保活] $message", true)
@@ -44,6 +46,7 @@ class NotificationKeepAliveService : Service() {
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (isStopping) return
             when (intent?.action) {
                 Intent.ACTION_SCREEN_ON -> handleScreenOn()
                 Intent.ACTION_SCREEN_OFF -> handleScreenOff()
@@ -135,12 +138,6 @@ class NotificationKeepAliveService : Service() {
         val sessionStore = LinuxDoPushSdk.getConfig().sessionProvider(this)
         logService("启动 action=${intent?.action ?: "常规/系统恢复"} 后台通知=${sessionStore.isBackgroundNotificationEnabled()} 会话存在=${sessionStore.hasSession()}")
         NotificationHelper.recordPushState(this, "服务启动")
-        if (!sessionStore.isBackgroundNotificationEnabled() || !sessionStore.hasSession()) {
-            cancelDozeAlarm(this)
-            cancelMinimizedPoll(this)
-            stopSelf()
-            return START_NOT_STICKY
-        }
 
         val config = LinuxDoPushSdk.getConfig()
         val openAppIntent = Intent(this, config.targetActivityClass).apply {
@@ -167,14 +164,36 @@ class NotificationKeepAliveService : Service() {
             .setOngoing(true)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (error: RuntimeException) {
+            // startForeground 在服务回调中执行，外层 startForegroundService 的捕获覆盖不到这里。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && error is ForegroundServiceStartNotAllowedException) {
+                stopForSystemLimit("前台服务启动受系统限制 ${error.message.orEmpty()}", startId)
+                return START_NOT_STICKY
+            }
+            throw error
+        }
+
+        // 即使准备退出，也先处理本次前台启动要求，避免排队的启动请求触发未及时进入前台的崩溃。
+        if (isStopping) {
+            stopForSystemLimit("启动时服务已在停止", startId)
+            return START_NOT_STICKY
+        }
+        if (!sessionStore.isBackgroundNotificationEnabled() || !sessionStore.hasSession()) {
+            cancelDozeAlarm(this)
+            cancelMinimizedPoll(this)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
 
         if (intent?.action == ACTION_DOZE_ALARM_POLL) {
@@ -296,7 +315,7 @@ class NotificationKeepAliveService : Service() {
             while (isActive) {
                 val currentStore = LinuxDoPushSdk.getConfig().sessionProvider(this@NotificationKeepAliveService)
                 if (!currentStore.isBackgroundNotificationEnabled() || !currentStore.hasSession()) {
-                    stopSelf()
+                    stopForSystemLimit("轮询检测到后台通知未启用或会话已退出")
                     break
                 }
 
@@ -372,16 +391,32 @@ class NotificationKeepAliveService : Service() {
         }
     }
 
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stopForSystemLimit("前台服务超时 startId=$startId type=$fgsType")
+    }
+
+    private fun stopForSystemLimit(reason: String, startId: Int? = null) {
+        isStopping = true
+        if (startId == null) {
+            // 超时回调必须立即停止整个服务，不能使用可能过期的 startId。
+            stopSelf()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            // 启动回调只结束已处理的 startId，让后续排队请求有机会处理各自的前台启动要求。
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf(startId)
+        }
+        serviceScope.cancel()
+        releaseGraceWakeLock()
+        releaseWakeLockSafely()
+        logService("$reason：已停止服务，后续由闹钟检查通知")
+    }
+
     override fun onDestroy() {
+        isStopping = true
         logService("服务销毁")
         unregisterScreenReceiver()
-        val store = LinuxDoPushSdk.getConfig().sessionProvider(this)
-        if (store.isBackgroundNotificationEnabled() && store.hasSession()) {
-            scheduleNextDozeAlarm(this)
-        } else {
-            cancelDozeAlarm(this)
-            cancelMinimizedPoll(this)
-        }
+        scheduleFallbackPolls(this)
 
         graceOffJob?.cancel()
         pollJob?.cancel()
@@ -558,6 +593,19 @@ class NotificationKeepAliveService : Service() {
             }
         }
 
+        private fun scheduleFallbackPolls(context: Context) {
+            val store = LinuxDoPushSdk.getConfig().sessionProvider(context)
+            if (store.isBackgroundNotificationEnabled() && store.hasSession()) {
+                scheduleNextDozeAlarm(context)
+                if (isScreenInteractive(context) && !store.isAppInForeground()) {
+                    scheduleMinimizedPoll(context)
+                }
+            } else {
+                cancelDozeAlarm(context)
+                cancelMinimizedPoll(context)
+            }
+        }
+
         fun start(context: Context) {
             val sessionStore = LinuxDoPushSdk.getConfig().sessionProvider(context)
             if (!sessionStore.isBackgroundNotificationEnabled() || !sessionStore.hasSession()) {
@@ -568,6 +616,7 @@ class NotificationKeepAliveService : Service() {
             runCatching {
                 context.startForegroundService(intent)
             }.onFailure {
+                scheduleFallbackPolls(context)
                 NotificationHelper.logDiagnostic(context, "service.start.error", "[保活] 启动服务失败 ${it.javaClass.simpleName}", true)
             }
         }

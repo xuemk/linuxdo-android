@@ -41,6 +41,9 @@ class OkHttpTransport(
         return execute(path, present = present)
     }
 
+    override suspend fun getForVerification(path: String, present: Boolean): TransportResult =
+        execute(path, present = present, isClearanceProbe = true, expectedGeneration = store.sessionGeneration)
+
     override suspend fun write(
         path: String,
         method: String,
@@ -50,9 +53,9 @@ class OkHttpTransport(
         present: Boolean,
     ): TransportResult = execute(path, csrf, method, body, contentType, present = present)
 
-    override suspend fun revalidate(reason: String, failedClearanceFp: String): Boolean {
+    override suspend fun revalidate(reason: String, failedClearanceFp: String, requestHost: String): Boolean {
         diagnostics.recordSilentRevalidation()
-        return browser.clearChallenge("A: $reason", failedClearanceFp)
+        return browser.clearChallenge("A: $reason", failedClearanceFp, requestHost)
     }
 
     override suspend fun upload(
@@ -93,9 +96,14 @@ class OkHttpTransport(
         body: String? = null,
         contentType: String = Transport.JSON_CONTENT_TYPE,
         present: Boolean = true,
+        isClearanceProbe: Boolean = false,
+        expectedGeneration: Long? = null,
     ): TransportResult {
         // 先把 WebView 的现场 Cookie 同步进加密存储,共享客户端的 Interceptor 会读这份快照。
-        withContext(Dispatchers.Main) { store.syncFromWebView() }
+        withContext(Dispatchers.Main) {
+            if (expectedGeneration != null && expectedGeneration != store.sessionGeneration) throw CancellationException("会话已切换")
+            store.syncFromWebView()
+        }
         val targetUrl = if (path.startsWith("http://") || path.startsWith("https://")) path else Config.BASE_URL + path
         val isConnect = targetUrl.contains("connect.linux.do")
         val acceptHeader = if (path.startsWith("/raw/")) {
@@ -136,14 +144,18 @@ class OkHttpTransport(
             }
             .build()
 
-        return runRequest(request)
+        return runRequest(request, isClearanceProbe, expectedGeneration)
     }
 
-    private suspend fun runRequest(request: Request): TransportResult {
+    private suspend fun runRequest(
+        request: Request,
+        isClearanceProbe: Boolean = false,
+        expectedGeneration: Long? = null,
+    ): TransportResult {
         // 在发起前取标签：失败时记的是这次请求实际走的代次，而不是之后被回收换上的新代次。
         val label = clientLabel
         return try {
-            sendRequest(request)
+            sendRequest(request, isClearanceProbe, expectedGeneration)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: IOException) {
@@ -157,9 +169,14 @@ class OkHttpTransport(
         }
     }
 
-    private suspend fun sendRequest(request: Request): TransportResult {
-        val reqGeneration = store.sessionGeneration
-        val activeTag = ActiveSessionRequest(reqGeneration)
+    private suspend fun sendRequest(
+        request: Request,
+        isClearanceProbe: Boolean = false,
+        expectedGeneration: Long? = null,
+    ): TransportResult {
+        val reqGeneration = expectedGeneration ?: store.sessionGeneration
+        if (reqGeneration != store.sessionGeneration) throw CancellationException("会话已切换")
+        val activeTag = ActiveSessionRequest(reqGeneration, isClearanceProbe = isClearanceProbe)
         val result = suspendCancellableCoroutine<TransportResult> { continuation ->
             val call = client.newCall(request.newBuilder()
                 .tag(ActiveSessionRequest::class.java, activeTag).build())
@@ -192,6 +209,7 @@ class OkHttpTransport(
                                 retryAfterSeconds = retryAfter,
                                 sentClearanceFp = activeTag.sentClearanceFp,
                                 cfMitigated = mitigated,
+                                sentSessionTokenHash = activeTag.sentSessionTokenHash,
                             )
                             if (continuation.isActive) {
                                 continuation.resume(transportResult)

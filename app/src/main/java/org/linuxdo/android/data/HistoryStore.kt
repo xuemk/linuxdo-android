@@ -93,9 +93,122 @@ class HistoryStore(context: Context) {
         preferences.edit { remove(storageKey(userId)) }
     }
 
+    @Synchronized
+    fun updateMetadata(userId: Long, topicId: Long, title: String, categoryName: String?, categoryColor: String?) {
+        val current = entries(userId)
+        val updated = current.map { if (it.topicId == topicId) it.copy(title = title, categoryName = categoryName, categoryColor = categoryColor) else it }
+        if (updated != current) check(preferences.edit().putString(storageKey(userId), json.encodeToString(updated)).commit()) { "历史记录更新失败" }
+    }
+
     private companion object {
         const val PREFERENCES = "reading_history"
         const val KEY_ENTRIES = "entries"
         const val MAX_ENTRIES = 500
+    }
+}
+
+@Serializable
+data class TopicReadingPosition(
+    val postNumber: Int = 1,
+    val partIndex: Int = 0,
+    val offset: Int = 0,
+    val atTop: Boolean = true,
+    val filterUserId: Long? = null,
+    val descending: Boolean = false,
+    val collapsed: List<Long> = emptyList(),
+    val expanded: List<Long> = emptyList(),
+) : java.io.Serializable
+
+@Serializable
+data class SavedTopic(
+    val topicId: Long,
+    val title: String,
+    val savedAt: Long,
+    val categoryName: String? = null,
+    val categoryColor: String? = null,
+    val totalPosts: Int = 1,
+    val pinned: Boolean = false,
+    val position: TopicReadingPosition = TopicReadingPosition(),
+)
+
+/** 暂存不设置过期时间；账号切换只切换读写分区，清缓存不清暂存。 */
+class SavedTopicStore(context: Context) {
+    private val preferences = context.getSharedPreferences("saved_topics", Context.MODE_PRIVATE)
+    private val json = Json { ignoreUnknownKeys = true }
+
+    @Synchronized
+    fun entries(userId: Long): List<SavedTopic> {
+        if (userId <= 0L) return emptyList()
+        val raw = preferences.getString("entries_$userId", null) ?: return emptyList()
+        return json.decodeFromString<List<SavedTopic>>(raw).filter { it.topicId > 0L }.distinctBy { it.topicId }
+    }
+
+    @Synchronized
+    fun add(userId: Long, entry: SavedTopic): List<SavedTopic> {
+        require(userId > 0L && entry.topicId > 0L)
+        val current = entries(userId)
+        if (current.any { it.topicId == entry.topicId }) return current
+        check(current.size < 10) { "最多暂存 10 篇，请先移除不需要的话题" }
+        return write(userId, current + entry)
+    }
+
+    @Synchronized
+    fun updatePosition(userId: Long, topicId: Long, position: TopicReadingPosition, totalPosts: Int = 0): List<SavedTopic> {
+        val current = entries(userId)
+        if (current.none { it.topicId == topicId }) return current
+        val updated = current.map {
+            if (it.topicId == topicId) it.copy(position = position, totalPosts = maxOf(it.totalPosts, totalPosts, position.postNumber)) else it
+        }
+        return if (updated == current) current else write(userId, updated)
+    }
+
+    /** 用列表探测或实时消息带回的楼层数刷新总数；不新增条目，已移除的话题直接忽略。 */
+    @Synchronized
+    fun updateTotals(userId: Long, totals: Map<Long, Int>): List<SavedTopic> {
+        val current = entries(userId)
+        val updated = current.map { entry ->
+            val fresh = totals[entry.topicId]?.takeIf { it > 0 } ?: return@map entry
+            entry.copy(totalPosts = maxOf(fresh, entry.position.postNumber, 1))
+        }
+        return if (updated == current) current else write(userId, updated)
+    }
+
+    @Synchronized
+    fun togglePin(userId: Long, topicId: Long): List<SavedTopic> {
+        val current = entries(userId)
+        return write(userId, current.map { if (it.topicId == topicId) it.copy(pinned = !it.pinned) else it })
+    }
+
+    @Synchronized
+    fun updateMetadata(userId: Long, topicId: Long, title: String, categoryName: String?, categoryColor: String?): List<SavedTopic> {
+        val current = entries(userId)
+        val updated = current.map { if (it.topicId == topicId) it.copy(title = title, categoryName = categoryName, categoryColor = categoryColor) else it }
+        return if (updated == current) current else write(userId, updated)
+    }
+
+    @Synchronized
+    fun remove(userId: Long, topicId: Long): List<SavedTopic> {
+        return write(userId, entries(userId).filterNot { it.topicId == topicId })
+    }
+
+    @Synchronized
+    fun clear(userId: Long): List<SavedTopic> {
+        return write(userId, emptyList())
+    }
+
+    @Synchronized
+    fun restore(userId: Long, removed: List<SavedTopic>): List<SavedTopic> {
+        val current = entries(userId)
+        val combined = current + removed.filter { entry -> current.none { it.topicId == entry.topicId } }
+        check(combined.size <= 10) { "撤销后将超过 10 篇，请先整理暂存" }
+        return write(userId, combined)
+    }
+
+    private fun write(userId: Long, entries: List<SavedTopic>): List<SavedTopic> {
+        require(userId > 0L)
+        check(preferences.edit().putString("entries_$userId", json.encodeToString(entries)).commit()) {
+            "暂存保存失败，请重试"
+        }
+        return entries
     }
 }

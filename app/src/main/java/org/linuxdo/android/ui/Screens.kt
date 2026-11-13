@@ -16,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
@@ -88,6 +90,7 @@ import java.util.Date
 import kotlin.math.min
 import org.linuxdo.android.Config
 import org.linuxdo.android.BuildConfig
+import org.linuxdo.android.data.SavedTopic
 import org.linuxdo.android.service.NotificationHelper
 import org.linuxdo.android.service.ApkUpdateInstaller
 import org.linuxdo.android.data.DiscourseTagInfo
@@ -110,6 +113,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
+import org.linuxdo.android.data.EditorSuggestion
+import org.linuxdo.android.data.EditorCompletionRequest
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
@@ -176,6 +182,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import kotlinx.coroutines.flow.first
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.geometry.Size
@@ -187,6 +194,7 @@ import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.AvatarCache
 import org.linuxdo.android.data.isAnimatedAvatarPath
 import org.linuxdo.android.data.compactCategoryGroups
+import org.linuxdo.android.data.creatableCategories
 import org.linuxdo.android.data.fixedTagsForCategory
 import org.linuxdo.android.data.flattenCategories
 import org.linuxdo.android.ui.design.IosNavBar
@@ -195,6 +203,10 @@ import org.linuxdo.android.ui.screen.ComposerAttachmentIcon
 import org.linuxdo.android.ui.screen.ComposerEmojiIcon
 import org.linuxdo.android.ui.screen.ComposerImageIcon
 import org.linuxdo.android.ui.screen.ComposerBoldIcon
+import org.linuxdo.android.ui.screen.ComposerPollIcon
+import android.graphics.Typeface
+import android.text.TextUtils
+import androidx.core.graphics.ColorUtils
 import org.linuxdo.android.ui.screen.ComposerTagIcon
 import org.linuxdo.android.ui.screen.ComposerLockIcon
 import org.linuxdo.android.ui.screen.PostAction
@@ -4172,7 +4184,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.accent.copy(alpha = 0.12f))
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 val nextBadge = store.incrementLastBadgeCount().coerceAtLeast(1)
                                 store.setBadgeTestHoldUntil(System.currentTimeMillis() + BADGE_TEST_HOLD_MILLIS)
@@ -4198,7 +4211,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.fieldBackground)
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 val nextBadge = (store.getLastBadgeCount() - 1).coerceAtLeast(0)
                                 store.setLastBadgeCount(nextBadge, force = true)
@@ -4218,7 +4232,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(Color(0xFFFF2D55).copy(alpha = 0.12f))
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 store.setTestSimulatedUnreadCount(0)
                                 store.setLastBadgeCount(99, force = true)
                                 store.setBadgeTestHoldUntil(System.currentTimeMillis() + BADGE_TEST_HOLD_MILLIS)
@@ -4244,7 +4259,8 @@ fun SettingsScreen(
                             .clip(RoundedCornerShape(8.dp))
                             .background(IosTheme.colors.fieldBackground)
                             .clickable {
-                                val store = org.linuxdo.android.data.SessionStore(context)
+                                val store = (context.applicationContext as? org.linuxdo.android.App)?.container?.sessionStore
+                                    ?: org.linuxdo.android.data.SessionStore(context.applicationContext)
                                 // 解除锁定并清掉模拟未读，让下一轮 refreshUnread 立刻校准回真实未读。
                                 store.setBadgeTestHoldUntil(0L)
                                 store.setTestSimulatedUnreadCount(0)
@@ -6510,14 +6526,580 @@ internal class CreatorMediaSpan(
     }
 }
 
+// ==========================================
+// ── 可视化投票构建器数据结构与所见即所得 Span ──
+// ==========================================
+
+internal const val POLL_TYPE_REGULAR = "regular"
+internal const val POLL_TYPE_MULTIPLE = "multiple"
+internal const val POLL_TYPE_NUMBER = "number"
+
+internal val POLL_RESULT_OPTIONS = listOf(
+    "always" to "始终可见",
+    "on_vote" to "投票后可见",
+    "on_close" to "关闭后可见",
+    "staff_only" to "仅管理人员可见",
+)
+
+internal data class PollBuilderSpec(
+    val type: String = POLL_TYPE_REGULAR,
+    val results: String = "always",
+    val publicVoter: Boolean = true,
+    val chartType: String = "bar",
+    val title: String = "",
+    val options: List<String> = emptyList(),
+    val min: Int? = null,
+    val max: Int? = null,
+    val step: Int? = null,
+    val closeMillis: Long? = null,
+    val pollName: String? = null,
+    val extraAttrs: Map<String, String> = emptyMap(),
+) {
+    /** 组装标准 Discourse `[poll ...]` BBCode（对齐官方 poll-ui-builder 与 Fluxdo PollSpec.toBBCode） */
+    fun toBBCode(existingPollCount: Int = 0): String {
+        val sb = StringBuilder("[poll")
+        val nameToUse = pollName ?: extraAttrs["name"] ?: if (existingPollCount > 0) "poll${existingPollCount + 1}" else null
+        if (!nameToUse.isNullOrBlank()) {
+            sb.append(if (nameToUse.contains(' ')) " name=\"$nameToUse\"" else " name=$nameToUse")
+        }
+        sb.append(" type=$type results=$results")
+        if (type != POLL_TYPE_REGULAR) {
+            if (min != null) sb.append(" min=$min")
+            if (max != null) sb.append(" max=$max")
+        }
+        if (type == POLL_TYPE_NUMBER) {
+            sb.append(" step=${step ?: 1}")
+        }
+        sb.append(" public=$publicVoter")
+        if (type != POLL_TYPE_NUMBER) {
+            sb.append(" chartType=$chartType")
+        }
+        if (closeMillis != null) {
+            sb.append(" close=${java.time.Instant.ofEpochMilli(closeMillis)}")
+        }
+        // 未建模的扩展属性原样写回 (groups/status/dynamic 等)
+        for ((k, v) in extraAttrs) {
+            if (k.equals("name", ignoreCase = true)) continue
+            sb.append(if (v.contains(' ')) " $k=\"$v\"" else " $k=$v")
+        }
+        sb.append("]\n")
+        val trimmedTitle = title.trim()
+        if (trimmedTitle.isNotEmpty()) {
+            sb.append("# $trimmedTitle\n")
+        }
+        if (type != POLL_TYPE_NUMBER) {
+            for (opt in options) {
+                val o = opt.trim()
+                if (o.isNotEmpty()) {
+                    sb.append("* $o\n")
+                }
+            }
+        }
+        sb.append("[/poll]")
+        return sb.toString()
+    }
+
+    companion object {
+        private val POLL_REGEX = Regex("""(?s)^\s*\[poll(?:\s+([^\]]*))?\](.*?)\[/poll\]\s*$""", RegexOption.IGNORE_CASE)
+        private val MANAGED_KEYS = setOf(
+            "name", "type", "results", "public", "charttype", "min", "max", "step", "close"
+        )
+
+        fun fromBBCode(block: String): PollBuilderSpec? {
+            val match = POLL_REGEX.matchEntire(block.trim()) ?: return null
+            val attrStr = match.groupValues[1]
+            val body = match.groupValues[2]
+
+            val attrs = linkedMapOf<String, String>()
+            val attrTokens = Regex("""(\w+)=(?:"([^"]*)"|'([^']*)'|(\S+))""")
+            for (attr in attrTokens.findAll(attrStr)) {
+                val key = attr.groupValues[1].lowercase()
+                val value = attr.groupValues[2].ifEmpty {
+                    attr.groupValues[3].ifEmpty { attr.groupValues[4] }
+                }
+                attrs[key] = value
+            }
+
+            val type = attrs["type"]?.lowercase() ?: POLL_TYPE_REGULAR
+            if (type != POLL_TYPE_REGULAR && type != POLL_TYPE_MULTIPLE && type != POLL_TYPE_NUMBER) {
+                // ranked_choice 等表单暂不支持的类型，回退原始 BBCode 编辑，不强转卡片
+                return null
+            }
+
+            val closeRaw = attrs["close"]
+            val closeMillis = if (!closeRaw.isNullOrBlank()) {
+                runCatching {
+                    java.time.Instant.parse(closeRaw).toEpochMilli()
+                }.getOrNull() ?: return null
+            } else {
+                null
+            }
+
+            var title = ""
+            val options = mutableListOf<String>()
+            for (line in body.lines()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty()) continue
+                if (trimmed.startsWith("# ") && title.isEmpty()) {
+                    title = trimmed.substring(2).trim()
+                } else if (trimmed.startsWith("* ") || trimmed.startsWith("- ")) {
+                    options.add(trimmed.substring(2).trim())
+                } else {
+                    // 体内出现无法归类的非空行（嵌套块、多标题、复杂 Markdown 等）→ 拒绝解析，保留原始 BBCode
+                    return null
+                }
+            }
+
+            val results = attrs["results"] ?: "always"
+            val publicVoter = attrs["public"]?.equals("true", ignoreCase = true) ?: true
+            val chartType = if (attrs["charttype"]?.equals("pie", ignoreCase = true) == true) "pie" else "bar"
+            val min = attrs["min"]?.toIntOrNull()
+            val max = attrs["max"]?.toIntOrNull()
+            val step = attrs["step"]?.toIntOrNull()
+            val name = attrs["name"]
+            val extraAttrs = attrs.filterKeys { it !in MANAGED_KEYS }
+
+            return PollBuilderSpec(
+                type = type,
+                results = results,
+                publicVoter = publicVoter,
+                chartType = chartType,
+                title = title,
+                options = options,
+                min = min,
+                max = max,
+                step = step,
+                closeMillis = closeMillis,
+                pollName = name,
+                extraAttrs = extraAttrs,
+            )
+        }
+    }
+}
+
+/** 从当前正文中提取已占用的投票名称集合，从 2 开始递增分配第一个未占用的 poll$n */
+internal fun nextAvailablePollName(raw: String): String? {
+    val pollHeaders = Regex("""\[poll\b([^\]]*)\]""", RegexOption.IGNORE_CASE).findAll(raw).toList()
+    if (pollHeaders.isEmpty()) return null
+    val nameRegex = Regex("""\bname=(?:"([^"]*)"|'([^']*)'|(\S+))""", RegexOption.IGNORE_CASE)
+    val usedNames = mutableSetOf<String>()
+    for (header in pollHeaders) {
+        val attrPart = header.groupValues[1]
+        val m = nameRegex.find(attrPart)
+        val name = if (m != null) {
+            m.groupValues[1].ifEmpty { m.groupValues[2].ifEmpty { m.groupValues[3] } }
+        } else {
+            "poll"
+        }
+        usedNames.add(name.lowercase())
+    }
+    var index = 2
+    while ("poll$index" in usedNames) {
+        index++
+    }
+    return "poll$index"
+}
+
+/** 所见即所得投票预览卡片 Span (参照 PC 端 Discourse 编辑器投票卡片交互) */
+internal class CreatorPollSpan(
+    var spec: PollBuilderSpec,
+    private val context: Context,
+    private val view: EditText,
+    private val onEdit: (CreatorPollSpan, PollBuilderSpec) -> Unit,
+    private val onRemove: (CreatorPollSpan) -> Unit,
+) : ReplacementSpan() {
+
+    private val density = context.resources.displayMetrics.density
+    val lastDrawBounds = RectF()
+    val closeBtnBounds = RectF()
+    val editBtnBounds = RectF()
+
+    private fun getAvailableWidth(): Float {
+        val w = view.width - view.paddingLeft - view.paddingRight
+        if (w > 100) return w.toFloat()
+        val screenW = context.resources.displayMetrics.widthPixels
+        val pad = view.paddingLeft + view.paddingRight
+        val fallback = screenW - (if (pad > 0) pad else (32 * density).toInt())
+        return fallback.coerceAtLeast(100).toFloat()
+    }
+
+    private fun computeHeight(): Float {
+        val padTop = 14f * density
+        val padBottom = 14f * density
+        var leftH = padTop
+
+        val hasTitle = spec.title.isNotBlank()
+        leftH += if (hasTitle) 36f * density else 24f * density
+
+        leftH += when (spec.type) {
+            POLL_TYPE_NUMBER -> 36f * density
+            else -> {
+                val optsCount = spec.options.count { it.isNotBlank() }.coerceAtLeast(2)
+                optsCount * 28f * density
+            }
+        }
+
+        leftH += 8f * density + 30f * density + padBottom
+
+        val rightH = padTop + 28f * density + 16f * density + 14f * density + 3 * 20f * density + padBottom
+
+        return maxOf(leftH, rightH).coerceAtLeast(140f * density)
+    }
+
+    override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int {
+        val cardH = computeHeight()
+        val totalH = cardH + 12f * density
+        if (fm != null) {
+            val totalInt = totalH.toInt()
+            fm.ascent = -totalInt
+            fm.descent = 0
+            fm.top = fm.ascent
+            fm.bottom = 0
+        }
+        return getAvailableWidth().toInt()
+    }
+
+    override fun draw(
+        canvas: Canvas,
+        text: CharSequence?,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint
+    ) {
+        val availWidth = getAvailableWidth()
+        val cardHeight = computeHeight()
+        val lineH = (bottom - top).toFloat()
+        val drawLeft = x
+        val drawTop = top + (lineH - cardHeight) / 2f
+        val drawRight = x + availWidth
+        val drawBottom = drawTop + cardHeight
+
+        lastDrawBounds.set(drawLeft, drawTop, drawRight, drawBottom)
+
+        val isDark = ColorUtils.calculateLuminance(view.currentTextColor) > 0.5f
+
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF1E2023.toInt() else 0xFFFBFBFC.toInt()
+            style = Paint.Style.FILL
+        }
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF32353A.toInt() else 0xFFE2E4E8.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * density
+        }
+
+        val cornerR = 10f * density
+        val cardRect = RectF(drawLeft, drawTop, drawRight, drawBottom)
+        canvas.drawRoundRect(cardRect, cornerR, cornerR, bgPaint)
+        canvas.drawRoundRect(cardRect, cornerR, cornerR, borderPaint)
+
+        // 右上角关闭按钮 ✕
+        val closeSize = 26f * density
+        closeBtnBounds.set(
+            drawRight - closeSize - 6f * density,
+            drawTop + 6f * density,
+            drawRight - 6f * density,
+            drawTop + closeSize + 6f * density
+        )
+        val closeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0x26FFFFFF else 0x1A000000
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(closeBtnBounds.centerX(), closeBtnBounds.centerY(), closeSize / 2f, closeBgPaint)
+        val closeXPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFFA0A5AD.toInt() else 0xFF8A8F98.toInt()
+            textSize = 12f * density
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        canvas.drawText("✕", closeBtnBounds.centerX(), closeBtnBounds.centerY() + 4f * density, closeXPaint)
+
+        // 划分左右两栏：右侧固定约 116.dp
+        val rightColWidth = (116f * density).coerceAtMost(availWidth * 0.36f)
+        val dividerX = drawRight - rightColWidth
+
+        // 纵向分割线
+        canvas.drawLine(
+            dividerX,
+            drawTop + 10f * density,
+            dividerX,
+            drawBottom - 10f * density,
+            borderPaint
+        )
+
+        // ── 绘制左侧区域 ──
+        val padLeft = drawLeft + 14f * density
+        val leftContentRight = dividerX - 12f * density
+        var curY = drawTop + 14f * density
+
+        // 1. 标题
+        val titleText = spec.title.trim().ifEmpty { "投票标题" }
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (spec.title.isNotBlank()) view.currentTextColor else (if (isDark) 0xFF7A808A.toInt() else 0xFF999EA7.toInt())
+            textSize = 15f * density
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val titleMetrics = titlePaint.fontMetrics
+        val titleBase = curY - titleMetrics.ascent
+        val maxTitleW = (leftContentRight - padLeft).coerceAtLeast(50f)
+        val titleEllipsized = TextUtils.ellipsize(titleText, android.text.TextPaint(titlePaint), maxTitleW, TextUtils.TruncateAt.END).toString()
+        canvas.drawText(titleEllipsized, padLeft, titleBase, titlePaint)
+        curY += 24f * density
+
+        // 标题下细水平分割线（对齐 PC 截图）
+        val dividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF2A2D33.toInt() else 0xFFECEEF2.toInt()
+            strokeWidth = 1f * density
+        }
+        canvas.drawLine(padLeft, curY, leftContentRight, curY, dividerPaint)
+        curY += 12f * density
+
+        // 2. 选项列表
+        val optTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = view.currentTextColor
+            textSize = 13.5f * density
+        }
+        val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF6D737D.toInt() else 0xFF9096A0.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1.6f * density
+        }
+
+        if (spec.type == POLL_TYPE_NUMBER) {
+            val minV = spec.min ?: 1
+            val maxV = (spec.max ?: 5).coerceAtLeast(minV)
+            val stepV = (spec.step ?: 1).coerceAtLeast(1)
+            var pillX = padLeft
+            val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (isDark) 0xFF2A2D33.toInt() else 0xFFE9ECF0.toInt()
+                style = Paint.Style.FILL
+            }
+            val numTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = view.currentTextColor
+                textSize = 12f * density
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            var v = minV
+            while (v <= maxV && pillX + 26f * density <= leftContentRight) {
+                val pillRect = RectF(pillX, curY, pillX + 24f * density, curY + 24f * density)
+                canvas.drawRoundRect(pillRect, 6f * density, 6f * density, pillPaint)
+                canvas.drawText(v.toString(), pillRect.centerX(), pillRect.centerY() + 4f * density, numTextPaint)
+                pillX += 28f * density
+                v += stepV
+            }
+            curY += 32f * density
+        } else {
+            val validOptions = spec.options.map { it.trim() }.filter { it.isNotEmpty() }
+                .ifEmpty { listOf("选项 1", "选项 2") }
+
+            for (opt in validOptions) {
+                val lineCenterY = curY + 10f * density
+                val maxTextWidth = leftContentRight - padLeft - 24f * density
+                val ellipsizedOpt = TextUtils.ellipsize(opt, android.text.TextPaint(optTextPaint), maxTextWidth, TextUtils.TruncateAt.END).toString()
+
+                if (spec.type == POLL_TYPE_MULTIPLE) {
+                    val boxSize = 13f * density
+                    val boxRect = RectF(padLeft, lineCenterY - boxSize / 2f, padLeft + boxSize, lineCenterY + boxSize / 2f)
+                    canvas.drawRoundRect(boxRect, 2.5f * density, 2.5f * density, boxPaint)
+                } else {
+                    val radius = 6.5f * density
+                    canvas.drawCircle(padLeft + radius, lineCenterY, radius, boxPaint)
+                }
+
+                canvas.drawText(ellipsizedOpt, padLeft + 22f * density, lineCenterY + 4.5f * density, optTextPaint)
+                curY += 28f * density
+            }
+        }
+
+        // 3. 底部“编辑投票”按钮（对齐 PC 截图）
+        val editBtnTop = (drawBottom - 14f * density - 28f * density).coerceAtLeast(curY + 6f * density)
+        val editBtnW = 96f * density
+        val editBtnH = 28f * density
+        editBtnBounds.set(padLeft, editBtnTop, padLeft + editBtnW, editBtnTop + editBtnH)
+
+        val editBtnBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF2B2E34.toInt() else 0xFFF0F2F5.toInt()
+            style = Paint.Style.FILL
+        }
+        val editBtnBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF3D414A.toInt() else 0xFFD8DCE3.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * density
+        }
+        canvas.drawRoundRect(editBtnBounds, 6f * density, 6f * density, editBtnBgPaint)
+        canvas.drawRoundRect(editBtnBounds, 6f * density, 6f * density, editBtnBorderPaint)
+
+        val editBtnTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFFB0B6C0.toInt() else 0xFF555A63.toInt()
+            textSize = 12f * density
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText("✎ 编辑投票", editBtnBounds.centerX(), editBtnBounds.centerY() + 4f * density, editBtnTextPaint)
+
+        // ── 绘制右侧区域（对齐 PC 截图）──
+        val rightLeft = dividerX + 10f * density
+        val rightAvailW = (drawRight - rightLeft - 8f * density).coerceAtLeast(30f)
+        var rightY = drawTop + 14f * density
+
+        val voterNumPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = view.currentTextColor
+            textSize = 24f * density
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val numMetrics = voterNumPaint.fontMetrics
+        canvas.drawText("0", rightLeft + 4f * density, rightY - numMetrics.ascent, voterNumPaint)
+        rightY += 28f * density
+
+        val voterLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF7A808A.toInt() else 0xFF8A9099.toInt()
+            textSize = 11.5f * density
+        }
+        canvas.drawText("投票人", rightLeft + 4f * density, rightY + 4f * density, voterLabelPaint)
+        rightY += 16f * density
+
+        canvas.drawLine(rightLeft + 4f * density, rightY + 6f * density, rightLeft + 40f * density, rightY + 6f * density, dividerPaint)
+        rightY += 16f * density
+
+        val metaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isDark) 0xFF8E95A0.toInt() else 0xFF6D737D.toInt()
+            textSize = 10.5f * density
+        }
+
+        val metaLines = mutableListOf<String>()
+        when (spec.type) {
+            POLL_TYPE_REGULAR -> metaLines.add("• 单选投票")
+            POLL_TYPE_MULTIPLE -> {
+                val maxV = spec.max ?: 2
+                val minV = spec.min ?: 1
+                if (minV == maxV) {
+                    metaLines.add("≡ 选择 $minV 个选项")
+                } else {
+                    metaLines.add("≡ 最多选择 $maxV 个选项")
+                }
+            }
+            POLL_TYPE_NUMBER -> metaLines.add("≡ 评分投票")
+        }
+
+        if (spec.publicVoter) {
+            metaLines.add("👁 投票为公开")
+        } else {
+            metaLines.add("🔒 匿名投票")
+        }
+
+        val closeMillisVal = spec.closeMillis
+        if (closeMillisVal != null) {
+            val dateStr = runCatching {
+                val localTime = java.time.Instant.ofEpochMilli(closeMillisVal)
+                    .atZone(java.time.ZoneId.systemDefault())
+                "${localTime.year}-${localTime.monthValue.toString().padStart(2, '0')}-${localTime.dayOfMonth.toString().padStart(2, '0')}"
+            }.getOrNull()
+            if (dateStr != null) {
+                metaLines.add("🕒 截止: $dateStr")
+            }
+        }
+
+        for (meta in metaLines) {
+            val ellipsizedMeta = TextUtils.ellipsize(meta, android.text.TextPaint(metaPaint), rightAvailW, TextUtils.TruncateAt.END).toString()
+            canvas.drawText(ellipsizedMeta, rightLeft + 4f * density, rightY + 6f * density, metaPaint)
+            rightY += 18f * density
+        }
+    }
+
+    fun handleTouch(eventX: Float, eventY: Float): Boolean {
+        if (closeBtnBounds.contains(eventX, eventY)) {
+            onRemove(this)
+            return true
+        } else if (editBtnBounds.contains(eventX, eventY)) {
+            onEdit(this, spec)
+            return true
+        } else if (lastDrawBounds.contains(eventX, eventY)) {
+            return true
+        }
+        return false
+    }
+}
+
+internal val LocalEditorSuggestionSource = androidx.compose.runtime.staticCompositionLocalOf<
+    suspend (EditorCompletionRequest) -> List<EditorSuggestion>
+> { { emptyList() } }
+
+internal val LocalPostMarkdownLoader = androidx.compose.runtime.staticCompositionLocalOf<suspend (Long, Int) -> String> {
+    { _, _ -> error("原文暂不可用") }
+}
+internal val LocalPostRevisionLoader = androidx.compose.runtime.staticCompositionLocalOf<suspend (Long, Int?) -> org.linuxdo.android.data.PostRevision> {
+    { _, _ -> error("编辑历史暂不可用") }
+}
+internal val LocalTopicPreviewLoader = androidx.compose.runtime.staticCompositionLocalOf<(suspend (Long) -> org.linuxdo.android.data.TopicDetail)?> { null }
+
+internal data class EditorCompletionToken(val marker: Char, val term: String, val start: Int, val cursor: Int, val end: Int)
+
+internal fun editorCompletionToken(text: String, start: Int, end: Int): EditorCompletionToken? {
+    if (start != end || start !in 1..text.length) return null
+    val prefix = text.substring(0, start)
+    fun valid(marker: Char, character: Char) = character.isLetterOrDigit() || character == '_' || character == '-' ||
+        (marker == '@' && character == '.') || (marker == '#' && character == ':')
+    var scan = start - 1
+    while (scan >= 0 && (prefix[scan].isLetterOrDigit() || prefix[scan] == '_' || prefix[scan] == '-' || prefix[scan] == '.' || prefix[scan] == ':')) {
+        scan--
+    }
+    if (scan < 0) return null
+    val marker = prefix[scan].takeIf { it == '@' || it == '#' } ?: return null
+    if (scan > 0) {
+        val prev = prefix[scan - 1]
+        if (prev.code < 128 && (prev.isLetterOrDigit() || prev == '_' || prev == '/')) return null
+    }
+    val tokenStart = scan
+    val token = prefix.substring(tokenStart)
+    if (token.drop(1).any { !valid(marker, it) } || token.length > 80) return null
+    var fence: Char? = null
+    var fenceLength = 0
+    prefix.lineSequence().forEach { line ->
+        val trimmed = line.trimStart()
+        val lead = trimmed.firstOrNull()
+        if (lead == '`' || lead == '~') {
+            val length = trimmed.takeWhile { it == lead }.length
+            if (length >= 3) {
+                if (fence == null) { fence = lead; fenceLength = length }
+                else if (fence == lead && length >= fenceLength && trimmed.drop(length).isBlank()) fence = null
+            }
+        }
+    }
+    if (fence != null || prefix.substringAfterLast('\n').count { it == '`' } % 2 != 0) return null
+    var tokenEnd = start
+    while (tokenEnd < text.length && text[tokenEnd].code < 128 && valid(marker, text[tokenEnd])) tokenEnd++
+    return EditorCompletionToken(marker, token.drop(1), tokenStart, start, tokenEnd)
+}
+
+private sealed interface InitialSpanItem {
+    val range: IntRange
+    data class Media(override val range: IntRange, val media: AttachedMedia) : InitialSpanItem
+    data class Poll(override val range: IntRange, val spec: PollBuilderSpec) : InitialSpanItem
+}
+
 internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     private var onMarkdownChange: ((String) -> Unit)? = null
     private var onRemoveAttachment: ((String) -> Unit)? = null
     private var onPreviewImage: ((String) -> Unit)? = null
+    private var onEditPoll: ((CreatorPollSpan, PollBuilderSpec) -> Unit)? = null
 
     private var isInternalUpdating = false
     private val density = resources.displayMetrics.density
+    private var completionSource: (suspend (EditorCompletionRequest) -> List<EditorSuggestion>)? = null
+    private var completionTopicId: Long? = null
+    private var completionCategoryId: Int? = null
+    private var completionScope: kotlinx.coroutines.CoroutineScope? = null
+    private var completionJob: kotlinx.coroutines.Job? = null
+    private var requestedCompletion: EditorCompletionToken? = null
+    private var completionPopup: android.widget.PopupWindow? = null
+    private val completionImages = mutableListOf<coil.request.Disposable>()
+    private val completionRunnable = Runnable { searchCompletion() }
 
     init {
         background = null
@@ -6546,17 +7128,194 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
             override fun afterTextChanged(s: Editable?) {
                 if (isInternalUpdating) return
-                if (beforeSpans.isNotEmpty() && s != null) {
-                    val currentSpans = s.getSpans(0, s.length, CreatorMediaSpan::class.java).toSet()
-                    for (oldSpan in beforeSpans) {
-                        if (oldSpan !in currentSpans) {
-                            onRemoveAttachment?.invoke(oldSpan.media.id)
+                if (s != null) {
+                    for (pollSpan in s.getSpans(0, s.length, CreatorPollSpan::class.java)) {
+                        if (s.getSpanStart(pollSpan) >= s.getSpanEnd(pollSpan)) {
+                            s.removeSpan(pollSpan)
+                        }
+                    }
+                    for (mediaSpan in s.getSpans(0, s.length, CreatorMediaSpan::class.java)) {
+                        if (s.getSpanStart(mediaSpan) >= s.getSpanEnd(mediaSpan)) {
+                            s.removeSpan(mediaSpan)
+                        }
+                    }
+                    if (beforeSpans.isNotEmpty()) {
+                        val currentSpans = s.getSpans(0, s.length, CreatorMediaSpan::class.java).toSet()
+                        for (oldSpan in beforeSpans) {
+                            if (oldSpan !in currentSpans) {
+                                onRemoveAttachment?.invoke(oldSpan.media.id)
+                            }
                         }
                     }
                 }
                 onMarkdownChange?.invoke(exportToMarkdown())
+                removeCallbacks(completionRunnable)
+                post(completionRunnable)
             }
         })
+    }
+
+    fun setCompletionSource(
+        source: suspend (EditorCompletionRequest) -> List<EditorSuggestion>,
+        topicId: Long? = null,
+        categoryId: Int? = null,
+    ) {
+        if (completionTopicId != topicId || completionCategoryId != categoryId) dismissCompletion()
+        completionSource = source
+        completionTopicId = topicId
+        completionCategoryId = categoryId
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        completionScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(completionRunnable)
+        dismissCompletion()
+        completionScope?.cancel()
+        completionScope = null
+        super.onDetachedFromWindow()
+    }
+
+    override fun onSelectionChanged(selStart: Int, selEnd: Int) {
+        super.onSelectionChanged(selStart, selEnd)
+        if (completionSource != null) {
+            removeCallbacks(completionRunnable)
+            post(completionRunnable)
+        }
+    }
+
+    override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
+        super.onFocusChanged(focused, direction, previouslyFocusedRect)
+        if (completionSource == null) return
+        if (!focused) dismissCompletion() else if (completionSource != null) post(completionRunnable)
+    }
+
+    override fun onKeyPreIme(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_BACK && completionPopup?.isShowing == true) {
+            if (event.action == android.view.KeyEvent.ACTION_UP) dismissCompletion()
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
+
+    private fun currentCompletion(): EditorCompletionToken? {
+        val editable = text ?: return null
+        if (!hasFocus() || !isEnabled || isInternalUpdating ||
+            android.view.inputmethod.BaseInputConnection.getComposingSpanStart(editable) >= 0) return null
+        return editorCompletionToken(editable.toString(), selectionStart, selectionEnd)
+    }
+
+    private fun dismissCompletion() {
+        completionJob?.cancel()
+        completionJob = null
+        requestedCompletion = null
+        completionPopup?.dismiss()
+        completionPopup = null
+        completionImages.forEach { it.dispose() }
+        completionImages.clear()
+    }
+
+    private fun searchCompletion() {
+        val source = completionSource ?: return
+        val token = currentCompletion()
+        if (token == null) { dismissCompletion(); return }
+        if (token == requestedCompletion && (completionJob?.isActive == true || completionPopup?.isShowing == true)) return
+        dismissCompletion()
+        requestedCompletion = token
+        val query = EditorCompletionRequest(token.marker, token.term, completionTopicId, completionCategoryId)
+        completionJob = completionScope?.launch {
+            kotlinx.coroutines.delay(300)
+            val suggestions = try {
+                source(query)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                emptyList()
+            }
+            if (isAttachedToWindow && currentCompletion() == token && requestedCompletion == token && suggestions.isNotEmpty()) {
+                showCompletion(token, suggestions)
+            }
+        }
+    }
+
+    private fun showCompletion(token: EditorCompletionToken, suggestions: List<EditorSuggestion>) {
+        val textLayout = layout ?: return
+        val frame = android.graphics.Rect().also { getWindowVisibleDisplayFrame(it) }
+        val location = IntArray(2).also { getLocationOnScreen(it) }
+        val line = textLayout.getLineForOffset(token.cursor)
+        val caretX = location[0] + totalPaddingLeft + textLayout.getPrimaryHorizontal(token.cursor).toInt() - scrollX
+        val caretTop = location[1] + totalPaddingTop + textLayout.getLineTop(line) - scrollY
+        val caretBottom = location[1] + totalPaddingTop + textLayout.getLineBottom(line) - scrollY
+        val popupWidth = minOf((300 * density).toInt(), frame.width()).coerceAtLeast(1)
+        val popupHeight = minOf((suggestions.size * 56 * density).toInt(), (240 * density).toInt(), frame.height() / 2).coerceAtLeast(1)
+        val dark = android.graphics.Color.luminance(currentTextColor) > 0.5f
+        val backgroundColor = if (dark) android.graphics.Color.rgb(38, 38, 40) else android.graphics.Color.WHITE
+        val rows = android.widget.LinearLayout(context).apply { orientation = android.widget.LinearLayout.VERTICAL }
+        suggestions.forEach { suggestion ->
+            val row = android.widget.LinearLayout(context).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding((12 * density).toInt(), (6 * density).toInt(), (12 * density).toInt(), (6 * density).toInt())
+                layoutParams = android.widget.LinearLayout.LayoutParams(-1, (56 * density).toInt())
+                setOnClickListener {
+                    if (currentCompletion() == token) {
+                        val ed = text
+                        val needLeadingSpace = ed != null && token.start > 0 && !ed[token.start - 1].isWhitespace()
+                        val value = (if (needLeadingSpace) " " else "") + suggestion.insertion + " "
+                        ed?.replace(token.start, token.end, value)
+                        setSelection(token.start + value.length)
+                    }
+                    dismissCompletion()
+                }
+            }
+            suggestion.avatarUrl?.let { avatar ->
+                val image = android.widget.ImageView(context).apply {
+                    layoutParams = android.widget.LinearLayout.LayoutParams((32 * density).toInt(), (32 * density).toInt()).apply {
+                        marginEnd = (8 * density).toInt()
+                    }
+                    scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(backgroundColor)
+                    }
+                    clipToOutline = true
+                }
+                row.addView(image)
+                completionImages += coil.Coil.imageLoader(context).enqueue(ImageRequest.Builder(context).data(avatar).target(image).build())
+            }
+            row.addView(android.widget.TextView(context).apply {
+                text = "${suggestion.label}\n${suggestion.description}"
+                setTextColor(this@RichMarkdownEditorView.currentTextColor)
+                textSize = 13f
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+            rows.addView(row)
+        }
+        val scroll = android.widget.ScrollView(context).apply { addView(rows) }
+        val popup = android.widget.PopupWindow(scroll, popupWidth, popupHeight, false).apply {
+            isOutsideTouchable = true
+            inputMethodMode = android.widget.PopupWindow.INPUT_METHOD_NEEDED
+            elevation = 8 * density
+            setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+                setColor(backgroundColor)
+                cornerRadius = 10 * density
+            })
+            setOnDismissListener {
+                completionImages.forEach { it.dispose() }
+                completionImages.clear()
+                completionPopup = null
+                requestedCompletion = null
+            }
+        }
+        completionPopup = popup
+        val left = caretX.coerceIn(frame.left, (frame.right - popupWidth).coerceAtLeast(frame.left))
+        val top = (if (frame.bottom - caretBottom >= popupHeight) caretBottom else caretTop - popupHeight)
+            .coerceIn(frame.top, (frame.bottom - popupHeight).coerceAtLeast(frame.top))
+        popup.showAtLocation(rootView, Gravity.TOP or Gravity.LEFT, left, top)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -6565,6 +7324,12 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (ed != null) {
                 val touchX = event.x - totalPaddingLeft + scrollX
                 val touchY = event.y - totalPaddingTop + scrollY
+                val pollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java)
+                for (span in pollSpans) {
+                    if (span.handleTouch(touchX, touchY)) {
+                        return true
+                    }
+                }
                 val spans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java)
                 for (span in spans) {
                     if (span.handleTouch(touchX, touchY)) {
@@ -6574,6 +7339,10 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    fun setOnEditPollListener(listener: (CreatorPollSpan, PollBuilderSpec) -> Unit) {
+        onEditPoll = listener
     }
 
     fun setOnMarkdownChangeListener(listener: (String) -> Unit) {
@@ -6615,6 +7384,117 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         ed.replace(min, max, token)
         setSelection((min + token.length).coerceIn(0, ed.length))
         requestFocus()
+    }
+
+    /** 块级插入（对齐 Fluxdo insertBlockSnippet）：非行首先补换行，末尾补换行，确保独立成段 */
+    fun insertBlockSnippet(snippet: String) {
+        val ed = text ?: return
+        val start = selectionStart.coerceAtLeast(0)
+        val end = selectionEnd.coerceAtLeast(0)
+        val min = minOf(start, end)
+        val max = maxOf(start, end)
+        val needsLeadingNewline = min > 0 && ed[min - 1] != '\n'
+        val blockText = buildString {
+            if (needsLeadingNewline) append('\n')
+            append(snippet)
+            append('\n')
+        }
+        ed.replace(min, max, blockText)
+        setSelection((min + blockText.length).coerceIn(0, ed.length))
+        requestFocus()
+    }
+
+    /** 插入所见即所得投票卡片 Span (对齐 PC 端 Discourse 编辑器交互) */
+    fun insertPoll(spec: PollBuilderSpec) {
+        val ed = text ?: return
+        val cursor = selectionStart.coerceAtLeast(0)
+        val sb = SpannableStringBuilder()
+        val isStartOfLine = cursor == 0 || (cursor > 0 && ed[cursor - 1] == '\n')
+        if (!isStartOfLine) sb.append("\n")
+        val spanStart = sb.length
+        sb.append(OBJECT_REPLACEMENT_CHAR)
+        sb.setSpan(
+            createPollSpan(spec),
+            spanStart,
+            sb.length,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        val hasTrailingNewline = cursor < ed.length && ed[cursor] == '\n'
+        if (!hasTrailingNewline) {
+            sb.append("\n")
+        }
+
+        val end = selectionEnd.coerceAtLeast(cursor)
+        ed.replace(cursor, end, sb)
+        val newCaret = (cursor + sb.length).coerceIn(0, ed.length)
+        setSelection(newCaret)
+        requestFocus()
+        onMarkdownChange?.invoke(exportToMarkdown())
+    }
+
+    fun updatePollSpan(span: CreatorPollSpan, newSpec: PollBuilderSpec) {
+        val ed = text ?: return
+        var start = ed.getSpanStart(span)
+        var end = ed.getSpanEnd(span)
+        var targetSpan = span
+
+        if (start < 0 || end <= start) {
+            val allPollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java)
+                .filter { ed.getSpanStart(it) >= 0 && ed.getSpanEnd(it) > ed.getSpanStart(it) }
+            val matched = allPollSpans.firstOrNull { it === span }
+                ?: allPollSpans.firstOrNull { it.spec == span.spec }
+                ?: allPollSpans.firstOrNull { it.spec.pollName != null && it.spec.pollName == span.spec.pollName }
+                ?: allPollSpans.firstOrNull()
+            if (matched != null) {
+                targetSpan = matched
+                start = ed.getSpanStart(matched)
+                end = ed.getSpanEnd(matched)
+            }
+        }
+
+        if (start >= 0 && end > start) {
+            isInternalUpdating = true
+            ed.removeSpan(targetSpan)
+            val newSpan = createPollSpan(newSpec)
+            val replacement = OBJECT_REPLACEMENT_CHAR
+            ed.replace(start, end, replacement)
+            ed.setSpan(newSpan, start, start + replacement.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            isInternalUpdating = false
+            requestLayout()
+            invalidate()
+        }
+        onMarkdownChange?.invoke(exportToMarkdown())
+    }
+
+    fun removePollSpan(span: CreatorPollSpan) {
+        val ed = text ?: return
+        val start = ed.getSpanStart(span)
+        val end = ed.getSpanEnd(span)
+        if (start >= 0 && end > start) {
+            isInternalUpdating = true
+            val deleteStart = if (start > 0 && ed[start - 1] == '\n') start - 1 else start
+            val deleteEnd = if (end < ed.length && ed[end] == '\n') end + 1 else end
+            ed.removeSpan(span)
+            ed.delete(deleteStart, deleteEnd)
+            isInternalUpdating = false
+            onMarkdownChange?.invoke(exportToMarkdown())
+        } else {
+            ed.removeSpan(span)
+        }
+    }
+
+    private fun createPollSpan(spec: PollBuilderSpec): CreatorPollSpan {
+        return CreatorPollSpan(
+            spec = spec,
+            context = context,
+            view = this,
+            onEdit = { span, sp ->
+                onEditPoll?.invoke(span, sp)
+            },
+            onRemove = { span ->
+                removePollSpan(span)
+            }
+        )
     }
 
     fun insertMedia(media: AttachedMedia) {
@@ -6663,13 +7543,16 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (span.media.id == mediaId) {
                 val start = ed.getSpanStart(span)
                 val end = ed.getSpanEnd(span)
-                if (start >= 0 && end >= start) {
+                if (start >= 0 && end > start) {
                     isInternalUpdating = true
                     val deleteStart = if (start > 0 && ed[start - 1] == '\n') start - 1 else start
                     val deleteEnd = if (end < ed.length && ed[end] == '\n') end + 1 else end
+                    ed.removeSpan(span)
                     ed.delete(deleteStart, deleteEnd)
                     isInternalUpdating = false
                     onMarkdownChange?.invoke(exportToMarkdown())
+                } else {
+                    ed.removeSpan(span)
                 }
                 break
             }
@@ -6678,61 +7561,73 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     fun setInitialMarkdown(raw: String, attachments: List<AttachedMedia>) {
         isInternalUpdating = true
-        if (attachments.isEmpty()) {
-            setText(raw)
-            setSelection(raw.length)
-            isInternalUpdating = false
-            return
-        }
+        val matches = mutableListOf<InitialSpanItem>()
 
-        data class Match(val range: IntRange, val media: AttachedMedia)
-        val matches = mutableListOf<Match>()
         for (media in attachments) {
             val shortUrl = media.uploaded.shortUrl
             if (shortUrl.isBlank()) continue
             val pattern = Regex("""(!?\[[^\]]*\]\(${Regex.escape(shortUrl)}\))""")
             val m = pattern.find(raw)
             if (m != null) {
-                matches.add(Match(m.range, media))
+                matches.add(InitialSpanItem.Media(m.range, media))
             }
         }
 
+        val pollRegex = Regex("""(?s)\[poll(?:\s+[^\]]*)?\](.*?)\[/poll\]""")
+        for (m in pollRegex.findAll(raw)) {
+            val spec = PollBuilderSpec.fromBBCode(m.value)
+            if (spec != null) {
+                matches.add(InitialSpanItem.Poll(m.range, spec))
+            }
+        }
+
+        if (matches.isEmpty() && attachments.isEmpty()) {
+            setText(raw)
+            setSelection(raw.length)
+            isInternalUpdating = false
+            return
+        }
+
         val sb = SpannableStringBuilder()
-        if (matches.isEmpty()) {
-            sb.append(raw.trimEnd())
-            for (media in attachments) {
-                if (sb.isNotEmpty() && !sb.endsWith("\n")) sb.append("\n")
-                val spanStart = sb.length
-                sb.append(OBJECT_REPLACEMENT_CHAR)
-                sb.setSpan(createSpan(media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        matches.sortBy { it.range.first }
+        var cursor = 0
+        for (match in matches) {
+            if (match.range.first > cursor) {
+                val textBefore = raw.substring(cursor, match.range.first)
+                val trimmed = if (textBefore.endsWith("\n\n")) textBefore.trimEnd('\n') + "\n" else textBefore
+                sb.append(trimmed)
+            }
+            if (sb.isNotEmpty() && !sb.endsWith("\n")) {
                 sb.append("\n")
             }
-        } else {
-            matches.sortBy { it.range.first }
-            var cursor = 0
-            for (match in matches) {
-                if (match.range.first > cursor) {
-                    val textBefore = raw.substring(cursor, match.range.first)
-                    // 卡片自身独占高度，若前序段落末尾有多余空行（如 \n\n），收拢为单换行避免留白过大
-                    val trimmed = if (textBefore.endsWith("\n\n")) textBefore.trimEnd('\n') + "\n" else textBefore
-                    sb.append(trimmed)
+            val spanStart = sb.length
+            sb.append(OBJECT_REPLACEMENT_CHAR)
+            when (match) {
+                is InitialSpanItem.Media -> {
+                    sb.setSpan(createSpan(match.media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
-                if (sb.isNotEmpty() && !sb.endsWith("\n")) {
-                    sb.append("\n")
-                }
-                val spanStart = sb.length
-                sb.append(OBJECT_REPLACEMENT_CHAR)
-                sb.setSpan(createSpan(match.media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                sb.append("\n")
-                cursor = match.range.last + 1
-                // 跳过紧随卡片后面的连续空行换行符（如 Markdown 常用的 \n\n）
-                while (cursor < raw.length && raw[cursor] == '\n') {
-                    cursor++
+                is InitialSpanItem.Poll -> {
+                    sb.setSpan(createPollSpan(match.spec), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
             }
-            if (cursor < raw.length) {
-                sb.append(raw.substring(cursor))
+            sb.append("\n")
+            cursor = match.range.last + 1
+            while (cursor < raw.length && raw[cursor] == '\n') {
+                cursor++
             }
+        }
+        if (cursor < raw.length) {
+            sb.append(raw.substring(cursor))
+        }
+
+        val matchedMediaIds = matches.filterIsInstance<InitialSpanItem.Media>().map { it.media.id }.toSet()
+        val unplacedAttachments = attachments.filter { it.id !in matchedMediaIds }
+        for (media in unplacedAttachments) {
+            if (sb.isNotEmpty() && !sb.endsWith("\n")) sb.append("\n")
+            val spanStart = sb.length
+            sb.append(OBJECT_REPLACEMENT_CHAR)
+            sb.setSpan(createSpan(media), spanStart, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append("\n")
         }
 
         setText(sb)
@@ -6742,16 +7637,20 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
 
     fun exportToMarkdown(): String {
         val ed = text ?: return ""
-        val spans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java)
-        if (spans.isEmpty()) return ed.toString().trimEnd()
+        val mediaSpans = ed.getSpans(0, ed.length, CreatorMediaSpan::class.java).map { span ->
+            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span.media.toMarkdown())
+        }
+        val pollSpans = ed.getSpans(0, ed.length, CreatorPollSpan::class.java).map { span ->
+            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span.spec.toBBCode())
+        }
+        val allSpans = (mediaSpans + pollSpans).filter { it.first >= 0 && it.second > it.first }
+            .sortedBy { it.first }
 
-        val sorted = spans.map { span ->
-            Triple(ed.getSpanStart(span), ed.getSpanEnd(span), span)
-        }.filter { it.first >= 0 && it.second >= it.first }.sortedBy { it.first }
+        if (allSpans.isEmpty()) return ed.toString().trimEnd()
 
         val sb = StringBuilder()
         var cursor = 0
-        for ((start, end, span) in sorted) {
+        for ((start, end, md) in allSpans) {
             if (start > cursor) {
                 val seg = ed.subSequence(cursor, start).toString()
                 sb.append(seg.trimEnd('\n'))
@@ -6759,7 +7658,7 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
             if (sb.isNotEmpty()) {
                 sb.append("\n\n")
             }
-            sb.append(span.media.toMarkdown())
+            sb.append(md)
             sb.append("\n\n")
             cursor = end
         }
@@ -6803,8 +7702,11 @@ fun TopicCreatorSheet(
     onClose: () -> Unit,
     onClearNotice: () -> Unit,
 ) {
+    val completionSource = LocalEditorSuggestionSource.current
     val keyboard = LocalSoftwareKeyboardController.current
     var showEmojiPicker by remember { mutableStateOf(false) }
+    var showPollDialog by remember { mutableStateOf(false) }
+    var editingPollTarget by remember { mutableStateOf<Pair<CreatorPollSpan, PollBuilderSpec>?>(null) }
     var showCategoryDialog by remember { mutableStateOf(false) }
     var showTagDialog by remember { mutableStateOf(false) }
     var showCloseConfirmDialog by remember { mutableStateOf(false) }
@@ -6841,6 +7743,10 @@ fun TopicCreatorSheet(
 
     BackHandler {
         when {
+            showPollDialog -> {
+                showPollDialog = false
+                editingPollTarget = null
+            }
             showEmojiPicker -> showEmojiPicker = false
             else -> attemptClose()
         }
@@ -6854,13 +7760,13 @@ fun TopicCreatorSheet(
     }
 
     val flattenedCategories = remember(categories) {
-        flattenCategories(categories)
+        creatableCategories(categories)
     }
     val categoryGroups = remember(flattenedCategories) {
         compactCategoryGroups(flattenedCategories)
     }
     val selectedCategory = remember(flattenedCategories, state.categoryId) {
-        state.categoryId?.let { id -> flattenedCategories.firstOrNull { it.id.toInt() == id } }
+        state.categoryId?.let { id -> flattenedCategories.firstOrNull { it.id == id } }
     }
     val selectedGroup = remember(categoryGroups, state.categoryId) {
         val targetId = state.categoryId ?: return@remember null
@@ -6874,7 +7780,6 @@ fun TopicCreatorSheet(
         } else {
             (listOf(selectedGroup.first) + selectedGroup.second.sortedBy { categoryLevelOf(it) })
                 .distinctBy { it.id }
-                .filter { categoryLevelOf(it) in 0..3 }
         }
     }
 
@@ -7385,15 +8290,25 @@ fun TopicCreatorSheet(
                 factory = { ctx ->
                     RichMarkdownEditorView(ctx).apply {
                         updateThemeColors(textColorInt, hintColorInt)
+                        setCompletionSource(completionSource, categoryId = state.categoryId)
                         setInitialMarkdown(state.raw, state.attachments)
                         setOnMarkdownChangeListener { newRaw -> onRawChange(newRaw) }
                         setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
                         setOnPreviewImageListener { previewUrl -> previewingImage = previewUrl }
+                        setOnEditPollListener { span, spec ->
+                            editingPollTarget = Pair(span, spec)
+                            showPollDialog = true
+                        }
                         editorView = this
                     }
                 },
                 update = { view ->
                     view.updateThemeColors(textColorInt, hintColorInt)
+                    view.setCompletionSource(completionSource, categoryId = state.categoryId)
+                    view.setOnEditPollListener { span, spec ->
+                        editingPollTarget = Pair(span, spec)
+                        showPollDialog = true
+                    }
                 },
             )
 
@@ -7506,6 +8421,31 @@ fun TopicCreatorSheet(
                 )
             }
 
+            Spacer(Modifier.width(4.dp))
+
+            // 投票图标：参照 Fluxdo PollBuilderDialog，点击弹出可视化投票构建器并在光标处插入所见即所得投票卡片
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (showPollDialog) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent,
+                    )
+                    .clickable(enabled = canPickMedia) {
+                        keyboard?.hide()
+                        showEmojiPicker = false
+                        editingPollTarget = null
+                        showPollDialog = true
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                ComposerPollIcon(
+                    tint = if (showPollDialog) IosTheme.colors.accent
+                    else if (canPickMedia) IosTheme.colors.secondaryLabel
+                    else IosTheme.colors.tertiaryLabel,
+                )
+            }
+
             Spacer(Modifier.weight(1f))
 
             if (state.uploading) {
@@ -7539,7 +8479,7 @@ fun TopicCreatorSheet(
             groups = categoryGroups,
             selectedCategoryId = state.categoryId,
             onSelect = { id ->
-                val newCat = categories.firstOrNull { it.id.toInt() == id }
+                val newCat = flattenedCategories.firstOrNull { it.id == id }
                 val newAllowed = fixedTagsForCategory(newCat)
                 val validTags = state.tags.filter { it in newAllowed }
                 if (validTags != state.tags) {
@@ -7549,6 +8489,7 @@ fun TopicCreatorSheet(
                 showCategoryDialog = false
             },
             onDismiss = { showCategoryDialog = false },
+            includeAllLevels = true,
         )
     }
 
@@ -7562,6 +8503,32 @@ fun TopicCreatorSheet(
                 showTagDialog = false
             },
             onDismiss = { showTagDialog = false },
+        )
+    }
+
+    // 投票构建器弹窗（支持全新创建与所见即所得卡片编辑回显）
+    if (showPollDialog) {
+        val currentRaw = editorView?.exportToMarkdown() ?: state.raw
+        val suggestedPollName = remember(currentRaw) {
+            nextAvailablePollName(currentRaw)
+        }
+        PollBuilderDialog(
+            suggestedPollName = suggestedPollName,
+            initialSpec = editingPollTarget?.second,
+            onDismiss = {
+                showPollDialog = false
+                editingPollTarget = null
+            },
+            onConfirm = { resultSpec ->
+                val target = editingPollTarget
+                if (target != null) {
+                    editorView?.updatePollSpan(target.first, resultSpec)
+                } else {
+                    editorView?.insertPoll(resultSpec)
+                }
+                showPollDialog = false
+                editingPollTarget = null
+            },
         )
     }
 
@@ -7675,6 +8642,7 @@ private fun CategoryPickerDialog(
     selectedCategoryId: Int?,
     onSelect: (Int) -> Unit,
     onDismiss: () -> Unit,
+    includeAllLevels: Boolean = false,
 ) {
     Dialog(
         onDismissRequest = onDismiss,
@@ -7714,10 +8682,10 @@ private fun CategoryPickerDialog(
                 items(groups, key = { it.first.id }) { (parent, levels) ->
                     val baseName = categoryBaseNameOf(parent.name)
                     val dotColor = parseCategoryColor(parent.color) ?: IosTheme.colors.accent
-                    val variants = remember(parent, levels) {
+                    val variants = remember(parent, levels, includeAllLevels) {
                         (listOf(parent) + levels.sortedBy { categoryLevelOf(it) })
                             .distinctBy { it.id }
-                            .filter { categoryLevelOf(it) in 0..3 }
+                            .filter { includeAllLevels || categoryLevelOf(it) in 0..3 }
                     }
                     val isGroupSelected = selectedCategoryId != null && variants.any { it.id.toInt() == selectedCategoryId }
 
@@ -7947,6 +8915,740 @@ private fun TagPickerDialog(
                 }
             }
         }
+    }
+}
+
+@Composable
+internal fun PollBuilderDialog(
+    suggestedPollName: String? = null,
+    initialSpec: PollBuilderSpec? = null,
+    onDismiss: () -> Unit,
+    onConfirm: (PollBuilderSpec) -> Unit,
+) {
+    val context = LocalContext.current
+    var pollType by remember(initialSpec) { mutableStateOf(initialSpec?.type ?: POLL_TYPE_REGULAR) }
+    var pollTitle by remember(initialSpec) { mutableStateOf(initialSpec?.title.orEmpty()) }
+    val pollOptions = remember(initialSpec) {
+        mutableStateListOf<String>().apply {
+            if (!initialSpec?.options.isNullOrEmpty()) {
+                addAll(initialSpec!!.options)
+            } else {
+                addAll(listOf("", ""))
+            }
+        }
+    }
+    var minText by remember(initialSpec) { mutableStateOf(initialSpec?.min?.toString() ?: "1") }
+    var maxText by remember(initialSpec) { mutableStateOf(initialSpec?.max?.toString() ?: "2") }
+    var stepText by remember(initialSpec) { mutableStateOf(initialSpec?.step?.toString() ?: "1") }
+    var showAdvanced by remember(initialSpec) {
+        mutableStateOf(
+            initialSpec != null && (
+                initialSpec.closeMillis != null ||
+                initialSpec.results != "always" ||
+                !initialSpec.publicVoter ||
+                initialSpec.chartType != "bar"
+            )
+        )
+    }
+    var resultsVisibility by remember(initialSpec) { mutableStateOf(initialSpec?.results ?: "always") }
+    var publicVoter by remember(initialSpec) { mutableStateOf(initialSpec?.publicVoter ?: true) }
+    var chartType by remember(initialSpec) { mutableStateOf(initialSpec?.chartType ?: "bar") }
+    var closeMillis by remember(initialSpec) { mutableStateOf(initialSpec?.closeMillis) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    val validOptions = pollOptions.map { it.trim() }.filter { it.isNotEmpty() }
+    val isNumber = pollType == POLL_TYPE_NUMBER
+
+    val onTypeSelect = { newType: String ->
+        pollType = newType
+        errorMsg = null
+        when (newType) {
+            POLL_TYPE_MULTIPLE -> {
+                minText = "1"
+                maxText = validOptions.size.coerceIn(2, 999).toString()
+            }
+            POLL_TYPE_NUMBER -> {
+                minText = "1"
+                maxText = "10"
+                stepText = "1"
+            }
+        }
+    }
+
+    val pickCloseDateTime = {
+        val cal = java.util.Calendar.getInstance()
+        if (closeMillis != null) {
+            cal.timeInMillis = closeMillis!!
+        } else {
+            cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            cal.set(java.util.Calendar.HOUR_OF_DAY, 12)
+            cal.set(java.util.Calendar.MINUTE, 0)
+            cal.set(java.util.Calendar.SECOND, 0)
+            cal.set(java.util.Calendar.MILLISECOND, 0)
+        }
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                android.app.TimePickerDialog(
+                    context,
+                    { _, hourOfDay, minute ->
+                        val picked = java.util.Calendar.getInstance().apply {
+                            set(year, month, dayOfMonth, hourOfDay, minute, 0)
+                            set(java.util.Calendar.MILLISECOND, 0)
+                        }
+                        closeMillis = picked.timeInMillis
+                    },
+                    cal.get(java.util.Calendar.HOUR_OF_DAY),
+                    cal.get(java.util.Calendar.MINUTE),
+                    true,
+                ).show()
+            },
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH),
+            cal.get(java.util.Calendar.DAY_OF_MONTH),
+        ).apply {
+            datePicker.minDate = System.currentTimeMillis()
+        }.show()
+    }
+
+    val closeLabel = remember(closeMillis) {
+        if (closeMillis == null) {
+            "不自动关闭"
+        } else {
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(closeMillis!!))
+        }
+    }
+
+    val validateAndSubmit = {
+        val minVal = minText.trim().toIntOrNull()
+        val maxVal = maxText.trim().toIntOrNull()
+        val stepVal = stepText.trim().toIntOrNull()
+        val opts = pollOptions.map { it.trim() }.filter { it.isNotEmpty() }
+
+        when {
+            pollType != POLL_TYPE_NUMBER && opts.isEmpty() -> {
+                errorMsg = "至少需要填写 1 个有效投票选项"
+            }
+            pollType == POLL_TYPE_MULTIPLE && (minVal == null || maxVal == null || minVal < 1 || minVal > maxVal || maxVal > opts.size) -> {
+                errorMsg = "需满足 1 ≤ 最少选 ≤ 至多选 ≤ 有效选项数(${opts.size})"
+            }
+            pollType == POLL_TYPE_NUMBER && (minVal == null || maxVal == null || stepVal == null || minVal < 0 || maxVal < minVal) -> {
+                errorMsg = "需满足 0 ≤ 最小值 ≤ 最大值"
+            }
+            pollType == POLL_TYPE_NUMBER && (stepVal ?: 0) < 1 -> {
+                errorMsg = "步长至少为 1"
+            }
+            pollType == POLL_TYPE_NUMBER && (((maxVal!! - minVal!! + 1).toDouble() / stepVal!!) < 2.0) -> {
+                errorMsg = "评分范围除以步长至少要产生 2 个分值选项"
+            }
+            else -> {
+                errorMsg = null
+                val spec = PollBuilderSpec(
+                    type = pollType,
+                    results = resultsVisibility,
+                    publicVoter = publicVoter,
+                    chartType = chartType,
+                    title = pollTitle,
+                    options = opts,
+                    min = if (pollType == POLL_TYPE_REGULAR) null else minVal,
+                    max = if (pollType == POLL_TYPE_REGULAR) null else maxVal,
+                    step = if (pollType == POLL_TYPE_NUMBER) stepVal else null,
+                    closeMillis = closeMillis,
+                    pollName = initialSpec?.pollName ?: suggestedPollName,
+                    extraAttrs = initialSpec?.extraAttrs.orEmpty(),
+                )
+                onConfirm(spec)
+            }
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .heightIn(max = 620.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(IosTheme.colors.card)
+                .padding(horizontal = 18.dp, vertical = 16.dp),
+        ) {
+            // 1. 顶部栏：投票图标 + 标题 + 关闭按钮
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ComposerPollIcon(
+                    tint = IosTheme.colors.accent,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = if (initialSpec != null) "编辑投票" else "创建投票",
+                    style = IosTheme.type.headline.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                    color = IosTheme.colors.label,
+                    modifier = Modifier.weight(1f),
+                )
+                IosTextAction("关闭", color = IosTheme.colors.secondaryLabel, onClick = onDismiss)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 2. 投票类型胶囊切换栏（单选 / 多选 / 评分）
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(38.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(IosTheme.colors.fieldBackground)
+                    .padding(3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val typeTabs = listOf(
+                    POLL_TYPE_REGULAR to "单选",
+                    POLL_TYPE_MULTIPLE to "多选",
+                    POLL_TYPE_NUMBER to "评分",
+                )
+                for ((typeKey, typeLabel) in typeTabs) {
+                    val selected = pollType == typeKey
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(50))
+                            .background(if (selected) IosTheme.colors.accent else Color.Transparent)
+                            .clickable { onTypeSelect(typeKey) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = typeLabel,
+                            style = IosTheme.type.subheadline.copy(
+                                fontSize = 13.5.sp,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                            ),
+                            color = if (selected) Color.White else IosTheme.colors.secondaryLabel,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 3. 中部可滚动表单区域
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                // 投票标题输入
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = "投票标题（可选）",
+                        style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    PollTextInputField(
+                        value = pollTitle,
+                        onValueChange = { pollTitle = it },
+                        placeholder = "输入投票主题或问题…",
+                    )
+                }
+
+                // 投票选项列表（单选/多选显示）
+                if (!isNumber) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "投票选项",
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            Text(
+                                text = "已填 ${validOptions.size} 项",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.tertiaryLabel,
+                            )
+                        }
+
+                        pollOptions.forEachIndexed { idx, optText ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.accent.copy(alpha = 0.12f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "${idx + 1}",
+                                        style = IosTheme.type.caption.copy(
+                                            fontSize = 11.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                        ),
+                                        color = IosTheme.colors.accent,
+                                    )
+                                }
+
+                                Box(modifier = Modifier.weight(1f)) {
+                                    PollTextInputField(
+                                        value = optText,
+                                        onValueChange = { newVal ->
+                                            pollOptions[idx] = newVal
+                                            if (errorMsg != null) errorMsg = null
+                                        },
+                                        placeholder = "选项 ${idx + 1}",
+                                    )
+                                }
+
+                                val canRemove = pollOptions.size > 1
+                                Box(
+                                    modifier = Modifier
+                                        .size(30.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (canRemove) IosTheme.colors.fieldBackground
+                                            else Color.Transparent
+                                        )
+                                        .clickable(enabled = canRemove) {
+                                            if (pollOptions.size > 1) {
+                                                pollOptions.removeAt(idx)
+                                                if (errorMsg != null) errorMsg = null
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "✕",
+                                        style = IosTheme.type.caption.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
+                                        color = if (canRemove) IosTheme.colors.secondaryLabel else IosTheme.colors.tertiaryLabel.copy(alpha = 0.35f),
+                                    )
+                                }
+                            }
+                        }
+
+                        // 添加选项按钮
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(IosTheme.colors.accent.copy(alpha = 0.10f))
+                                .clickable {
+                                    pollOptions.add("")
+                                    if (pollType == POLL_TYPE_MULTIPLE) {
+                                        val nextMax = (validOptions.size + 1).coerceAtLeast(2)
+                                        if ((maxText.toIntOrNull() ?: 2) < nextMax) {
+                                            maxText = nextMax.toString()
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "＋ 添加选项",
+                                style = IosTheme.type.subheadline.copy(
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                ),
+                                color = IosTheme.colors.accent,
+                            )
+                        }
+                    }
+                }
+
+                // 多选：至少选 / 至多选
+                if (pollType == POLL_TYPE_MULTIPLE) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "至少选",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            PollTextInputField(
+                                value = minText,
+                                onValueChange = { minText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "至多选",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            PollTextInputField(
+                                value = maxText,
+                                onValueChange = { maxText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "${validOptions.size.coerceAtLeast(2)}",
+                                isNumber = true,
+                            )
+                        }
+                    }
+                }
+
+                // 评分：最小值 / 最大值 / 步长
+                if (isNumber) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("最小值", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = minText,
+                                onValueChange = { minText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("最大值", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = maxText,
+                                onValueChange = { maxText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "10",
+                                isNumber = true,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("步长", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            PollTextInputField(
+                                value = stepText,
+                                onValueChange = { stepText = it.filter { ch -> ch.isDigit() }; errorMsg = null },
+                                placeholder = "1",
+                                isNumber = true,
+                            )
+                        }
+                    }
+                }
+
+                // 高级选项折叠开关（参照 Fluxdo _showAdvanced）
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showAdvanced = !showAdvanced }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (showAdvanced) "▾ 高级选项" else "▸ 高级选项",
+                        style = IosTheme.type.subheadline.copy(
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.Medium,
+                        ),
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = if (showAdvanced) "收起" else "结果可见性 · 公开投票人 · 截止时间",
+                        style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                        color = IosTheme.colors.tertiaryLabel,
+                    )
+                }
+
+                if (showAdvanced) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(IosTheme.colors.fieldBackground.copy(alpha = 0.65f))
+                            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        // 结果可见性
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "结果可见性",
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                            @OptIn(ExperimentalLayoutApi::class)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                for ((resVal, resLabel) in POLL_RESULT_OPTIONS) {
+                                    val selected = resultsVisibility == resVal
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(
+                                                if (selected) IosTheme.colors.accent
+                                                else IosTheme.colors.card
+                                            )
+                                            .border(
+                                                0.5.dp,
+                                                if (selected) IosTheme.colors.accent else IosTheme.colors.separator.copy(alpha = 0.6f),
+                                                RoundedCornerShape(8.dp),
+                                            )
+                                            .clickable { resultsVisibility = resVal }
+                                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = resLabel,
+                                            style = IosTheme.type.caption.copy(
+                                                fontSize = 12.sp,
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                            ),
+                                            color = if (selected) Color.White else IosTheme.colors.label,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 公开投票人
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "公开投票人",
+                                    style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                    color = IosTheme.colors.label,
+                                )
+                                Text(
+                                    text = "显示每个选项的具体投票用户头像与名单",
+                                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                                    color = IosTheme.colors.tertiaryLabel,
+                                )
+                            }
+                            IosSwitch(
+                                checked = publicVoter,
+                                onCheckedChange = { publicVoter = it },
+                            )
+                        }
+
+                        // 图表类型（非评分模式展示）
+                        if (!isNumber) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "图表样式",
+                                    style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                    color = IosTheme.colors.label,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val chartTabs = listOf("bar" to "柱状图", "pie" to "饼图")
+                                    for ((cKey, cLabel) in chartTabs) {
+                                        val selected = chartType == cKey
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(if (selected) IosTheme.colors.accent else IosTheme.colors.card)
+                                                .border(
+                                                    0.5.dp,
+                                                    if (selected) IosTheme.colors.accent else IosTheme.colors.separator.copy(alpha = 0.6f),
+                                                    RoundedCornerShape(8.dp),
+                                                )
+                                                .clickable { chartType = cKey }
+                                                .padding(horizontal = 12.dp, vertical = 5.dp),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Text(
+                                                text = cLabel,
+                                                style = IosTheme.type.caption.copy(
+                                                    fontSize = 12.sp,
+                                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                                ),
+                                                color = if (selected) Color.White else IosTheme.colors.label,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 自动关闭时间
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "自动关闭",
+                                style = IosTheme.type.subheadline.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.label,
+                            )
+                            Spacer(Modifier.weight(1f))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(IosTheme.colors.card)
+                                    .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                    .clickable { pickCloseDateTime() }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = closeLabel,
+                                    style = IosTheme.type.caption.copy(
+                                        fontSize = 12.sp,
+                                        fontWeight = if (closeMillis != null) FontWeight.SemiBold else FontWeight.Normal,
+                                    ),
+                                    color = if (closeMillis != null) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                                )
+                            }
+                            if (closeMillis != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(26.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.card)
+                                        .clickable { closeMillis = null },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "✕",
+                                        style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                        color = IosTheme.colors.secondaryLabel,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 校验错误提示
+                errorMsg?.let { err ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(IosTheme.colors.destructive.copy(alpha = 0.10f))
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                    ) {
+                        Text(
+                            text = err,
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+                            color = IosTheme.colors.destructive,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+            IosDivider()
+            Spacer(Modifier.height(12.dp))
+
+            // 4. 底部操作按钮：取消 + 插入投票
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable { onDismiss() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1.3f)
+                        .height(42.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(IosTheme.colors.accent)
+                        .clickable { validateAndSubmit() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = if (initialSpec != null) "保存修改" else "插入投票",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PollTextInputField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    isNumber: Boolean = false,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            keyboardOptions = if (isNumber) KeyboardOptions(keyboardType = KeyboardType.Number) else KeyboardOptions.Default,
+            textStyle = IosTheme.type.subheadline.copy(
+                fontSize = 14.sp,
+                color = IosTheme.colors.label,
+            ),
+            cursorBrush = SolidColor(IosTheme.colors.accent),
+            modifier = Modifier.fillMaxWidth(),
+            decorationBox = { innerField ->
+                Box(Modifier.fillMaxWidth()) {
+                    if (value.isEmpty()) {
+                        Text(
+                            text = placeholder,
+                            style = IosTheme.type.subheadline.copy(fontSize = 14.sp),
+                            color = IosTheme.colors.tertiaryLabel,
+                        )
+                    }
+                    innerField()
+                }
+            },
+        )
     }
 }
 
@@ -8672,6 +10374,7 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
         FloatingAction.History -> Color(0xFF7E57C2).copy(alpha = 0.15f) to Color(0xFF7E57C2)
         FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f) to Color(0xFF1E88E5)
         FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f) to Color(0xFFE91E63)
+        FloatingAction.Apps -> Color(0xFF07C160).copy(alpha = 0.15f) to Color(0xFF07C160)
     }
 
     Box(
@@ -8785,6 +10488,694 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
                         drawCircle(actionTint, 1.1f, Offset(12f, 10f))
                         drawCircle(actionTint, 1.1f, Offset(15.5f, 10f))
                     }
+                    FloatingAction.Apps -> {
+                        drawArc(color = actionTint, startAngle = 120f, sweepAngle = 250f, useCenter = false, topLeft = Offset(3.5f, 3.5f), size = Size(11f, 11f), style = stroke)
+                        drawArc(color = actionTint, startAngle = -60f, sweepAngle = 250f, useCenter = false, topLeft = Offset(9.5f, 9.5f), size = Size(11f, 11f), style = stroke)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SavedTopicChip(
+    count: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier
+            .clip(RoundedCornerShape(50))
+            .background(IosTheme.colors.card.copy(alpha = 0.97f))
+            .border(0.5.dp, IosTheme.colors.separator, RoundedCornerShape(50))
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = "打开暂存话题，共 $count 篇" }
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("▱", color = IosTheme.colors.accent, fontSize = 17.sp)
+        Spacer(Modifier.width(6.dp))
+        Text("暂存 $count", color = IosTheme.colors.accent, style = IosTheme.type.footnote)
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+internal fun SavedTopicsSheet(
+    entries: List<SavedTopic>,
+    currentTopicId: Long?,
+    busy: Boolean,
+    notice: String?,
+    canUndo: Boolean,
+    onOpen: (SavedTopic) -> Unit,
+    onRemove: (Long) -> Unit,
+    onPin: (Long) -> Unit,
+    onClear: () -> Unit,
+    onUndo: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var confirmClear by rememberSaveable { mutableStateOf(false) }
+    val height = minOf(443f, androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp * 0.53f).dp
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.groupedBackground,
+        contentColor = IosTheme.colors.label,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("暂存话题", style = IosTheme.type.title3, color = IosTheme.colors.label)
+            Text("  ${entries.size} / 10", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            Spacer(Modifier.weight(1f))
+            TextButton(enabled = !busy && entries.isNotEmpty(), onClick = { confirmClear = true }) {
+                Text("全部清空", color = IosTheme.colors.accent)
+            }
+            TextButton(onClick = onDismiss, modifier = Modifier.width(44.dp)) {
+                Text("×", color = IosTheme.colors.secondaryLabel, fontSize = 23.sp)
+            }
+        }
+        Text(
+            "点卡片继续阅读 · 左滑移除 · 长按置顶",
+            modifier = Modifier.padding(start = 20.dp, bottom = 14.dp),
+            style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel,
+        )
+        if (entries.isEmpty()) {
+            Column(
+                Modifier.fillMaxWidth().height(170.dp).padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text("还没有暂存话题", style = IosTheme.type.headline, color = IosTheme.colors.label)
+                Spacer(Modifier.height(10.dp))
+                Text("在话题右上角点“暂存”，下次从这里接着读",
+                    style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            }
+        } else {
+            androidx.compose.foundation.lazy.LazyColumn(
+                modifier = Modifier.fillMaxWidth().height(height),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                items(entries, key = { it.topicId }) { entry ->
+                    SavedTopicCard(
+                        entry, entry.topicId == currentTopicId, busy,
+                        onOpen = { onOpen(entry) },
+                        onRemove = { onRemove(entry.topicId) },
+                        onPin = { onPin(entry.topicId) },
+                    )
+                }
+            }
+        }
+        if (notice != null) {
+            SavedTopicsNotice(notice, canUndo, onUndo, Modifier.padding(12.dp))
+        }
+    }
+    if (confirmClear) {
+        ClearSavedTopicsDialog(
+            count = entries.size,
+            onDismiss = { confirmClear = false },
+            onConfirm = { confirmClear = false; onClear() },
+        )
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun SavedTopicCard(
+    entry: SavedTopic,
+    current: Boolean,
+    busy: Boolean,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit,
+    onPin: () -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    val dismiss = androidx.compose.material3.rememberSwipeToDismissBoxState(
+        confirmValueChange = {
+            if (it == androidx.compose.material3.SwipeToDismissBoxValue.Settled) true
+            else if (it == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart && !busy) {
+                onRemove()
+                true
+            } else false
+        },
+    )
+    LaunchedEffect(busy) {
+        if (!busy && dismiss.currentValue != androidx.compose.material3.SwipeToDismissBoxValue.Settled) dismiss.reset()
+    }
+    androidx.compose.material3.SwipeToDismissBox(
+        state = dismiss,
+        enableDismissFromStartToEnd = false,
+        enableDismissFromEndToStart = !busy,
+        backgroundContent = {
+            // 仅在左滑时绘制红色底，静止状态下不让它透出卡片。
+            if (dismiss.dismissDirection == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart) {
+                Box(
+                    Modifier.fillMaxWidth().fillMaxHeight().clip(RoundedCornerShape(16.dp)).background(Color(0xFFE55D66)),
+                    contentAlignment = Alignment.CenterEnd,
+                ) { Text("移除", color = Color.White, modifier = Modifier.padding(end = 24.dp)) }
+            }
+        },
+    ) {
+        Box {
+            Column(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(IosTheme.colors.card)
+                    .border(
+                        if (current) 1.5.dp else 0.7.dp,
+                        if (current) IosTheme.colors.accent else IosTheme.colors.separator,
+                        RoundedCornerShape(16.dp),
+                    )
+                    .combinedClickable(enabled = !busy, onClick = onOpen, onLongClick = { menu = true })
+                    .padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 12.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.weight(1f).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            listOfNotNull(entry.categoryName, "已置顶".takeIf { entry.pinned }).joinToString(" · "),
+                            style = IosTheme.type.caption, color = IosTheme.colors.accent,
+                            modifier = Modifier.weight(1f, fill = false), maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                        if (current) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "当前",
+                                style = IosTheme.type.caption.copy(fontSize = 10.5.sp),
+                                color = IosTheme.colors.accent,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .border(0.75.dp, IosTheme.colors.accent, RoundedCornerShape(5.dp))
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                            )
+                        }
+                    }
+                    Box(
+                        Modifier.size(28.dp).clickable(enabled = !busy) { menu = true }
+                            .semantics { contentDescription = "暂存操作：${entry.title}" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("⋯", color = IosTheme.colors.secondaryLabel, fontSize = 20.sp)
+                        androidx.compose.material3.DropdownMenu(
+                            expanded = menu,
+                            onDismissRequest = { menu = false },
+                            containerColor = if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White,
+                            tonalElevation = 0.dp,
+                            modifier = Modifier.background(if (IosTheme.colors.isDark) IosTheme.colors.card else Color.White),
+                        ) {
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PostActionIcon(PostAction.Pin, entry.pinned, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = if (entry.pinned) "取消置顶" else "置顶",
+                                            color = if (entry.pinned) IosTheme.colors.accent else IosTheme.colors.label,
+                                        )
+                                    }
+                                },
+                                onClick = { menu = false; onPin() },
+                                enabled = !busy,
+                            )
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PostActionIcon(PostAction.Delete, false, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("移除暂存", color = IosTheme.colors.destructive)
+                                    }
+                                },
+                                onClick = { menu = false; onRemove() },
+                                enabled = !busy,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    entry.title, style = IosTheme.type.body.copy(fontSize = 15.sp, lineHeight = 21.sp),
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                    color = IosTheme.colors.label, maxLines = 2, minLines = 2,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(9.dp))
+                val floor = entry.position.postNumber.coerceAtLeast(1)
+                val total = maxOf(entry.totalPosts, floor, 1)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("读到第 $floor / $total 楼", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        org.linuxdo.android.ui.format.RelativeTime.format(java.time.Instant.ofEpochMilli(entry.savedAt).toString()) + "暂存",
+                        style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel,
+                        maxLines = 1,
+                    )
+                }
+                Spacer(Modifier.height(9.dp))
+                Box(Modifier.fillMaxWidth().height(2.dp).clip(RoundedCornerShape(2.dp)).background(IosTheme.colors.separator.copy(alpha = 0.45f))) {
+                    Box(Modifier.fillMaxWidth((floor.toFloat() / total).coerceIn(0f, 1f)).height(2.dp).background(IosTheme.colors.accent.copy(alpha = 0.65f)))
+                }
+            }
+        }
+    }
+}
+
+// 与评论删除确认框（TopicDetailScreen.DeleteConfirmDialog）保持同一套样式。
+@Composable
+private fun ClearSavedTopicsDialog(count: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Column(
+            Modifier
+                .widthIn(min = 280.dp, max = 340.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "确认清空全部暂存？",
+                style = IosTheme.type.headline,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                color = IosTheme.colors.label,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "将移除这 $count 篇暂存话题，清空后可立即撤销。论坛收藏和浏览历史不受影响。",
+                style = IosTheme.type.footnote,
+                color = IosTheme.colors.secondaryLabel,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFFFF3B30))
+                        .clickable(onClick = onConfirm),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "全部清空",
+                        style = IosTheme.type.subheadline.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SavedTopicsNotice(message: String, canUndo: Boolean, onUndo: () -> Unit, modifier: Modifier = Modifier) {
+    androidx.compose.material3.Snackbar(
+        modifier = modifier,
+        action = { if (canUndo) TextButton(onClick = onUndo) { Text("撤销", color = Color(0xFFD4C7FF)) } },
+    ) { Text(message) }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+internal fun TopicSearchSheet(
+    state: TopicSearchUiState,
+    onQuery: (String) -> Unit,
+    onOrder: (org.linuxdo.android.data.SearchOrder) -> Unit,
+    onLoadMore: () -> Unit,
+    onOpen: (org.linuxdo.android.data.TopicSearchHit) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val list = rememberLazyListState()
+    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var sorting by remember { mutableStateOf(false) }
+    val nearEnd by remember { derivedStateOf {
+        (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 3
+    } }
+    LaunchedEffect(nearEnd, state.hits.size, state.hasMore, state.loadingMore, state.error) {
+        if (nearEnd && state.hits.isNotEmpty() && state.hasMore && !state.loading && !state.loadingMore && state.error == null) onLoadMore()
+    }
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.groupedBackground,
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        tonalElevation = 0.dp,
+        dragHandle = {
+            Box(Modifier.fillMaxWidth().background(IosTheme.colors.card).padding(top = 10.dp, bottom = 6.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.width(40.dp).height(4.dp).clip(RoundedCornerShape(3.dp)).background(IosTheme.colors.separator))
+            }
+        },
+    ) {
+        val focus = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = LocalSoftwareKeyboardController.current
+        val window = androidx.compose.ui.platform.LocalWindowInfo.current
+        val requester = remember(state.topicId) { FocusRequester() }
+        LaunchedEffect(state.topicId) {
+            // 等当前弹层取得窗口焦点，避免菜单退场和弹层入场时 IME 请求丢失。
+            androidx.compose.runtime.snapshotFlow {
+                sheetState.currentValue != androidx.compose.material3.SheetValue.Hidden && window.isWindowFocused
+            }.first { it }
+            androidx.compose.runtime.withFrameNanos { }
+            requester.requestFocus()
+            androidx.compose.runtime.withFrameNanos { }
+            keyboard?.show()
+        }
+        Column(Modifier.fillMaxWidth().fillMaxHeight(0.86f)) {
+            ReaderPanelHeader("贴内搜索", onClose = { keyboard?.hide(); onDismiss() })
+            Column(Modifier.padding(horizontal = 16.dp)) {
+                Text(state.title, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
+                ReaderSearchField(
+                    state.query, onQuery, "搜索当前话题", requester = requester,
+                    onSearch = { focus.clearFocus(); keyboard?.hide() },
+                )
+                Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (state.hits.isEmpty()) "搜索结果" else "已找到 ${state.hits.size}${if (state.hasMore) "+" else ""} 条结果",
+                        style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel, modifier = Modifier.weight(1f))
+                    Box {
+                        ReaderActionPill(state.order.label + " ▾", onClick = { focus.clearFocus(); keyboard?.hide(); sorting = true })
+                        DropdownMenu(sorting, { sorting = false }, modifier = Modifier.background(IosTheme.colors.card)) {
+                            org.linuxdo.android.data.SearchOrder.entries.forEach { order ->
+                                DropdownMenuItem(
+                                    text = { Text(order.label, style = IosTheme.type.body,
+                                        color = if (order == state.order) IosTheme.colors.accent else IosTheme.colors.label) },
+                                    onClick = { sorting = false; onOrder(order) },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            LazyColumn(
+                state = list, modifier = Modifier.weight(1f),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (state.loading) item("loading") { org.linuxdo.android.ui.design.IosLoadingBox() }
+                if (!state.loading && state.hits.isEmpty() && state.error == null) item("empty") {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        ReaderSearchGlyph(Modifier.size(32.dp))
+                        Spacer(Modifier.height(16.dp))
+                        Text(if (state.query.isBlank()) "搜索话题中的内容" else "没有找到匹配楼层",
+                            style = IosTheme.type.headline, color = IosTheme.colors.secondaryLabel)
+                        Spacer(Modifier.height(6.dp))
+                        Text(if (state.query.isBlank()) "输入关键词即可查找" else "换个关键词再试试",
+                            style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                    }
+                }
+                items(state.hits, key = { it.postId }) { hit ->
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                        .background(IosTheme.colors.card)
+                        .clickable { focus.clearFocus(); keyboard?.hide(); onOpen(hit) }.padding(15.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            org.linuxdo.android.ui.design.UserAvatar(
+                                avatarUrl = hit.avatarUrl, username = hit.username, modifier = Modifier.size(30.dp), cornerRadius = 8.dp)
+                            Column(Modifier.weight(1f).padding(start = 9.dp)) {
+                                Text(hit.username, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold,
+                                    color = IosTheme.colors.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                hit.createdAt?.takeIf { it.isNotBlank() }?.let {
+                                    Text(org.linuxdo.android.ui.format.RelativeTime.format(it), style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                }
+                            }
+                            Text("#${hit.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.accent,
+                                fontWeight = FontWeight.SemiBold, modifier = Modifier.clip(RoundedCornerShape(8.dp))
+                                    .background(IosTheme.colors.accent.copy(alpha = 0.09f)).padding(horizontal = 9.dp, vertical = 5.dp))
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Text(hit.blurb, style = IosTheme.type.body.copy(fontSize = 14.5.sp, lineHeight = 22.sp),
+                            color = IosTheme.colors.label, maxLines = 5, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                if (state.loadingMore) item("more") { org.linuxdo.android.ui.design.IosLoadingBox() }
+                state.error?.let { error -> item("error") {
+                    ReaderEditorError(error, onRetry = { if (state.hits.isEmpty()) onQuery(state.query) else onLoadMore() })
+                } }
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+internal fun TopicMetadataEditorSheet(
+    state: TopicMetadataEditorUiState,
+    onTitle: (String) -> Unit,
+    onCategory: (Int) -> Unit,
+    onTags: (List<String>) -> Unit,
+    onTagQuery: (String) -> Unit,
+    onSave: () -> Unit,
+    onRetry: () -> Unit,
+    onClose: () -> Unit,
+) {
+    var discard by remember { mutableStateOf(false) }
+    var selectCategory by remember { mutableStateOf(false) }
+    val editable = state.original?.canEdit == true && !state.saving && !state.loading
+    val category = state.rules?.categories?.firstOrNull { it.id == state.categoryId }
+    val requestClose = { if (!state.saving) { if (state.dirty) discard = true else onClose() } }
+    Dialog(onDismissRequest = requestClose, properties = androidx.compose.ui.window.DialogProperties(
+        usePlatformDefaultWidth = false, decorFitsSystemWindows = false, dismissOnClickOutside = false)) {
+        androidx.activity.compose.BackHandler(enabled = true, onBack = requestClose)
+        val focus = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = LocalSoftwareKeyboardController.current
+        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).systemBarsPadding().imePadding()) {
+            ReaderPanelHeader(
+                "话题编辑", onClose = requestClose, closeEnabled = !state.saving,
+                actionText = if (state.saving) "保存中…" else "保存", actionEnabled = state.canSave,
+                onAction = { focus.clearFocus(); keyboard?.hide(); onSave() },
+            )
+            org.linuxdo.android.ui.design.IosFullDivider()
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                if (state.loading) org.linuxdo.android.ui.design.IosLoadingBox()
+                state.error?.let { Box(Modifier.padding(horizontal = 16.dp)) { ReaderEditorError(it, onRetry = if (state.saving) null else onRetry) } }
+                if (state.original != null && !state.loading) {
+                    IosGroupCard(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("话题标题", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                            BasicTextField(
+                                value = state.title, onValueChange = onTitle, enabled = editable,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 70.dp),
+                                minLines = 2, maxLines = 5,
+                                textStyle = IosTheme.type.body.copy(fontSize = 18.sp, lineHeight = 27.sp,
+                                    fontWeight = FontWeight.Medium, color = if (editable) IosTheme.colors.label else IosTheme.colors.secondaryLabel),
+                                cursorBrush = androidx.compose.ui.graphics.SolidColor(IosTheme.colors.accent),
+                                decorationBox = { field -> Box {
+                                    if (state.title.isEmpty()) Text("输入话题标题", style = IosTheme.type.body, color = IosTheme.colors.tertiaryLabel)
+                                    field()
+                                } },
+                            )
+                            val changedTitle = state.patch?.title != null
+                            val minimum = if (state.original.privateMessage) state.rules?.minPmTitleLength ?: 2 else state.rules?.minTitleLength ?: 15
+                            val length = state.title.trim().length
+                            Row(Modifier.fillMaxWidth()) {
+                                Text(if (changedTitle) "至少 $minimum 个字符" else "",
+                                    style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel, modifier = Modifier.weight(1f))
+                                Text("$length / 200", style = IosTheme.type.caption,
+                                    color = if (changedTitle && (length < minimum || length > 200)) IosTheme.colors.destructive else IosTheme.colors.tertiaryLabel)
+                            }
+                        }
+                    }
+                    if (!state.original.privateMessage) {
+                        IosGroupCard(Modifier.fillMaxWidth()) {
+                            Row(Modifier.fillMaxWidth()
+                                .clickable(enabled = editable && state.rules?.selectableCategories?.isNotEmpty() == true) { selectCategory = true }
+                                .padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                                    Text("分类", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.size(8.dp).clip(CircleShape).background(category?.color?.let(::parseCategoryColor) ?: IosTheme.colors.accent))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(category?.name ?: "请选择分类", style = IosTheme.type.body, color = IosTheme.colors.label,
+                                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                                org.linuxdo.android.ui.design.IosChevron()
+                            }
+                        }
+                        IosGroupCard(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Row(Modifier.fillMaxWidth()) {
+                                    Text("标签", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, modifier = Modifier.weight(1f))
+                                    Text("${state.tags.size} / 5", style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                }
+                                androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    state.tags.forEach { tag ->
+                                        Text(tag + if (editable && state.rules?.canTagTopics == true) "  ×" else "",
+                                            style = IosTheme.type.footnote, color = IosTheme.colors.accent,
+                                            modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(IosTheme.colors.accent.copy(alpha = 0.1f))
+                                                .clickable(enabled = editable && state.rules?.canTagTopics == true) { onTags(state.tags - tag) }
+                                                .padding(horizontal = 12.dp, vertical = 9.dp))
+                                    }
+                                }
+                                if (state.tags.isEmpty()) Text("未选择标签", style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                                if (state.rules?.canTagTopics == true) {
+                                    ReaderSearchField(
+                                        state.tagQuery, onTagQuery, "搜索并添加标签", enabled = editable,
+                                        background = IosTheme.colors.fieldBackground,
+                                        onSearch = { focus.clearFocus(); keyboard?.hide() },
+                                    )
+                                    state.requiredTagName?.let {
+                                        Text("请从「$it」组至少选择 ${state.requiredTagMin} 个标签",
+                                            style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                                    }
+                                    if (state.loadingTags) Text("正在加载…", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                                    state.tagError?.let { error ->
+                                        ReaderEditorError(error, onRetry = if (editable) ({ onTagQuery(state.tagQuery) }) else null)
+                                    }
+                                    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        state.tagOptions.filterNot { it.name in state.tags }.forEach { option ->
+                                            Text("+ " + option.text, style = IosTheme.type.footnote, color = IosTheme.colors.label,
+                                                modifier = Modifier.clip(RoundedCornerShape(9.dp)).background(IosTheme.colors.fieldBackground)
+                                                    .clickable(enabled = editable) { onTags(state.tags + option.name) }
+                                                    .padding(horizontal = 11.dp, vertical = 9.dp))
+                                        }
+                                    }
+                                    if (!state.loadingTags && state.tagError == null && state.tagOptions.isEmpty()) {
+                                        Text("没有找到可选标签", style = IosTheme.type.caption, color = IosTheme.colors.tertiaryLabel)
+                                    }
+                                } else {
+                                    Text("当前账号不能修改标签，已有标签会保留", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                }
+                                category?.minimumRequiredTags?.takeIf { it > 0 }?.let {
+                                    Text("该分类至少需要 $it 个标签", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                }
+                            }
+                        }
+                    }
+                    if (state.dirty) state.validationError?.let { Box(Modifier.padding(horizontal = 16.dp)) { ReaderEditorError(it) } }
+                }
+            }
+        }
+    }
+    if (selectCategory) CategoryPickerDialog(
+        groups = compactCategoryGroups(state.rules?.selectableCategories.orEmpty()),
+        selectedCategoryId = state.categoryId,
+        onSelect = { categoryId -> selectCategory = false; onCategory(categoryId) },
+        onDismiss = { selectCategory = false },
+        includeAllLevels = true,
+    )
+    if (discard) ReaderDiscardDialog(onDiscard = { discard = false; onClose() }, onCancel = { discard = false })
+}
+
+@Composable
+private fun ReaderPanelHeader(
+    title: String,
+    onClose: () -> Unit,
+    closeEnabled: Boolean = true,
+    actionText: String? = null,
+    actionEnabled: Boolean = true,
+    onAction: () -> Unit = {},
+) {
+    Row(Modifier.fillMaxWidth().background(IosTheme.colors.card).height(54.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(34.dp).clip(CircleShape).background(IosTheme.colors.fieldBackground)
+            .clickable(enabled = closeEnabled, onClick = onClose).semantics { contentDescription = "关闭$title" },
+            contentAlignment = Alignment.Center) {
+            Text("✕", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+        }
+        Text(title, style = IosTheme.type.headline.copy(fontSize = 17.sp), color = IosTheme.colors.label,
+            modifier = Modifier.weight(1f).padding(horizontal = 12.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (actionText != null) ReaderActionPill(actionText, actionEnabled, onAction)
+    }
+}
+
+@Composable
+private fun ReaderActionPill(text: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(Modifier.clip(RoundedCornerShape(18.dp))
+        .background(if (enabled) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.fieldBackground)
+        .clickable(enabled = enabled, onClick = onClick).padding(horizontal = 14.dp, vertical = 9.dp),
+        contentAlignment = Alignment.Center) {
+        Text(text, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold,
+            color = if (enabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel)
+    }
+}
+
+@Composable
+private fun ReaderSearchGlyph(modifier: Modifier = Modifier) {
+    val color = IosTheme.colors.secondaryLabel
+    Canvas(modifier) {
+        val stroke = size.minDimension * 0.085f
+        drawCircle(color, radius = size.minDimension * 0.29f, center = Offset(size.width * 0.42f, size.height * 0.42f), style = Stroke(stroke))
+        drawLine(color, Offset(size.width * 0.64f, size.height * 0.64f), Offset(size.width * 0.88f, size.height * 0.88f),
+            strokeWidth = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun ReaderSearchField(
+    value: String, onChange: (String) -> Unit, placeholder: String,
+    enabled: Boolean = true, requester: FocusRequester? = null,
+    background: Color = IosTheme.colors.card, onSearch: () -> Unit = {},
+) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(background)
+        .padding(horizontal = 13.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        ReaderSearchGlyph(Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        BasicTextField(
+            value = value, onValueChange = onChange, singleLine = true, enabled = enabled,
+            modifier = Modifier.weight(1f).then(if (requester != null) Modifier.focusRequester(requester) else Modifier),
+            textStyle = IosTheme.type.body.copy(fontSize = 14.5.sp, color = IosTheme.colors.label),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(IosTheme.colors.accent),
+            keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { onSearch() }),
+            decorationBox = { field -> Box {
+                if (value.isEmpty()) Text(placeholder, style = IosTheme.type.footnote, color = IosTheme.colors.tertiaryLabel)
+                field()
+            } },
+        )
+        if (value.isNotEmpty()) Box(Modifier.padding(start = 8.dp).size(22.dp).clip(CircleShape)
+            .background(IosTheme.colors.separator.copy(alpha = 0.4f))
+            .clickable(enabled = enabled) { onChange("") }
+            .semantics { contentDescription = "清空搜索内容" }, contentAlignment = Alignment.Center) {
+            Text("×", color = IosTheme.colors.secondaryLabel, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun ReaderEditorError(message: String, onRetry: (() -> Unit)? = null) {
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+        .background(IosTheme.colors.destructive.copy(alpha = 0.07f)).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(message, style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
+        if (onRetry != null) ReaderActionPill("重试", onClick = onRetry)
+    }
+}
+
+@Composable
+private fun ReaderDiscardDialog(onDiscard: () -> Unit, onCancel: () -> Unit) {
+    Dialog(onDismissRequest = onCancel) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(IosTheme.colors.card).padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("放弃本次修改？", style = IosTheme.type.headline, color = IosTheme.colors.label)
+            Text("尚未保存的话题信息将不会提交。", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Box(Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.fieldBackground).clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
+                    Text("继续编辑", style = IosTheme.type.footnote, color = IosTheme.colors.label)
+                }
+                Box(Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.destructive).clickable(onClick = onDiscard), contentAlignment = Alignment.Center) {
+                    Text("放弃修改", style = IosTheme.type.footnote, color = Color.White)
                 }
             }
         }

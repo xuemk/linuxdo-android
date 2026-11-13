@@ -15,8 +15,27 @@ import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.animation.animateContentSize
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.drop
+import org.linuxdo.android.data.TopicReadingPosition
+import org.linuxdo.android.ui.html.segmentCookedBlocks
 import kotlin.math.abs
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -75,6 +94,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import org.linuxdo.android.ui.RichMarkdownEditorView
+import org.linuxdo.android.ui.CreatorPollSpan
+import org.linuxdo.android.ui.PollBuilderDialog
+import org.linuxdo.android.ui.PollBuilderSpec
+import org.linuxdo.android.ui.nextAvailablePollName
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.geometry.Offset
@@ -157,6 +180,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -209,11 +233,13 @@ import org.linuxdo.android.ui.format.RelativeTime
 import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
+import org.linuxdo.android.ui.html.isImageLinkUrl
 import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
 import org.linuxdo.android.net.awaitImageRetrySlot
 import org.linuxdo.android.net.isTransientImageError
 
 private val LocalOpenTopic = compositionLocalOf<((Long, String, Int?) -> Unit)?> { null }
+private val LocalOpenPicture = compositionLocalOf<((List<ImageViewerItem>, Int) -> Unit)?> { null }
 private val LocalSelectionResetKey = compositionLocalOf { 0 }
 private val LocalOpenExternalUrl = compositionLocalOf<(String) -> Unit> { {} }
 private val LocalVotePoll = compositionLocalOf<(Long, String, List<String>) -> Unit> { { _, _, _ -> } }
@@ -221,6 +247,20 @@ private val LocalPollBusy = compositionLocalOf<(Long) -> Boolean> { { false } }
 private val LocalPollError = compositionLocalOf<(Long) -> String?> { { null } }
 private val LocalDecryptSelection = compositionLocalOf<(String) -> Unit> { {} }
 private val LocalTocTarget = compositionLocalOf<String?> { null }
+private val LocalPostPageActive = compositionLocalOf { true }
+private val LocalSelectionPost = compositionLocalOf<Post?> { null }
+private val LocalQuoteSelection = compositionLocalOf<((Post, String) -> Unit)?> { null }
+private val LocalSharePost = compositionLocalOf<(Post) -> Unit> { {} }
+private val LocalCopyPostMarkdown = compositionLocalOf<(Post) -> Unit> { {} }
+private val LocalPostHistory = compositionLocalOf<(Post) -> Unit> { {} }
+
+internal data class TopicShareActions(
+    val onShareImage: () -> Unit,
+    val onCopyMarkdown: () -> Unit,
+    val shareLoading: Boolean = false,
+    val copyLoading: Boolean = false,
+)
+internal val LocalTopicShareActions = compositionLocalOf<TopicShareActions?> { null }
 
 private data class TocEntry(
     val postId: Long,
@@ -251,11 +291,28 @@ private data class ReadingFloorIndicator(
         }
 }
 
+private class SelectionClipboard(private val delegate: androidx.compose.ui.platform.ClipboardManager) :
+    androidx.compose.ui.platform.ClipboardManager by delegate {
+    var capture: ((AnnotatedString) -> Unit)? = null
+    override fun setText(annotatedString: AnnotatedString) {
+        val receiver = capture
+        if (receiver != null) receiver(annotatedString) else delegate.setText(annotatedString)
+    }
+}
+
 private class CopyInterceptingTextToolbar(
     private val delegate: androidx.compose.ui.platform.TextToolbar,
+    private val view: android.view.View,
+    private val onQuote: (((() -> Unit)) -> Unit)?,
     private val onCopied: () -> Unit,
 ) : androidx.compose.ui.platform.TextToolbar {
-    override val status: TextToolbarStatus get() = delegate.status
+    private var mode: android.view.ActionMode? = null
+    companion object {
+        private var active: java.lang.ref.WeakReference<CopyInterceptingTextToolbar>? = null
+        val hasActive: Boolean get() = active?.get()?.mode != null
+        fun hideActive() { active?.get()?.hide() }
+    }
+    override val status: TextToolbarStatus get() = if (mode != null) TextToolbarStatus.Shown else delegate.status
 
     override fun showMenu(
         rect: Rect,
@@ -264,6 +321,42 @@ private class CopyInterceptingTextToolbar(
         onCutRequested: (() -> Unit)?,
         onSelectAllRequested: (() -> Unit)?,
     ) {
+        if (onQuote != null && onCopyRequested != null) {
+            hide()
+            hideActive()
+            val actions = linkedMapOf<Int, Pair<String, () -> Unit>>()
+            actions[android.R.id.copy] = "复制" to { onCopyRequested(); onCopied() }
+            actions[android.view.Menu.FIRST + 70] = "引用回复" to { onQuote.invoke(onCopyRequested) }
+            onSelectAllRequested?.let { actions[android.R.id.selectAll] = "全选" to it }
+            onCutRequested?.let { actions[android.R.id.cut] = "剪切" to it }
+            onPasteRequested?.let { actions[android.R.id.paste] = "粘贴" to it }
+            mode = view.startActionMode(object : android.view.ActionMode.Callback2() {
+                override fun onCreateActionMode(mode: android.view.ActionMode, menu: android.view.Menu): Boolean {
+                    actions.entries.forEachIndexed { index, (id, action) ->
+                        menu.add(0, id, index, action.first).setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_IF_ROOM)
+                    }
+                    return true
+                }
+                override fun onPrepareActionMode(mode: android.view.ActionMode, menu: android.view.Menu) = false
+                override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem): Boolean {
+                    val action = actions[item.itemId] ?: return false
+                    action.second()
+                    if (item.itemId != android.R.id.selectAll) mode.finish()
+                    return true
+                }
+                override fun onDestroyActionMode(mode: android.view.ActionMode) {
+                    this@CopyInterceptingTextToolbar.mode = null
+                    if (active?.get() === this@CopyInterceptingTextToolbar) active = null
+                }
+                override fun onGetContentRect(mode: android.view.ActionMode, view: android.view.View, outRect: android.graphics.Rect) {
+                    outRect.set(rect.left.toInt(), rect.top.toInt(), rect.right.toInt(), rect.bottom.toInt())
+                }
+            }, android.view.ActionMode.TYPE_FLOATING)
+            if (mode != null) {
+                active = java.lang.ref.WeakReference(this)
+                return
+            }
+        }
         delegate.showMenu(
             rect,
             onCopyRequested?.let { copy -> { copy(); onCopied() } },
@@ -273,20 +366,36 @@ private class CopyInterceptingTextToolbar(
         )
     }
 
-    override fun hide() = delegate.hide()
+    override fun hide() {
+        mode?.finish()
+        mode = null
+        if (active?.get() === this) active = null
+        delegate.hide()
+    }
 }
 
 @Composable
 private fun DecryptableSelection(content: @Composable () -> Unit) {
     val delegate = LocalTextToolbar.current
-    val clipboard = LocalClipboardManager.current
+    val originalClipboard = LocalClipboardManager.current
+    val clipboard = remember(originalClipboard) { SelectionClipboard(originalClipboard) }
+    val view = LocalView.current
+    val post = LocalSelectionPost.current
+    val quoteSelection = LocalQuoteSelection.current
     val onSelectionCopied = LocalDecryptSelection.current
-    val toolbar = remember(delegate, clipboard, onSelectionCopied) {
-        CopyInterceptingTextToolbar(delegate) {
+    val toolbar = remember(delegate, clipboard, onSelectionCopied, view, post, quoteSelection) {
+        val quote: ((() -> Unit) -> Unit)? = if (post != null && quoteSelection != null) { copy ->
+            var selected: AnnotatedString? = null
+            clipboard.capture = { selected = it }
+            try { copy() } finally { clipboard.capture = null }
+            selected?.text?.takeIf { it.isNotBlank() }?.let { quoteSelection(post, it) }
+        } else null
+        CopyInterceptingTextToolbar(delegate, view, quote) {
             clipboard.getText()?.text?.takeIf { it.isNotBlank() }?.let(onSelectionCopied)
         }
     }
-    CompositionLocalProvider(LocalTextToolbar provides toolbar) {
+    DisposableEffect(toolbar) { onDispose { toolbar.hide() } }
+    CompositionLocalProvider(LocalTextToolbar provides toolbar, LocalClipboardManager provides clipboard) {
         SelectionContainer(content = content)
     }
 }
@@ -351,6 +460,11 @@ fun TopicDetailScreen(
     onOpenExternalLink: (String) -> Unit = {},
     trailing: @Composable () -> Unit = {},
     blockedUsernames: Set<String> = emptySet(),
+    initialPosition: TopicReadingPosition? = null,
+    onReadingPosition: (TopicReadingPosition) -> Unit = {},
+    savedTopicCount: Int = 0,
+    onOpenSavedTopics: () -> Unit = {},
+    onOpenTag: (String) -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -358,8 +472,9 @@ fun TopicDetailScreen(
     val textToolbar = LocalTextToolbar.current
     var selectionResetKey by remember { mutableIntStateOf(0) }
     var pictureGallery by remember { mutableStateOf<Pair<List<ImageViewerItem>, Int>?>(null) }
-    var collapsed by rememberSaveable { mutableStateOf(emptyList<Long>()) }
-    var expanded by rememberSaveable { mutableStateOf(emptyList<Long>()) }
+    var collapsed by rememberSaveable { mutableStateOf(initialPosition?.collapsed.orEmpty()) }
+    var expanded by rememberSaveable { mutableStateOf(initialPosition?.expanded.orEmpty()) }
+    var savedPositionRestored by rememberSaveable { mutableStateOf(initialPosition == null) }
     val locateTarget = state.locatePostNumber ?: initialPostNumber
     val explicitLocateVersion = if (state.locatePostNumber != null) state.locateVersion else 0
     var located by rememberSaveable(locateTarget, explicitLocateVersion) { mutableStateOf(locateTarget == null) }
@@ -397,6 +512,43 @@ fun TopicDetailScreen(
         }
     }
     val clipboardManager = LocalClipboardManager.current
+    val markdownLoader = org.linuxdo.android.ui.LocalPostMarkdownLoader.current
+    val previewLoader = org.linuxdo.android.ui.LocalTopicPreviewLoader.current
+    var sharePost by remember(topicId) { mutableStateOf<Post?>(null) }
+    var historyPost by remember(topicId) { mutableStateOf<Post?>(null) }
+    var copyingMarkdown by remember(topicId) { mutableStateOf(false) }
+    var preparingShare by remember(topicId) { mutableStateOf(false) }
+    fun copyMarkdown(postNumber: Int) {
+        if (copyingMarkdown) return
+        copyingMarkdown = true
+        scope.launch {
+            try {
+                val raw = markdownLoader(topicId, postNumber)
+                clipboardManager.setText(AnnotatedString(raw))
+                noticeToast = "Markdown 原文已复制"
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                noticeToast = "原文获取失败，请稍后重试"
+            } finally { copyingMarkdown = false }
+        }
+    }
+    fun shareFirstPost() {
+        val first = state.posts.firstOrNull { it.postNumber == 1 }
+        if (first != null) { sharePost = first; return }
+        if (preparingShare || previewLoader == null) return
+        preparingShare = true
+        scope.launch {
+            try {
+                sharePost = previewLoader(topicId).postStream.posts.firstOrNull { it.postNumber == 1 }
+                if (sharePost == null) noticeToast = "主帖暂不可用"
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                noticeToast = "主帖获取失败，请稍后重试"
+            } finally { preparingShare = false }
+        }
+    }
     val onCopyLinkAction: (Post) -> Unit = { p ->
         val url = "${Config.BASE_URL}/t/topic/$topicId/${p.postNumber}"
         clipboardManager.setText(AnnotatedString(url))
@@ -430,17 +582,44 @@ fun TopicDetailScreen(
             flatPostRows(displayedPosts, descending = state.descending)
         }
     }
-    val tocEntries = remember(state.posts) {
-        state.posts.sortedBy { it.postNumber }.flatMap { post ->
-            fun headings(blocks: List<CookedBlock>): List<CookedBlock.Heading> = blocks.flatMap { block ->
-                when (block) {
-                    is CookedBlock.Heading -> listOf(block)
-                    is CookedBlock.Quote -> headings(block.blocks)
-                    is CookedBlock.ListBlock -> block.entries.flatMap(::headings)
-                    else -> emptyList()
+    val reportUnknownTag by rememberUpdatedState(onUnknownTag)
+    var preparedBodies by remember(topicId) { mutableStateOf(emptyMap<Long, PreparedPostBody>()) }
+    val preparationAnchor by remember { derivedStateOf {
+        list.layoutInfo.visibleItemsInfo.firstNotNullOfOrNull { postIdFromListKey(it.key) }
+    } }
+    LaunchedEffect(state.posts, active, preparationAnchor) {
+        if (!active) return@LaunchedEffect
+        val postsById = state.posts.associateBy { it.id }
+        preparedBodies = preparedBodies.filter { (id, body) -> postsById[id]?.let(body::matches) == true }
+        val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
+        val targetFloor = initialPosition?.postNumber ?: initialPostNumber
+        val pending = state.posts.filter { post -> preparedBodies[post.id]?.matches(post) != true }
+            .sortedBy { if (it.id in visibleIds || it.postNumber == targetFloor) 0 else 1 }
+        for (post in pending) {
+            val body = withContext(Dispatchers.Default) {
+                val blocks = try {
+                    CookedParser.parsePostCached(post, reportUnknownTag)
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    val plain = org.jsoup.Jsoup.parseBodyFragment(post.cooked).text()
+                    listOf(CookedBlock.Paragraph(listOf(InlineText(plain))))
                 }
+                PreparedPostBody(post, blocks, segmentCookedBlocks(blocks), extractPostImages(blocks), collectHeadings(blocks))
             }
-            headings(CookedParser.parsePostCached(post)).map { heading ->
+            preparedBodies = preparedBodies + (post.id to body)
+            // 分帧发布已准备好的楼层，首屏不等待整批正文。
+            withFrameNanos { }
+        }
+    }
+    val slices = remember(rows, preparedBodies) {
+        rows.flatMap { row ->
+            val body = preparedBodies[row.post.id]?.takeIf { it.matches(row.post) }
+            List(body?.parts?.size ?: 1) { index -> PostContentSlice(row, body, index) }
+        }
+    }
+    val tocEntries = remember(state.posts, preparedBodies) {
+        state.posts.sortedBy { it.postNumber }.flatMap { post ->
+            preparedBodies[post.id]?.headings.orEmpty().map { heading ->
                 TocEntry(post.id, post.postNumber, heading.level, heading.title, heading.anchor)
             }
         }
@@ -485,7 +664,7 @@ fun TopicDetailScreen(
         val visibleIds = layout.visibleItemsInfo.filter { item ->
             val overlap = minOf(item.offset + item.size, layout.viewportEndOffset) - maxOf(item.offset, layout.viewportStartOffset)
             overlap > 0
-        }.mapNotNull { it.key as? Long }.toSet()
+        }.mapNotNull { postIdFromListKey(it.key) }.toSet()
         rows.filter { it.post.id in visibleIds }.map { it.post.postNumber }
     } }
     val currentPostNumber by remember(rows, visiblePostNumbers) { derivedStateOf {
@@ -493,7 +672,7 @@ fun TopicDetailScreen(
     } }
     val firstPostId = remember(rows) { rows.firstOrNull { it.post.postNumber == 1 }?.post?.id }
     val firstPostVisible by remember(list, firstPostId) {
-        derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { it.key == firstPostId } }
+        derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { postIdFromListKey(it.key) == firstPostId } }
     }
     LaunchedEffect(visiblePostNumbers, active) {
         onPostsVisible(if (active) visiblePostNumbers else emptyList())
@@ -526,7 +705,7 @@ fun TopicDetailScreen(
     }
     val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView) {
         derivedStateOf {
-            val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
+            val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
             val visibleRows = rows.filter { it.post.id in visibleIds }
             if (visibleRows.isEmpty()) {
                 val first = rows.firstOrNull()?.post?.postNumber ?: 1
@@ -577,6 +756,8 @@ fun TopicDetailScreen(
     val opPinned = rows.firstOrNull()?.post?.postNumber == 1
     val headRows = if (opPinned) rows.take(1) else emptyList()
     val bodyRows = if (opPinned) rows.drop(1) else rows
+    val headSlices = if (opPinned) slices.takeWhile { it.row.post.id == headRows.first().post.id } else emptyList()
+    val bodySlices = slices.drop(headSlices.size)
     val replyTotal = (totalPosts - 1).coerceAtLeast(0)
     val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
     val topErrorCount = if (showTopError && state.error != null) 1 else 0
@@ -588,11 +769,51 @@ fun TopicDetailScreen(
     val hasHeadPost = rows.any { it.post.postNumber == 1 }
     val showPreviousGap = state.previousIds.isNotEmpty() && !hasHeadPost
 
-    fun lazyIndexOf(rowIndex: Int): Int {
+    fun lazyIndexOf(rowIndex: Int, partIndex: Int = 0): Int {
         val afterHead = rowIndex >= headRows.size
         val orderBarBefore = if (showOrderBar && afterHead) 1 else 0
         val gapBefore = if (showPreviousGap && afterHead) 1 else 0
-        return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
+        val postId = rows.getOrNull(rowIndex)?.post?.id
+        val sliceIndex = slices.indexOfFirst { it.row.post.id == postId }.takeIf { it >= 0 } ?: slices.size
+        val count = preparedBodies[postId]?.parts?.size ?: 1
+        return 1 + topErrorCount + orderBarBefore + gapBefore + sliceIndex + partIndex.coerceIn(0, count - 1)
+    }
+
+    LaunchedEffect(active, state.loading, preparedBodies, rows, savedPositionRestored) {
+        val position = initialPosition ?: return@LaunchedEffect
+        if (!active || savedPositionRestored || state.loading || state.error != null) return@LaunchedEffect
+        val target = rows.firstOrNull { it.post.postNumber == position.postNumber }
+            ?: rows.minByOrNull { kotlin.math.abs(it.post.postNumber - position.postNumber) }
+            ?: return@LaunchedEffect
+        if (preparedBodies[target.post.id] == null) return@LaunchedEffect
+        if (position.atTop) list.scrollToItem(0)
+        else list.scrollToItem(lazyIndexOf(rows.indexOf(target), position.partIndex), position.offset.coerceAtLeast(0))
+        located = true
+        savedPositionRestored = true
+    }
+
+    val latestPositionCallback by rememberUpdatedState(onReadingPosition)
+    val latestPositionProvider by rememberUpdatedState(newValue = {
+        val anchor = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == list.firstVisibleItemIndex }
+        val slice = slices.firstOrNull { it.key == anchor?.key }
+        if (located && savedPositionRestored && state.topic != null && (slice?.body != null || list.firstVisibleItemIndex == 0)) {
+            TopicReadingPosition(
+                postNumber = slice?.row?.post?.postNumber ?: 1,
+                partIndex = slice?.partIndex ?: 0,
+                offset = list.firstVisibleItemScrollOffset,
+                atTop = list.firstVisibleItemIndex == 0,
+                filterUserId = state.filterUserId, descending = state.descending,
+                collapsed = collapsed, expanded = expanded,
+            )
+        } else null
+    })
+    LaunchedEffect(active, located, savedPositionRestored, state.filterUserId, state.descending, collapsed, expanded) {
+        if (active) snapshotFlow {
+            if (!list.isScrollInProgress) latestPositionProvider() else null
+        }.collect { position -> position?.let(latestPositionCallback) }
+    }
+    DisposableEffect(topicId, active) {
+        onDispose { if (active) latestPositionProvider()?.let(latestPositionCallback) }
     }
 
     val latestEdgeVisible = if (state.descending) list.firstVisibleItemIndex <= lazyIndexOf(headRows.size)
@@ -604,12 +825,14 @@ fun TopicDetailScreen(
     var anchoredRealtimeVersion by remember { mutableIntStateOf(state.realtimeVersion) }
     if (anchoredRealtimeVersion != state.realtimeVersion) {
         val firstIndex = list.firstVisibleItemIndex
-        val anchorId = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }?.key as? Long
+        val anchorKey = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }?.key
+        val anchorId = postIdFromListKey(anchorKey)
+        val anchorPart = partIndexFromListKey(anchorKey)
         val anchorRow = rows.indexOfFirst { it.post.id == anchorId }
         val offset = list.firstVisibleItemScrollOffset
         SideEffect {
             anchoredRealtimeVersion = state.realtimeVersion
-            if (anchorRow >= 0 && !list.isScrollInProgress) list.requestScrollToItem(lazyIndexOf(anchorRow), offset)
+            if (anchorRow >= 0 && !list.isScrollInProgress) list.requestScrollToItem(lazyIndexOf(anchorRow, anchorPart), offset)
         }
     }
 
@@ -618,7 +841,8 @@ fun TopicDetailScreen(
         val index = rows.indexOfFirst { it.post.id == target.postId }
         if (index >= 0) {
             tocTarget = target.anchor
-            list.animateScrollToItem(lazyIndexOf(index))
+            val part = preparedBodies[target.postId]?.parts?.indexOfFirst { blocks -> containsHeading(blocks, target.anchor) } ?: 0
+            list.animateScrollToItem(lazyIndexOf(index, part.coerceAtLeast(0)))
             withFrameNanos { }
         } else {
             // 目标楼层可能折叠着或还没加载进来。先尝试按楼层号就近定位，
@@ -702,13 +926,13 @@ fun TopicDetailScreen(
         if (!showOrderBar) return@LaunchedEffect
         // 定位尚未完成时，不允许倒序切换滚动覆盖初始定位位置
         if (!located) return@LaunchedEffect
-        list.scrollToItem(1 + topErrorCount + headRows.size)
+        list.scrollToItem(1 + topErrorCount + headSlices.size)
     }
 
     LaunchedEffect(active, locateTarget, pendingTargetFloor, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty(), explicitLocateVersion) {
         val targetLocateNumber = pendingTargetFloor ?: locateTarget
         val needLocate = (!located && locateTarget != null) || pendingTargetFloor != null
-        if (active && needLocate && !state.loading && state.error == null && targetLocateNumber != null) {
+        if (active && needLocate && !state.loading && state.error == null && targetLocateNumber != null && (savedPositionRestored || initialPosition == null)) {
             // 目标楼层可能已被删除(抽楼)或超出当前加载范围。此时不能直接 return，
             // 否则 located 永远为 false，会连带锁死倒序切换等依赖它的逻辑。
             // 降级为「第一个不小于目标楼层的可见楼层」，再不行就按帖子顺序找最近的一层。
@@ -743,7 +967,7 @@ fun TopicDetailScreen(
                 if (index >= 0) {
                     list.scrollToItem(lazyIndexOf(index))
                     withFrameNanos { }
-                    if (list.layoutInfo.visibleItemsInfo.none { it.key == target.id }) {
+                    if (list.layoutInfo.visibleItemsInfo.none { postIdFromListKey(it.key) == target.id }) {
                         list.scrollToItem(lazyIndexOf(index))
                     }
                     if (isUserJump) highlightedPost = target.id
@@ -756,7 +980,7 @@ fun TopicDetailScreen(
     }
 
     // 向上回填前序切片时锁定当前首个可见楼层锚点，新楼层前置插入后在同一帧恢复视口位置，防止跳屏。
-    var upwardAnchor by remember { mutableStateOf<Pair<Long, Int>?>(null) }
+    var upwardAnchor by remember { mutableStateOf<Triple<Long, Int, Int>?>(null) }
     var upwardPrevRowCount by remember { mutableIntStateOf(0) }
     val triggerLoadPrevious = {
         // 已包含 1 楼时不存在"更早的可见楼层"，前序仅剩被删除/占位的幽灵 id。
@@ -764,11 +988,11 @@ fun TopicDetailScreen(
         if (!hasHeadPost && !state.loading && state.previousIds.isNotEmpty()) {
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
             val anchorItem = list.layoutInfo.visibleItemsInfo.firstOrNull { info ->
-                val key = info.key as? Long ?: return@firstOrNull false
+                val key = postIdFromListKey(info.key) ?: return@firstOrNull false
                 key != firstPostId
             }
             if (anchorItem != null) {
-                upwardAnchor = (anchorItem.key as Long) to anchorItem.offset
+                upwardAnchor = Triple(postIdFromListKey(anchorItem.key)!!, partIndexFromListKey(anchorItem.key), anchorItem.offset)
                 upwardPrevRowCount = rows.size
             }
             onLoadPrevious()
@@ -779,7 +1003,7 @@ fun TopicDetailScreen(
         if (rows.size > upwardPrevRowCount) {
             val idx = rows.indexOfFirst { it.post.id == anchor.first }
             if (idx >= 0) {
-                list.scrollToItem(lazyIndexOf(idx), (-anchor.second).coerceAtLeast(0))
+                list.scrollToItem(lazyIndexOf(idx, anchor.second), (-anchor.third).coerceAtLeast(0))
             }
             upwardAnchor = null
         }
@@ -790,7 +1014,7 @@ fun TopicDetailScreen(
             val info = list.layoutInfo.visibleItemsInfo
             val hasGap = info.any { it.key == "load-previous" }
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
-            val firstPostAtTop = firstPostId != null && info.firstOrNull()?.key == firstPostId
+            val firstPostAtTop = firstPostId != null && postIdFromListKey(info.firstOrNull()?.key) == firstPostId
             hasGap && !firstPostAtTop && list.isScrollInProgress
         }
     }
@@ -800,13 +1024,34 @@ fun TopicDetailScreen(
         }
     }
 
-    // 发布后的状态收尾不改变视口，也不自动高亮新回复。
-    LaunchedEffect(state.createdPostId) {
-        if (state.createdPostId != null) onCreatedPostShown()
+    // 用户发表回复后，自动滚动定位到新发表的楼层并高亮显示
+    LaunchedEffect(state.createdPostId, rows) {
+        val createdId = state.createdPostId ?: return@LaunchedEffect
+        val createdPost = state.posts.firstOrNull { it.id == createdId }
+        val parentNumber = createdPost?.effectiveReplyToPostNumber()
+        if (parentNumber != null && parentNumber > 1) {
+            val parentPost = state.posts.firstOrNull { it.postNumber == parentNumber }
+            if (parentPost != null && parentPost.id in collapsed) {
+                collapsed = collapsed - parentPost.id
+            }
+        }
+        val targetIdx = rows.indexOfFirst { it.post.id == createdId }
+        if (targetIdx >= 0) {
+            withFrameNanos { }
+            val lazyIndex = lazyIndexOf(targetIdx)
+            if (kotlin.math.abs(list.firstVisibleItemIndex - lazyIndex) <= 15) {
+                list.animateScrollToItem(lazyIndex)
+            } else {
+                list.scrollToItem(lazyIndex)
+            }
+            highlightedPost = createdId
+            onCreatedPostShown()
+        }
     }
 
     @Composable
-    fun RenderPostEntry(row: TreePost) {
+    fun RenderPostEntry(slice: PostContentSlice) {
+        val row = slice.row
         val post = row.post
         val isTopicAuthor = topicAuthorUsername != null && post.username == topicAuthorUsername
         val unreadDotVisible = showUnreadDot && signedIn && !post.yours && !post.read &&
@@ -820,13 +1065,13 @@ fun TopicDetailScreen(
             Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
                 PostRow(
                     post = post,
+                    slice = slice,
                     isTopicAuthor = isTopicAuthor,
                     compactBottom = hasExpandedSubtree || showCollapsedSubtreeBar,
                     showReplyToHint = !treeView,
                     unreadDotVisible = unreadDotVisible,
                     unreadDotPosition = unreadDotPosition,
                     onPicture = { list, idx -> pictureGallery = list to idx },
-                    onUnknownTag = onUnknownTag,
                     reactions = state.topic?.validReactions.orEmpty(),
                     emojiUrls = state.emojiUrls,
                     busy = writeBusy,
@@ -853,7 +1098,7 @@ fun TopicDetailScreen(
                     onEdit = { onOpenComposer(ComposerTarget.Edit(topicId, post.id, post.postNumber)) },
                     onDelete = { deleteTarget = post },
                 )
-                if (showCollapsedSubtreeBar) {
+                if (slice.last && showCollapsedSubtreeBar) {
                     val replyLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
                     val totalHint = maxOf(row.totalSubtreeCount, row.allLoadedCount, post.replyCount, row.childCount)
                     Box(
@@ -882,7 +1127,7 @@ fun TopicDetailScreen(
                         )
                     }
                 }
-                if (!hasExpandedSubtree) {
+                if (slice.last && !hasExpandedSubtree) {
                     IosDivider()
                 }
             }
@@ -890,7 +1135,7 @@ fun TopicDetailScreen(
             // ── 贴吧式“楼中楼”子回复区域（默认最多展示前 3 条预览，点击展开全部，与主评论同宽） ──
             val selfHasMore = post.replyCount > row.childCount && post.id !in state.completedReplies
             val isRootExpanded = row.rootPostId in expanded
-            val topCorner = if (row.isFirstInSubtree) 10.dp else 0.dp
+            val topCorner = if (row.isFirstInSubtree && slice.first) 10.dp else 0.dp
             val boxShape = RoundedCornerShape(
                 topStart = topCorner,
                 topEnd = topCorner,
@@ -905,7 +1150,7 @@ fun TopicDetailScreen(
                         .clip(boxShape)
                         .background(IosTheme.colors.fieldBackground),
                 ) {
-                    if (!row.isFirstInSubtree) {
+                    if (slice.first && !row.isFirstInSubtree) {
                         Box(
                             Modifier
                                 .fillMaxWidth()
@@ -916,11 +1161,11 @@ fun TopicDetailScreen(
                     }
                     SubReplyRow(
                         row = row,
+                        slice = slice,
                         isTopicAuthor = isTopicAuthor,
                         unreadDotVisible = unreadDotVisible,
                         unreadDotPosition = unreadDotPosition,
                         onPicture = { list, idx -> pictureGallery = list to idx },
-                        onUnknownTag = onUnknownTag,
                         reactions = state.topic?.validReactions.orEmpty(),
                         emojiUrls = state.emojiUrls,
                         busy = writeBusy,
@@ -952,7 +1197,7 @@ fun TopicDetailScreen(
                         },
                     )
                 }
-                if (row.isLastInSubtree) {
+                if (slice.last && row.isLastInSubtree) {
                     val moreTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
                     val moreLoading = row.unloadedCandidateIds.any { it in state.loadingReplies }
                     val hasHiddenLoaded = row.allLoadedCount > row.subtreeSize
@@ -1021,7 +1266,7 @@ fun TopicDetailScreen(
                                     .clip(RoundedCornerShape(4.dp))
                                     .clickable {
                                         val rootId = row.rootPostId
-                                        val visibleRoot = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key == rootId }
+                                        val visibleRoot = list.layoutInfo.visibleItemsInfo.firstOrNull { postIdFromListKey(it.key) == rootId }
                                         val rootRowIndex = rows.indexOfFirst { it.post.id == rootId }
                                         val needScrollToRoot = visibleRoot == null || visibleRoot.offset < 0
                                         if (row.allLoadedCount > DEFAULT_SUB_REPLY_LIMIT && rootId in expanded) {
@@ -1031,7 +1276,7 @@ fun TopicDetailScreen(
                                             collapsed = (collapsed + rootId).distinct()
                                         }
                                         if (needScrollToRoot && rootRowIndex >= 0) {
-                                            val targetLazyIndex = lazyIndexOf(rootRowIndex)
+                                            val targetLazyIndex = lazyIndexOf(rootRowIndex, partIndexFromListKey(visibleRoot?.key))
                                             scope.launch {
                                                 list.scrollToItem(targetLazyIndex, 0)
                                             }
@@ -1062,6 +1307,14 @@ fun TopicDetailScreen(
             }
         },
         LocalTocTarget provides tocTarget,
+        LocalPostPageActive provides active,
+        LocalQuoteSelection provides if (signedIn && state.topic?.canReply == true) { post, selected ->
+            onOpenComposer(ComposerTarget.ReplyTo(topicId, post.postNumber, post.username, quote = selected))
+        } else null,
+        LocalSharePost provides { sharePost = it },
+        LocalCopyPostMarkdown provides { copyMarkdown(it.postNumber) },
+        LocalPostHistory provides { historyPost = it },
+        LocalTopicShareActions provides TopicShareActions(::shareFirstPost, { copyMarkdown(1) }, preparingShare, copyingMarkdown),
     ) {
         Box(
             Modifier
@@ -1079,8 +1332,9 @@ fun TopicDetailScreen(
                             if (change == null || !change.pressed) {
                                 val elapsed = System.currentTimeMillis() - downTime
                                 if (!moved && elapsed < 400L) {
-                                    if (textToolbar.status == TextToolbarStatus.Shown) {
+                                    if (textToolbar.status == TextToolbarStatus.Shown || CopyInterceptingTextToolbar.hasActive) {
                                         textToolbar.hide()
+                                        CopyInterceptingTextToolbar.hideActive()
                                         selectionResetKey++
                                     }
                                 }
@@ -1135,6 +1389,14 @@ fun TopicDetailScreen(
                                     ) {
                                         // 1. 分类标签（位置不动，稳定居左）
                                         state.category?.let { CategoryTag(it) }
+
+                                        val topicTags = remember(state.topic?.tags) {
+                                            state.topic?.tags.orEmpty().filter { it.isNotBlank() }.distinct()
+                                        }
+                                        if (topicTags.isNotEmpty()) {
+                                            if (state.category != null) Spacer(Modifier.width(6.dp))
+                                            TopicTagSelector(tags = topicTags, onOpenTag = onOpenTag)
+                                        }
 
                                         // 弹性占位：将后续功能按键组整体推向右端
                                         Spacer(Modifier.weight(1f))
@@ -1219,11 +1481,11 @@ fun TopicDetailScreen(
                             if (showTopError) state.error?.let { message ->
                                 item("top-error") { ErrorNotice(message, onRetry) }
                             }
-                            items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            items(headSlices, key = { it.key }, contentType = { if (it.first) "post" else "post-part" }) { slice -> RenderPostEntry(slice) }
                             if (showOrderBar) stickyHeader(key = "order-bar") {
                                 val isPinned by remember {
                                     derivedStateOf {
-                                        list.firstVisibleItemIndex >= 1 + topErrorCount + headRows.size
+                                        list.firstVisibleItemIndex >= 1 + topErrorCount + headSlices.size
                                     }
                                 }
                                 CommentOrderBar(
@@ -1248,7 +1510,7 @@ fun TopicDetailScreen(
                                     onClick = triggerLoadPrevious,
                                 )
                             }
-                            items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            items(bodySlices, key = { it.key }, contentType = { if (it.first) "post" else "post-part" }) { slice -> RenderPostEntry(slice) }
                             if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
                                 item("loading") { IosLoadingBox() }
                             }
@@ -1309,6 +1571,8 @@ fun TopicDetailScreen(
                         if (effectiveFloorTotal > 3 && !firstPostVisible) {
                             ReadingProgressPill(
                                 indicator = readingFloorIndicator,
+                                savedCount = savedTopicCount,
+                                onOpenSavedTopics = onOpenSavedTopics,
                                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                                 onScrollToTop = {
                                     if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
@@ -1316,6 +1580,12 @@ fun TopicDetailScreen(
                                 onOpenJumpBar = {
                                     showJumpBar = !showJumpBar
                                 },
+                            )
+                        }
+                        if (savedTopicCount > 0 && (effectiveFloorTotal <= 3 || firstPostVisible)) {
+                            org.linuxdo.android.ui.SavedTopicChip(
+                                savedTopicCount, onOpenSavedTopics,
+                                Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                             )
                         }
                         if (canReply) {
@@ -1401,6 +1671,12 @@ fun TopicDetailScreen(
                 )
             }
         }
+    }
+    sharePost?.let { post ->
+        PostShareSheet(post, state.topic?.title ?: title, topicId) { sharePost = null }
+    }
+    historyPost?.let { post ->
+        PostRevisionSheet(post) { historyPost = null }
     }
     pictureGallery?.let { (imgs, idx) -> ImageViewer(images = imgs, initialIndex = idx) { pictureGallery = null } }
     browserUrl?.let { url ->
@@ -2076,6 +2352,8 @@ private fun ReplyFab(enabled: Boolean, onClick: () -> Unit) {
 @Composable
 private fun ReadingProgressPill(
     indicator: ReadingFloorIndicator,
+    savedCount: Int,
+    onOpenSavedTopics: () -> Unit,
     modifier: Modifier = Modifier,
     onScrollToTop: () -> Unit,
     onOpenJumpBar: () -> Unit,
@@ -2139,6 +2417,14 @@ private fun ReadingProgressPill(
                 color = IosTheme.colors.secondaryLabel,
                 fontWeight = FontWeight.Medium,
             )
+        }
+        if (savedCount > 0) {
+            Box(Modifier.width(0.8.dp).height(12.dp).background(IosTheme.colors.separator))
+            Box(
+                Modifier.clickable(onClick = onOpenSavedTopics).height(40.dp).padding(horizontal = 12.dp)
+                    .semantics { contentDescription = "打开暂存话题，共 $savedCount 篇" },
+                contentAlignment = Alignment.Center,
+            ) { Text("暂存 $savedCount", style = IosTheme.type.footnote, color = IosTheme.colors.accent) }
         }
     }
 }
@@ -2511,6 +2797,29 @@ fun ComposerBoldIcon(tint: Color, modifier: Modifier = Modifier) {
                 lineTo(7f, 19.5f)
             }
             drawPath(lower, tint, style = stroke)
+        }
+    }
+}
+
+/** 投票图标：对齐 Fluxdo squarePollVertical，圆角方框 + 三根高低错落投票柱状条，与粗体/表情/图片图标保持一致的 22.dp 规范 */
+@Composable
+fun ComposerPollIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(22.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(3f, 3f),
+                size = androidx.compose.ui.geometry.Size(18f, 18f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(3.5f, 3.5f),
+                style = stroke,
+            )
+            // 左柱（中等高度）
+            drawLine(tint, Offset(8f, 16.8f), Offset(8f, 12.2f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+            // 中柱（最高）
+            drawLine(tint, Offset(12f, 16.8f), Offset(12f, 7.6f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+            // 右柱（中高）
+            drawLine(tint, Offset(16f, 16.8f), Offset(16f, 10.0f), strokeWidth = 2.1f, cap = StrokeCap.Round)
         }
     }
 }
@@ -2954,6 +3263,7 @@ private fun ComposerSheet(
     onRemoveAttachment: (String) -> Unit = {},
 ) {
     val target = composer.target ?: return
+    val completionSource = org.linuxdo.android.ui.LocalEditorSuggestionSource.current
     val heading = when (target) {
         is ComposerTarget.NewReply -> "发表评论"
         is ComposerTarget.ReplyTo -> "回复 @${target.username}"
@@ -2963,6 +3273,8 @@ private fun ComposerSheet(
     val keyboardController = LocalSoftwareKeyboardController.current
     var isFullScreen by rememberSaveable { mutableStateOf(false) }
     var showEmojiPicker by rememberSaveable { mutableStateOf(false) }
+    var showPollDialog by remember { mutableStateOf(false) }
+    var editingPollTarget by remember { mutableStateOf<Pair<CreatorPollSpan, PollBuilderSpec>?>(null) }
     var previewingImage by remember { mutableStateOf<String?>(null) }
     var editorView by remember(target) { mutableStateOf<RichMarkdownEditorView?>(null) }
 
@@ -2999,7 +3311,14 @@ private fun ComposerSheet(
     val busy = composer.submitting || composer.uploading
 
     BackHandler(enabled = true) {
-        onClose()
+        when {
+            showPollDialog -> {
+                showPollDialog = false
+                editingPollTarget = null
+            }
+            showEmojiPicker -> showEmojiPicker = false
+            else -> onClose()
+        }
     }
 
     Box(
@@ -3025,7 +3344,7 @@ private fun ComposerSheet(
                     when {
                         isFullScreen -> Modifier.fillMaxHeight(0.92f)
                         showEmojiPicker -> Modifier.height(420.dp)
-                        composer.attachments.isNotEmpty() || composer.uploading -> Modifier.height(380.dp)
+                        composer.attachments.isNotEmpty() || composer.uploading || composer.draft.contains("[poll", ignoreCase = true) -> Modifier.height(380.dp)
                         else -> Modifier.height(280.dp)
                     }
                 )
@@ -3100,16 +3419,26 @@ private fun ComposerSheet(
                         factory = { ctx ->
                             RichMarkdownEditorView(ctx).apply {
                                 updateThemeColors(textColorInt, hintColorInt)
+                                setCompletionSource(completionSource, topicId = target.topicId)
                                 setInitialMarkdown(composer.draft, composer.attachments)
                                 setOnMarkdownChangeListener { newRaw -> onDraftChange(newRaw) }
                                 setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
                                 setOnPreviewImageListener { previewUrl -> previewingImage = previewUrl }
+                                setOnEditPollListener { span, spec ->
+                                    editingPollTarget = Pair(span, spec)
+                                    showPollDialog = true
+                                }
                                 editorView = this
                                 post { requestInputFocus() }
                             }
                         },
                         update = { view ->
                             view.updateThemeColors(textColorInt, hintColorInt)
+                            view.setCompletionSource(completionSource, topicId = target.topicId)
+                            view.setOnEditPollListener { span, spec ->
+                                editingPollTarget = Pair(span, spec)
+                                showPollDialog = true
+                            }
                         },
                     )
                 }
@@ -3206,6 +3535,32 @@ private fun ComposerSheet(
                     )
                 }
 
+                Spacer(Modifier.width(8.dp))
+
+                // 投票 Icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(if (showPollDialog) IosTheme.colors.accent.copy(alpha = 0.12f) else Color.Transparent)
+                        .clickable(enabled = !busy) {
+                            keyboardController?.hide()
+                            showEmojiPicker = false
+                            editingPollTarget = null
+                            showPollDialog = true
+                        }
+                        .semantics { contentDescription = "插入投票" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposerPollIcon(
+                        tint = when {
+                            busy -> IosTheme.colors.tertiaryLabel
+                            showPollDialog -> IosTheme.colors.accent
+                            else -> IosTheme.colors.label
+                        },
+                    )
+                }
+
                 if (composer.uploading) {
                     Spacer(Modifier.width(10.dp))
                     IosActivityIndicator(diameter = 16.dp)
@@ -3260,6 +3615,31 @@ private fun ComposerSheet(
             runCatching { focus.requestFocus() }
             keyboardController?.show()
         }
+    }
+
+    if (showPollDialog) {
+        val currentRaw = editorView?.exportToMarkdown() ?: composer.draft
+        val suggestedPollName = remember(currentRaw) {
+            nextAvailablePollName(currentRaw)
+        }
+        PollBuilderDialog(
+            suggestedPollName = suggestedPollName,
+            initialSpec = editingPollTarget?.second,
+            onDismiss = {
+                showPollDialog = false
+                editingPollTarget = null
+            },
+            onConfirm = { resultSpec ->
+                val targetPoll = editingPollTarget
+                if (targetPoll != null) {
+                    editorView?.updatePollSpan(targetPoll.first, resultSpec)
+                } else {
+                    editorView?.insertPoll(resultSpec)
+                }
+                showPollDialog = false
+                editingPollTarget = null
+            },
+        )
     }
 
     previewingImage?.let { previewUrl ->
@@ -3381,13 +3761,13 @@ private fun UnreadDot(visible: Boolean) {
 @OptIn(ExperimentalFoundationApi::class)
 private fun PostRow(
     post: Post,
+    slice: PostContentSlice,
     isTopicAuthor: Boolean = false,
     compactBottom: Boolean = false,
     showReplyToHint: Boolean = true,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
-    onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
     busy: Boolean,
@@ -3414,18 +3794,19 @@ private fun PostRow(
     signedIn: Boolean = false,
     canFlag: Boolean = !post.yours,
 ) {
-    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
+    val blocks = slice.blocks
     val background = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card
     val canManage = post.canEdit || post.canDelete
     Column(
         Modifier
             .fillMaxWidth()
             .background(background)
-            .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = if (compactBottom) 8.dp else 16.dp),
+            .padding(start = 16.dp, end = 16.dp, top = if (slice.first) 16.dp else 0.dp, bottom = if (!slice.last) 0.dp else if (compactBottom) 8.dp else 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         // 长按放在头部这一行,而不是整条楼层:正文裹在 SelectionContainer 里,
         // 长按那里是"选择文本",两个手势会抢。
+        if (slice.first) {
         Row(
             Modifier.fillMaxWidth().then(
                 if (canManage) Modifier
@@ -3517,7 +3898,10 @@ private fun PostRow(
                         }
                     }
                 }
-                Text(RelativeTime.format(post.createdAt), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(RelativeTime.format(post.createdAt), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    PostRevisionBadge(post)
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("#${post.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
@@ -3527,8 +3911,10 @@ private fun PostRow(
             }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.footnote, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture, pollPost = post)
-        PostActions(
+        }
+        if (slice.body == null) PreparingPostBody()
+        else CookedContent(blocks, onPicture, postImages = slice.body.images, pollPost = post)
+        if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
             emojiUrls = emojiUrls,
@@ -3563,11 +3949,11 @@ private fun PostRow(
 @OptIn(ExperimentalFoundationApi::class)
 private fun SubReplyRow(
     row: TreePost,
+    slice: PostContentSlice,
     isTopicAuthor: Boolean,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
-    onUnknownTag: (String) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
     busy: Boolean,
@@ -3595,16 +3981,17 @@ private fun SubReplyRow(
     canFlag: Boolean = !row.post.yours,
 ) {
     val post = row.post
-    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
+    val blocks = slice.blocks
     val canManage = post.canEdit || post.canDelete
     val bg = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent
     Column(
         Modifier
             .fillMaxWidth()
             .background(bg)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(start = 12.dp, end = 12.dp, top = if (slice.first) 10.dp else 0.dp, bottom = if (slice.last) 10.dp else 0.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        if (slice.first) {
         Row(
             Modifier.fillMaxWidth().then(
                 if (canManage) Modifier
@@ -3678,14 +4065,17 @@ private fun SubReplyRow(
                     style = IosTheme.type.caption,
                     color = IosTheme.colors.tertiaryLabel,
                 )
+                PostRevisionBadge(post)
                 if (unreadDotPosition == UnreadDotPosition.FloorRight) {
                     UnreadDot(unreadDotVisible)
                 }
             }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.caption, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture, subReply = true, pollPost = post)
-        PostActions(
+        }
+        if (slice.body == null) PreparingPostBody()
+        else CookedContent(blocks, onPicture, postImages = slice.body.images, subReply = true, pollPost = post)
+        if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
             emojiUrls = emojiUrls,
@@ -3710,7 +4100,7 @@ private fun SubReplyRow(
             signedIn = signedIn,
             canFlag = canFlag,
         )
-        if (selfHasMore) {
+        if (slice.last && selfHasMore) {
             Text(
                 text = if (selfLoadingReplies) "正在加载回复…" else "查看该层更多回复 >",
                 style = IosTheme.type.caption,
@@ -3752,6 +4142,9 @@ private fun PostActions(
     signedIn: Boolean = false,
     canFlag: Boolean = !post.yours,
 ) {
+    val sharePost = LocalSharePost.current
+    val copyMarkdown = LocalCopyPostMarkdown.current
+    val openHistory = LocalPostHistory.current
     var chooseReaction by remember { mutableStateOf(false) }
     var visibleBoosts by rememberSaveable(post.id) { mutableIntStateOf(8) }
     var deleteId by remember { mutableStateOf<Long?>(null) }
@@ -3848,6 +4241,9 @@ private fun PostActions(
                     onDismissRequest = { showMoreMenu = false },
                     modifier = Modifier.background(IosTheme.colors.card),
                 ) {
+                    if (post.version > 1 && post.canViewEditHistory) {
+                        DropdownMenuItem(text = { Text("编辑历史") }, onClick = { showMoreMenu = false; openHistory(post) })
+                    }
                     DropdownMenuItem(
                         text = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -4709,7 +5105,7 @@ private fun ReactionIcon(name: String, urls: Map<String, String>, modifier: Modi
     AsyncImage(urls[name] ?: "https://linux.do/images/emoji/twemoji/$name.png?v=15", name, modifier = modifier)
 }
 
-internal enum class PostAction { Solution, Like, Boost, Reply, Edit, Delete, Bookmark, CopyLink, Flag, More }
+internal enum class PostAction { Solution, Like, Boost, Reply, Edit, Delete, Bookmark, CopyLink, Flag, More, Pin, Search, Share, Markdown }
 
 @Composable
 internal fun PostActionIcon(
@@ -4876,6 +5272,53 @@ internal fun PostActionIcon(
                     drawCircle(color, r, Offset(12f, 12f))
                     drawCircle(color, r, Offset(18.5f, 12f))
                 }
+                // 置顶图钉 (Pin)
+                PostAction.Pin -> {
+                    drawLine(color, Offset(8f, 5f), Offset(16f, 5f), 1.8f, cap = StrokeCap.Round)
+                    shape.moveTo(9.5f, 5f)
+                    shape.lineTo(10.5f, 10.5f)
+                    shape.lineTo(7f, 13.5f)
+                    shape.lineTo(17f, 13.5f)
+                    shape.lineTo(13.5f, 10.5f)
+                    shape.lineTo(14.5f, 5f)
+                    shape.close()
+                    if (selected) {
+                        drawPath(shape, color)
+                    } else {
+                        drawPath(shape, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    }
+                    drawLine(color, Offset(12f, 13.5f), Offset(12f, 20f), 1.8f, cap = StrokeCap.Round)
+                }
+                // 搜索放大镜 (Search)
+                PostAction.Search -> {
+                    drawCircle(color, radius = 5.5f, center = Offset(10.5f, 10.5f), style = Stroke(1.8f))
+                    drawLine(color, Offset(14.5f, 14.5f), Offset(19.5f, 19.5f), 2.2f, cap = StrokeCap.Round)
+                }
+                // 分享 (Share)
+                PostAction.Share -> {
+                    val r = 2.1f
+                    val top = Offset(17f, 6.5f)
+                    val bottom = Offset(17f, 17.5f)
+                    val left = Offset(6.5f, 12f)
+                    drawLine(color, left, top, 1.8f, cap = StrokeCap.Round)
+                    drawLine(color, left, bottom, 1.8f, cap = StrokeCap.Round)
+                    drawCircle(color, r, left)
+                    drawCircle(color, r, top)
+                    drawCircle(color, r, bottom)
+                }
+                // Markdown / 文档 (Markdown)
+                PostAction.Markdown -> {
+                    drawRoundRect(
+                        color = color,
+                        topLeft = Offset(5.5f, 4f),
+                        size = androidx.compose.ui.geometry.Size(13f, 16f),
+                        cornerRadius = CornerRadius(2.5f, 2.5f),
+                        style = Stroke(1.7f),
+                    )
+                    drawLine(color, Offset(8.5f, 8.5f), Offset(14.5f, 8.5f), 1.5f, cap = StrokeCap.Round)
+                    drawLine(color, Offset(8.5f, 12f), Offset(14.5f, 12f), 1.5f, cap = StrokeCap.Round)
+                    drawLine(color, Offset(8.5f, 15.5f), Offset(12f, 15.5f), 1.5f, cap = StrokeCap.Round)
+                }
             }
         }
     }
@@ -4937,9 +5380,14 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
         for (b in list) {
             when (b) {
                 is CookedBlock.Picture -> {
-                    result.add(ImageViewerItem(url = b.originalUrl, previewUrl = b.url, description = b.description))
+                    if (b.svgMarkup == null) {
+                        result.add(ImageViewerItem(url = b.originalUrl, previewUrl = b.url, description = b.description))
+                    }
                 }
                 is CookedBlock.Quote -> traverse(b.blocks)
+                is CookedBlock.Details -> traverse(b.blocks)
+                is CookedBlock.ImageGrid -> traverse(b.pictures)
+                is CookedBlock.Table -> b.rows.forEach { row -> row.forEach { traverse(it.blocks) } }
                 is CookedBlock.ListBlock -> b.entries.forEach { traverse(it) }
                 else -> {}
             }
@@ -4949,8 +5397,104 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
     return result
 }
 
+private val SVG_SCRIPT_REGEX = Regex("<script\\b[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE)
+private val SVG_EVENT_ATTR_REGEX = Regex("\\s+on[a-z0-9_]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)", RegexOption.IGNORE_CASE)
+private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)(?:javascript|vbscript|file)\\s*:")
+private val SVG_ANIMATION_REGEX = Regex("(?i)(@keyframes|-webkit-keyframes|\\banimation\\s*:|\\banimation-name\\s*:|<animate\\b|<animateTransform\\b|<animateMotion\\b|<animateColor\\b|<set\\b)")
+
+private fun sanitizeSvgMarkup(raw: String): String {
+    val startIdx = raw.indexOf("<svg", ignoreCase = true)
+    val endIdx = raw.lastIndexOf("</svg>", ignoreCase = true)
+    var svg = if (startIdx >= 0 && endIdx > startIdx) {
+        raw.substring(startIdx, endIdx + 6)
+    } else {
+        raw.trim()
+    }
+    svg = svg.replace(SVG_SCRIPT_REGEX, "")
+    svg = svg.replace(SVG_EVENT_ATTR_REGEX, "")
+    svg = svg.replace(SVG_DANGEROUS_URI_REGEX, "about:blank#")
+    val tagEnd = svg.indexOf('>')
+    if (tagEnd > 0) {
+        val openTag = svg.substring(0, tagEnd)
+        if (!openTag.contains("xmlns=", ignoreCase = true)) {
+            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg xmlns=\"http://www.w3.org/2000/svg\"")
+        }
+    }
+    return svg
+}
+
+private fun hasSvgAnimation(svg: String): Boolean = SVG_ANIMATION_REGEX.containsMatchIn(svg)
+
+private fun extractSvgAspectRatio(svg: String): Float? = runCatching {
+    val el = Jsoup.parseBodyFragment(svg).selectFirst("svg") ?: return@runCatching null
+    fun parseDim(attr: String): Float? {
+        val v = el.attr(attr).trim()
+        if (v.isEmpty() || v.endsWith("%")) return null
+        return Regex("^([0-9]+(?:\\.[0-9]+)?)").find(v)?.groupValues?.get(1)?.toFloatOrNull()?.takeIf { it > 0f }
+    }
+    val w = parseDim("width")
+    val h = parseDim("height")
+    if (w != null && h != null) return@runCatching (w / h).takeIf { it.isFinite() && it > 0f }
+    val vb = el.attr("viewBox").ifBlank { el.attr("viewbox") }.trim()
+    if (vb.isNotEmpty()) {
+        val parts = vb.split(Regex("[\\s,]+")).mapNotNull { it.toFloatOrNull() }
+        if (parts.size >= 4 && parts[2] > 0f && parts[3] > 0f) {
+            return@runCatching (parts[2] / parts[3]).takeIf { it.isFinite() && it > 0f }
+        }
+    }
+    null
+}.getOrNull()
+
+private fun isSvgUrl(url: String): Boolean =
+    url.substringBefore('#').substringBefore('?').lowercase().endsWith(".svg")
+
 @Composable
-private fun CookedContent(
+private fun InlineSvgView(
+    svgMarkup: String,
+    modifier: Modifier = Modifier,
+) {
+    val html = remember(svgMarkup) {
+        val clean = sanitizeSvgMarkup(svgMarkup)
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+            "<style>" +
+            "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;display:flex;align-items:center;justify-content:center;}" +
+            "svg{width:100%!important;height:100%!important;max-width:100%;max-height:100%;display:block;object-fit:contain;}" +
+            "</style></head><body>$clean</body></html>"
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            object : WebView(ctx) {
+                override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+            }.apply {
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                isVerticalScrollBarEnabled = false
+                isHorizontalScrollBarEnabled = false
+                isClickable = false
+                isFocusable = false
+                settings.apply {
+                    javaScriptEnabled = false
+                    allowFileAccess = false
+                    allowContentAccess = false
+                    setSupportZoom(false)
+                    defaultTextEncodingName = "UTF-8"
+                }
+                tag = html
+                loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            }
+        },
+        update = { webView ->
+            if (webView.tag != html) {
+                webView.tag = html
+                webView.loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            }
+        },
+    )
+}
+
+@Composable
+internal fun CookedContent(
     blocks: List<CookedBlock>,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
     postImages: List<ImageViewerItem> = remember(blocks) { extractPostImages(blocks) },
@@ -4958,15 +5502,29 @@ private fun CookedContent(
     subReply: Boolean = false,
     pollPost: Post? = null,
 ) {
+    CompositionLocalProvider(
+        LocalSelectionPost provides pollPost,
+        LocalOpenPicture provides onPicture,
+    ) {
     Column(verticalArrangement = Arrangement.spacedBy(if (compact || subReply) 6.dp else 10.dp)) {
         blocks.forEach { block ->
             when (block) {
                 is CookedBlock.Paragraph -> RichParagraph(block.runs, compact = compact, subReply = subReply)
                 is CookedBlock.Heading -> CookedHeading(block)
-                is CookedBlock.Video -> VideoCard(block)
+                is CookedBlock.Video -> InlineMediaCard(block.url, block.title, block.posterUrl, block.mimeType, video = true, width = block.width, height = block.height)
+                is CookedBlock.Audio -> InlineMediaCard(block.url, block.title, mimeType = block.mimeType, video = false)
+                is CookedBlock.Details -> DetailsCard(block, onPicture, postImages, compact, subReply, pollPost)
+                is CookedBlock.Table -> CookedTable(block, onPicture, postImages, pollPost)
+                is CookedBlock.ImageGrid -> PictureGrid(block, onPicture, postImages)
                 is CookedBlock.Onebox -> OneboxCard(block)
                 is CookedBlock.Poll -> PollCard(block, pollPost?.id)
                 is CookedBlock.Code -> {
+                    if (block.copyText != null) {
+                        val clipboard = LocalClipboardManager.current
+                        TextButton(onClick = { clipboard.setText(AnnotatedString(block.copyText)) }) {
+                            Text("复制完整代码", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                        }
+                    }
                     val codeResetKey = LocalSelectionResetKey.current
                     key(codeResetKey) {
                         DecryptableSelection {
@@ -4992,20 +5550,35 @@ private fun CookedContent(
                 }
                 is CookedBlock.Picture -> {
                     val maxPortraitHeight = if (subReply) 220.dp else 320.dp
-                    val ratioModifier = if (block.width > 0 && block.height > 0) {
-                        val rawRatio = block.width.toFloat() / block.height.toFloat()
-                        if (rawRatio >= 0.85f) {
+                    var currentUrl by remember(block.url) { mutableStateOf(block.url) }
+                    var isError by remember(block.url) { mutableStateOf(false) }
+                    var isLoading by remember(block.url) { mutableStateOf(block.svgMarkup == null) }
+                    var retryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var autoRetryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var pendingAutoRetry by remember(block.url) { mutableStateOf(false) }
+                    var loadedAspectRatio by remember(block.url) {
+                        mutableStateOf(block.svgMarkup?.let { extractSvgAspectRatio(it) })
+                    }
+                    var inlineSvgContent by remember(block.url) { mutableStateOf(block.svgMarkup) }
+
+                    val effectiveRatio = if (block.width > 0 && block.height > 0) {
+                        block.width.toFloat() / block.height.toFloat()
+                    } else {
+                        loadedAspectRatio
+                    }
+                    val ratioModifier = if (effectiveRatio != null && effectiveRatio > 0f) {
+                        if (effectiveRatio >= 0.85f) {
                             // 横图或近似方图：撑满宽度，高度由比例唯一确定，不加 heightIn 以避免与 fillMaxWidth 产生无解约束导致溢出重叠
                             Modifier
                                 .fillMaxWidth()
-                                .aspectRatio(rawRatio.coerceAtMost(4f))
+                                .aspectRatio(effectiveRatio.coerceAtMost(6f))
                                 .clip(RoundedCornerShape(14.dp))
                                 .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         } else {
                             // 竖屏长截图（如手机截图）：固定高度上限并按比例自适应宽度（左对齐，与网页端一致），既锁死高度防滚动抖动，又绝不越界遮挡文字
                             Modifier
                                 .height(maxPortraitHeight)
-                                .aspectRatio(rawRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
+                                .aspectRatio(effectiveRatio.coerceAtLeast(0.25f), matchHeightConstraintsFirst = true)
                                 .clip(RoundedCornerShape(14.dp))
                                 .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                         }
@@ -5016,12 +5589,7 @@ private fun CookedContent(
                             .clip(RoundedCornerShape(14.dp))
                             .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.18f), RoundedCornerShape(14.dp))
                     }
-                    var currentUrl by remember(block.url) { mutableStateOf(block.url) }
-                    var isError by remember(block.url) { mutableStateOf(false) }
-                    var isLoading by remember(block.url) { mutableStateOf(true) }
-                    var retryCount by remember(block.url) { mutableIntStateOf(0) }
-                    var autoRetryCount by remember(block.url) { mutableIntStateOf(0) }
-                    var pendingAutoRetry by remember(block.url) { mutableStateOf(false) }
+
                     if (pendingAutoRetry) {
                         LaunchedEffect(autoRetryCount) {
                             awaitImageRetrySlot(autoRetryCount)
@@ -5032,6 +5600,40 @@ private fun CookedContent(
                     }
 
                     val context = LocalContext.current
+                    if (block.svgMarkup == null && isSvgUrl(currentUrl)) {
+                        LaunchedEffect(currentUrl, retryCount) {
+                            val fetched = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val container = (context.applicationContext as App).container
+                                    val host = runCatching { Uri.parse(currentUrl).host?.lowercase() }.getOrNull().orEmpty()
+                                    val isSite = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
+                                        host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+                                    val factory = if (isSite) container.dynamicCallFactory else externalMediaCallFactory
+                                    val req = Request.Builder()
+                                        .url(currentUrl)
+                                        .header("User-Agent", container.userAgent)
+                                        .header("Accept", "image/svg+xml,application/xml,text/xml,*/*;q=0.8")
+                                        .build()
+                                    factory.newCall(req).execute().use { resp ->
+                                        if (!resp.isSuccessful) return@use null
+                                        val body = resp.body?.string().orEmpty()
+                                        if (body.contains("<svg", ignoreCase = true)) body else null
+                                    }
+                                }.getOrNull()
+                            }
+                            if (fetched != null) {
+                                extractSvgAspectRatio(fetched)?.let { ratio ->
+                                    if (loadedAspectRatio == null) loadedAspectRatio = ratio
+                                }
+                                if (hasSvgAnimation(fetched) || isError) {
+                                    inlineSvgContent = fetched
+                                    isLoading = false
+                                    isError = false
+                                }
+                            }
+                        }
+                    }
+
                     val imageRequest = remember(currentUrl, retryCount) {
                         ImageRequest.Builder(context)
                             .data(currentUrl)
@@ -5048,52 +5650,72 @@ private fun CookedContent(
                         ImageViewerItem(url = block.originalUrl, previewUrl = currentUrl, description = block.description)
                     )
 
+                    val activeSvgMarkup = inlineSvgContent
                     Box(
                         modifier = ratioModifier.background(IosTheme.colors.fieldBackground),
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (isLoading && !isError) {
-                            IosActivityIndicator(diameter = 20.dp)
-                        }
-                        AsyncImage(
-                            model = imageRequest,
-                            contentDescription = block.description,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .clickable { onPicture(imageList, clickedIndex) },
-                            onLoading = {
-                                isLoading = true
-                                isError = false
-                            },
-                            onSuccess = {
-                                isLoading = false
-                                isError = false
-                            },
-                            onError = { errorState ->
-                                val err = errorState.result.throwable
-                                android.util.Log.w("CookedContent", "Failed to load image: $currentUrl, reason: ${err.message}")
-                                if (isTransientImageError(err) && autoRetryCount < IMAGE_AUTO_RETRY_LIMIT) {
-                                    // 门禁冷却 / 429 / 网络抖动：换原图只会再撞一次，原地等冷却结束后重试同一地址
-                                    pendingAutoRetry = true
-                                } else if (currentUrl == block.url && block.url != block.originalUrl) {
-                                    // 缩略图拉取失败（如 Discourse 未生成或 404/超时），自动透明降级尝试原图！
-                                    currentUrl = block.originalUrl
+                        if (activeSvgMarkup != null) {
+                            val clickMod = if (block.svgMarkup == null) {
+                                Modifier.fillMaxSize().clickable { onPicture(imageList, clickedIndex) }
+                            } else {
+                                Modifier.fillMaxSize()
+                            }
+                            Box(modifier = clickMod, contentAlignment = Alignment.Center) {
+                                InlineSvgView(
+                                    svgMarkup = activeSvgMarkup,
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                            }
+                        } else {
+                            if (isLoading && !isError) {
+                                IosActivityIndicator(diameter = 20.dp)
+                            }
+                            AsyncImage(
+                                model = imageRequest,
+                                contentDescription = block.description,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clickable { onPicture(imageList, clickedIndex) },
+                                onLoading = {
                                     isLoading = true
-                                } else {
+                                    isError = false
+                                },
+                                onSuccess = { successState ->
                                     isLoading = false
-                                    isError = true
-                                }
-                            },
-                        )
-                        if (isError) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.padding(8.dp),
-                            ) {
-                                Text("图片未显示", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    isError = false
+                                    val drawable = successState.result.drawable
+                                    val dw = drawable.intrinsicWidth
+                                    val dh = drawable.intrinsicHeight
+                                    if (dw > 0 && dh > 0 && loadedAspectRatio == null) {
+                                        loadedAspectRatio = dw.toFloat() / dh.toFloat()
+                                    }
+                                },
+                                onError = { errorState ->
+                                    val err = errorState.result.throwable
+                                    android.util.Log.w("CookedContent", "Failed to load image: $currentUrl, reason: ${err.message}")
+                                    if (isTransientImageError(err) && autoRetryCount < IMAGE_AUTO_RETRY_LIMIT) {
+                                        // 门禁冷却 / 429 / 网络抖动：换原图只会再撞一次，原地等冷却结束后重试同一地址
+                                        pendingAutoRetry = true
+                                    } else if (currentUrl == block.url && block.url != block.originalUrl) {
+                                        // 缩略图拉取失败（如 Discourse 未生成或 404/超时），自动透明降级尝试原图！
+                                        currentUrl = block.originalUrl
+                                        isLoading = true
+                                    } else if (inlineSvgContent == null) {
+                                        isLoading = false
+                                        isError = true
+                                    }
+                                },
+                            )
+                            if (isError) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(8.dp),
+                                ) {
+                                    Text("图片未显示", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                     Text(
                                         text = "重新加载",
                                         style = IosTheme.type.caption,
@@ -5115,13 +5737,14 @@ private fun CookedContent(
                                     )
                                 }
                             }
+                            }
                         }
                     }
                 }
                 is CookedBlock.ListBlock -> block.entries.forEachIndexed { index, entry ->
                     Row {
                         Text(
-                            text = block.start?.let { "${it + index}. " } ?: "• ",
+                            text = if (block.continuation && index == 0) "" else block.start?.let { "${it + index}. " } ?: "• ",
                             style = if (subReply) IosTheme.type.subheadline.copy(fontSize = 14.sp, lineHeight = 19.5.sp)
                                     else IosTheme.type.body.copy(fontSize = 15.5.sp, lineHeight = 22.sp),
                             modifier = Modifier.widthIn(min = 22.dp),
@@ -5134,6 +5757,7 @@ private fun CookedContent(
                 CookedBlock.Divider -> IosFullDivider()
             }
         }
+    }
     }
 }
 
@@ -5158,45 +5782,1916 @@ private fun CookedHeading(heading: CookedBlock.Heading) {
 }
 
 @Composable
-private fun VideoCard(video: CookedBlock.Video) {
-    val openUrl = LocalOpenExternalUrl.current
-    Box(
-        Modifier.fillMaxWidth().height(180.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(IosTheme.colors.fieldBackground)
-            .clickable { openUrl(video.url) },
-        contentAlignment = Alignment.Center,
-    ) {
-        video.posterUrl?.let { url ->
-            AsyncImage(url, video.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+private fun DetailsCard(
+    block: CookedBlock.Details,
+    onPicture: (List<ImageViewerItem>, Int) -> Unit,
+    postImages: List<ImageViewerItem>,
+    compact: Boolean,
+    subReply: Boolean,
+    post: Post?,
+) {
+    var expanded by rememberSaveable(block.id) { mutableStateOf(block.initiallyOpen) }
+    val target = LocalTocTarget.current
+    LaunchedEffect(target, block.id) {
+        if (target != null && containsHeading(block.blocks, target)) {
+            expanded = true
         }
-        Column(
-            Modifier.align(Alignment.Center).clip(RoundedCornerShape(8.dp))
-                .background(Color.Black.copy(alpha = 0.66f)).padding(horizontal = 14.dp, vertical = 9.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(3.dp),
+    }
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+            .border(0.5.dp, IosTheme.colors.separator, RoundedCornerShape(8.dp)).animateContentSize(),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().background(IosTheme.colors.fieldBackground)
+                .clickable { expanded = !expanded }.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("▶", color = Color.White, style = IosTheme.type.title3)
-            Text(video.title.ifBlank { "播放视频" }, color = Color.White, style = IosTheme.type.caption)
+            Text(if (expanded) "▾" else "▸", color = IosTheme.colors.secondaryLabel)
+            Box(Modifier.weight(1f)) { RichParagraph(block.summary, compact = true) }
+        }
+        if (expanded) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CookedContent(block.blocks, onPicture, postImages, compact, subReply, post)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PictureGrid(block: CookedBlock.ImageGrid, onPicture: (List<ImageViewerItem>, Int) -> Unit, postImages: List<ImageViewerItem>) {
+    val gallery = postImages.ifEmpty { extractPostImages(block.pictures) }
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        block.pictures.chunked(block.columns).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                row.forEach { picture ->
+                    var imageUrl by remember(picture.url) { mutableStateOf(picture.url) }
+                    SubcomposeAsyncImage(
+                        model = imageUrl,
+                        contentDescription = picture.description,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp))
+                            .background(IosTheme.colors.fieldBackground).clickable {
+                                onPicture(gallery, gallery.indexOfFirst { it.url == picture.originalUrl }.coerceAtLeast(0))
+                            },
+                        loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IosActivityIndicator(diameter = 18.dp) } },
+                        error = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("查看图片", style = IosTheme.type.caption) } },
+                        onError = { if (imageUrl != picture.originalUrl) imageUrl = picture.originalUrl },
+                    )
+                }
+                repeat(block.columns - row.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CookedTable(
+    table: CookedBlock.Table,
+    onPicture: (List<ImageViewerItem>, Int) -> Unit,
+    images: List<ImageViewerItem>,
+    post: Post?,
+) {
+    val cells = remember(table) { table.rows.flatMapIndexed { rowIndex, row -> row.map { rowIndex to it } } }
+    val rectangles = remember(table) { arrayOfNulls<Rect>(cells.size) }
+    val colors = IosTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (table.caption.isNotEmpty()) RichParagraph(table.caption, compact = true)
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val columnWidth = when (table.columns) {
+                1 -> maxWidth
+                2, 3 -> (maxWidth / table.columns).coerceAtLeast(100.dp)
+                else -> (maxWidth / 3).coerceIn(110.dp, 200.dp)
+            }
+            Box(Modifier.horizontalScroll(rememberScrollState())) {
+                Layout(
+                    content = {
+                        cells.forEach { (_, cell) ->
+                            Box(Modifier.padding(10.dp)) {
+                                val content = if (cell.header) cell.blocks.map {
+                                    if (it is CookedBlock.Paragraph) it.copy(runs = it.runs.map { run -> run.copy(bold = true) }) else it
+                                } else cell.blocks
+                                CookedContent(content, onPicture, images, pollPost = post)
+                            }
+                        }
+                    },
+                    modifier = Modifier.drawBehind {
+                        rectangles.forEachIndexed { index, rect ->
+                            if (rect != null) {
+                                drawRect(if (cells[index].second.header) colors.fieldBackground else colors.card, rect.topLeft, rect.size)
+                                drawRect(colors.separator, rect.topLeft, rect.size, style = Stroke(0.5.dp.toPx()))
+                            }
+                        }
+                    },
+                ) { measurables, _ ->
+                    val cellWidth = columnWidth.roundToPx()
+                    val placeables = measurables.mapIndexed { index, measurable ->
+                        measurable.measure(Constraints.fixedWidth(cellWidth * cells[index].second.columnSpan))
+                    }
+                    val rowHeights = IntArray(table.rows.size) { 36.dp.roundToPx() }
+                    cells.forEachIndexed { index, (row, cell) ->
+                        if (cell.rowSpan == 1) rowHeights[row] = maxOf(rowHeights[row], placeables[index].height)
+                    }
+                    cells.forEachIndexed { index, (row, cell) ->
+                        val end = (row + cell.rowSpan).coerceAtMost(rowHeights.size)
+                        val height = (row until end).sumOf { rowHeights[it] }
+                        if (height < placeables[index].height) rowHeights[end - 1] += placeables[index].height - height
+                    }
+                    val offsets = IntArray(rowHeights.size + 1)
+                    rowHeights.indices.forEach { offsets[it + 1] = offsets[it] + rowHeights[it] }
+                    cells.forEachIndexed { index, (row, cell) ->
+                        rectangles[index] = Rect(
+                            (cell.column * cellWidth).toFloat(), offsets[row].toFloat(),
+                            ((cell.column + cell.columnSpan) * cellWidth).toFloat(),
+                            offsets[(row + cell.rowSpan).coerceAtMost(rowHeights.size)].toFloat(),
+                        )
+                    }
+                    layout(table.columns * cellWidth, offsets.last()) {
+                        placeables.forEachIndexed { index, placeable ->
+                            val (row, cell) = cells[index]
+                            placeable.placeRelative(cell.column * cellWidth, offsets[row])
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private class InlineMediaSession(val player: ExoPlayer, val generation: Long, private val onClose: (Long) -> Unit) {
+    var closed by mutableStateOf(false)
+        private set
+    fun close() {
+        if (closed) return
+        onClose(if (player.playbackState == Player.STATE_ENDED) 0L else player.currentPosition.coerceAtLeast(0))
+        closed = true
+        player.release()
+        if (current === this) current = null
+    }
+    companion object {
+        private var current: InlineMediaSession? = null
+        fun stop() { current?.close() }
+        fun activate(session: InlineMediaSession) {
+            current?.close()
+            current = session
+        }
+    }
+}
+
+private val externalMediaCallFactory: okhttp3.Call.Factory by lazy {
+    okhttp3.OkHttpClient.Builder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+}
+
+private fun mediaTime(position: Long): String {
+    val seconds = position.coerceAtLeast(0) / 1000
+    return if (seconds >= 3600) "%d:%02d:%02d".format(java.util.Locale.ROOT, seconds / 3600, seconds / 60 % 60, seconds % 60)
+        else "%d:%02d".format(java.util.Locale.ROOT, seconds / 60, seconds % 60)
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun InlineMediaCard(
+    url: String,
+    title: String,
+    poster: String? = null,
+    mimeType: String? = null,
+    video: Boolean,
+    width: Int = 0,
+    height: Int = 0,
+) {
+    val context = LocalContext.current
+    val container = (context.applicationContext as App).container
+    val view = LocalView.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val pageActive = LocalPostPageActive.current
+    val openUrl = LocalOpenExternalUrl.current
+    var position by rememberSaveable(url) { mutableLongStateOf(0L) }
+    var speed by rememberSaveable(url) { mutableFloatStateOf(1f) }
+    var muted by rememberSaveable(url) { mutableStateOf(false) }
+    var session by remember(url) { mutableStateOf<InlineMediaSession?>(null) }
+    val player = session?.takeUnless { it.closed }?.player
+    var fullscreen by remember(url) { mutableStateOf(false) }
+    var visible by remember(url) { mutableStateOf(true) }
+    var playRequested by remember(url) { mutableStateOf(false) }
+    var loading by remember(url) { mutableStateOf(false) }
+    var duration by remember(url) { mutableLongStateOf(0L) }
+    var seeking by remember(url) { mutableStateOf<Float?>(null) }
+    var error by remember(url) { mutableStateOf<String?>(null) }
+    var useDirectFallback by remember(url) { mutableStateOf(false) }
+    var videoAspectRatio by remember(url, width, height) {
+        mutableFloatStateOf(
+            if (width > 0 && height > 0) {
+                (width.toFloat() / height.toFloat()).coerceIn(9f / 16f, 21f / 9f)
+            } else {
+                16f / 9f
+            }
+        )
+    }
+    fun start(forceDirect: Boolean = useDirectFallback) {
+        if (!pageActive) return
+        if (!forceDirect && player != null && player.playerError == null) {
+            if (player.playbackState == Player.STATE_ENDED) {
+                player.seekTo(0)
+                player.play()
+            } else {
+                player.playWhenReady = !player.playWhenReady
+            }
+            return
+        }
+        session?.close()
+        error = null
+        val host = runCatching { Uri.parse(url).host?.lowercase() }.getOrNull().orEmpty()
+        val isSiteHost = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
+            host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+        val callFactory = if (isSiteHost && !forceDirect) container.dynamicCallFactory else externalMediaCallFactory
+        val dataSource = OkHttpDataSource.Factory(callFactory)
+            .setUserAgent(container.sessionStore.userAgentOrNull() ?: container.userAgent)
+        val next = ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSource)).build().apply {
+                setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA)
+                    .setContentType(if (video) C.AUDIO_CONTENT_TYPE_MOVIE else C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
+                setHandleAudioBecomingNoisy(true)
+                volume = if (muted) 0f else 1f
+                setPlaybackSpeed(speed)
+                addListener(object : Player.Listener {
+                    override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                        if (videoSize.width > 0 && videoSize.height > 0) {
+                            val pixelRatio = if (videoSize.pixelWidthHeightRatio > 0f) videoSize.pixelWidthHeightRatio else 1f
+                            val ratio = (videoSize.width * pixelRatio) / videoSize.height.toFloat()
+                            if (ratio.isFinite() && ratio > 0f) {
+                                videoAspectRatio = ratio.coerceIn(9f / 16f, 21f / 9f)
+                            }
+                        }
+                    }
+
+                    override fun onPlayerError(err: androidx.media3.common.PlaybackException) {
+                        if (isSiteHost && !forceDirect && !useDirectFallback) {
+                            useDirectFallback = true
+                            start(forceDirect = true)
+                        }
+                    }
+                })
+                setMediaItem(MediaItem.Builder().setUri(url).apply { mimeType?.let { setMimeType(it) } }.build())
+                seekTo(position)
+            }
+        val nextSession = InlineMediaSession(next, container.sessionStore.sessionGeneration) { saved ->
+            position = saved
+            fullscreen = false
+            playRequested = false
+        }
+        InlineMediaSession.activate(nextSession)
+        session = nextSession
+        next.prepare()
+        next.play()
+    }
+    DisposableEffect(session, lifecycle) {
+        val current = session
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) current?.close()
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+            current?.close()
+        }
+    }
+    LaunchedEffect(pageActive, visible, fullscreen) {
+        if (!pageActive || (video && !visible && !fullscreen)) session?.close()
+    }
+    LaunchedEffect(player) {
+        if (player == null) return@LaunchedEffect
+        val currentSession = session ?: return@LaunchedEffect
+        if (currentSession.player !== player) return@LaunchedEffect
+        val generation = currentSession.generation
+        while (!currentSession.closed) {
+            if (generation != container.sessionStore.sessionGeneration) {
+                currentSession.close()
+                break
+            }
+            position = player.currentPosition.coerceAtLeast(0)
+            duration = player.duration.takeIf { it > 0 } ?: 0
+            playRequested = player.playWhenReady && player.playbackState != Player.STATE_ENDED && player.playerError == null
+            loading = player.playbackState == Player.STATE_BUFFERING
+            error = player.playerError?.let { "暂时无法播放，请重试" }
+            delay(250)
+        }
+    }
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(IosTheme.colors.fieldBackground)
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
+            },
+    ) {
+        if (video) {
+            Box(
+                Modifier.fillMaxWidth().aspectRatio(videoAspectRatio).background(Color.Black)
+                    .clickable(enabled = player == null) { start() },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (player != null && !fullscreen) {
+                    NativePlayerView(player, Modifier.fillMaxSize(), playRequested)
+                } else {
+                    poster?.let { AsyncImage(it, title, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+                    TextButton(onClick = { start() }) { Text("▶  $title", color = Color.White) }
+                }
+                if (loading && playRequested && !fullscreen) IosActivityIndicator(diameter = 24.dp, color = Color.White)
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { start() }) { Text(if (error != null) "重试" else if (playRequested) "暂停" else "播放") }
+            if (!video) Text(title, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = IosTheme.type.footnote)
+            else Spacer(Modifier.weight(1f))
+            TextButton(onClick = { muted = !muted; player?.volume = if (muted) 0f else 1f }) { Text(if (muted) "取消静音" else "静音", style = IosTheme.type.caption) }
+            TextButton(onClick = {
+                speed = when (speed) { 1f -> 1.25f; 1.25f -> 1.5f; 1.5f -> 2f; else -> 1f }
+                player?.setPlaybackSpeed(speed)
+            }) { Text("${speed}×", style = IosTheme.type.caption) }
+            if (video && player != null) TextButton(onClick = { fullscreen = true }) { Text("全屏", style = IosTheme.type.caption) }
+        }
+        if (!video || player != null) {
+            Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(mediaTime(position), style = IosTheme.type.caption)
+                Slider(
+                    value = seeking ?: if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
+                    onValueChange = { seeking = it },
+                    onValueChangeFinished = { seeking?.let { player?.seekTo((it * duration).toLong()) }; seeking = null },
+                    enabled = player != null && duration > 0 && player.isCurrentMediaItemSeekable,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                )
+                Text(if (loading && playRequested) "加载中" else mediaTime(duration), style = IosTheme.type.caption)
+            }
+        }
+        error?.let {
+            Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(it, modifier = Modifier.weight(1f), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                TextButton(onClick = { openUrl(url) }) { Text("打开链接", style = IosTheme.type.caption) }
+            }
+        }
+    }
+    if (fullscreen && player != null) {
+        Dialog(onDismissRequest = { fullscreen = false }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+                NativePlayerView(player, Modifier.fillMaxSize(), playRequested)
+                TextButton(onClick = { fullscreen = false }, modifier = Modifier.align(Alignment.TopEnd)) {
+                    Text("退出全屏", color = Color.White)
+                }
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun NativePlayerView(player: ExoPlayer, modifier: Modifier, keepScreenOn: Boolean) {
+    AndroidView(
+        factory = { context ->
+            PlayerView(context).apply {
+                useController = true
+                setShowNextButton(false)
+                setShowPreviousButton(false)
+                this.player = player
+            }
+        },
+        update = { it.player = player; it.keepScreenOn = keepScreenOn },
+        onRelease = { it.player = null; it.keepScreenOn = false },
+        modifier = modifier,
+    )
+}
+
+private fun isAutoPreviewDemoOnebox(onebox: CookedBlock.Onebox): Boolean {
+    if (parseInternalTopicUrl(onebox.url) != null) return false
+    val uri = runCatching { Uri.parse(onebox.url) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase() ?: return false
+    if (scheme != "http" && scheme != "https") return false
+    val host = uri.host?.lowercase().orEmpty()
+    val path = uri.path?.lowercase().orEmpty()
+    val text = "${onebox.title} ${onebox.description.orEmpty()}".lowercase()
+    val hasVisualDemoKeyword = text.contains("svg") || text.contains("动画") ||
+        text.contains("canvas") || text.contains("webgl") || text.contains("demo")
+    val isHtmlPath = path.endsWith(".html") || path.endsWith(".htm")
+    val isDemoHost = host.contains("pelicanarena") || host.endsWith(".dpdns.org") ||
+        host.endsWith(".github.io") || host.endsWith(".pages.dev") ||
+        host.endsWith(".vercel.app") || host.endsWith(".netlify.app") ||
+        host.contains("codepen.io") || host.contains("jsfiddle.net")
+    return (isHtmlPath && (hasVisualDemoKeyword || isDemoHost)) ||
+        host.contains("pelicanarena") ||
+        text.contains("svg 动画") || text.contains("svg动画")
+}
+
+@Composable
+private fun SandboxedWebPreview(
+    url: String,
+    active: Boolean,
+    allowTouchIntercept: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (isTrustedForumUrl(url)) {
+        SandboxedGeckoPreview(
+            url = url,
+            active = active,
+            allowTouchIntercept = allowTouchIntercept,
+            modifier = modifier,
+        )
+        return
+    }
+    var loading by remember(url) { mutableStateOf(true) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var webViewRef by remember(url) { mutableStateOf<WebView?>(null) }
+
+    DisposableEffect(webViewRef, lifecycle) {
+        val wv = webViewRef
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> wv?.onPause()
+                Lifecycle.Event.ON_RESUME -> if (active) wv?.onResume()
+                else -> {}
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(webViewRef, active) {
+        val wv = webViewRef ?: return@LaunchedEffect
+        if (active) {
+            wv.onResume()
+        } else {
+            wv.onPause()
+        }
+    }
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                object : WebView(ctx) {
+                    override fun requestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {
+                        super.requestDisallowInterceptTouchEvent(if (allowTouchIntercept) disallowIntercept else false)
+                    }
+                }.apply {
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    isVerticalScrollBarEnabled = allowTouchIntercept
+                    isHorizontalScrollBarEnabled = allowTouchIntercept
+                    runCatching {
+                        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                    }
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        allowFileAccess = false
+                        allowContentAccess = false
+                        mediaPlaybackRequiresUserGesture = false
+                        loadWithOverviewMode = true
+                        useWideViewPort = true
+                        setSupportZoom(allowTouchIntercept)
+                        builtInZoomControls = allowTouchIntercept
+                        displayZoomControls = false
+                        defaultTextEncodingName = "UTF-8"
+                    }
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: android.webkit.WebResourceRequest?,
+                        ): Boolean {
+                            val reqScheme = request?.url?.scheme?.lowercase()
+                            return reqScheme != "http" && reqScheme != "https"
+                        }
+
+                        override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                            loading = false
+                        }
+                    }
+                    webViewRef = this
+                    loadUrl(url)
+                }
+            },
+            update = { wv ->
+                if (wv.url != url && wv.originalUrl != url) {
+                    loading = true
+                    wv.loadUrl(url)
+                }
+            },
+            onRelease = { wv ->
+                webViewRef = null
+                runCatching {
+                    wv.stopLoading()
+                    wv.loadUrl("about:blank")
+                    wv.onPause()
+                    wv.removeAllViews()
+                    wv.destroy()
+                }
+            },
+        )
+        if (loading) {
+            IosActivityIndicator(diameter = 22.dp)
+        }
+    }
+}
+
+@Composable
+private fun SandboxedGeckoPreview(
+    url: String,
+    active: Boolean,
+    allowTouchIntercept: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var loading by remember(url) { mutableStateOf(true) }
+    var bootstrapping by remember(url) { mutableStateOf(true) }
+    val geckoView = remember(url, allowTouchIntercept) {
+        org.linuxdo.android.net.gecko.GeckoManager.createGeckoView(
+            context = context,
+            allowTouchInterceptOverride = allowTouchIntercept,
+        )
+    }
+    var sessionRef by remember(url, allowTouchIntercept) {
+        mutableStateOf<org.mozilla.geckoview.GeckoSession?>(null)
+    }
+
+    LaunchedEffect(bootstrapping) {
+        if (bootstrapping) {
+            delay(1_200)
+            if (bootstrapping) {
+                geckoView.alpha = 1f
+            }
+        }
+    }
+
+    DisposableEffect(geckoView, url) {
+        val container = (context.applicationContext as? App)?.container
+        val sessionStore = container?.sessionStore
+        val browserSession = container?.browser
+        val bootstrapUrl = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
+        var disposed = false
+        var bootstrapDone = false
+        var bridgeRef: org.linuxdo.android.net.gecko.GeckoAuthBridge? = null
+
+        fun isBootstrapLocation(raw: String?): Boolean {
+            val parsed = runCatching { Uri.parse(raw.orEmpty()) }.getOrNull() ?: return false
+            return parsed.host?.equals(Config.HOST, ignoreCase = true) == true &&
+                parsed.path == IN_APP_BOOTSTRAP_PATH
+        }
+
+        fun syncClearanceBack(pageUrl: String) {
+            if (disposed || !isTrustedForumUrl(pageUrl)) return
+            scope.launch {
+                val clearances = runCatching { bridgeRef?.readCfClearances() }.getOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: withContext(Dispatchers.IO) {
+                        org.linuxdo.android.net.gecko.GeckoManager.cfClearancesFromDb(context).toList()
+                    }
+                if (!disposed) {
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览")
+                }
+            }
+        }
+
+        val session = org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
+            context = context,
+            onLocationChanged = { navUrl ->
+                if (!isBootstrapLocation(navUrl)) {
+                    geckoView.alpha = 1f
+                }
+            },
+            onPageStarted = { startUrl ->
+                if (!isBootstrapLocation(startUrl)) {
+                    geckoView.alpha = 1f
+                }
+            },
+            onPageFinished = { finishedUrl ->
+                if (isBootstrapLocation(finishedUrl) && !bootstrapDone) {
+                    return@createChallengeSession
+                }
+                bootstrapping = false
+                loading = false
+                geckoView.alpha = 1f
+                syncClearanceBack(finishedUrl)
+            },
+            onPageError = { _, _ ->
+                bootstrapping = false
+                loading = false
+                geckoView.alpha = 1f
+            },
+            onExternalRequest = { targetUri ->
+                val scheme = runCatching { Uri.parse(targetUri).scheme?.lowercase() }.getOrNull()
+                scheme != "http" && scheme != "https"
+            },
+        )
+        geckoView.alpha = 0f
+        geckoView.setSession(session)
+        session.setActive(active)
+        sessionRef = session
+
+        val initJob = scope.launch {
+            val bridge = runCatching {
+                org.linuxdo.android.net.gecko.GeckoAuthBridge.create(
+                    context = context,
+                    session = session,
+                    onReady = { readyUrl ->
+                        if (disposed) return@create
+                        if (!bootstrapDone && isBootstrapLocation(readyUrl)) {
+                            bootstrapDone = true
+                            scope.launch {
+                                runCatching {
+                                    val cookies = sessionStore?.syncFromWebView().orEmpty()
+                                    val challenged = sessionStore?.cfClearancesForVerification()
+                                        ?.filterTo(mutableSetOf()) { sessionStore.isClearanceChallenged(it) }
+                                        .orEmpty()
+                                    bridgeRef?.prepareInAppSessionCookies(cookies, challenged)
+                                }
+                                if (!disposed) {
+                                    syncClearanceBack(readyUrl)
+                                    bootstrapping = false
+                                    geckoView.alpha = 1f
+                                    session.loadUri(url)
+                                }
+                            }
+                        } else {
+                            syncClearanceBack(readyUrl)
+                        }
+                    },
+                    onCallback = { _, _ -> },
+                )
+            }.getOrNull()
+            if (disposed) {
+                bridge?.close()
+                return@launch
+            }
+            bridgeRef = bridge
+            if (bridge != null) {
+                session.loadUri(bootstrapUrl)
+                delay(3_500)
+                if (!disposed && !bootstrapDone) {
+                    bootstrapDone = true
+                    bootstrapping = false
+                    geckoView.alpha = 1f
+                    session.loadUri(url)
+                }
+            } else {
+                bootstrapDone = true
+                bootstrapping = false
+                geckoView.alpha = 1f
+                session.loadUri(url)
+            }
+        }
+
+        onDispose {
+            disposed = true
+            initJob.cancel()
+            runCatching { bridgeRef?.close() }
+            bridgeRef = null
+            runCatching { geckoView.releaseSession() }
+            runCatching { session.stop() }
+            runCatching { session.close() }
+            sessionRef = null
+        }
+    }
+
+    DisposableEffect(sessionRef, lifecycle, active) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> sessionRef?.setActive(false)
+                Lifecycle.Event.ON_RESUME -> sessionRef?.setActive(active)
+                else -> {}
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(sessionRef, active) {
+        sessionRef?.setActive(active)
+    }
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { geckoView },
+        )
+        if (loading) {
+            IosActivityIndicator(diameter = 22.dp)
         }
     }
 }
 
 @Composable
 private fun OneboxCard(onebox: CookedBlock.Onebox) {
+    val context = LocalContext.current
+    val openTopic = LocalOpenTopic.current
     val openUrl = LocalOpenExternalUrl.current
+    val view = LocalView.current
+    val pageActive = LocalPostPageActive.current
+    val internalTopic = remember(onebox.url) { parseInternalTopicUrl(onebox.url) }
+    val canPreview = remember(onebox.url) {
+        val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
+        (scheme == "http" || scheme == "https") && internalTopic == null
+    }
+    val isMiniAppOnebox = remember(onebox.url) { isLinuxDoMiniAppUrl(onebox.url) }
+    val isTrustedOnebox = remember(onebox.url) { isTrustedForumUrl(onebox.url) }
+    var expanded by rememberSaveable(onebox.url) { mutableStateOf(!isMiniAppOnebox && isAutoPreviewDemoOnebox(onebox)) }
+    var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
+    var visible by remember(onebox.url) { mutableStateOf(true) }
+
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
             .background(IosTheme.colors.fieldBackground)
-            .clickable { openUrl(onebox.url) }
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
+            }
+            .clickable {
+                if (internalTopic != null && openTopic != null) {
+                    openTopic(
+                        internalTopic.topicId,
+                        onebox.title.ifBlank { "话题 #${internalTopic.topicId}" },
+                        internalTopic.postNumber,
+                    )
+                } else if (isTrustedForumUrl(onebox.url)) {
+                    openUrl(onebox.url)
+                } else {
+                    openExternal(context, onebox.url)
+                }
+            }
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(onebox.title, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label)
+        if (expanded && canPreview && !isMiniAppOnebox) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 10f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(IosTheme.colors.card)
+                    .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.2f), RoundedCornerShape(8.dp)),
+            ) {
+                if (!fullscreen) {
+                    SandboxedWebPreview(
+                        url = onebox.url,
+                        active = pageActive && visible,
+                        allowTouchIntercept = false,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+        } else {
+            onebox.posterUrl?.let {
+                AsyncImage(it, onebox.title, modifier = Modifier.fillMaxWidth().height(160.dp), contentScale = ContentScale.Crop)
+            }
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (isMiniAppOnebox) {
+                MiniAppTinyEmblem(isMiniApp = true, modifier = Modifier.size(16.dp))
+            }
+            Text(
+                onebox.title,
+                style = IosTheme.type.subheadline,
+                fontWeight = FontWeight.SemiBold,
+                color = IosTheme.colors.label,
+            )
+        }
         onebox.description?.let {
             Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
-        Text(Uri.parse(onebox.url).host.orEmpty(), style = IosTheme.type.caption, color = IosTheme.colors.accent, maxLines = 1)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                if (isMiniAppOnebox) "linux.do · 小程序" else Uri.parse(onebox.url).host.orEmpty(),
+                style = IosTheme.type.caption,
+                color = if (isMiniAppOnebox) Color(0xFF07C160) else IosTheme.colors.accent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (canPreview) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (isMiniAppOnebox) {
+                        Text(
+                            text = "进入小程序 ›",
+                            style = IosTheme.type.caption,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF07C160),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color(0xFF07C160).copy(alpha = 0.14f))
+                                .clickable { openUrl(onebox.url) }
+                                .padding(horizontal = 10.dp, vertical = 4.dp),
+                        )
+                    } else {
+                        if (expanded) {
+                            Text(
+                                text = "全屏交互",
+                                style = IosTheme.type.caption,
+                                fontWeight = FontWeight.Medium,
+                                color = IosTheme.colors.accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        if (isTrustedOnebox) openUrl(onebox.url) else fullscreen = true
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                        Text(
+                            text = if (expanded) "收起预览" else "▶ 帖内预览",
+                            style = IosTheme.type.caption,
+                            fontWeight = FontWeight.Medium,
+                            color = IosTheme.colors.accent,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { expanded = !expanded }
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    if (fullscreen && canPreview) {
+        Dialog(
+            onDismissRequest = { fullscreen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+                SandboxedWebPreview(
+                    url = onebox.url,
+                    active = true,
+                    allowTouchIntercept = true,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "外部打开",
+                        color = Color.White,
+                        style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.48f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable { openUrl(onebox.url) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                    Text(
+                        text = "退出全屏",
+                        color = Color.White,
+                        style = IosTheme.type.footnote.copy(fontWeight = FontWeight.Medium),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.48f))
+                            .border(0.6.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                            .clickable { fullscreen = false }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private data class PostShareImages(val pages: List<File>, val missingImages: Int)
+
+private class PostImageWriter(private val directory: File, private val link: String) : java.io.Closeable {
+    val width = 960
+    val margin = 40
+    val contentWidth = width - margin * 2
+    private val pageHeight = 3072
+    private val bottom = pageHeight - 80
+    private var bitmap: android.graphics.Bitmap? = null
+    private var canvas: android.graphics.Canvas? = null
+    private var position = 84
+    private val pages = mutableListOf<File>()
+
+    private fun page(): android.graphics.Canvas {
+        canvas?.let { return it }
+        val image = android.graphics.Bitmap.createBitmap(width, pageHeight, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap = image
+        return android.graphics.Canvas(image).also {
+            canvas = it
+            it.drawColor(android.graphics.Color.WHITE)
+            val brand = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                color = android.graphics.Color.rgb(24, 101, 174)
+                textSize = 27f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }
+            it.drawText("LINUX DO", margin.toFloat(), 47f, brand)
+            brand.textAlign = android.graphics.Paint.Align.RIGHT
+            it.drawText("第 ${pages.size + 1} 页", (width - margin).toFloat(), 47f, brand)
+        }
+    }
+
+    fun layout(text: CharSequence, size: Float = 35f, availableWidth: Int = contentWidth, monospace: Boolean = false, bold: Boolean = false): android.text.StaticLayout {
+        val paint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.rgb(35, 39, 45)
+            textSize = size
+            typeface = when { monospace -> android.graphics.Typeface.MONOSPACE; bold -> android.graphics.Typeface.DEFAULT_BOLD; else -> android.graphics.Typeface.DEFAULT }
+        }
+        return android.text.StaticLayout.Builder.obtain(text, 0, text.length, paint, availableWidth.coerceAtLeast(40))
+            .setIncludePad(false).setLineSpacing(8f, 1f).build()
+    }
+
+    fun text(value: CharSequence, size: Float = 35f, indent: Int = 0, code: Boolean = false, bold: Boolean = false) {
+        val text = layout(value, size, contentWidth - indent, code, bold)
+        var offset = 0
+        while (offset < text.height) {
+            if (bottom - position < 80) flush()
+            val available = bottom - position
+            var lastLine = text.getLineForVertical(minOf(offset + available, text.height) - 1)
+            while (lastLine > 0 && text.getLineBottom(lastLine) > offset + available) lastLine--
+            val end = text.getLineBottom(lastLine).takeIf { it > offset } ?: minOf(offset + available, text.height)
+            val surface = page()
+            surface.save()
+            surface.clipRect(margin + indent, position, width - margin, position + end - offset)
+            if (code) surface.drawColor(android.graphics.Color.rgb(242, 244, 247))
+            surface.translate((margin + indent).toFloat(), (position - offset).toFloat())
+            text.draw(surface)
+            surface.restore()
+            position += end - offset
+            offset = end
+            if (offset < text.height) flush()
+        }
+        position += 16
+    }
+
+    fun drawing(height: Int, indent: Int = 0, draw: (android.graphics.Canvas) -> Unit) {
+        if (height <= bottom - 84 && position + height > bottom) flush()
+        var offset = 0
+        while (offset < height) {
+            if (position >= bottom) flush()
+            val count = minOf(bottom - position, height - offset)
+            val surface = page()
+            surface.save()
+            surface.clipRect(margin + indent, position, width - margin, position + count)
+            surface.translate((margin + indent).toFloat(), (position - offset).toFloat())
+            draw(surface)
+            surface.restore()
+            position += count
+            offset += count
+            if (offset < height) flush()
+        }
+        position += 16
+    }
+
+    private fun flush() {
+        val original = bitmap ?: return
+        val height = (position + 70).coerceAtMost(pageHeight)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.GRAY
+            textSize = 22f
+        }
+        canvas?.drawText(link, margin.toFloat(), (height - 25).toFloat(), paint)
+        val cropped = android.graphics.Bitmap.createBitmap(original, 0, 0, width, height)
+        try {
+            val file = File(directory, "page-${pages.size + 1}.png")
+            file.outputStream().use { check(cropped.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)) }
+            pages += file
+        } finally {
+            if (cropped !== original) cropped.recycle()
+            original.recycle()
+            bitmap = null
+            canvas = null
+            position = 84
+        }
+    }
+
+    fun finish(): List<File> { flush(); return pages.toList() }
+    override fun close() { bitmap?.recycle(); bitmap = null; canvas = null }
+}
+
+private fun shareStyledText(runs: List<InlineText>): CharSequence = android.text.SpannableStringBuilder().apply {
+    runs.forEach { run ->
+        val start = length
+        append(run.text)
+        if (run.bold) setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (run.italic) setSpan(android.text.style.StyleSpan(android.graphics.Typeface.ITALIC), start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (run.code) setSpan(android.text.style.TypefaceSpan("monospace"), start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (run.href != null) setSpan(android.text.style.ForegroundColorSpan(android.graphics.Color.rgb(24, 101, 174)), start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    }
+}
+
+private fun shareBlockText(blocks: List<CookedBlock>, includeDetails: Boolean = true): String = blocks.joinToString("\n") { block ->
+    when (block) {
+        is CookedBlock.Paragraph -> block.runs.joinToString("") { it.text }
+        is CookedBlock.Heading -> block.title
+        is CookedBlock.Code -> block.text
+        is CookedBlock.Quote -> shareBlockText(block.blocks, includeDetails)
+        is CookedBlock.Details -> block.summary.joinToString("") { it.text } + if (includeDetails) "\n" + shareBlockText(block.blocks, true) else ""
+        is CookedBlock.ListBlock -> block.entries.joinToString("\n") { shareBlockText(it, includeDetails) }
+        is CookedBlock.Table -> block.rows.joinToString("\n") { row -> row.joinToString(" | ") { shareBlockText(it.blocks, includeDetails) } }
+        is CookedBlock.Picture -> "[图片：${block.description}]"
+        is CookedBlock.ImageGrid -> block.pictures.joinToString("\n") { "[图片：${it.description}]" }
+        is CookedBlock.Video -> "[视频：${block.title}]"
+        is CookedBlock.Audio -> "[音频：${block.title}]"
+        is CookedBlock.Onebox -> block.title + "\n" + block.url
+        is CookedBlock.Poll -> block.title + "\n" + block.options.joinToString("\n") { "• ${it.title}（${it.votes}）" }
+        CookedBlock.Divider -> "—"
+    }
+}
+
+private suspend fun generatePostShareImages(context: Context, post: Post, title: String, topicId: Long, includeDetails: Boolean): PostShareImages =
+    withContext(Dispatchers.Default) {
+        val root = File(context.cacheDir, "shared-posts").apply { mkdirs() }
+        val cutoff = System.currentTimeMillis() - java.util.concurrent.TimeUnit.DAYS.toMillis(2)
+        root.listFiles()?.filter {
+            it.isDirectory && it.name.startsWith("post-") && it.lastModified() < cutoff && it.canonicalFile.parentFile == root.canonicalFile
+        }?.forEach { it.deleteRecursively() }
+        val directory = File(root, "post-${post.id}-${java.util.UUID.randomUUID()}").apply { check(mkdirs()) }
+        var missing = 0
+        val loader = (context.applicationContext as App).container.imageLoader
+        suspend fun drawable(url: String, width: Int, height: Int): android.graphics.drawable.Drawable? {
+            val result = loader.execute(ImageRequest.Builder(context).data(url).size(width, height)
+                .allowHardware(false).memoryCachePolicy(coil.request.CachePolicy.DISABLED).build())
+            return (result as? coil.request.SuccessResult)?.drawable
+        }
+        try {
+            PostImageWriter(directory, "${Config.BASE_URL}/t/topic/$topicId/${post.postNumber}").use { writer ->
+                writer.text(title, size = 46f, bold = true)
+                val avatar = avatarUrlOf(post.avatarTemplate)?.let { drawable(it, 72, 72) }
+                writer.drawing(80) { canvas ->
+                    if (avatar != null) {
+                        canvas.save()
+                        val clip = android.graphics.Path().apply { addCircle(36f, 36f, 36f, android.graphics.Path.Direction.CW) }
+                        canvas.clipPath(clip)
+                        avatar.setBounds(0, 0, 72, 72)
+                        avatar.draw(canvas)
+                        canvas.restore()
+                    }
+                    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.DKGRAY; textSize = 29f }
+                    canvas.drawText("${post.displayName}  @${post.username} · #${post.postNumber}", 88f, 35f, paint)
+                    paint.textSize = 23f
+                    canvas.drawText(post.createdAt?.take(10).orEmpty(), 88f, 68f, paint)
+                }
+                suspend fun picture(url: String, description: String, indent: Int) {
+                    val image = drawable(url, writer.contentWidth - indent, 2200)
+                    if (image == null) { missing++; writer.text("[图片未加载：$description]", size = 28f, indent = indent); return }
+                    val ratio = image.intrinsicWidth.coerceAtLeast(1).toFloat() / image.intrinsicHeight.coerceAtLeast(1)
+                    val height = ((writer.contentWidth - indent) / ratio).toInt().coerceIn(1, 2200)
+                    val width = (height * ratio).toInt().coerceIn(1, writer.contentWidth - indent)
+                    writer.drawing(height, indent) { canvas ->
+                        val left = (writer.contentWidth - indent - width) / 2
+                        image.setBounds(left, 0, left + width, height)
+                        image.draw(canvas)
+                    }
+                }
+                suspend fun render(blocks: List<CookedBlock>, depth: Int = 0) {
+                    val indent = (depth * 28).coerceAtMost(160)
+                    for (block in blocks) {
+                        kotlinx.coroutines.yield()
+                        when (block) {
+                            is CookedBlock.Paragraph -> writer.text(shareStyledText(block.runs), indent = indent)
+                            is CookedBlock.Heading -> writer.text(block.title, size = (46 - block.level * 2).coerceAtLeast(36).toFloat(), indent = indent, bold = true)
+                            is CookedBlock.Code -> writer.text(block.text, size = 28f, indent = indent, code = true)
+                            is CookedBlock.Picture -> picture(block.originalUrl, block.description, indent)
+                            is CookedBlock.ImageGrid -> {
+                                val size = (writer.contentWidth - indent - (block.columns - 1) * 10) / block.columns
+                                for (row in block.pictures.chunked(block.columns)) {
+                                    val images = row.map { drawable(it.url, size, size) }
+                                    missing += images.count { it == null }
+                                    writer.drawing(size, indent) { canvas ->
+                                        images.forEachIndexed { index, image ->
+                                            val left = index * (size + 10)
+                                            val paint = android.graphics.Paint().apply { color = android.graphics.Color.LTGRAY }
+                                            canvas.drawRect(left.toFloat(), 0f, (left + size).toFloat(), size.toFloat(), paint)
+                                            image?.let {
+                                                val ratio = it.intrinsicWidth.coerceAtLeast(1).toFloat() / it.intrinsicHeight.coerceAtLeast(1)
+                                                val drawWidth = if (ratio > 1) size else (size * ratio).toInt()
+                                                val drawHeight = if (ratio > 1) (size / ratio).toInt() else size
+                                                val x = left + (size - drawWidth) / 2
+                                                val y = (size - drawHeight) / 2
+                                                it.setBounds(x, y, x + drawWidth, y + drawHeight)
+                                                it.draw(canvas)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            is CookedBlock.Quote -> { writer.text("引用", size = 27f, indent = indent, bold = true); render(block.blocks, depth + 1) }
+                            is CookedBlock.Details -> {
+                                writer.text((if (includeDetails) "▾ " else "▸ ") + block.summary.joinToString("") { it.text }, indent = indent, bold = true)
+                                if (includeDetails) render(block.blocks, depth + 1)
+                            }
+                            is CookedBlock.ListBlock -> block.entries.forEachIndexed { index, entry ->
+                                val prefix = if (block.continuation && index == 0) "" else block.start?.let { "${it + index}. " } ?: "• "
+                                val first = entry.firstOrNull() as? CookedBlock.Paragraph
+                                if (first != null) {
+                                    writer.text(shareStyledText(listOf(InlineText(prefix)) + first.runs), indent = indent)
+                                    render(entry.drop(1), depth + 1)
+                                } else { writer.text(prefix, indent = indent); render(entry, depth + 1) }
+                            }
+                            is CookedBlock.Table -> {
+                                if (block.caption.isNotEmpty()) writer.text(shareStyledText(block.caption), size = 29f, indent = indent)
+                                val columnWidth = (writer.contentWidth - indent) / block.columns
+                                val cells = block.rows.flatMapIndexed { row, values -> values.map { row to it } }
+                                val layouts = cells.map { (_, cell) -> writer.layout(shareBlockText(cell.blocks, includeDetails), 27f, columnWidth * cell.columnSpan - 16, bold = cell.header) }
+                                val heights = IntArray(block.rows.size) { 48 }
+                                cells.forEachIndexed { index, (row, cell) -> if (cell.rowSpan == 1) heights[row] = maxOf(heights[row], layouts[index].height + 16) }
+                                cells.forEachIndexed { index, (row, cell) ->
+                                    val end = (row + cell.rowSpan).coerceAtMost(heights.size)
+                                    val total = (row until end).sumOf { heights[it] }
+                                    if (layouts[index].height + 16 > total) heights[end - 1] += layouts[index].height + 16 - total
+                                }
+                                val offsets = IntArray(heights.size + 1)
+                                heights.indices.forEach { offsets[it + 1] = offsets[it] + heights[it] }
+                                writer.drawing(offsets.last(), indent) { canvas ->
+                                    cells.forEachIndexed { index, (row, cell) ->
+                                        val left = cell.column * columnWidth
+                                        val top = offsets[row]
+                                        val right = left + cell.columnSpan * columnWidth
+                                        val bottom = offsets[(row + cell.rowSpan).coerceAtMost(heights.size)]
+                                        val paint = android.graphics.Paint().apply { color = if (cell.header) 0xFFF0F3F7.toInt() else android.graphics.Color.WHITE }
+                                        canvas.drawRect(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat(), paint)
+                                        paint.style = android.graphics.Paint.Style.STROKE
+                                        paint.color = android.graphics.Color.LTGRAY
+                                        canvas.drawRect(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat(), paint)
+                                        canvas.save()
+                                        canvas.translate((left + 8).toFloat(), (top + 8).toFloat())
+                                        layouts[index].draw(canvas)
+                                        canvas.restore()
+                                    }
+                                }
+                            }
+                            is CookedBlock.Video -> {
+                                block.posterUrl?.let { picture(it, block.title, indent) }
+                                writer.text("视频 · ${block.title}（在原帖播放）", size = 29f, indent = indent)
+                            }
+                            is CookedBlock.Audio -> writer.text("音频 · ${block.title}（在原帖播放）", size = 29f, indent = indent)
+                            is CookedBlock.Onebox -> {
+                                block.posterUrl?.let { picture(it, block.title, indent) }
+                                writer.text(block.title, indent = indent, bold = true)
+                                block.description?.let { writer.text(it, size = 29f, indent = indent) }
+                                writer.text(block.url, size = 26f, indent = indent)
+                            }
+                            is CookedBlock.Poll -> writer.text(shareBlockText(listOf(block)), indent = indent)
+                            CookedBlock.Divider -> writer.drawing(12, indent) { canvas ->
+                                canvas.drawLine(0f, 6f, (writer.contentWidth - indent).toFloat(), 6f, android.graphics.Paint().apply { color = android.graphics.Color.LTGRAY })
+                            }
+                        }
+                    }
+                }
+                render(segmentCookedBlocks(CookedParser.parsePostCached(post)).flatten())
+                PostShareImages(writer.finish(), missing)
+            }
+        } catch (error: Throwable) {
+            if (directory.canonicalFile.parentFile == root.canonicalFile) directory.deleteRecursively()
+            throw error
+        }
+    }
+
+private suspend fun savePostShareImages(context: Context, pages: List<File>): Int = withContext(Dispatchers.IO) {
+    var saved = 0
+    for (file in pages) {
+        kotlinx.coroutines.yield()
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "LINUXDO_${file.parentFile?.name}_${file.name}")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LinuxDo")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("无法创建相册图片")
+        try {
+            requireNotNull(resolver.openOutputStream(uri)).use { output -> file.inputStream().use { it.copyTo(output) } }
+            if (Build.VERSION.SDK_INT >= 29) resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+            saved++
+        } catch (error: Throwable) {
+            resolver.delete(uri, null, null)
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            throw java.io.IOException("已保存 $saved 张，其余图片保存失败", error)
+        }
+    }
+    saved
+}
+
+@Composable
+internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val clipboardManager = LocalClipboardManager.current
+    val previewLoader = org.linuxdo.android.ui.LocalTopicPreviewLoader.current
+    var effectivePost by remember(post) { mutableStateOf(post) }
+    var selectedTab by rememberSaveable(post.id) { mutableIntStateOf(0) } // 0: 分享链接, 1: 生成卡片
+    var includeDetails by rememberSaveable(post.id) { mutableStateOf(false) }
+    var retry by remember { mutableIntStateOf(0) }
+    var result by remember { mutableStateOf<PostShareImages?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val shareUrl = remember(topicId, effectivePost.postNumber) {
+        if (effectivePost.postNumber <= 1) "${Config.BASE_URL}/t/topic/$topicId"
+        else "${Config.BASE_URL}/t/topic/$topicId/${effectivePost.postNumber}"
+    }
+    val shareText = remember(title, shareUrl) {
+        "【LINUX DO】$title\n$shareUrl"
+    }
+
+    LaunchedEffect(post.id, topicId) {
+        if (effectivePost.id < 0 && effectivePost.cooked.isBlank() && previewLoader != null) {
+            runCatching {
+                val detail = previewLoader(topicId)
+                val targetNo = effectivePost.postNumber.coerceAtLeast(1)
+                val fetched = detail.postStream.posts.firstOrNull { it.postNumber == targetNo }
+                    ?: detail.postStream.posts.firstOrNull()
+                if (fetched != null) {
+                    effectivePost = fetched.copy(
+                        avatarTemplate = fetched.avatarTemplate ?: effectivePost.avatarTemplate
+                    )
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(selectedTab, effectivePost.id, effectivePost.cooked, includeDetails, retry) {
+        if (selectedTab != 1) return@LaunchedEffect
+        InlineMediaSession.stop()
+        loading = true
+        result = null
+        error = null
+        try {
+            var targetPost = effectivePost
+            if (targetPost.id < 0 && previewLoader != null) {
+                val detail = previewLoader(topicId)
+                val targetNo = targetPost.postNumber.coerceAtLeast(1)
+                val fetched = detail.postStream.posts.firstOrNull { it.postNumber == targetNo }
+                    ?: detail.postStream.posts.firstOrNull()
+                if (fetched != null) {
+                    targetPost = fetched.copy(
+                        avatarTemplate = fetched.avatarTemplate ?: targetPost.avatarTemplate
+                    )
+                    effectivePost = targetPost
+                }
+            }
+            result = generatePostShareImages(context, targetPost, title, topicId, includeDetails)
+        }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: OutOfMemoryError) { error = "内存不足，暂时无法生成图片" }
+        catch (_: Exception) { error = "图片生成失败，请重试" }
+        finally { loading = false }
+    }
+    fun save() {
+        val pages = result?.pages ?: return
+        saving = true
+        scope.launch {
+            try {
+                val count = savePostShareImages(context, pages)
+                Toast.makeText(context, "已保存 $count 张图片到相册", Toast.LENGTH_LONG).show()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (failure: Exception) { Toast.makeText(context, failure.message ?: "保存失败", Toast.LENGTH_LONG).show() }
+            finally { saving = false }
+        }
+    }
+    val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) save() else Toast.makeText(context, "未获得相册保存权限，仍可直接分享", Toast.LENGTH_SHORT).show()
+    }
+    Dialog(onDismissRequest = { if (!saving) onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
+            Modifier
+                .padding(16.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+                .clip(RoundedCornerShape(22.dp))
+                .background(IosTheme.colors.card)
+        ) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PostActionIcon(PostAction.Share, false, tint = IosTheme.colors.accent, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("分享卡片 · #${effectivePost.postNumber.coerceAtLeast(1)}", style = IosTheme.type.headline)
+                }
+                TextButton(onClick = onDismiss, enabled = !saving) {
+                    Text("关闭", color = IosTheme.colors.secondaryLabel)
+                }
+            }
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val tabs = listOf("话题链接分享", "生成卡片分享")
+                tabs.forEachIndexed { index, tabTitle ->
+                    val isSelected = selectedTab == index
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (isSelected) IosTheme.colors.accent else IosTheme.colors.groupedBackground)
+                            .clickable { selectedTab = index }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            tabTitle,
+                            style = IosTheme.type.subheadline,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (isSelected) Color.White else IosTheme.colors.secondaryLabel
+                        )
+                    }
+                }
+            }
+
+            if (selectedTab == 0) {
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .background(IosTheme.colors.groupedBackground)
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(IosTheme.colors.card)
+                            .padding(16.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    "LINUX DO",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.accent,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("·", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    if (effectivePost.postNumber <= 1) "首楼" else "#${effectivePost.postNumber}",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.secondaryLabel
+                                )
+                            }
+                            Text(
+                                title,
+                                style = IosTheme.type.headline,
+                                fontWeight = FontWeight.Bold,
+                                color = IosTheme.colors.label,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                val avatarUrl = remember(effectivePost.avatarTemplate) { avatarUrlOf(effectivePost.avatarTemplate) }
+                                if (avatarUrl != null) {
+                                    AsyncImage(
+                                        avatarUrl,
+                                        contentDescription = "avatar",
+                                        modifier = Modifier
+                                            .size(24.dp)
+                                            .clip(CircleShape)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                }
+                                Text(
+                                    effectivePost.name?.ifBlank { effectivePost.username } ?: effectivePost.username,
+                                    style = IosTheme.type.subheadline,
+                                    fontWeight = FontWeight.Medium,
+                                    color = IosTheme.colors.label
+                                )
+                                if (effectivePost.username.isNotBlank()) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        "@${effectivePost.username}",
+                                        style = IosTheme.type.footnote,
+                                        color = IosTheme.colors.secondaryLabel
+                                    )
+                                }
+                            }
+                            val excerpt = remember(effectivePost.cooked) {
+                                effectivePost.cooked?.let { android.text.Html.fromHtml(it, android.text.Html.FROM_HTML_MODE_LEGACY).toString().trim() }
+                                    ?.take(200)
+                                    ?.replace(Regex("\n+"), " ")
+                                    .orEmpty()
+                            }
+                            if (excerpt.isNotBlank()) {
+                                Text(
+                                    excerpt,
+                                    style = IosTheme.type.footnote,
+                                    color = IosTheme.colors.secondaryLabel,
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(IosTheme.colors.card)
+                            .padding(16.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("链接与内容", style = IosTheme.type.headline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label)
+                            Text("话题链接", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            Text(
+                                shareUrl,
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.accent,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Button(
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(shareUrl))
+                                    Toast.makeText(context, "已复制话题链接", Toast.LENGTH_SHORT).show()
+                                },
+                                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                    containerColor = IosTheme.colors.groupedBackground,
+                                    contentColor = IosTheme.colors.label
+                                ),
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
+                            ) {
+                                Text("复制链接", style = IosTheme.type.footnote, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+
+                    Text(
+                        "分享话题链接可直接在各应用中打开，原生秒级直达，免去图片生成等待。",
+                        style = IosTheme.type.footnote,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                }
+            } else {
+                val hasDetails = remember(effectivePost.cooked) {
+                    effectivePost.cooked?.contains("<details", ignoreCase = true) == true
+                }
+                if (hasDetails) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.groupedBackground)
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(checked = includeDetails, onCheckedChange = { includeDetails = it }, enabled = !saving)
+                        Text("包含折叠展开内容", modifier = Modifier.weight(1f), style = IosTheme.type.footnote)
+                        TextButton(onClick = { retry++ }, enabled = !loading && !saving) {
+                            Text("重新生成", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                        }
+                    }
+                }
+                LazyColumn(
+                    Modifier
+                        .weight(1f)
+                        .padding(top = if (hasDetails) 4.dp else 8.dp)
+                        .background(IosTheme.colors.groupedBackground),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    if (loading) item { IosLoadingBox() }
+                    error?.let { item { Text(it, color = IosTheme.colors.destructive, style = IosTheme.type.footnote) } }
+                    result?.let { images ->
+                        if (images.missingImages > 0) item {
+                            Text("有 ${images.missingImages} 张图片未加载，可点击右上角重新生成后再分享", style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
+                        }
+                        items(images.pages, key = { it.name }) { file ->
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(IosTheme.colors.card)
+                            ) {
+                                AsyncImage(file, "分享图片", modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (selectedTab == 0) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                            containerColor = IosTheme.colors.groupedBackground,
+                            contentColor = IosTheme.colors.label
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(shareText))
+                            Toast.makeText(context, "已复制话题标题与链接", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Text("复制文本", fontWeight = FontWeight.Medium)
+                    }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                            containerColor = IosTheme.colors.accent,
+                            contentColor = Color.White
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        onClick = {
+                            runCatching {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(android.content.Intent.EXTRA_SUBJECT, title)
+                                    putExtra(android.content.Intent.EXTRA_TEXT, shareText)
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "分享话题链接"))
+                            }.onFailure { Toast.makeText(context, "无法打开系统分享菜单", Toast.LENGTH_SHORT).show() }
+                        }
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            PostActionIcon(PostAction.Share, false, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("系统分享", fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                } else {
+                    Button(
+                        enabled = !loading && !saving && result != null,
+                        modifier = Modifier.weight(1f),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                            containerColor = IosTheme.colors.groupedBackground,
+                            contentColor = IosTheme.colors.label
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        onClick = {
+                            if (Build.VERSION.SDK_INT < 29 && androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                permission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                            } else save()
+                        }
+                    ) {
+                        Text(if (saving) "保存中…" else "保存到相册", fontWeight = FontWeight.Medium)
+                    }
+                    Button(
+                        enabled = !loading && !saving && result != null,
+                        modifier = Modifier.weight(1f),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                            containerColor = IosTheme.colors.accent,
+                            contentColor = Color.White
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        onClick = {
+                            val pages = result?.pages.orEmpty()
+                            if (pages.isNotEmpty()) runCatching {
+                                val uris = ArrayList(pages.map { androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", it) })
+                                val intent = android.content.Intent(if (uris.size == 1) android.content.Intent.ACTION_SEND else android.content.Intent.ACTION_SEND_MULTIPLE).apply {
+                                    type = "image/png"
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    if (uris.size == 1) putExtra(android.content.Intent.EXTRA_STREAM, uris.first()) else putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, uris)
+                                    clipData = android.content.ClipData.newUri(context.contentResolver, title, uris.first()).apply {
+                                        uris.drop(1).forEach { addItem(android.content.ClipData.Item(it)) }
+                                    }
+                                }
+                                context.startActivity(android.content.Intent.createChooser(intent, "分享卡片"))
+                            }.onFailure { Toast.makeText(context, "无法打开系统分享菜单", Toast.LENGTH_SHORT).show() }
+                        }
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            PostActionIcon(PostAction.Share, false, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("系统分享", fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PostRevisionBadge(post: Post) {
+    if (post.version <= 1) return
+    val open = LocalPostHistory.current
+    Text(
+        "已编辑 ${post.version - 1} 次",
+        style = IosTheme.type.caption,
+        color = if (post.canViewEditHistory) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+        modifier = Modifier.padding(start = 4.dp).clickable(enabled = post.canViewEditHistory) { open(post) },
+    )
+}
+
+internal fun revisionDiffText(html: String, inserted: Color, deleted: Color): AnnotatedString = buildAnnotatedString {
+    fun visit(node: org.jsoup.nodes.Node, change: Int = 0) {
+        if (node is org.jsoup.nodes.TextNode) { append(node.wholeText); return }
+        if (node !is org.jsoup.nodes.Element || node.normalName() in setOf("script", "style", "noscript")) return
+        val kind = when {
+            node.normalName() == "ins" || node.hasClass("diff-ins") -> 1
+            node.normalName() == "del" || node.hasClass("diff-del") -> -1
+            else -> change
+        }
+        if (node.normalName() == "br") { append("\n"); return }
+        if (node.normalName() == "img") { append(node.attr("alt").ifBlank { "[图片]" }); return }
+        withStyle(SpanStyle(
+            background = when (kind) { 1 -> inserted.copy(alpha = 0.15f); -1 -> deleted.copy(alpha = 0.15f); else -> Color.Unspecified },
+            color = when (kind) { 1 -> inserted; -1 -> deleted; else -> Color.Unspecified },
+            textDecoration = if (kind == -1) androidx.compose.ui.text.style.TextDecoration.LineThrough else null,
+        )) { node.childNodes().forEach { visit(it, kind) } }
+        if (node.normalName() in setOf("p", "div", "li", "tr", "pre", "h1", "h2", "h3", "h4")) append("\n")
+        else if (node.normalName() in setOf("td", "th")) append("  ")
+    }
+    Jsoup.parseBodyFragment(html).body().childNodes().forEach { visit(it) }
+}
+
+@Composable
+internal fun PostRevisionSheet(post: Post, onDismiss: () -> Unit) {
+    val loader = org.linuxdo.android.ui.LocalPostRevisionLoader.current
+    var requested by remember(post.id) { mutableStateOf<Int?>(null) }
+    var revision by remember(post.id) { mutableStateOf<org.linuxdo.android.data.PostRevision?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var retry by remember { mutableIntStateOf(0) }
+    var markdown by remember { mutableStateOf(false) }
+    LaunchedEffect(post.id, requested, retry) {
+        loading = true
+        error = null
+        try { revision = loader(post.id, requested) }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { error = "无法获取此版本，可能没有查看权限或网络暂不可用" }
+        finally { loading = false }
+    }
+    val current = revision
+    val html = current?.bodyChanges?.let { if (markdown) it.markdownHtml ?: it.inlineHtml else it.inlineHtml ?: it.markdownHtml }.orEmpty()
+    val diff = remember(html) { revisionDiffText(html, Color(0xFF27864B), Color(0xFFC84040)) }
+    val chunks = remember(diff) {
+        buildList {
+            var offset = 0
+            while (offset < diff.length) {
+                var end = minOf(offset + 4000, diff.length)
+                if (end < diff.length && Character.isLowSurrogate(diff.text[end])) end--
+                add(diff.subSequence(offset, end))
+                offset = end
+            }
+        }
+    }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
+            Modifier
+                .padding(16.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(0.90f)
+                .clip(RoundedCornerShape(22.dp))
+                .background(IosTheme.colors.card)
+        ) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                PostActionIcon(PostAction.Edit, false, tint = IosTheme.colors.accent, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("编辑历史 · #${post.postNumber}", modifier = Modifier.weight(1f), style = IosTheme.type.headline)
+                TextButton(onClick = onDismiss) {
+                    Text("关闭", color = IosTheme.colors.secondaryLabel)
+                }
+            }
+            LazyColumn(
+                Modifier
+                    .weight(1f)
+                    .background(IosTheme.colors.groupedBackground),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                when {
+                    loading -> item { IosLoadingBox() }
+                    error != null -> item {
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(IosTheme.colors.card)
+                                .padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(error.orEmpty(), color = IosTheme.colors.secondaryLabel, style = IosTheme.type.footnote)
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(onClick = { retry++ }) { Text("重新加载", color = IosTheme.colors.accent) }
+                        }
+                    }
+                    current != null -> {
+                        item {
+                            Column(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(IosTheme.colors.card)
+                                    .padding(14.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        current.displayUsername ?: current.username,
+                                        style = IosTheme.type.subheadline,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = IosTheme.colors.label
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        RelativeTime.format(current.createdAt),
+                                        style = IosTheme.type.caption,
+                                        color = IosTheme.colors.secondaryLabel
+                                    )
+                                    Spacer(Modifier.weight(1f))
+                                    Box(
+                                        Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(IosTheme.colors.accent.copy(alpha = 0.12f))
+                                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            "v${current.currentRevision} / ${current.lastRevision}",
+                                            style = IosTheme.type.caption,
+                                            color = IosTheme.colors.accent,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                }
+                                current.editReason?.takeIf { it.isNotBlank() }?.let { reason ->
+                                    Spacer(Modifier.height(8.dp))
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(IosTheme.colors.groupedBackground)
+                                            .padding(8.dp)
+                                    ) {
+                                        Text("备注: $reason", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                                    }
+                                }
+                            }
+                        }
+                        if (current.currentHidden || current.previousHidden) {
+                            item {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(IosTheme.colors.card)
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("此版本的内容已隐藏", color = IosTheme.colors.secondaryLabel, style = IosTheme.type.footnote)
+                                }
+                            }
+                        } else {
+                            item {
+                                val titles = current.titleChanges
+                                val previous = when (titles) {
+                                    is kotlinx.serialization.json.JsonArray -> titles.getOrNull(0)
+                                    is kotlinx.serialization.json.JsonObject -> titles["previous"]
+                                    else -> null
+                                }
+                                val next = when (titles) {
+                                    is kotlinx.serialization.json.JsonArray -> titles.getOrNull(1)
+                                    is kotlinx.serialization.json.JsonObject -> titles["current"]
+                                    else -> null
+                                }
+                                if (titles != null) {
+                                    Column(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .padding(bottom = 8.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(IosTheme.colors.card)
+                                            .padding(12.dp)
+                                    ) {
+                                        Text("标题修改", style = IosTheme.type.headline)
+                                        Spacer(Modifier.height(4.dp))
+                                        Text("- ${(previous as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()}", color = Color(0xFFC84040), style = IosTheme.type.footnote)
+                                        Text("+ ${(next as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()}", color = Color(0xFF27864B), style = IosTheme.type.footnote)
+                                    }
+                                }
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("绿色为新增 · 红色为删除", modifier = Modifier.weight(1f), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                                    if (current.bodyChanges?.markdownHtml != null) {
+                                        TextButton(onClick = { markdown = !markdown }) {
+                                            Text(if (markdown) "切换到正文对比" else "切换到源码对比", style = IosTheme.type.caption, color = IosTheme.colors.accent)
+                                        }
+                                    }
+                                }
+                            }
+                            if (chunks.isEmpty()) item {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(IosTheme.colors.card)
+                                        .padding(20.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(if (current.diffError) "此版本暂时无法生成正文差异" else "此版本没有正文差异", color = IosTheme.colors.secondaryLabel)
+                                }
+                            }
+                            items(chunks.size) { index ->
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(IosTheme.colors.card)
+                                        .padding(14.dp)
+                                ) {
+                                    SelectionContainer {
+                                        Text(
+                                            chunks[index],
+                                            style = IosTheme.type.footnote,
+                                            fontFamily = if (markdown) FontFamily.Monospace else null,
+                                            lineHeight = 22.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    enabled = !loading && current != null && current.previousRevision > 0 && current.previousRevision != current.currentRevision,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = IosTheme.colors.groupedBackground,
+                        contentColor = IosTheme.colors.label
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    onClick = { requested = current?.previousRevision }
+                ) {
+                    Text("◀ 上一版", style = IosTheme.type.footnote)
+                }
+                Text(
+                    current?.let { "第 ${it.currentRevision} 次修改" }.orEmpty(),
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center,
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.secondaryLabel
+                )
+                Button(
+                    enabled = !loading && current?.nextRevision != null && current.nextRevision != current.currentRevision,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = IosTheme.colors.groupedBackground,
+                        contentColor = IosTheme.colors.label
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    onClick = { requested = current?.nextRevision }
+                ) {
+                    Text("下一版 ▶", style = IosTheme.type.footnote)
+                }
+            }
+        }
     }
 }
 
@@ -5280,6 +7775,8 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
     val context = LocalContext.current
     val openTopic = LocalOpenTopic.current
     val updatedOpenTopic by rememberUpdatedState(openTopic)
+    val openPicture = LocalOpenPicture.current
+    val updatedOpenPicture by rememberUpdatedState(openPicture)
     val openExternal = LocalOpenExternalUrl.current
     val updatedOpenExternal by rememberUpdatedState(openExternal)
     val scope = rememberCoroutineScope()
@@ -5316,6 +7813,7 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                             } else {
                                 val internalTarget = parseInternalTopicUrl(link)
                                 val opener = updatedOpenTopic
+                                val pictureOpener = updatedOpenPicture
                                 if (internalTarget != null && opener != null) {
                                     val rawLabel = run.text.trim()
                                     val titleHint = if (rawLabel.isNotBlank() &&
@@ -5327,10 +7825,15 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                         "话题 #${internalTarget.topicId}"
                                     }
                                     opener(internalTarget.topicId, titleHint, internalTarget.postNumber)
+                                } else if (pictureOpener != null && isImageLinkUrl(link)) {
+                                    pictureOpener(
+                                        listOf(ImageViewerItem(url = link, previewUrl = link, description = run.text.trim())),
+                                        0,
+                                    )
                                 } else {
                                     val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
                                     val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()
-                                    if (host.isNotBlank() && host !in TRUSTED_FORUM_HOSTS) {
+                                    if (host.isNotBlank() && !isTrustedForumHost(host)) {
                                         openExternal(context, link)
                                     } else {
                                         updatedOpenExternal(link)
@@ -6457,8 +8960,9 @@ private suspend fun saveMediaToPublicStorage(
             val request = Request.Builder().url(url).get().build()
             var response = container.httpClient.newCall(request).execute()
             if (response.code == 403 && response.header("cf-mitigated") != null) {
+                val challengedHost = response.request.url.host
                 response.close()
-                val cleared = container.browser.clearChallenge("download")
+                val cleared = container.browser.clearChallenge("download", requestHost = challengedHost)
                 if (cleared) {
                     response = container.httpClient.newCall(request).execute()
                 } else {
@@ -6578,6 +9082,116 @@ private fun resolveDownloadFileName(
         base = "$base.$ext"
     }
     return base
+}
+
+// 全角字符按 2 个宽度计，近似视觉宽度，避免中文标签被误判为“短”。
+private fun tagDisplayWidth(tag: String): Int =
+    tag.fold(0) { width, char -> width + if (char.code >= 0x2E80) 2 else 1 }
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TopicTagSelector(
+    tags: List<String>,
+    onOpenTag: (String) -> Unit,
+) {
+    val primaryTag = remember(tags) { tags.minBy(::tagDisplayWidth) }
+    val hasMore = tags.size > 1
+    var expanded by remember(tags) { mutableStateOf(false) }
+    val isDark = IosTheme.colors.isDark
+    val shape = RoundedCornerShape(8.dp)
+    val pillBg = if (isDark) Color(0xFF2C2C2E) else IosTheme.colors.fieldBackground
+    val borderColor = if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6)
+    val textColor = IosTheme.colors.secondaryLabel
+    val textStyle = IosTheme.type.footnote.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+
+    Box {
+        Row(
+            modifier = Modifier
+                .height(IntrinsicSize.Min)
+                .clip(shape)
+                .border(0.75.dp, borderColor, shape)
+                .background(pillBg),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                modifier = Modifier
+                    .clickable { onOpenTag(primaryTag) }
+                    .padding(start = 7.dp, end = if (hasMore) 5.dp else 7.dp, top = 2.5.dp, bottom = 2.5.dp)
+                    .widthIn(max = 112.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("#", style = textStyle, color = IosTheme.colors.tertiaryLabel)
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    text = primaryTag,
+                    style = textStyle,
+                    color = textColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (hasMore) {
+                Box(
+                    Modifier
+                        .width(0.75.dp)
+                        .fillMaxHeight()
+                        .padding(vertical = 4.dp)
+                        .background(borderColor),
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .clickable { expanded = !expanded }
+                        .padding(horizontal = 7.dp)
+                        .semantics { contentDescription = "展开全部 ${tags.size} 个标签" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(if (expanded) "▴" else "▾", style = textStyle, color = textColor)
+                }
+            }
+        }
+
+        if (hasMore) {
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.background(IosTheme.colors.card),
+            ) {
+                FlowRow(
+                    modifier = Modifier
+                        .widthIn(max = 260.dp)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    tags.forEach { tag ->
+                        val isCurrent = tag == primaryTag
+                        Text(
+                            text = "# $tag",
+                            style = textStyle,
+                            color = if (isCurrent) IosTheme.colors.accent else IosTheme.colors.label,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .widthIn(max = 236.dp)
+                                .clip(shape)
+                                .background(if (isCurrent) IosTheme.colors.accent.copy(alpha = 0.12f) else pillBg)
+                                .border(
+                                    0.75.dp,
+                                    if (isCurrent) IosTheme.colors.accent.copy(alpha = 0.35f) else borderColor,
+                                    shape,
+                                )
+                                .clickable {
+                                    expanded = false
+                                    onOpenTag(tag)
+                                }
+                                .padding(horizontal = 9.dp, vertical = 5.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -6785,6 +9399,65 @@ private fun FlagDialog(
                     Text(if (submitting) "提交中…" else "提交", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
                 }
             }
+        }
+    }
+}
+
+private data class PreparedPostBody(
+    val source: Post,
+    val blocks: List<CookedBlock>,
+    val parts: List<List<CookedBlock>>,
+    val images: List<ImageViewerItem>,
+    val headings: List<CookedBlock.Heading>,
+) {
+    fun matches(post: Post): Boolean =
+        source.cooked == post.cooked && source.polls == post.polls && source.pollsVotes == post.pollsVotes
+}
+
+private data class PostContentSlice(val row: TreePost, val body: PreparedPostBody?, val partIndex: Int) {
+    val first: Boolean get() = partIndex == 0
+    val last: Boolean get() = partIndex == (body?.parts?.lastIndex ?: 0)
+    val key: Any get() = if (first) row.post.id else "part/${row.post.id}/$partIndex"
+    val blocks: List<CookedBlock> get() = body?.parts?.getOrNull(partIndex).orEmpty()
+}
+
+private fun postIdFromListKey(key: Any?): Long? = when (key) {
+    is Long -> key
+    is String -> if (key.startsWith("part/")) key.substringAfter("part/").substringBefore('/').toLongOrNull() else null
+    else -> null
+}
+
+private fun partIndexFromListKey(key: Any?): Int =
+    if (key is String && key.startsWith("part/")) key.substringAfterLast('/').toIntOrNull() ?: 0 else 0
+
+private fun containsHeading(blocks: List<CookedBlock>, anchor: String): Boolean = blocks.any {
+    when (it) {
+        is CookedBlock.Heading -> it.anchor == anchor
+        is CookedBlock.Quote -> containsHeading(it.blocks, anchor)
+        is CookedBlock.Details -> containsHeading(it.blocks, anchor)
+        is CookedBlock.Table -> it.rows.any { row -> row.any { cell -> containsHeading(cell.blocks, anchor) } }
+        is CookedBlock.ListBlock -> it.entries.any { entry -> containsHeading(entry, anchor) }
+        else -> false
+    }
+}
+
+private fun collectHeadings(blocks: List<CookedBlock>): List<CookedBlock.Heading> = blocks.flatMap {
+    when (it) {
+        is CookedBlock.Heading -> listOf(it)
+        is CookedBlock.Quote -> collectHeadings(it.blocks)
+        is CookedBlock.Details -> collectHeadings(it.blocks)
+        is CookedBlock.Table -> it.rows.flatMap { row -> row.flatMap { cell -> collectHeadings(cell.blocks) } }
+        is CookedBlock.ListBlock -> it.entries.flatMap(::collectHeadings)
+        else -> emptyList()
+    }
+}
+
+@Composable
+private fun PreparingPostBody() {
+    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        repeat(3) { index ->
+            Box(Modifier.fillMaxWidth(if (index == 2) 0.68f else 1f).height(9.dp)
+                .clip(RoundedCornerShape(5.dp)).background(IosTheme.colors.separator.copy(alpha = 0.35f)))
         }
     }
 }

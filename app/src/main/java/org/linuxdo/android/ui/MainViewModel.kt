@@ -16,6 +16,11 @@ import android.os.PersistableBundle
 import android.provider.OpenableColumns
 import android.text.Spanned
 import android.widget.Toast
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.linuxdo.android.data.SavedTopic
+import org.linuxdo.android.data.SavedTopicStore
+import org.linuxdo.android.data.TopicReadingPosition
 import androidx.lifecycle.AndroidViewModel
 import androidx.core.content.edit
 import androidx.lifecycle.viewModelScope
@@ -60,6 +65,9 @@ import org.linuxdo.android.service.NotificationKeepAliveService
 import org.linuxdo.android.service.NotificationHelper
 import org.linuxdo.android.service.ApkUpdateInstaller
 import org.linuxdo.android.data.TopicRepository
+import org.linuxdo.android.data.EditorSuggestion
+import org.linuxdo.android.data.EditorCompletionRequest
+import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.Topic
 import org.linuxdo.android.data.ExcerptCache
 import org.linuxdo.android.data.ReadTimingBatch
@@ -67,6 +75,7 @@ import org.linuxdo.android.data.ReadReportSchedule
 import org.linuxdo.android.data.TopicReadTracker
 import org.linuxdo.android.data.AccountSession
 import org.linuxdo.android.data.AccountManager
+import org.linuxdo.android.data.SessionStore
 import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.AvatarCache
 import org.linuxdo.android.data.isAnimatedAvatarPath
@@ -117,6 +126,12 @@ import org.linuxdo.android.net.RateLimitException
 import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.ui.screen.TopicListUiState
+import org.linuxdo.android.data.TopicSearchHit
+import org.linuxdo.android.data.TopicMetadata
+import org.linuxdo.android.data.TopicEditRules
+import org.linuxdo.android.data.TopicMetadataPatch
+import org.linuxdo.android.data.topicMetadataPatch
+import org.linuxdo.android.data.validateTopicMetadata
 
 enum class Screen { Boot, Login, Verify, List }
 
@@ -192,6 +207,8 @@ private const val TOPIC_DETAIL_CACHE_CAPACITY = 20
 private const val TOPIC_DETAIL_CACHE_TTL_MS = 3 * 60 * 1_000L
 private const val SCROLL_IDLE_DELAY_MS = 400L
 private const val UNREAD_CHALLENGE_BACKOFF_MS = 3 * 60 * 1_000L
+private const val APP_PATH_PROBE_FIRST_DELAY_MS = 2_500L
+private const val APP_PATH_PROBE_INTERVAL_MS = 3_000L
 
 data class DetailUiState(
     val topic: TopicDetail? = null,
@@ -417,6 +434,14 @@ data class TagsUiState(
 )
 
 /** 编辑器要做的事。三种目标共用一个输入框,区别只在提交时调哪个接口。 */
+internal fun appendQuoteToDraft(draft: String, username: String, postNumber: Int, topicId: Long, selection: String): String {
+    if (selection.isBlank() || postNumber <= 0 || topicId <= 0) return draft
+    val author = username.filter { it.isLetterOrDigit() || it in "_.-" }
+    val quoted = selection.trim().replace(Regex("\\[(/?quote)(?=[=\\]\\s])", RegexOption.IGNORE_CASE), "&#91;$1")
+    val separator = if (draft.isEmpty() || draft.endsWith("\n\n")) "" else if (draft.endsWith("\n")) "\n" else "\n\n"
+    return "$draft$separator[quote=\"$author, post:$postNumber, topic:$topicId\"]\n$quoted\n[/quote]\n\n"
+}
+
 sealed interface ComposerTarget {
     val topicId: Long
 
@@ -431,6 +456,7 @@ sealed interface ComposerTarget {
         override val topicId: Long,
         val postNumber: Int,
         val username: String,
+        val quote: String? = null,
     ) : ComposerTarget
 
     /** 编辑自己的楼层。 */
@@ -581,6 +607,28 @@ data class SearchUiState(
     val order: SearchOrder = SearchOrder.Relevance,
 )
 
+data class TopicSearchUiState(
+    val open: Boolean = false, val topicId: Long = 0, val title: String = "", val query: String = "",
+    val hits: List<TopicSearchHit> = emptyList(), val page: Int = 0, val hasMore: Boolean = false,
+    val loading: Boolean = false, val loadingMore: Boolean = false, val error: String? = null,
+    val order: SearchOrder = SearchOrder.Relevance,
+)
+
+data class TopicMetadataEditorUiState(
+    val open: Boolean = false, val topicId: Long = 0, val userId: Long = 0, val generation: Long = 0,
+    val original: TopicMetadata? = null, val rules: TopicEditRules? = null,
+    val title: String = "", val categoryId: Int? = null, val tags: List<String> = emptyList(),
+    val loading: Boolean = false, val saving: Boolean = false, val error: String? = null,
+    val tagQuery: String = "", val loadingTags: Boolean = false,
+    val tagOptions: List<org.linuxdo.android.data.DiscourseTagInfo> = emptyList(),
+    val tagError: String? = null, val requiredTagName: String? = null, val requiredTagMin: Int = 0,
+) {
+    val patch: TopicMetadataPatch? get() = original?.let { topicMetadataPatch(it, title, categoryId, tags, rules?.canTagTopics == true) }
+    val dirty: Boolean get() = patch?.changed == true
+    val validationError: String? get() = original?.let { original -> rules?.let { validateTopicMetadata(original, it, patch ?: TopicMetadataPatch()) } }
+    val canSave: Boolean get() = open && !loading && !saving && !loadingTags && original?.canEdit == true && rules != null && dirty && validationError == null
+}
+
 data class ProfileUiState(
     val content: ProfilePage = ProfilePage(),
     val loaded: Boolean = false,
@@ -632,6 +680,175 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val userApiKeyAuthService = container.userApiKeyAuthService
     val diagnostics = container.diagnostics
 
+    private val savedTopicStore = SavedTopicStore(application)
+    private val savedTopicWriteGate = Mutex()
+    private val _savedTopics = MutableStateFlow<List<SavedTopic>>(emptyList())
+    val savedTopics = _savedTopics.asStateFlow()
+    private val _savedTopicsUserId = MutableStateFlow(0L)
+    val savedTopicsUserId = _savedTopicsUserId.asStateFlow()
+    private val _savedTopicsBusy = MutableStateFlow(false)
+    val savedTopicsBusy = _savedTopicsBusy.asStateFlow()
+    private val _savedTopicsNotice = MutableStateFlow<String?>(null)
+    val savedTopicsNotice = _savedTopicsNotice.asStateFlow()
+    private val _canUndoSavedTopics = MutableStateFlow(false)
+    val canUndoSavedTopics = _canUndoSavedTopics.asStateFlow()
+    private var removedSavedTopics: List<SavedTopic> = emptyList()
+    private val topicReadingPositions = mutableMapOf<Long, TopicReadingPosition>()
+
+    private fun publishSavedTopics(entries: List<SavedTopic>) {
+        _savedTopics.value = entries.sortedWith(compareByDescending<SavedTopic> { it.pinned }.thenByDescending { it.savedAt })
+    }
+
+    private fun changeSavedTopics(
+        userId: Long,
+        operation: suspend () -> List<SavedTopic>,
+        onSuccess: () -> Unit = {},
+    ) {
+        if (userId <= 0L || userId != _savedTopicsUserId.value || _savedTopicsBusy.value) return
+        val generation = accountScopeGeneration
+        _savedTopicsBusy.value = true
+        viewModelScope.launch {
+            try {
+                // 锁内发布：避免排在后面的旧结果覆盖较新的列表。
+                val published = savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { operation() }
+                    val sameScope = generation == accountScopeGeneration && userId == _savedTopicsUserId.value
+                    if (sameScope) publishSavedTopics(updated)
+                    sameScope
+                }
+                if (published) onSuccess()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (generation == accountScopeGeneration) _savedTopicsNotice.value = error.message ?: "暂存操作失败，请重试"
+            } finally {
+                if (generation == accountScopeGeneration) _savedTopicsBusy.value = false
+            }
+        }
+    }
+
+    fun saveTopic(userId: Long, topicId: Long) {
+        val detail = _details.value[topicId] ?: return
+        val topic = detail.topic ?: return
+        val entry = SavedTopic(
+            topicId = topicId, title = topic.title, savedAt = System.currentTimeMillis(),
+            categoryName = detail.category?.name, categoryColor = detail.category?.color,
+            totalPosts = maxOf(topic.postsCount, topic.postStream.stream.size, 1),
+            position = topicReadingPositions[topicId] ?: TopicReadingPosition(),
+        )
+        changeSavedTopics(userId, { savedTopicStore.add(userId, entry) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已加入暂存"
+        }
+    }
+
+    /** 列表长按加入暂存：没有阅读视口，按服务端已读楼层恢复。 */
+    fun saveTopicFromList(topic: Topic) {
+        val userId = _savedTopicsUserId.value
+        if (userId <= 0L) return
+        if (_savedTopics.value.any { it.topicId == topic.id }) {
+            _savedTopicsNotice.value = "已在暂存中"
+            return
+        }
+        val category = repository.cachedCategoryMap()[topic.categoryId]
+        val lastRead = topic.lastReadPostNumber?.takeIf { it > 1 }
+        val entry = SavedTopic(
+            topicId = topic.id, title = topic.title, savedAt = System.currentTimeMillis(),
+            categoryName = category?.name, categoryColor = category?.color,
+            totalPosts = maxOf(topic.postsCount, topic.highestPostNumber ?: 0, 1),
+            position = topicReadingPositions[topic.id]
+                ?: lastRead?.let { TopicReadingPosition(postNumber = it, atTop = false) }
+                ?: TopicReadingPosition(),
+        )
+        changeSavedTopics(userId, { savedTopicStore.add(userId, entry) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已加入暂存"
+        }
+    }
+
+    fun updateSavedTopicPosition(userId: Long, topicId: Long, position: TopicReadingPosition) {
+        if (userId <= 0L || userId != _savedTopicsUserId.value) return
+        if (topicReadingPositions.put(topicId, position) == position) return
+        if (_savedTopics.value.none { it.topicId == topicId }) return
+        val generation = accountScopeGeneration
+        val totalPosts = _details.value[topicId]?.topic?.postsCount ?: 0
+        viewModelScope.launch {
+            try {
+                savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { savedTopicStore.updatePosition(userId, topicId, position, totalPosts) }
+                    if (generation == accountScopeGeneration && userId == _savedTopicsUserId.value) publishSavedTopics(updated)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("暂存阅读位置保存失败: ${error.message}")
+            }
+        }
+    }
+
+    /** 复用列表静默探测和话题实时消息的数据，不额外发请求。 */
+    private fun syncSavedTopicTotals(totals: Map<Long, Int>) {
+        val userId = _savedTopicsUserId.value
+        if (userId <= 0L || totals.isEmpty()) return
+        val changed = _savedTopics.value.any { entry ->
+            totals[entry.topicId]?.let { it > 0 && it != entry.totalPosts } == true
+        }
+        if (!changed) return
+        val generation = accountScopeGeneration
+        viewModelScope.launch {
+            try {
+                savedTopicWriteGate.withLock {
+                    val updated = withContext(Dispatchers.IO) { savedTopicStore.updateTotals(userId, totals) }
+                    if (generation == accountScopeGeneration && userId == _savedTopicsUserId.value) publishSavedTopics(updated)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("暂存楼层数同步失败: ${error.message}")
+            }
+        }
+    }
+
+    fun removeSavedTopic(userId: Long, topicId: Long) {
+        val removed = _savedTopics.value.filter { it.topicId == topicId }.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        changeSavedTopics(userId, { savedTopicStore.remove(userId, topicId) }) {
+            removedSavedTopics = removed
+            _canUndoSavedTopics.value = removed.isNotEmpty()
+            _savedTopicsNotice.value = "已移除暂存"
+        }
+    }
+
+    fun clearSavedTopics(userId: Long) {
+        val removed = _savedTopics.value.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        changeSavedTopics(userId, { savedTopicStore.clear(userId) }) {
+            removedSavedTopics = removed
+            _canUndoSavedTopics.value = removed.isNotEmpty()
+            _savedTopicsNotice.value = "已清空全部暂存"
+        }
+    }
+
+    fun undoSavedTopics(userId: Long) {
+        val removed = removedSavedTopics.map { it.copy(position = topicReadingPositions[it.topicId] ?: it.position) }
+        if (removed.isEmpty()) return
+        changeSavedTopics(userId, { savedTopicStore.restore(userId, removed) }) {
+            removedSavedTopics = emptyList()
+            _canUndoSavedTopics.value = false
+            _savedTopicsNotice.value = "已撤销"
+        }
+    }
+
+    fun pinSavedTopic(userId: Long, topicId: Long) {
+        changeSavedTopics(userId, { savedTopicStore.togglePin(userId, topicId) })
+    }
+
+    fun clearSavedTopicsNotice() {
+        _savedTopicsNotice.value = null
+        _canUndoSavedTopics.value = false
+        removedSavedTopics = emptyList()
+    }
+
     private val initialHomeFeed = HomeFeedType.fromName(store.homeFeed())
     private val _feedStates = MutableStateFlow<Map<HomeFeedType, TopicListUiState>>(emptyMap())
     val feedStates = _feedStates.asStateFlow()
@@ -663,10 +880,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
     private val _accounts = MutableStateFlow(
-        AccountUiState(
-            accounts = container.accountManager.accounts(),
-            activeUserId = container.accountManager.activeUserId(),
-        ),
+        container.accountManager.snapshot().let { snapshot ->
+            AccountUiState(accounts = snapshot.accounts, activeUserId = snapshot.activeUserId, error = snapshot.error)
+        },
     )
     val accounts: StateFlow<AccountUiState> = _accounts.asStateFlow()
     private var lastAccountSwitchAt: Long? = null
@@ -683,6 +899,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private var bootJob: Job? = null
+    private var sessionStorageNeedsRetry = false
     private var autoJob: Job? = null
     private var reconcileSessionJob: Job? = null
     private var verifying = false
@@ -707,6 +924,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var topicLiveId: Long? = null
     private val topicLiveAtEnd = mutableSetOf<Long>()
     private val topicLiveScrolling = mutableSetOf<Long>()
+    /** 详情页最近一次停滑时间（elapsedRealtime），timings 据此错峰。 */
+    private val topicScrollSettledAt = mutableMapOf<Long, Long>()
     private val scrollBusySignal = ScrollBusySignal(SCROLL_IDLE_DELAY_MS)
     private var excerptPrefetchJob: Job? = null
     private var previewListVisible = false
@@ -731,6 +950,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val userRepliesStates = _userRepliesStates.asStateFlow()
     private val _search = MutableStateFlow(SearchUiState())
     val search = _search.asStateFlow()
+    private var searchSequence = 0L
+    private var topicSearchSequence = 0L
+    private var topicSearchJob: Job? = null
+    private val _topicSearch = MutableStateFlow(TopicSearchUiState())
+    val topicSearch = _topicSearch.asStateFlow()
+    private var metadataSequence = 0L
+    private var metadataJob: Job? = null
+    private var metadataTagJob: Job? = null
+    private var metadataTagSequence = 0L
+    private val _metadataEditor = MutableStateFlow(TopicMetadataEditorUiState())
+    val metadataEditor = _metadataEditor.asStateFlow()
+    private val _metadataUpdated = MutableStateFlow<TopicMetadata?>(null)
+    val metadataUpdated = _metadataUpdated.asStateFlow()
     private val _searchHistory = MutableStateFlow(store.getSearchHistory())
     val searchHistory = _searchHistory.asStateFlow()
     private val _profile = MutableStateFlow<Map<ProfileSection, ProfileUiState>>(emptyMap())
@@ -772,6 +1004,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var cdkScoreBackoffUntil: Long = 0L
     private val connectManualRefreshTimestamps = mutableListOf<Long>()
     private var connectSilentBackoffUntil: Long = 0L
+    private var ldcBackoffUntil: Long = 0L
+    private val ldcFetchGate = Mutex()
+    private var ldcLastAttempt: Pair<Long, Result<LdcUserInfo>>? = null
+
+    private fun connectSessionCheck(username: String): () -> Unit {
+        val userId = store.currentUserId()
+        val generation = store.sessionGeneration
+        return {
+            if (store.sessionChanging || store.sessionGeneration != generation ||
+                store.currentUserId() != userId || _state.value.username?.equals(username, ignoreCase = true) != true) {
+                throw CancellationException("账号已切换，取消等级积分更新")
+            }
+        }
+    }
+
+    private fun siteFailureDelayMs(error: Exception): Long = when (error) {
+        is RateLimitException -> error.retryAfterMs.coerceAtLeast(1_000L)
+        is NeedsInteractiveVerification -> Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
+        is HttpStatusException -> if (error.status == 401 || error.status == 403) Config.CONNECT_SILENT_REFRESH_BACKOFF_MS else 30_000L
+        else -> 30_000L
+    }
+
+    private suspend fun <T> readSiteWithAuthorization(
+        checkSession: () -> Unit,
+        read: suspend () -> T,
+        authorize: suspend () -> Boolean,
+    ): T {
+        checkSession()
+        val result = try {
+            repository.readAfterShortCooldown { checkSession(); read() }
+        } catch (error: HttpStatusException) {
+            checkSession()
+            if (error.status != 401) throw error
+            if (!authorize()) throw error
+            checkSession()
+            repository.readAfterShortCooldown { checkSession(); read() }
+        }
+        checkSession()
+        return result
+    }
+
+    private suspend fun fetchAuthorizedLdc(username: String, checkSession: () -> Unit): LdcUserInfo {
+        val queuedAt = SystemClock.elapsedRealtime()
+        return ldcFetchGate.withLock {
+            checkSession()
+            // 同一轮已排队请求共享成功或失败，避免预热失败后手动请求紧接着重复 OAuth。
+            ldcLastAttempt?.takeIf { it.first >= queuedAt }?.let { return@withLock it.second.getOrThrow() }
+            try {
+                val info = readSiteWithAuthorization(checkSession, { repository.fetchLdcUserInfo() }, { repository.authorizeLdc() })
+                check(info.username.equals(username, ignoreCase = true)) { "积分账号与当前账号不一致，请重新授权" }
+                ldcLastAttempt = SystemClock.elapsedRealtime() to Result.success(info)
+                info
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                checkSession()
+                ldcLastAttempt = SystemClock.elapsedRealtime() to Result.failure(error)
+                throw error
+            }
+        }
+    }
 
     private fun checkConnectManualRefreshRateLimit(): Boolean {
         val now = System.currentTimeMillis()
@@ -804,69 +1097,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun connectFirstFetchLockMessage(remainingMs: Long): String {
         val minutes = ((remainingMs + 59_999L) / 60_000L).coerceAtLeast(1L)
-        return "首次获取需错峰，后台稍后会自动拉取；约 $minutes 分钟后可手动刷新"
+        return "首次获取正在错峰，后台会尝试获取；约 $minutes 分钟后可手动刷新"
     }
 
     private var idleWarmupJob: Job? = null
 
     private fun scheduleIdleConnectWarmup() {
-        idleWarmupJob?.cancel()
-        idleWarmupJob = viewModelScope.launch(Dispatchers.IO) {
+        if (idleWarmupJob?.isActive == true) return
+        val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
+        idleWarmupJob = viewModelScope.launch {
             // 冷启动首轮不早于进程启动 2 分钟，避开首屏请求峰值；之后的触发至少再等 30 秒
             delay(maxOf(
                 Config.CONNECT_IDLE_WARMUP_DELAY_MS,
                 Config.CONNECT_FIRST_WARMUP_AFTER_START_MS - sinceProcessStartMs(),
             ))
-            if (!isActive) return@launch
-            val username = _state.value.username ?: return@launch
-            val now = System.currentTimeMillis()
+            suspend fun awaitQuietWindow() {
+                checkSession()
+                while (!store.isAppInForeground() || store.isClearanceRecoveryInProgress() || repository.isRateLimitCoolingDown()) {
+                    delay(maxOf(5_000L, TopicRepository.rateLimitRemainingMs()))
+                    checkSession()
+                }
+            }
+            repeat(2) { round ->
+                awaitQuietWindow()
+                var retryAfterMs = 0L
+                val now = System.currentTimeMillis()
+                val cachedTrust = repository.getCachedTrustReport(username)
+                if (cachedTrust == null || now - cachedTrust.second >= Config.TRUST_REPORT_CACHE_TTL_MS) {
+                    if (now >= connectSilentBackoffUntil) {
+                        try {
+                            val fresh = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                            checkSession()
+                            if (fresh != null) {
+                                val updateTime = System.currentTimeMillis()
+                                repository.saveCachedTrustReport(username, fresh)
+                                _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null) }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            connectSilentBackoffUntil = System.currentTimeMillis() + pause
+                            if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
+                            diagnostics.log("等级预热暂缓: ${e.message}")
+                        }
+                    }
+                }
 
-            // 1. 检查升级进度是否超过 6 小时
-            val cachedTrust = repository.getCachedTrustReport(username)
-            if (cachedTrust == null || now - cachedTrust.second >= Config.TRUST_REPORT_CACHE_TTL_MS) {
-                if (now >= connectSilentBackoffUntil) {
-                    try {
-                        val fresh = repository.fetchTrustReport()
-                        if (fresh != null) {
+                // 两个接口之间错峰间隔 6 秒，杜绝并发特征
+                delay(6_000L)
+                awaitQuietWindow()
+
+                // 2. 检查等级积分是否超过 6 小时
+                val cachedLdc = repository.getCachedLdcUserInfo(username)
+                if (cachedLdc == null || now - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
+                    if (System.currentTimeMillis() >= ldcBackoffUntil) {
+                        try {
+                            val fresh = fetchAuthorizedLdc(username, checkSession)
+                            checkSession()
                             val updateTime = System.currentTimeMillis()
-                            repository.saveCachedTrustReport(username, fresh)
-                            _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null) }
-                        }
-                    } catch (e: Exception) {
-                        val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                        if (isRisk) {
-                            connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                        }
-                    }
-                }
-            }
-
-            // 两个接口之间错峰间隔 6 秒，杜绝并发特征
-            delay(6_000L)
-            if (!isActive) return@launch
-
-            // 2. 检查等级积分是否超过 6 小时
-            val cachedLdc = repository.getCachedLdcUserInfo(username)
-            if (cachedLdc == null || now - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
-                if (now >= connectSilentBackoffUntil) {
-                    try {
-                        val fresh = repository.fetchLdcUserInfo()
-                        val updateTime = System.currentTimeMillis()
-                        repository.saveCachedLdcUserInfo(username, fresh)
-                        _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
-                    } catch (e: Exception) {
-                        val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                        if (isRisk) {
-                            connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
+                            repository.saveCachedLdcUserInfo(username, fresh)
+                            _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            ldcBackoffUntil = System.currentTimeMillis() + pause
+                            if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
+                            _ldcState.update { it.copy(error = "积分预热暂缓: ${e.message}") }
+                            diagnostics.log("积分预热暂缓: ${e.message}")
                         }
                     }
                 }
-            }
 
-            // 两个接口之间同样错峰 6 秒，再取社区分
-            delay(6_000L)
-            if (!isActive) return@launch
-            loadCdkScore(fromWarmup = true)
+                // 两个接口之间同样错峰 6 秒，再取社区分
+                delay(6_000L)
+                awaitQuietWindow()
+                loadCdkScore(fromWarmup = true)
+                cdkScoreJob?.join()
+                checkSession()
+                val cdkRemaining = cdkScoreBackoffUntil - System.currentTimeMillis()
+                if (cdkRemaining in 1L..60_000L) retryAfterMs = maxOf(retryAfterMs, cdkRemaining)
+                if (round > 0 || retryAfterMs <= 0L) return@launch
+                delay(maxOf(30_000L, retryAfterMs))
+            }
         }
     }
     private val _chat = MutableStateFlow(ChatUiState())
@@ -1369,6 +1686,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeTopicIds.remove(topicId)
             topicLiveAtEnd.remove(topicId)
             topicLiveScrolling.remove(topicId)
+            topicScrollSettledAt.remove(topicId)
             if (topicLiveId == topicId) {
                 topicLiveJob?.cancel()
                 topicLiveId = null
@@ -1386,6 +1704,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onTopicViewport(topicId: Long, atLatestEnd: Boolean, scrolling: Boolean) {
         if (atLatestEnd) topicLiveAtEnd.add(topicId) else topicLiveAtEnd.remove(topicId)
+        if (!scrolling && topicId in topicLiveScrolling) topicScrollSettledAt[topicId] = SystemClock.elapsedRealtime()
         if (scrolling) topicLiveScrolling.add(topicId) else topicLiveScrolling.remove(topicId)
         if (!scrolling) topicLiveSessions[topicId]?.updates?.trySend(Unit)
     }
@@ -2201,10 +2520,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when {
                     success -> {
                         diagnostics.log("安全验证与网页登录全流程成功，正在同步会话...")
-                        android.webkit.CookieManager.getInstance().flush()
-                        store.syncFromWebView()
-                        if (u.isNotBlank()) {
-                            store.saveCredentials(u, p, rememberPassword)
+                        try {
+                            android.webkit.CookieManager.getInstance().flush()
+                            store.syncFromWebView()
+                            if (u.isNotBlank()) store.saveCredentials(u, p, rememberPassword)
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _loginUiState.update { it.copy(loading = false, error = error.message) }
+                            return@launch
                         }
                         _loginUiState.update {
                             LoginUiState(
@@ -2380,8 +2702,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when {
                     success -> {
                         diagnostics.log("邮件登录令牌已在应用内完成安全验证与兑换")
-                        android.webkit.CookieManager.getInstance().flush()
-                        store.syncFromWebView()
+                        try {
+                            android.webkit.CookieManager.getInstance().flush()
+                            store.syncFromWebView()
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _loginUiState.update { it.copy(loading = false, error = error.message) }
+                            return@launch
+                        }
                         _loginUiState.update { LoginUiState() }
                         boot()
                     }
@@ -2567,7 +2894,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (allowInteractiveVerification) {
                     // 保留本轮授权；验证后重新取 CSRF，避免使用验证前的 _forum_session 配对。
                     resumeAfterVerification = { handleWebAuthCallback(uri, allowInteractiveVerification = false) }
-                    enterWebScreen(Screen.Verify, error.message.orEmpty())
+                    enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
                 }
             } catch (e: Exception) {
                 diagnostics.log("网页授权登录兑换失败: ${e.message}")
@@ -2714,6 +3041,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         container.reading.setSyncReadProgress(enabled)
         if (!enabled) {
             _readSyncVerifyBanner.value = false
+            readSyncVerificationProbePath = null
             readReportJobs.values.forEach { it.cancel() }
             readReportJobs.clear()
             readSendJobs.values.forEach { it.cancel() }
@@ -2856,6 +3184,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 tracker.tick(tickAt)
                 if (readSendJobs[topicId]?.isActive == true) continue
+                // 滑动中及停滑后 2.5s 内只累计停留时间，不发 CSRF + timings，避免与分页/头像请求叠进同一速率窗口。
+                if (topicId in topicLiveScrolling ||
+                    tickAt - (topicScrollSettledAt[topicId] ?: 0L) < READ_REPORT_SCROLL_SETTLE_MS) continue
                 val rush = tracker.hasRush(alreadyReadPostsForTracker(topicId))
                 if (!schedule.canSend(tickAt, rush)) continue
                 val batch = tracker.takeBatch(tickAt, READ_REPORT_POST_CAP) ?: continue
@@ -3445,8 +3776,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun createPrivateMessage(targetUsernames: List<String>, title: String, raw: String): Long =
         repository.createPrivateMessage(targetUsernames, title, raw)
 
+    suspend fun loadPostMarkdown(topicId: Long, postNumber: Int): String {
+        val generation = store.sessionGeneration
+        val raw = repository.fetchPostMarkdown(topicId, postNumber)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return raw
+    }
+
+    suspend fun loadPostRevision(postId: Long, revision: Int?): org.linuxdo.android.data.PostRevision {
+        val generation = store.sessionGeneration
+        val result = repository.fetchPostRevision(postId, revision)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return result
+    }
+
+    suspend fun loadTopicPreview(topicId: Long): org.linuxdo.android.data.TopicDetail {
+        val generation = store.sessionGeneration
+        val detail = repository.fetchTopic(topicId, trackVisit = false, present = false)
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return detail
+    }
+
+    suspend fun searchEditorSuggestions(query: EditorCompletionRequest): List<EditorSuggestion> {
+        if (!store.hasSession()) return emptyList()
+        val generation = store.sessionGeneration
+        val local = if (query.marker == '@') _details.value[query.topicId]?.posts.orEmpty()
+            .filter { it.username.matches(Regex("[A-Za-z0-9_.-]+")) }
+            .filter { it.username.contains(query.term, ignoreCase = true) || it.displayName.contains(query.term, ignoreCase = true) }
+            .distinctBy { it.username.lowercase() }.take(8)
+            .map { EditorSuggestion("@${it.username}", it.displayName, "本帖参与者 · @${it.username}", avatarUrlOf(it.avatarTemplate)) }
+            else emptyList()
+        val remote = try {
+            repository.searchEditorSuggestions(query)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            if (local.isEmpty()) throw error else emptyList()
+        }
+        if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+        return (local + remote).distinctBy { it.insertion.lowercase() }.take(8)
+    }
+
     fun loadTrustReport(refresh: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val current = _trustReport.value
         val now = System.currentTimeMillis()
 
@@ -3472,6 +3845,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新（首次进入或后台触发）
         if (!refresh) {
             if (current.loading) return
+            if (now < connectSilentBackoffUntil) return
             if (cached != null) {
                 val age = now - cached.second
                 // 若仍在 6 小时缓存有效期内，完全不发网络请求
@@ -3487,11 +3861,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val isSilent = !refresh && cached != null
         viewModelScope.launch {
+            checkSession()
             if (!isSilent) {
                 _trustReport.update { it.copy(loading = true, error = null) }
             }
             try {
-                val report = repository.fetchTrustReport()
+                val report = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                checkSession()
                 if (report != null) {
                     val updateTime = System.currentTimeMillis()
                     repository.saveCachedTrustReport(username, report)
@@ -3502,15 +3878,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                if (isRisk) {
-                    connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                }
+                checkSession()
+                connectSilentBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
                 if (!isSilent) {
                     _trustReport.update { it.copy(loading = false, error = e.message ?: "加载升级进度失败") }
                 }
             } finally {
-                if (!isSilent) {
+                if (!isSilent && runCatching { checkSession() }.isSuccess) {
                     _trustReport.update { it.copy(loading = false) }
                 }
             }
@@ -3522,11 +3896,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      *
      * 只读缓存不发请求；缓存过期(6 小时)才静默联网，且受三道保护：
      * 1. 本地没有缓存时，启动 10 分钟内交给后台预热([fromWarmup])错峰取，前台不抢；
-     * 2. 429/403 进入与 Connect/LDC 共用的熔断；任何失败 30 分钟内不再重试；
+     * 2. 短冷却到期后仅补取一次，真正授权/挑战失败才长期退避；
      * 3. 仅 CDK 返回 401(无会话)才做一次 OAuth 握手，握手结果是 Cookie，平时不重复握手。
      */
     fun loadCdkScore(fromWarmup: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val now = System.currentTimeMillis()
         var current = _cdkScore.value
         if (!current.username.equals(username, ignoreCase = true)) {
@@ -3540,41 +3915,94 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         if (current.score != null && now - current.cachedAt < Config.CDK_SCORE_CACHE_TTL_MS) return
-        if (now < connectSilentBackoffUntil || now < cdkScoreBackoffUntil) return
+        if (now < cdkScoreBackoffUntil) return
         if (current.score == null && !fromWarmup && connectFirstFetchLockRemainingMs(hasCache = false) > 0L) return
         if (cdkScoreJob?.isActive == true) return
         cdkScoreJob = viewModelScope.launch {
             try {
-                val score = try {
-                    repository.fetchCdkScore()
-                } catch (e: HttpStatusException) {
-                    if (e.status != 401) throw e
-                    diagnostics.log("CDK 社区分返回 401，触发一次应用内静默 OAuth 授权...")
-                    if (!repository.authorizeCdk()) throw e
-                    repository.fetchCdkScore()
-                }
-                if (_state.value.username?.equals(username, ignoreCase = true) != true) return@launch
+                val score = readSiteWithAuthorization(checkSession, { repository.fetchCdkScore() }, { repository.authorizeCdk() })
+                checkSession()
+                cdkScoreBackoffUntil = 0L
                 repository.saveCachedCdkScore(username, score)
                 _cdkScore.value = CdkScoreUiState(username, score, System.currentTimeMillis())
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                val failedAt = System.currentTimeMillis()
-                cdkScoreBackoffUntil = failedAt + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                if (isRisk) connectSilentBackoffUntil = failedAt + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                diagnostics.log("获取 CDK 社区分失败: ${e.message}")
+                checkSession()
+                val pause = siteFailureDelayMs(e)
+                cdkScoreBackoffUntil = System.currentTimeMillis() + pause
+                diagnostics.log("获取 CDK 社区分暂缓(${(pause + 999L) / 1_000L}s): ${e.message}")
+            }
+        }
+    }
+
+    private var ldcGamificationRefreshJob: Job? = null
+    private var lastLdcGamificationFetchAt: Long = 0L
+
+    private fun refreshLdcGamificationScoreIfNeeded(
+        username: String,
+        checkSession: () -> Unit,
+        forceIfMissing: Boolean,
+        missingTodayIncome: Boolean = false,
+    ) {
+        if (ldcGamificationRefreshJob?.isActive == true) return
+        if (repository.isRateLimitCoolingDown()) return
+        val now = System.currentTimeMillis()
+        if (!forceIfMissing && now - lastLdcGamificationFetchAt < 120_000L) return
+        ldcGamificationRefreshJob = viewModelScope.launch {
+            try {
+                checkSession()
+                val score = repository.fetchGamificationScore(username, present = false)
+                checkSession()
+                val income = if (missingTodayIncome) {
+                    runCatching {
+                        readSiteWithAuthorization(
+                            checkSession,
+                            { repository.fetchLdcTodayIncome(username, throwOnUnauthorized = true) },
+                            { repository.authorizeLdc() },
+                        )
+                    }.getOrNull() ?: repository.getCachedLdcTodayIncome(username)
+                } else {
+                    repository.fetchLdcTodayIncome(username, throwOnUnauthorized = false)
+                }
+                checkSession()
+                if (score != null || income != null) {
+                    lastLdcGamificationFetchAt = System.currentTimeMillis()
+                    _ldcState.update { state ->
+                        val info = state.userInfo ?: return@update state
+                        val updated = info.copy(
+                            gamificationScore = score ?: info.gamificationScore,
+                            todayIncome = income ?: info.todayIncome,
+                        )
+                        if (updated == info) state else state.copy(userInfo = updated)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
             }
         }
     }
 
     fun loadLdcUserInfo(refresh: Boolean = false) {
         val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
         val current = _ldcState.value
         val now = System.currentTimeMillis()
 
         // 1. 若内存中尚无数据，优先从磁盘持久化缓存读取（0ms 秒开直出）
-        var cached = current.userInfo?.let { it to current.cachedAt }
+        var cached = current.userInfo?.let { info ->
+            val fallbackScore = if (info.gamificationScore == null) repository.getCachedGamificationScore(username) else null
+            val fallbackIncome = repository.getCachedLdcTodayIncome(username)
+            val patched = info.copy(
+                gamificationScore = info.gamificationScore ?: fallbackScore,
+                todayIncome = fallbackIncome ?: info.todayIncome,
+            )
+            if (patched != info) {
+                _ldcState.update { it.copy(userInfo = patched) }
+            }
+            patched to current.cachedAt
+        }
         if (cached == null) {
             val fromDisk = repository.getCachedLdcUserInfo(username)
             if (fromDisk != null) {
@@ -3595,12 +4023,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新
         if (!refresh) {
             if (current.loading) return
+            if (now < ldcBackoffUntil) return
             if (cached != null) {
+                val missingIncome = cached.first.todayIncome == null
+                refreshLdcGamificationScoreIfNeeded(
+                    username = username,
+                    checkSession = checkSession,
+                    forceIfMissing = cached.first.gamificationScore == null || missingIncome,
+                    missingTodayIncome = missingIncome,
+                )
                 val age = now - cached.second
                 // 若仍在 4 小时缓存有效期内（3-6小时区间），完全不发网络请求
                 if (age < Config.LDC_USER_INFO_CACHE_TTL_MS) return
                 // 若处于风控熔断退避期，静默跳过
-                if (now < connectSilentBackoffUntil) return
+                if (now < ldcBackoffUntil) return
             }
         } else {
             // 3. 手动刷新：严格检查 30 分钟内刷新频率（最多 5 次）
@@ -3609,46 +4045,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val isSilent = !refresh && cached != null
+        _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
         viewModelScope.launch {
-            if (!isSilent) {
-                _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
-            }
             try {
-                val info = repository.fetchLdcUserInfo()
+                val info = fetchAuthorizedLdc(username, checkSession)
+                checkSession()
+                ldcBackoffUntil = 0L
                 val updateTime = System.currentTimeMillis()
+                if (info.gamificationScore != null) {
+                    lastLdcGamificationFetchAt = updateTime
+                }
                 repository.saveCachedLdcUserInfo(username, info)
                 _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val isExpired = (e as? HttpStatusException)?.let { it.status == 401 || it.status == 403 } ?: false
-                val isRisk = (e as? HttpStatusException)?.let { it.status == 429 || it.status == 403 } ?: false
-                if (isRisk) {
-                    connectSilentBackoffUntil = System.currentTimeMillis() + Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-                }
-                if (isExpired && !isSilent) {
-                    diagnostics.log("LDC 积分信息返回 401/403，触发应用内静默 OAuth 授权...")
-                    val authorized = repository.authorizeLdc()
-                    if (authorized) {
-                        try {
-                            val info = repository.fetchLdcUserInfo()
-                            val updateTime = System.currentTimeMillis()
-                            repository.saveCachedLdcUserInfo(username, info)
-                            _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
-                            return@launch
-                        } catch (reErr: CancellationException) {
-                            throw reErr
-                        } catch (reErr: Exception) {
-                            diagnostics.log("LDC 授权后二次拉取失败: ${reErr.message}")
-                        }
-                    }
-                }
+                checkSession()
+                val isExpired = (e as? HttpStatusException)?.status == 401
+                ldcBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
                 if (!isSilent) {
                     val msg = if (isExpired) "积分授权已过期或未登录" else (e.message ?: "加载积分数据失败")
                     _ldcState.update { it.copy(loading = false, error = msg, isExpired = isExpired) }
                 }
             } finally {
-                if (!isSilent) {
+                if (runCatching { checkSession() }.isSuccess) {
                     _ldcState.update { it.copy(loading = false) }
                 }
             }
@@ -3657,26 +4077,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun authorizeLdc() {
         if (_ldcState.value.loading) return
-        val username = _state.value.username ?: return
-        viewModelScope.launch {
-            _ldcState.update { it.copy(loading = true, error = null) }
-            diagnostics.log("用户手动触发 LDC 一键授权...")
-            val ok = repository.authorizeLdc()
-            if (ok) {
-                try {
-                    val info = repository.fetchLdcUserInfo()
-                    val updateTime = System.currentTimeMillis()
-                    repository.saveCachedLdcUserInfo(username, info)
-                    _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    _ldcState.update { it.copy(loading = false, error = "授权成功但拉取积分失败: ${e.message}", isExpired = false) }
-                }
-            } else {
-                _ldcState.update { it.copy(loading = false, error = "一键授权失败，请确认是否已登录论坛", isExpired = true) }
-            }
-        }
+        diagnostics.log("用户手动刷新 LDC，先复核已有授权，仅在 401 时重新授权")
+        loadLdcUserInfo(refresh = true)
     }
 
     fun loadProfile(section: ProfileSection, refresh: Boolean = false, more: Boolean = false) {
@@ -4010,15 +4412,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         previous: Boolean = false,
         resumePostNumber: Int? = null,
         fromNotification: Boolean = false,
+        restoredPosition: TopicReadingPosition? = null,
     ) {
         val pendingTarget = peekNotificationTopicPending(id)
         val isNotificationJump = fromNotification || (pendingTarget != null)
         val effectivePostNumber = postNumber ?: pendingTarget?.second
-        val current = if (!more && !previous && !retry) {
+        val base = if (!more && !previous && !retry) {
             restoreCachedTopicDetail(id) ?: DetailUiState()
         } else {
             _details.value[id] ?: DetailUiState()
         }
+        val current = restoredPosition?.let { base.copy(filterUserId = it.filterUserId, descending = it.descending) } ?: base
+        if (restoredPosition != null) _details.update { it + (id to current) }
         val targetPostNumber = effectivePostNumber ?: resumePostNumber
         val requestPostNumber = effectivePostNumber ?: resumePostNumber?.takeIf { it > 20 }
         if (!more && !previous) {
@@ -4103,8 +4508,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         nextCalibrationAt = SystemClock.elapsedRealtime() + 60_000L
                         needsCalibration = false
                     }
-                    val category = repository.categoryById(topic.categoryId)
-                    val emojis = repository.emojiUrls()
+                    val category = repository.cachedCategoryMap()[topic.categoryId]
+                    val emojis = current.emojiUrls
                     val rootPost = current.posts.filter { it.postNumber == 1 }
                     var posts = if (requestPostNumber != null) (rootPost + topic.postStream.posts).distinctBy { it.id }.sortedBy { it.postNumber }
                         else topic.postStream.posts.distinctBy { it.id }
@@ -4125,7 +4530,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             emojiUrls = emojis, windowStartId = topic.postStream.posts.minByOrNull { it.postNumber }?.id,
                             locateVersion = newLocateVersion,
                             locatePostNumber = if (isNotificationJump) effectiveTargetPostNumber else effectivePostNumber,
-                            confirmedReadPostNumbers = container.reading.confirmedPostNumbers(id)))
+                            confirmedReadPostNumbers = container.reading.confirmedPostNumbers(id),
+                            filterUserId = restoredPosition?.filterUserId,
+                            descending = restoredPosition?.descending ?: false))
+                    }
+                    val scopeGeneration = accountScopeGeneration
+                    viewModelScope.launch {
+                        val resolvedCategory = runCatching { repository.categoryById(topic.categoryId) }.getOrNull()
+                        val resolvedEmojis = repository.emojiUrls()
+                        if (scopeGeneration == accountScopeGeneration) _details.update { states ->
+                            states[id]?.let {
+                                states + (id to it.copy(
+                                    category = resolvedCategory ?: it.category,
+                                    emojiUrls = resolvedEmojis.ifEmpty { it.emojiUrls },
+                                ))
+                            } ?: states
+                        }
                     }
                     val firstPost = posts.firstOrNull { it.postNumber == 1 }
                         ?: topic.postStream.posts.firstOrNull { it.postNumber == 1 }
@@ -4615,10 +5035,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openComposer(target: ComposerTarget) {
         if (_composer.value.submitting) return
         val needsDraft = target is ComposerTarget.Edit
-        val localDraft = if (needsDraft) null else localDraftKey(target)?.let { key ->
-            container.draftStore.get(store.currentUserId(), key)
+        var storageError: String? = null
+        val localDraft = try {
+            if (needsDraft) null else localDraftKey(target)?.let { key -> container.draftStore.get(store.currentUserId(), key) }
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            storageError = "已有草稿暂时无法读取，请稍后重试，原稿已保留"
+            null
         }
-        _composer.value = ComposerUiState(target = target, draft = localDraft.orEmpty(), loadingDraft = needsDraft)
+        val draft = if (target is ComposerTarget.ReplyTo && !target.quote.isNullOrBlank()) {
+            appendQuoteToDraft(localDraft.orEmpty(), target.username, target.postNumber, target.topicId, target.quote)
+        } else localDraft.orEmpty()
+        _composer.value = ComposerUiState(target = target, draft = draft, loadingDraft = needsDraft, error = storageError)
+        if (storageError == null && target is ComposerTarget.ReplyTo && target.quote != null) {
+            updateDraft(draft)
+        }
         if (target !is ComposerTarget.Edit) return
         pageJobs["draft:${target.postId}"] = viewModelScope.launch {
             try {
@@ -4638,10 +5068,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun updateDraft(text: String) {
         val current = _composer.value
         val target = current.target
-        if (target != null) {
-            localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, text) }
-        }
         _composer.update { if (it.open) it.copy(draft = text, error = null) else it }
+        if (target != null) {
+            try {
+                localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, text) }
+            } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _composer.update { if (it.target == target) it.copy(error = "草稿尚未保存，请保持此页面，稍后重试") else it }
+            }
+        }
     }
 
     private fun localDraftKey(target: ComposerTarget): String? = when (target) {
@@ -4801,7 +5235,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         is ComposerTarget.Edit -> applyEditedPost(target.topicId, repository.updatePost(target.postId, raw))
                     }
                 }
-                localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, "") }
+                try {
+                    localDraftKey(target)?.let { key -> container.draftStore.put(store.currentUserId(), key, "") }
+                } catch (_: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                    diagnostics.log("评论已提交，草稿暂未清除；不重试已成功的提交")
+                }
                 _composer.value = ComposerUiState()
             } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
                 _composer.update { it.copy(submitting = false, error = "提交结果未确认，请刷新楼层检查后再决定是否重试") }
@@ -4882,11 +5320,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * - 从首页进入时 `initialCategoryId` 为 `null`（分类默认为空）。
      * - 从指定分区进入时 `initialCategoryId` 为当前分区的 `categoryId`（已包含当前所选等级 Lv.0~3）。
      */
+    /**
+     * 校验预设分类或草稿分类是否允许当前用户创建话题（对齐 FluxDO `_applyCurrentFilter` 与 `_restoreCategoryFromDraft`）。
+     * 若分类列表已就绪且该分类不在可创建列表中（如“未分类”、“公告”或高信任等级只读分区），则回退为 null。
+     */
+    private fun resolveCreatableCategoryId(categoryId: Int?): Int? {
+        val targetId = categoryId ?: return null
+        val currentItems = _categories.value.items
+        if (currentItems.isEmpty()) return targetId
+        val creatable = org.linuxdo.android.data.creatableCategories(currentItems)
+        return targetId.takeIf { id -> creatable.any { it.id == id } }
+    }
+
+    /**
+     * 若当前分类缓存尚未合并 `/site.json` 的发帖权限（例如首次升级后冷启动命中旧版持久化缓存），
+     * 打开话题发布器时立即后台拉取合并一次，并二次校验当前已选分类。
+     */
+    private fun ensureTopicCreatorCategoryPermissions() {
+        if (repository.hasSyncedCategoryPermissions()) return
+        val requestScopeGeneration = accountScopeGeneration
+        viewModelScope.launch {
+            val updated = runCatching { repository.ensureCategoryPermissionsFromSite() }.getOrNull() ?: return@launch
+            if (requestScopeGeneration != accountScopeGeneration) return@launch
+            val (freshList, rawJson) = updated
+            if (rawJson.isNotBlank()) {
+                container.preferences.edit { putString("cached_categories_json", rawJson) }
+            }
+            _categories.value = CategoriesUiState(items = freshList, loaded = true, order = store.loadCategoryOrder())
+            val currentCatId = _topicCreator.value.categoryId
+            if (_topicCreator.value.open && currentCatId != null) {
+                val validatedId = resolveCreatableCategoryId(currentCatId)
+                if (validatedId != currentCatId) {
+                    _topicCreator.update { state ->
+                        val next = state.copy(categoryId = validatedId)
+                        next.copy(savedSnapshot = next.currentSnapshot)
+                    }
+                }
+            }
+        }
+    }
+
     fun openTopicCreator(initialCategoryId: Int? = null) {
         if (_topicCreator.value.submitting || _topicCreator.value.savingDraft) return
         if (!_categories.value.loaded && !_categories.value.loading) {
             loadCategories()
         }
+        val validCategoryId = resolveCreatableCategoryId(initialCategoryId)
         val existingNewTopicDraft = _drafts.value.items.firstOrNull { it.draftKey == "new_topic" }
         val baseState = TopicCreatorUiState(
             open = true,
@@ -4895,12 +5374,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = "createTopic",
             title = "",
             raw = "",
-            categoryId = initialCategoryId,
+            categoryId = validCategoryId,
             tags = emptyList(),
         )
         _topicCreator.value = baseState.copy(savedSnapshot = baseState.currentSnapshot)
+        ensureTopicCreatorCategoryPermissions()
         populateCreatorEmojisAndSequence("new_topic")
-        loadTopicCreatorTags(initialCategoryId)
+        loadTopicCreatorTags(validCategoryId)
     }
 
     /** 如果是话题回复类草稿，直接打开该话题的回复栏并将草稿内容填入。 */
@@ -4926,6 +5406,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!_categories.value.loaded && !_categories.value.loading) {
             loadCategories()
         }
+        val validCategoryId = if (draft.isNewTopic) resolveCreatableCategoryId(draft.categoryId) else draft.categoryId
         val baseState = TopicCreatorUiState(
             open = true,
             draftKey = draft.draftKey,
@@ -4935,12 +5416,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             replyToPostNumber = draft.replyToPostNumber,
             title = draft.title,
             raw = draft.raw,
-            categoryId = draft.categoryId,
+            categoryId = validCategoryId,
             tags = draft.tags,
         )
         _topicCreator.value = baseState.copy(savedSnapshot = baseState.currentSnapshot)
+        ensureTopicCreatorCategoryPermissions()
         populateCreatorEmojisAndSequence(draft.draftKey)
-        loadTopicCreatorTags(draft.categoryId)
+        loadTopicCreatorTags(validCategoryId)
     }
 
     private fun populateCreatorEmojisAndSequence(targetDraftKey: String) {
@@ -6004,6 +6486,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateListCounters(fresh: List<TopicListItem>) {
         val byId = fresh.associate { it.topic.id to it.topic }
+        syncSavedTopicTotals(byId.mapValues { it.value.postsCount })
         mapTopicLists { list ->
             list.copy(items = mergeTopicCounters(list.items, byId),
                 pendingPage = list.pendingPage?.let { it.copy(items = mergeTopicCounters(it.items, byId)) })
@@ -6011,6 +6494,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun updateListPostCount(topicId: Long, count: Int, highestPostNumber: Int? = null) {
+        syncSavedTopicTotals(mapOf(topicId to count))
         fun update(items: List<TopicListItem>) = items.map { item ->
             if (item.topic.id != topicId) item else item.copy(topic = item.topic.copy(postsCount = count,
                 highestPostNumber = highestPostNumber ?: item.topic.highestPostNumber.takeIf { count <= item.topic.postsCount }))
@@ -6027,15 +6511,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             canProbeIncomingTopics()
         }
         if (!canProbe() || !store.isAutoRefreshIncomingEnabled() || repository.isRateLimitCoolingDown()) return
-        if (repository.isSilentPrefetchBackingOff()) return
+        if (repository.isSilentPrefetchBackingOff() || store.shouldPauseBackgroundForChallengedClearance()) return
         val probeGen = ++incomingProbeGeneration
         if (!canProbe() || probeGen != incomingProbeGeneration) return
         if (repository.isRateLimitCoolingDown()) return
         scrollBusySignal.awaitIdle()
         if (!canProbe() || probeGen != incomingProbeGeneration) return
-        if (repository.isSilentPrefetchBackingOff()) return
+        if (repository.isSilentPrefetchBackingOff() || store.shouldPauseBackgroundForChallengedClearance()) return
         // 等滚动停下后再申请准入，前台让行窗口才能看到用户刚触发的请求
         if (!ApiQuotaPool.INCOMING_PROBE.tryAcquire()) return
+        fun checkBeforeDispatch() {
+            check(canProbe() && probeGen == incomingProbeGeneration && store.isAutoRefreshIncomingEnabled() &&
+                !repository.isRateLimitCoolingDown() && !repository.isSilentPrefetchBackingOff() &&
+                !store.shouldPauseBackgroundForChallengedClearance()) { "后台新话题探测已暂停" }
+        }
         try {
             if (categoryId != null) {
                 val currentCategoryState = _categoryTopics.value[categoryId] ?: return
@@ -6044,7 +6533,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val slug = category?.slug ?: activeCategory?.takeIf { it.first == categoryId }?.second ?: "c"
                 val sortOrder = _topicSortOrder.value.apiValue
                 val sortAscending = _topicSortAscending.value.takeIf { sortOrder != null }
-                val freshPage = repository.fetchCategoryTopics(slug, categoryId, 0, present = false, order = sortOrder, ascending = sortAscending)
+                val freshPage = repository.fetchCategoryTopics(
+                    slug, categoryId, 0, present = false, order = sortOrder, ascending = sortAscending,
+                    beforeDispatch = ::checkBeforeDispatch,
+                )
                 ApiQuotaPool.INCOMING_PROBE.onSuccess()
                 if (!canProbe() || probeGen != incomingProbeGeneration) return
                 updateListCounters(freshPage.items)
@@ -6073,7 +6565,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (currentFeedState.items.isEmpty()) return
                 val sortOrder = _topicSortOrder.value.apiValue
                 val sortAscending = _topicSortAscending.value.takeIf { sortOrder != null }
-                val freshPage = repository.fetchFeed(feed, 0, awaitCategories = false, present = false, order = sortOrder, ascending = sortAscending)
+                val freshPage = repository.fetchFeed(
+                    feed, 0, awaitCategories = false, present = false, order = sortOrder, ascending = sortAscending,
+                    beforeDispatch = ::checkBeforeDispatch,
+                )
                 ApiQuotaPool.INCOMING_PROBE.onSuccess()
                 if (!canProbe() || probeGen != incomingProbeGeneration) return
                 updateListCounters(freshPage.items)
@@ -6368,7 +6863,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (refresh && !more) incomingProbeGeneration++
         val current = _categoryTopics.value[id]
         if (pageJobs["category:$id"]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -6409,7 +6904,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val key = "${if (isBookmark) "bookmark" else "created"}:$username"
         val current = _userTopicStates.value[key]
         if (pageJobs[key]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -6419,7 +6914,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )) }
             try {
                 val result = if (isBookmark) repository.fetchUserBookmarks(username, page) else repository.fetchUserCreatedTopics(username, page)
-                val items = if (more) (previous.items + result.items).distinctBy { it.topic.id } else result.items
+                val items = if (more) (previous.items + result.items).distinctBy { it.listKey } else result.items
                 val hasMore = result.hasMore && result.items.isNotEmpty() && (!more || page > previous.page)
                 _userTopicStates.update { it + (key to TopicListUiState(items, page,
                     hasMore, initialLoading = false)) }
@@ -6481,8 +6976,291 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+fun openTopicSearch(topicId: Long, title: String) {
+        topicSearchJob?.cancel()
+        topicSearchSequence++
+        _topicSearch.value = if (_topicSearch.value.topicId == topicId) _topicSearch.value.copy(open = true, title = title)
+            else TopicSearchUiState(open = true, topicId = topicId, title = title, order = _search.value.order)
+    }
+
+    fun closeTopicSearch() {
+        topicSearchJob?.cancel()
+        topicSearchSequence++
+        _topicSearch.update { it.copy(open = false, loading = false, loadingMore = false) }
+    }
+
+    fun openTopicSearchHit(hit: TopicSearchHit) {
+        val search = _topicSearch.value
+        if (!search.open || search.hits.none { it.postId == hit.postId }) return
+        closeTopicSearch()
+        loadTopic(search.topicId, postNumber = hit.postNumber,
+            restoredPosition = TopicReadingPosition(postNumber = hit.postNumber, atTop = false,
+                descending = _details.value[search.topicId]?.descending ?: false))
+    }
+
+    fun updateTopicSearch(query: String, order: SearchOrder = _topicSearch.value.order) {
+        topicSearchJob?.cancel()
+        val sequence = ++topicSearchSequence
+        val current = _topicSearch.value
+        if (!current.open) return
+        _topicSearch.value = current.copy(query = query, order = order, hits = emptyList(), page = 0,
+            hasMore = false, loading = query.isNotBlank(), loadingMore = false, error = null)
+        if (query.isBlank()) return
+        topicSearchJob = viewModelScope.launch {
+            delay(500L)
+            performTopicSearch(sequence, more = false)
+        }
+    }
+
+    fun loadMoreTopicSearch() {
+        if (topicSearchJob?.isActive == true) return
+        val current = _topicSearch.value
+        if (!current.open || !current.hasMore) return
+        topicSearchJob = viewModelScope.launch { performTopicSearch(topicSearchSequence, more = true) }
+    }
+
+    private suspend fun performTopicSearch(sequence: Long, more: Boolean) {
+        val current = _topicSearch.value
+        val generation = accountScopeGeneration
+        val page = if (more) current.page + 1 else 1
+        _topicSearch.update { it.copy(loading = !more, loadingMore = more, error = null) }
+        try {
+            val result = repository.searchInTopic(current.topicId, current.query, page, current.order)
+            if (sequence != topicSearchSequence || generation != accountScopeGeneration) return
+            _topicSearch.update { it.copy(hits = (if (more) current.hits + result.hits else result.hits).distinctBy { hit -> hit.postId },
+                page = page, hasMore = result.hasMore, loading = false, loadingMore = false) }
+        } catch (error: CancellationException) { throw error }
+        catch (error: Exception) {
+            if (sequence != topicSearchSequence || generation != accountScopeGeneration) return
+            _topicSearch.update { it.copy(loading = false, loadingMore = false, error = error.message ?: "帖内搜索失败") }
+            handlePageFailure(error) { updateTopicSearch(current.query, current.order) }
+        }
+    }
+
+    fun openTopicMetadataEditor(topicId: Long, preserveInput: Boolean = false) {
+        if (_metadataEditor.value.saving || store.currentUserId() <= 0L) return
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        val previous = _metadataEditor.value
+        val pendingPatch = if (preserveInput && previous.topicId == topicId) previous.patch else null
+        val sequence = ++metadataSequence
+        val userId = store.currentUserId()
+        val generation = store.sessionGeneration
+        _metadataEditor.value = if (pendingPatch != null) previous.copy(loading = true, error = null, generation = generation)
+            else TopicMetadataEditorUiState(open = true, topicId = topicId, userId = userId, generation = generation, loading = true)
+        metadataJob = viewModelScope.launch {
+            try {
+                val original = repository.fetchTopicMetadata(topicId)
+                if (sequence != metadataSequence) return@launch
+                if (userId != store.currentUserId() || generation != store.sessionGeneration) {
+                    _metadataEditor.update { it.copy(loading = false, original = it.original?.copy(canEdit = false),
+                        error = "账号状态已变化，请重新核对编辑权限") }
+                    return@launch
+                }
+                if (!original.canEdit) {
+                    _metadataEditor.update { it.copy(original = original, loading = false, error = "当前账号无权编辑此话题") }
+                    return@launch
+                }
+                val rules = repository.fetchTopicEditRules()
+                if (sequence != metadataSequence) return@launch
+                if (userId != store.currentUserId() || generation != store.sessionGeneration) {
+                    _metadataEditor.update { it.copy(loading = false, original = it.original?.copy(canEdit = false),
+                        error = "账号状态已变化，请重新核对编辑权限") }
+                    return@launch
+                }
+                val pending = pendingPatch?.let { if (rules.canTagTopics) it else it.copy(tags = null) }?.applyTo(original) ?: original
+                _metadataEditor.value = TopicMetadataEditorUiState(open = true, topicId = topicId, userId = userId,
+                    generation = generation, original = original, rules = rules, title = pending.title,
+                    categoryId = pending.categoryId, tags = pending.tags)
+                if (!original.privateMessage && rules.canTagTopics) searchMetadataTags("")
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence != metadataSequence) return@launch
+                _metadataEditor.update { it.copy(loading = false, error = error.message ?: "编辑信息加载失败") }
+                handlePageFailure(error) { if (userId == store.currentUserId()) openTopicMetadataEditor(topicId, preserveInput = true) }
+            }
+        }
+    }
+
+    fun closeTopicMetadataEditor() {
+        if (_metadataEditor.value.saving) return
+        metadataSequence++
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        _metadataEditor.value = TopicMetadataEditorUiState()
+    }
+
+    fun updateMetadataTitle(title: String) {
+        _metadataEditor.update { if (it.saving || it.original?.canEdit != true) it else it.copy(title = title, error = null) }
+    }
+
+    fun updateMetadataCategory(id: Int) {
+        val state = _metadataEditor.value
+        if (state.saving || state.original?.canEdit != true || state.rules?.selectableCategories?.none { it.id == id } != false) return
+        _metadataEditor.update { it.copy(categoryId = id, error = null) }
+        if (state.rules?.canTagTopics == true) searchMetadataTags("")
+    }
+
+    fun updateMetadataTags(tags: List<String>) {
+        val state = _metadataEditor.value
+        if (state.saving || state.original?.canEdit != true || state.rules?.canTagTopics != true) return
+        if (tags.any { it !in state.tags && state.tagOptions.none { option -> option.name == it } }) {
+            _metadataEditor.update { it.copy(tagError = "请选择查询结果中的标签") }
+            return
+        }
+        if (tags.size > 5) {
+            _metadataEditor.update { it.copy(tagError = "最多选择 5 个标签") }
+            return
+        }
+        _metadataEditor.update { it.copy(tags = tags.distinct(), error = null) }
+        searchMetadataTags(state.tagQuery)
+    }
+
+    fun searchMetadataTags(query: String) {
+        metadataTagJob?.cancel()
+        val tagSequence = ++metadataTagSequence
+        val sequence = metadataSequence
+        val current = _metadataEditor.value
+        if (!current.open || current.rules?.canTagTopics != true || current.original?.privateMessage == true) return
+        _metadataEditor.update { it.copy(tagQuery = query, loadingTags = true, tagError = null) }
+        metadataTagJob = viewModelScope.launch {
+            delay(300L)
+            try {
+                val result = repository.searchTopicEditTags(current.categoryId, query, current.tags)
+                if (sequence != metadataSequence || tagSequence != metadataTagSequence || current.userId != store.currentUserId()) return@launch
+                _metadataEditor.update { it.copy(loadingTags = false, tagOptions = result.results,
+                    requiredTagName = result.requiredTagName, requiredTagMin = result.requiredTagMinCount) }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence == metadataSequence && tagSequence == metadataTagSequence) _metadataEditor.update {
+                    it.copy(loadingTags = false, tagOptions = emptyList(), tagError = error.message ?: "标签加载失败，请重试")
+                }
+            }
+        }
+    }
+
+    fun submitTopicMetadata() {
+        val current = _metadataEditor.value
+        val original = current.original ?: return
+        val rules = current.rules ?: return
+        val patch = current.patch ?: return
+        if (!current.canSave) return
+        if (current.userId != store.currentUserId() || current.generation != store.sessionGeneration) {
+            _metadataEditor.update { it.copy(error = "账号状态已变化，请重新打开编辑") }
+            return
+        }
+        val sequence = metadataSequence
+        val accountGeneration = accountScopeGeneration
+        _metadataEditor.update { it.copy(saving = true, error = null) }
+        metadataJob = viewModelScope.launch {
+            try {
+                val updated = repository.updateTopicMetadata(original, rules, patch, current.userId, current.generation)
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                applyTopicMetadata(updated, rules, patch.categoryId != null || patch.tags != null, current.userId)
+                _metadataEditor.value = TopicMetadataEditorUiState()
+                Toast.makeText(getApplication(), "话题信息已保存", Toast.LENGTH_SHORT).show()
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                if (error is org.linuxdo.android.net.NetworkTimeoutException || (error is org.linuxdo.android.net.HttpStatusException && error.status >= 500)) {
+                    val confirmed = try { repository.fetchTopicMetadata(current.topicId) }
+                        catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { null }
+                    val expected = patch.applyTo(original)
+                    val matches = confirmed != null && (patch.title == null || confirmed.title == expected.title) &&
+                        (patch.categoryId == null || confirmed.categoryId == expected.categoryId) &&
+                        (patch.tags == null || confirmed.tags.sorted() == expected.tags.sorted())
+                    if (matches && sequence == metadataSequence && accountGeneration == accountScopeGeneration) {
+                        applyTopicMetadata(confirmed!!, rules, patch.categoryId != null || patch.tags != null, current.userId)
+                        _metadataEditor.value = TopicMetadataEditorUiState()
+                        Toast.makeText(getApplication(), "已确认话题信息保存成功", Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                }
+                if (sequence != metadataSequence || accountGeneration != accountScopeGeneration) return@launch
+                if (error is org.linuxdo.android.net.HttpStatusException && error.status == 403) {
+                    _details.update { states -> states[current.topicId]?.let { detail ->
+                        states + (current.topicId to detail.copy(topic = detail.topic?.copy(details = detail.topic.details.copy(canEdit = false))))
+                    } ?: states }
+                    updateCachedTopicDetail(current.topicId, refreshTtl = false)
+                }
+                _metadataEditor.update { it.copy(saving = false,
+                    original = if (error is org.linuxdo.android.net.HttpStatusException && error.status == 403) original.copy(canEdit = false) else original,
+                    error = error.message ?: "保存失败，请核对后重试") }
+                handlePageFailure(error) { if (current.userId == store.currentUserId()) openTopicMetadataEditor(current.topicId, preserveInput = true) }
+            } finally {
+                if (sequence == metadataSequence) _metadataEditor.update { it.copy(saving = false) }
+            }
+        }
+    }
+
+    private fun applyTopicMetadata(value: TopicMetadata, rules: TopicEditRules, membershipChanged: Boolean, userId: Long) {
+        val category = rules.categories.firstOrNull { it.id == value.categoryId }
+        fun patchList(list: TopicListUiState): TopicListUiState = list.copy(
+            items = list.items.map { item -> if (item.topic.id != value.topicId) item else item.copy(
+                topic = item.topic.copy(title = value.title, categoryId = value.categoryId, tags = value.tags), category = category) },
+            needsRefresh = list.needsRefresh || membershipChanged,
+        )
+        _details.update { states -> states[value.topicId]?.let { detail ->
+            states + (value.topicId to detail.copy(topic = detail.topic?.copy(title = value.title, categoryId = value.categoryId,
+                tags = value.tags, details = detail.topic.details.copy(canEdit = value.canEdit)), category = category))
+        } ?: states }
+        updateCachedTopicDetail(value.topicId, refreshTtl = false)
+        _state.update { it.copy(latest = patchList(it.latest)) }
+        _feedStates.update { states -> states.mapValues { patchList(it.value) } }
+        _categoryTopics.update { states -> states.mapValues { patchList(it.value) } }
+        _tagTopics.update { states -> states.mapValues { patchList(it.value) } }
+        _userTopicStates.update { states -> states.mapValues { patchList(it.value) } }
+        _search.update { it.copy(results = patchList(it.results).copy(needsRefresh = true)) }
+        _metadataUpdated.value = value
+        val generation = accountScopeGeneration
+        viewModelScope.launch {
+            try {
+                val saved = savedTopicWriteGate.withLock { withContext(Dispatchers.IO) {
+                    container.historyStore.updateMetadata(userId, value.topicId, value.title, category?.name, category?.color)
+                    savedTopicStore.updateMetadata(userId, value.topicId, value.title, category?.name, category?.color)
+                } }
+                if (generation == accountScopeGeneration && userId == store.currentUserId()) {
+                    publishSavedTopics(saved)
+                    _history.update { it.copy(entries = container.historyStore.entries(userId)) }
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { diagnostics.log("话题信息本地同步失败: ${error.message}") }
+        }
+    }
+
+    fun removeBookmarkFromList(item: TopicListItem, onResult: (String) -> Unit) {
+        val bookmarkId = item.bookmarkId ?: return
+        val key = "remove-bookmark:$bookmarkId"
+        if (pageJobs[key]?.isActive == true) return
+        val generation = accountScopeGeneration
+        val userId = store.currentUserId()
+        val sessionGeneration = store.sessionGeneration
+        pageJobs[key] = viewModelScope.launch {
+            try {
+                repository.unbookmarkPost(bookmarkId, userId, sessionGeneration)
+                if (generation != accountScopeGeneration) return@launch
+                _userTopicStates.update { states -> states.mapValues { (key, state) ->
+                    if (key.startsWith("bookmark:")) state.copy(items = state.items.filterNot { it.bookmarkId == bookmarkId }) else state
+                } }
+                _details.update { states -> states[item.topic.id]?.let { detail ->
+                    val posts = detail.posts.map { post -> if (post.bookmarkId == bookmarkId) post.copy(bookmarked = false, bookmarkId = null) else post }
+                    states + (item.topic.id to detail.copy(posts = posts, topic = detail.topic?.copy(postStream = detail.topic.postStream.copy(posts = posts))))
+                } ?: states }
+                updateCachedTopicDetail(item.topic.id, refreshTtl = false)
+                onResult("已取消这条书签")
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                if (generation == accountScopeGeneration) {
+                    onResult(error.message ?: "取消书签失败")
+                    handlePageFailure(error) { if (generation == accountScopeGeneration) removeBookmarkFromList(item, onResult) }
+                }
+            } finally { pageJobs.remove(key) }
+        }
+    }
+
     fun updateSearch(query: String) {
         searchJob?.cancel()
+        searchSequence++
         val trimmed = query.trim()
         _search.value = SearchUiState(query, TopicListUiState(initialLoading = trimmed.isNotEmpty(), hasMore = false), order = _search.value.order)
         if (trimmed.isEmpty()) return
@@ -6506,10 +7284,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun performSearch(query: String, page: Int) {
         val previous = _search.value
+        val sequence = searchSequence
+        val accountGeneration = accountScopeGeneration
         _search.update { it.copy(results = it.results.copy(initialLoading = page == 1, loadingMore = page > 1, error = null)) }
         try {
             val result = repository.search(query, page, previous.order)
-            val items = if (page == 1) result.items.distinctBy { it.topic.id } else (previous.results.items + result.items).distinctBy { it.topic.id }
+            if (sequence != searchSequence || accountGeneration != accountScopeGeneration) return
+            val items = if (page == 1) result.items.distinctBy { it.listKey } else (previous.results.items + result.items).distinctBy { it.listKey }
             val hasMore = result.hasMore && result.items.isNotEmpty() && (page == 1 || page > previous.results.page)
             _search.update { it.copy(
                 results = TopicListUiState(items, page, hasMore, initialLoading = false),
@@ -6521,6 +7302,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (sequence != searchSequence || accountGeneration != accountScopeGeneration) return
             _search.update { it.copy(results = it.results.copy(initialLoading = false, loadingMore = false, error = error.message ?: "搜索失败")) }
             handlePageFailure(error) { updateSearch(_search.value.query) }
         }
@@ -6540,7 +7322,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         diagnostics.log("浏览页面加载失败: ${error.message}")
         if (error is NeedsInteractiveVerification) {
             resumeAfterVerification = retry
-            enterWebScreen(Screen.Verify, error.message.orEmpty())
+            enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
         }
     }
 
@@ -6550,12 +7332,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository.onAutoHealRequested = {
             selfHealNetwork(context = null, silent = true)
         }
-        repository.onTimingsVerificationRequired = {
-            showReadSyncVerifyBanner()
+        repository.onTimingsVerificationRequired = { probePath ->
+            showReadSyncVerifyBanner(probePath)
         }
         repository.onTimingsRecovered = {
             if (_readSyncVerifyBanner.value) diagnostics.log("阅读进度已恢复同步，收起风控提示")
             _readSyncVerifyBanner.value = false
+            readSyncVerificationProbePath = null
         }
         NotificationHelper.ensureNotificationChannels(app)
         if (store.isBackgroundNotificationEnabled()) {
@@ -6611,14 +7394,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         bootJob = viewModelScope.launch {
             verifying = false
             _state.update { it.copy(screen = Screen.Boot, latest = it.latest.copy(error = null)) }
-            store.restoreMissingToWebView()
-            refreshCookieInfo()
-            if (!store.hasSessionCookie()) {
-                enterWebScreen(Screen.Login)
-                return@launch
-            }
             try {
-                val cachedUser = container.preferences.getString("cached_username", null)?.takeIf { it.isNotBlank() }
+                if (store.recoverInterruptedAccountSwitch()) {
+                    container.preferences.edit { remove("cached_username") }
+                    _state.update { it.copy(username = null) }
+                }
+                store.restoreMissingToWebView()
+                refreshCookieInfo()
+                sessionStorageNeedsRetry = false
+                if (!store.hasSessionCookie()) {
+                    enterWebScreen(Screen.Login)
+                    return@launch
+                }
+                val cachedUser = container.preferences.getString("cached_username", null)?.takeIf {
+                    it.isNotBlank() && store.currentUserId() > 0L &&
+                        container.preferences.getLong("cached_username_user_id", 0L) == store.currentUserId()
+                }
                 if (cachedUser != null) {
                     diagnostics.log("命中本地会话缓存($cachedUser),直拉首屏列表并后台复核")
                     val currentId = store.currentUserId()
@@ -6628,6 +7419,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         restoreAccountScopedLocalState(currentId)
                     }
                     _state.update { it.copy(username = cachedUser, screen = Screen.List) }
+                    browser.prewarmCfClearanceIfNeeded("会话缓存启动")
                     resumeAfterVerification?.also { resumeAfterVerification = null }?.invoke()
                     loadLatest(page = 0, pullRefresh = false)
                     viewModelScope.launch {
@@ -6669,8 +7461,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     container.historyStore.switchUser(currentUser.id)
                     restoreAccountScopedLocalState(currentUser.id)
                     rememberCurrentAccount(currentUser)
-                    container.preferences.edit { putString("cached_username", username) }
+                    container.preferences.edit {
+                        putString("cached_username", username)
+                        putLong("cached_username_user_id", currentUser.id)
+                    }
                     _state.update { it.copy(username = username, screen = Screen.List) }
+                    browser.prewarmCfClearanceIfNeeded("登录完成启动")
                     resumeAfterVerification?.also { resumeAfterVerification = null }?.invoke()
                     loadLatest(page = 0, pullRefresh = false)
                     viewModelScope.launch {
@@ -6683,7 +7479,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                sessionStorageNeedsRetry = true
+                _state.update { it.copy(screen = Screen.List, latest = it.latest.copy(initialLoading = false, error = error.message)) }
             } catch (error: Exception) {
                 diagnostics.log("启动检查失败: ${error.message}")
                 _state.update {
@@ -6725,7 +7524,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     realUser.username != cachedUser -> {
                         diagnostics.log("后台复核用户名更新: $cachedUser -> ${realUser.username}")
-                        container.preferences.edit { putString("cached_username", realUser.username) }
+                        container.preferences.edit {
+                            putString("cached_username", realUser.username)
+                            putLong("cached_username_user_id", realUser.id)
+                        }
                         _state.update { it.copy(username = realUser.username) }
                     }
                 }
@@ -6740,7 +7542,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
             } catch (error: Exception) {
                 diagnostics.log("后台会话复核跳过: ${error.javaClass.simpleName}")
             }
@@ -6892,7 +7694,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun loadTagTopics(tag: String, refresh: Boolean = false, more: Boolean = false) {
         val current = _tagTopics.value[tag]
         if (pageJobs["tag:$tag"]?.isActive == true) return
-        if (!refresh && !more && current != null) return
+        if (!refresh && !more && current != null && !current.needsRefresh) return
         val previous = current ?: TopicListUiState()
         if (more && !previous.hasMore) return
         val page = if (more) previous.page + 1 else 0
@@ -7005,49 +7807,167 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun pollVerification() {
         if (verifying) return
         if (_state.value.screen == Screen.Verify) {
-            if (!browser.interactiveVerificationComplete()) return
+            if (store.currentUserId() != verificationUserId || store.sessionGeneration != verificationSessionGeneration) {
+                cancelVerification()
+                return
+            }
+            if (restartVerificationIfNetworkChanged()) return
+            if (verificationMismatch) return
+            val attempt = verificationAttempt
+            val probePath = verificationProbePath
+            if (browser.interactiveVerificationComplete()) {
+                val now = SystemClock.elapsedRealtime()
+                val rateCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (rateCooldownMs > 0L) {
+                    verifyCompletionProbeNotBefore = maxOf(verifyCompletionProbeNotBefore, now + rateCooldownMs)
+                    return
+                }
+                if (now < verifyCompletionProbeNotBefore) return
+                val candidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
+                if (verificationConfirmedCandidateFp != candidateFp) {
+                    verificationConfirmedCandidateFp = null
+                    if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+                        scheduleVerificationConfirmation("本轮复核预算已用完")
+                        return
+                    }
+                    verifying = true
+                    val outcome = try {
+                        repository.probeClearanceAfterVerification(probePath)
+                    } catch (cancelled: CancellationException) {
+                        if (attempt != verificationAttempt || store.sessionGeneration != verificationSessionGeneration ||
+                            store.currentUserId() != verificationUserId) return
+                        throw cancelled
+                    } finally {
+                        if (attempt == verificationAttempt) verifying = false
+                    }
+                    if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+                    if (restartVerificationIfNetworkChanged()) return
+                    if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
+                        // 429 只说明限流，不计入复核预算；递增退避并换轻量接口，避免拿重分页硬撞进 MISMATCH。
+                        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + nextVerificationRateLimitWaitMs()
+                        return
+                    }
+                    if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) verificationProbeAttempts++
+                    val currentCandidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
+                    if (candidateFp != currentCandidateFp) {
+                        scheduleVerificationConfirmation("候选凭据已更新，忽略旧请求结果")
+                        return
+                    }
+                    when (outcome) {
+                        TopicRepository.VerificationProbeOutcome.CLEARED -> {
+                            verificationConfirmedCandidateFp = candidateFp
+                            val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
+                            if (postProbeCooldownMs > 0L) {
+                                verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + postProbeCooldownMs
+                                return
+                            }
+                        }
+                        TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
+                            scheduleVerificationConfirmation("App 请求仍受挑战")
+                            return
+                        }
+                        TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
+                            scheduleVerificationConfirmation("App 请求暂未确认恢复")
+                            return
+                        }
+                        TopicRepository.VerificationProbeOutcome.DEFERRED -> {
+                            scheduleVerificationConfirmation("等待已有冷却结束")
+                            return
+                        }
+                        TopicRepository.VerificationProbeOutcome.RATE_LIMITED -> return
+                    }
+                }
+            } else {
+                // 验证页尚未收口：用户可能已开代理/换了网络，App 通道不再被挑战，页面却停在 404 或加载失败上。
+                // 正在人工交互挑战组件或处于 429 冷却时不探测，避免对 CF 额外发请求。
+                val now = SystemClock.elapsedRealtime()
+                val rateCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (rateCooldownMs > 0L) {
+                    appPathProbeNotBefore = maxOf(appPathProbeNotBefore, now + rateCooldownMs)
+                    return
+                }
+                if (now < appPathProbeNotBefore) return
+                if (browser.isVerifyChallengeActive()) {
+                    diagnostics.logThrottled("verify-probe-active-challenge", "验证页仍有活跃挑战，暂缓 App 通道探测")
+                    return
+                }
+                appPathProbeNotBefore = now + APP_PATH_PROBE_INTERVAL_MS
+                verifying = true
+                val outcome = try {
+                    repository.probeAppPathDuringVerification(probePath)
+                } finally {
+                    if (attempt == verificationAttempt) verifying = false
+                }
+                if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
+                if (restartVerificationIfNetworkChanged()) return
+                // 从响应结束时退避，慢请求或超时后也不紧接着重探；旁路探测遇 429 仅切轻量接口并退避，不消耗验证完成后的复核预算。
+                val bypassWaitMs = if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
+                    val lightPath = repository.resolveVerificationProbePath(null)
+                    if (verificationProbePath != lightPath) {
+                        verificationProbePath = lightPath
+                        diagnostics.log("验证页旁路探测遇 429，后续复核改用轻量接口 $lightPath")
+                    }
+                    maxOf(VERIFY_RATE_LIMIT_BACKOFF_MS.first(), TopicRepository.rateLimitRemainingMs())
+                } else {
+                    APP_PATH_PROBE_INTERVAL_MS
+                }
+                appPathProbeNotBefore = SystemClock.elapsedRealtime() + bypassWaitMs
+                val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
+                if (postProbeCooldownMs > 0L) {
+                    appPathProbeNotBefore = maxOf(
+                        appPathProbeNotBefore,
+                        SystemClock.elapsedRealtime() + postProbeCooldownMs,
+                    )
+                    return
+                }
+                // 探测在途期间若页面刚刚刷出挑战组件且用户可能正在操作，放弃旁路收口，交由验证页继续处理
+                if (browser.isVerifyChallengeActive()) return
+                if (outcome != TopicRepository.VerificationProbeOutcome.CLEARED) return
+                // Gecko 若已换入新凭据并进入 DONE，留给下一轮完成后复核，不能沿用旧请求的结论。
+                if (!browser.finishVerifyForAppPath()) return
+                diagnostics.log("验证页未收口，但 App 请求通道已不被 Cloudflare 挑战，直接结束验证并恢复操作")
+            }
+            if (TopicRepository.isRateLimitCoolingDown()) return
+            store.completeVerification()
+            verificationProbePath = null
+            verifyCompletionProbeNotBefore = 0L
+            verificationProbeAttempts = 0
+            verificationRateLimitedProbes = 0
+            verificationConfirmedCandidateFp = null
             repository.clearCachedCsrfToken()
-            unreadChallengeBackoffUntil = 0L
+            // 起飞缓冲：timings 与未读轮询延后 8~10s，让 resume() 的前台读取先单独落地 200。
+            val runwayMs = (POST_VERIFY_RUNWAY_MIN_MS..POST_VERIFY_RUNWAY_MAX_MS).random()
+            repository.armPostVerificationRunway(runwayMs)
+            unreadChallengeBackoffUntil = SystemClock.elapsedRealtime() + runwayMs
             if (verificationFromReadSync || _readSyncVerifyBanner.value) {
                 verificationFromReadSync = false
                 _readSyncVerifyBanner.value = false
+                readSyncVerificationProbePath = null
                 repository.onManualVerificationCompleted()
-                diagnostics.log("阅读同步手工验证完成，后续阅读进度改走 WebView 网络栈")
+                diagnostics.log("阅读同步手工验证完成，优先尝试可用的 WebView 通道，否则继续使用 App 通道")
             }
             val resume = resumeAfterVerification
             resumeAfterVerification = null
             _state.update { it.copy(screen = verificationReturnScreen) }
             verificationDismissed = false
-            TopicRepository.clearRateLimitCooldown(store)
             if (resume != null) resume() else if (verificationReturnScreen == Screen.Boot) boot()
             return
         }
         if (!browser.isPageCleared()) return
-        val cookies = store.syncFromWebView()
+        val cookies = try {
+            store.syncFromWebView()
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _loginUiState.update { it.copy(error = error.message) }
+            return
+        }
         val hasSession = cookies.containsKey(Config.SESSION_COOKIE)
+        // Screen.Verify 已在上方分支统一经 completeVerification() 收口并 return，这里只处理登录页。
         when (_state.value.screen) {
-            Screen.Verify -> when {
-                resumeAfterVerification != null -> {
-                    verifying = true
-                    val resume = resumeAfterVerification
-                    resumeAfterVerification = null
-                    diagnostics.log("安全验证完成,恢复中断的操作")
-                    _state.update { it.copy(screen = Screen.List) }
-                    verifying = false
-                    resume?.invoke()
-                }
-                hasSession -> {
-                    verifying = true
-                    diagnostics.log("安全验证完成,重新校验会话")
-                    boot()
-                }
-                // 页面不再被挑战但仍无会话:本来就没登录,回登录页收场,不要在这里干等。
-                else -> {
-                    diagnostics.log("安全验证通过但无会话,回到登录页")
-                    enterWebScreen(Screen.Login)
-                }
-            }
             Screen.Login -> if (hasSession && !verifying) {
+                if (store.isSessionRecoveryPending()) {
+                    boot()
+                    return
+                }
                 verifying = true
                 diagnostics.log("检测到登录 Cookie _t，正在校验服务端真实会话...")
                 val verifiedUser = runCatching { repository.fetchCurrentUser() }.getOrNull()
@@ -7066,11 +7986,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshAccounts() {
         if (_accounts.value.switching || store.sessionChanging) return
-        _state.value.username?.let { username ->
-            val userId = store.currentUserId()
-            if (userId > 0L) container.accountManager.remember(userId, username, store.syncFromWebView())
+        try {
+            _state.value.username?.let { username ->
+                val userId = store.currentUserId()
+                if (userId > 0L) container.accountManager.remember(userId, username, store.syncFromWebView())
+            }
+            publishAccountState()
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _accounts.update { it.copy(error = error.message) }
         }
-        publishAccountState()
     }
 
     private var preAddAccountUserId: Long? = null
@@ -7083,12 +8007,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _accounts.update { it.copy(switching = true) }
         loginJob = viewModelScope.launch {
             try {
-                refreshAccounts()
+                val previousId = store.currentUserId()
+                val previousName = _state.value.username
+                if (previousId > 0L && !previousName.isNullOrBlank()) {
+                    container.accountManager.remember(previousId, previousName, store.syncFromWebView())
+                }
                 clearAccountScopedState()
                 browser.stopSessionRequests()
                 addAccountPrepared = true
-                store.clearBusinessCookies()
-                store.clearCurrentUserId()
+                store.replaceBusinessCookies(null, null, userId = 0L)
                 repository.clearCachedCsrfToken()
                 container.preferences.edit { remove("cached_username") }
                 _state.update { it.copy(username = null, screen = Screen.Login) }
@@ -7118,7 +8045,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (_accounts.value.switching || userId <= 0L) return
         val now = SystemClock.elapsedRealtime()
         if (!force && lastAccountSwitchAt?.let { now - it < 1_500L } == true) return
-        val target = container.accountManager.account(userId) ?: return
+        val target = try {
+            container.accountManager.account(userId)
+        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+            _accounts.update { it.copy(error = error.message) }
+            return
+        } ?: return
         if (!force && userId == store.currentUserId()) {
             _accounts.update { it.copy(error = null) }
             return
@@ -7126,14 +8058,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lastAccountSwitchAt = now
         _accounts.update { it.copy(switching = true, error = null) }
         viewModelScope.launch {
-            val oldCookies = store.syncFromWebView()
-            val oldUserId = store.currentUserId()
-            val oldActiveUserId = container.accountManager.activeUserId()
+            val oldState = _state.value
+            val snapshot = try {
+                val cookies = store.syncFromWebView()
+                val oldId = store.currentUserId()
+                val oldName = _state.value.username
+                if (oldId > 0L && !oldName.isNullOrBlank()) {
+                    container.accountManager.remember(oldId, oldName, cookies)
+                }
+                Triple(cookies, oldId, container.accountManager.activeUserId())
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _accounts.update { it.copy(switching = false, error = error.message) }
+                return@launch
+            }
+            val (oldCookies, oldUserId, oldActiveUserId) = snapshot
             try {
                 // 先结算并清空旧账号的内存态，再替换网络凭据，避免在新会话下处理旧页面。
                 clearAccountScopedState()
                 browser.stopSessionRequests()
-                store.replaceBusinessCookies(target.token, target.forumSession)
+                store.replaceBusinessCookies(target.token, target.forumSession, userId = target.userId)
                 repository.clearCachedCsrfToken()
                 val currentUser = repository.fetchCurrentUserDetails()
                     ?: error("切换后的会话未登录")
@@ -7145,7 +8088,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 container.reading.switchUser(currentUser.id)
                 container.historyStore.switchUser(currentUser.id)
                 restoreAccountScopedLocalState(currentUser.id)
-                container.preferences.edit { putString("cached_username", currentUser.username) }
+                rememberCurrentAccount(currentUser)
+                container.preferences.edit {
+                    putString("cached_username", currentUser.username)
+                    putLong("cached_username_user_id", currentUser.id)
+                }
                 _state.update {
                     it.copy(
                         username = currentUser.username,
@@ -7154,7 +8101,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         unreadCount = 0,
                     )
                 }
-                rememberCurrentAccount(currentUser)
                 publishAccountState()
                 loadLatest(page = 0, pullRefresh = false)
                 refreshUnread(force = true)
@@ -7171,6 +8117,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     store.replaceBusinessCookies(
                         oldCookies[Config.SESSION_COOKIE],
                         oldCookies["_forum_session"],
+                        userId = oldUserId,
                     )
                     if (oldUserId > 0L) {
                         store.saveCurrentUserId(oldUserId)
@@ -7187,6 +8134,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         container.accountManager.setActive(oldActiveUserId)
                     }
                     repository.clearCachedCsrfToken()
+                    container.preferences.edit {
+                        if (oldState.username == null) remove("cached_username")
+                        else putString("cached_username", oldState.username)
+                        putLong("cached_username_user_id", oldUserId)
+                    }
+                    _state.value = oldState
                     publishAccountState()
                 }.exceptionOrNull()
                 if (rollbackError == null) {
@@ -7196,7 +8149,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (rollbackError != null) {
                     clearAccountScopedState()
                     container.preferences.edit { remove("cached_username") }
-                    _state.update { it.copy(username = null, screen = Screen.Login, unreadCount = 0) }
+                    runCatching { store.requireSessionRecovery() }
+                        .onFailure { diagnostics.log("账号恢复标记暂未落盘，保持当前请求暂停") }
+                    sessionStorageNeedsRetry = true
+                    _state.update { it.copy(username = null, screen = Screen.List, unreadCount = 0,
+                        latest = it.latest.copy(initialLoading = false, error = "账号恢复尚未完成，请稍后重试")) }
                 }
                 _accounts.update {
                     it.copy(
@@ -7204,19 +8161,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         error = if (rollbackError == null) {
                             failureMessage ?: error.message ?: "账号切换失败"
                         } else {
-                            "账号切换失败，请重新登录"
+                            "账号恢复尚未完成，请稍后重试"
                         },
                     )
                 }
                 return@launch
             }
-            _accounts.update { it.copy(switching = false, error = null) }
+            _accounts.update { it.copy(switching = false) }
         }
     }
 
     fun addAccount() {
         if (_accounts.value.switching) return
         refreshAccounts()
+        val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _accounts.update { it.copy(error = snapshot.error) }
+            return
+        }
         if (_accounts.value.accounts.size >= AccountManager.MAX_ACCOUNTS) {
             Toast.makeText(
                 getApplication(),
@@ -7228,7 +8190,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         preAddAccountState = _state.value
         addAccountPrepared = false
         preAddAccountUserId = store.currentUserId().takeIf { it > 0L }
-            ?: container.accountManager.activeUserId().takeIf { it > 0L }
+            ?: snapshot.activeUserId.takeIf { it > 0L }
         _loginUiState.value = LoginUiState()
         _state.update { it.copy(screen = Screen.Login) }
     }
@@ -7240,7 +8202,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (_accounts.value.switching) return
         val previousState = preAddAccountState
         if (previousState != null) {
-            val previous = preAddAccountUserId?.let(container.accountManager::account)
             loginJob?.cancel()
             cancelWebAuth()
             browser.cancelCaptchaLogin()
@@ -7251,6 +8212,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _state.value = previousState
                 return
             }
+            val previous = try {
+                preAddAccountUserId?.let(container.accountManager::account)
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _loginUiState.update { it.copy(error = error.message) }
+                return
+            }
             if (previous == null) {
                 _loginUiState.update { it.copy(error = "原账号凭据不可用，请重新登录") }
                 return
@@ -7259,13 +8226,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch {
                 try {
                     browser.stopSessionRequests()
-                    store.replaceBusinessCookies(previous.token, previous.forumSession)
+                    store.replaceBusinessCookies(previous.token, previous.forumSession, userId = previous.userId)
                     store.saveCurrentUserId(previous.userId)
                     container.accountManager.setActive(previous.userId)
                     container.reading.switchUser(previous.userId)
                     container.historyStore.switchUser(previous.userId)
                     restoreAccountScopedLocalState(previous.userId)
-                    container.preferences.edit { putString("cached_username", previous.username) }
+                    container.preferences.edit {
+                        putString("cached_username", previous.username)
+                        putLong("cached_username_user_id", previous.userId)
+                    }
                     repository.clearCachedCsrfToken()
                     preAddAccountState = null
                     preAddAccountUserId = null
@@ -7284,9 +8254,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        val targetUserId = preAddAccountUserId?.takeIf { container.accountManager.account(it) != null }
-            ?: container.accountManager.activeUserId().takeIf { it > 0L && container.accountManager.account(it) != null }
-            ?: container.accountManager.accounts().firstOrNull()?.userId
+        val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _loginUiState.update { it.copy(error = snapshot.error) }
+            return
+        }
+        val targetUserId = preAddAccountUserId?.takeIf { expected -> snapshot.accounts.any { it.userId == expected } }
+            ?: snapshot.activeUserId.takeIf { expected -> snapshot.accounts.any { it.userId == expected } }
+            ?: snapshot.accounts.firstOrNull()?.userId
         preAddAccountUserId = null
         if (targetUserId != null && targetUserId > 0L) {
             switchAccountInternal(targetUserId, force = true)
@@ -7294,8 +8269,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun removeAccount(userId: Long) {
-        if (userId <= 0L) return
+        if (userId <= 0L || _accounts.value.switching) return
         val snapshot = container.accountManager.snapshot()
+        if (!snapshot.storageAvailable) {
+            _accounts.update { it.copy(error = snapshot.error) }
+            return
+        }
         val activeUserId = snapshot.activeUserId
         val isActive = userId == activeUserId
         if (isActive) {
@@ -7305,8 +8284,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     userId = nextAccount.userId,
                     force = true,
                     onSuccess = {
-                        container.accountManager.remove(userId)
-                        publishAccountState()
+                        try {
+                            container.accountManager.remove(userId)
+                            publishAccountState()
+                        } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                            _accounts.update { it.copy(error = error.message) }
+                        }
                     },
                     failureMessage = "切换至其他账号失败，未移除当前账号",
                 )
@@ -7314,8 +8297,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 logout()
             }
         } else {
-            container.accountManager.remove(userId)
-            publishAccountState()
+            try {
+                container.accountManager.remove(userId)
+                publishAccountState()
+            } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
+                _accounts.update { it.copy(error = error.message) }
+            }
         }
     }
 
@@ -7388,11 +8375,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 accounts = snapshot.accounts,
                 activeUserId = snapshot.activeUserId,
+                error = snapshot.error ?: it.error,
             )
         }
     }
 
     private fun restoreAccountScopedLocalState(userId: Long) {
+        _savedTopicsUserId.value = userId
+        publishSavedTopics(runCatching { savedTopicStore.entries(userId) }.getOrElse {
+            diagnostics.log("暂存列表读取失败: ${it.message}")
+            _savedTopicsNotice.value = "暂存列表读取失败，请重新打开应用后重试"
+            emptyList()
+        })
         _history.value = HistoryUiState(entries = container.historyStore.entries())
         val blocked = repository.getBlockedUsers(userId)
         _blockedUsers.value = blocked
@@ -7401,11 +8395,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun clearAccountScopedState() {
         accountScopeGeneration += 1
+        verificationAttempt++
+        verificationProbePath = null
+        readSyncVerificationProbePath = null
+        verificationFromReadSync = false
+        _readSyncVerifyBanner.value = false
+        searchSequence++
+        closeTopicSearch()
+        metadataSequence++
+        metadataJob?.cancel()
+        metadataTagJob?.cancel()
+        _metadataEditor.value = TopicMetadataEditorUiState()
+        _metadataUpdated.value = null
+        _savedTopicsUserId.value = 0L
+        _savedTopics.value = emptyList()
+        _savedTopicsBusy.value = false
+        clearSavedTopicsNotice()
+        topicReadingPositions.clear()
         topicLiveJob?.cancel()
         topicLiveId = null
         topicLiveSessions.clear()
         topicLiveAtEnd.clear()
         topicLiveScrolling.clear()
+        topicScrollSettledAt.clear()
         searchJob?.cancel()
         unreadJob?.cancel()
         reconcileSessionJob?.cancel()
@@ -7459,6 +8471,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _ldcState.value = LdcUiState()
         connectManualRefreshTimestamps.clear()
         connectSilentBackoffUntil = 0L
+        ldcBackoffUntil = 0L
+        ldcLastAttempt = null
+        cdkScoreJob?.cancel()
+        cdkScoreJob = null
+        cdkScoreBackoffUntil = 0L
+        _cdkScore.value = CdkScoreUiState()
         idleWarmupJob?.cancel()
         idleWarmupJob = null
         autoProbeJob?.cancel()
@@ -7470,6 +8488,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun logout() {
+        if (_accounts.value.switching) return
         preAddAccountState = null
         preAddAccountUserId = null
         addAccountPrepared = false
@@ -7481,41 +8500,70 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         searchJob?.cancel()
         unreadJob?.cancel()
         resumeAfterVerification = null
-        clearAccountScopedState()
-        container.reading.switchUser(0L)
-        container.historyStore.switchUser(0L)
-        container.preferences.edit { remove("cached_username") }
+        _accounts.update { it.copy(switching = true, error = null) }
         viewModelScope.launch {
-            val currentActiveId = container.accountManager.activeUserId()
-            if (currentActiveId > 0L) {
-                container.accountManager.remove(currentActiveId)
-            } else {
-                container.accountManager.clear()
+            try {
+                val currentUserId = store.currentUserId()
+                val token = store.storedCookies()[Config.SESSION_COOKIE]
+                // 先确认账号库可读，避免退出时误删其它账号或把不可读当成空库。
+                if (currentUserId > 0L) container.accountManager.account(currentUserId)
+                store.noteRejectedAuthToken(SessionStore.authTokenHash(token), currentUserId, store.sessionGeneration)
+                browser.stopSessionRequests()
+                store.replaceBusinessCookies(null, null, userId = 0L)
+                if (currentUserId > 0L) container.accountManager.remove(currentUserId)
+                publishAccountState()
+                clearAccountScopedState()
+                container.reading.switchUser(0L)
+                container.historyStore.switchUser(0L)
+                container.preferences.edit { remove("cached_username") }
+                repository.clearCachedCsrfToken()
+                browser.reset()
+                diagnostics.log("已登出并清除业务 Cookie（保留 Cloudflare 凭证）")
+                _state.update { UiState(path = it.path, userAgent = it.userAgent, homeFeed = initialHomeFeed) }
+                _loginUiState.update {
+                    LoginUiState(
+                        savedLogin = store.savedLogin().orEmpty(),
+                        savedPassword = store.savedPassword().orEmpty(),
+                        rememberPassword = store.isRememberPassword(),
+                    )
+                }
+                enterWebScreen(Screen.Login)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _accounts.update { it.copy(error = "退出未完成：${error.message}") }
+                runCatching { store.requireSessionRecovery() }
+                    .onFailure { diagnostics.log("退出恢复标记暂未落盘，保持当前请求暂停") }
+                sessionStorageNeedsRetry = true
+                _state.update { it.copy(username = null, latest = it.latest.copy(error = "退出未完成，请稍后重试")) }
+            } finally {
+                _accounts.update { it.copy(switching = false) }
             }
-            publishAccountState()
-            browser.stopSessionRequests()
-            store.clearBusinessCookies()
-            store.clearCurrentUserId()
-            repository.clearCachedCsrfToken()
-            browser.reset()
-            diagnostics.log("已登出并清除业务 Cookie（保留 Cloudflare 凭证）")
-            _state.update { UiState(path = it.path, userAgent = it.userAgent, homeFeed = initialHomeFeed) }
-            _loginUiState.update {
-                LoginUiState(
-                    savedLogin = store.savedLogin().orEmpty(),
-                    savedPassword = store.savedPassword().orEmpty(),
-                    rememberPassword = store.isRememberPassword(),
-                )
-            }
-            enterWebScreen(Screen.Login)
         }
     }
 
-    private suspend fun enterWebScreen(screen: Screen, reason: String = "") {
+    private suspend fun enterWebScreen(screen: Screen, reason: String = "", probePath: String? = null) {
+        if (screen == Screen.Verify) {
+            val accountGeneration = store.sessionGeneration
+            verificationCleanupJob?.join()
+            if (accountGeneration != store.sessionGeneration) return
+        }
         if (screen == Screen.Verify && _state.value.screen == Screen.Verify) return
         if (screen == Screen.Verify) {
             verificationReturnScreen = _state.value.screen
             verificationDismissed = false
+            verificationMismatch = false
+            verificationProbePath = repository.resolveVerificationProbePath(probePath)
+            verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
+            verifyCompletionProbeNotBefore = 0L
+            verificationProbeAttempts = 0
+            verificationRateLimitedProbes = 0
+            verificationConfirmedCandidateFp = null
+            verificationUserId = store.currentUserId()
+            verificationSessionGeneration = store.sessionGeneration
+            verifying = false
+            verificationAttempt++
+            armAppPathProbe()
             store.requireVerification()
         }
         if (screen == Screen.Verify) diagnostics.recordInteractiveRequired(reason.ifBlank { "未知" })
@@ -7524,10 +8572,57 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Verify 时打开根 URL 触发 Cloudflare 人机验证。
         if (screen == Screen.Verify) {
             browser.beginInteractiveVerification()
+        } else if (screen == Screen.Login) {
+            browser.prewarmCfClearanceIfNeeded("进入登录页")
         }
     }
 
     private var verificationReturnScreen = Screen.List
+    /** 触发当前轮交互验证的只读原请求路径；为空时复核回退至默认会话接口。 */
+    private var verificationProbePath: String? = null
+    private var verificationNetworkGeneration = 0L
+    /** 验证完成后复核若遇 0 / 429 / 5xx 暂时无法判断，退避到此时间后再重探。 */
+    private var verifyCompletionProbeNotBefore = 0L
+    private var verificationProbeAttempts = 0
+    private var verificationConfirmedCandidateFp: String? = null
+    private var verificationUserId = 0L
+    private var verificationSessionGeneration = 0L
+    private var verificationCleanupJob: Job? = null
+
+    /** 本轮验证复核连续遇到 429 的次数，用于 10s → 18s → 28s 递增退避。 */
+    private var verificationRateLimitedProbes = 0
+
+    /**
+     * 复核遇 429：递增退避并把后续探测切到轻量会话接口（重分页本身就是触发速率规则的元凶）。
+     * 档位用完后才计入复核预算，避免约 55 秒内就被 3 次固定间隔硬撞判成 MISMATCH。
+     */
+    private fun nextVerificationRateLimitWaitMs(): Long {
+        val step = VERIFY_RATE_LIMIT_BACKOFF_MS[verificationRateLimitedProbes.coerceAtMost(VERIFY_RATE_LIMIT_BACKOFF_MS.lastIndex)]
+        verificationRateLimitedProbes++
+        if (verificationRateLimitedProbes > VERIFY_RATE_LIMIT_BACKOFF_MS.size) verificationProbeAttempts++
+        val lightPath = repository.resolveVerificationProbePath(null)
+        if (verificationProbePath != lightPath) {
+            verificationProbePath = lightPath
+            diagnostics.log("验证复核遇 429，后续改用轻量接口 $lightPath 探测")
+        }
+        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+            scheduleVerificationConfirmation("App 请求持续被限流")
+        }
+        val waitMs = maxOf(step, TopicRepository.rateLimitRemainingMs())
+        diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${(waitMs + 999L) / 1_000L}s 后重探")
+        return waitMs
+    }
+
+    private fun scheduleVerificationConfirmation(reason: String) {
+        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+            verificationMismatch = true
+            diagnostics.log("App 连接复核 ${verificationProbeAttempts} 次仍未确认，停止自动复核，保留手动重试")
+            return
+        }
+        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
+        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + waitMs
+        diagnostics.log("$reason (${verificationProbeAttempts}/$MAX_VERIFICATION_CONFIRMATION_PROBES)，保留候选凭据，${(waitMs + 999L) / 1_000L}s 后复核")
+    }
 
     /**
      * 阅读同步被 CF 风控时的非打断式横幅，表示「阅读同步当前处于受阻状态」，而不是一次性事件：
@@ -7537,30 +8632,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _readSyncVerifyBanner = MutableStateFlow(false)
     val readSyncVerifyBanner: StateFlow<Boolean> = _readSyncVerifyBanner.asStateFlow()
     private var verificationFromReadSync = false
+    @Volatile private var readSyncVerificationProbePath: String? = null
 
-    private fun showReadSyncVerifyBanner() {
-        if (!_syncReadProgress.value || _readSyncVerifyBanner.value) return
+    private fun showReadSyncVerifyBanner(probePath: String?) {
+        if (!_syncReadProgress.value) return
+        readSyncVerificationProbePath = repository.resolveVerificationProbePath(probePath)
+        if (_readSyncVerifyBanner.value) return
         diagnostics.log("阅读同步触发 CF 风控，提示用户手工验证")
         _readSyncVerifyBanner.value = true
     }
 
     fun dismissReadSyncVerifyBanner() {
         _readSyncVerifyBanner.value = false
+        readSyncVerificationProbePath = null
     }
 
     fun openReadSyncVerification() {
         verificationFromReadSync = true
-        viewModelScope.launch { enterWebScreen(Screen.Verify, "阅读同步 CF 风控") }
+        val probePath = readSyncVerificationProbePath
+        viewModelScope.launch { enterWebScreen(Screen.Verify, "阅读同步 CF 风控", probePath) }
     }
     private var verificationDismissed = false
+
+    /** 有限次数的 App 复核仍未确认恢复；停止自动请求，等待用户重试或返回。 */
+    @Volatile private var verificationMismatch = false
+
+    /** 每次进入或重试验证递增，丢弃上一轮迟到的复核结果。 */
+    private var verificationAttempt = 0
+
+    /** 验证页打开期间旁路探测 App 请求通道的最早时间（elapsedRealtime），给 Gecko 页面留出首轮收口时间。 */
+    private var appPathProbeNotBefore = 0L
+
+    private fun armAppPathProbe() {
+        appPathProbeNotBefore = SystemClock.elapsedRealtime() + APP_PATH_PROBE_FIRST_DELAY_MS
+    }
 
     fun cancelVerification() {
         // 未通过验证就返回：横幅保持显示，用户可随时再次进入
         verificationFromReadSync = false
         verificationDismissed = true
+        verificationMismatch = false
+        verificationProbePath = null
+        verifyCompletionProbeNotBefore = 0L
+        verificationProbeAttempts = 0
+        verificationRateLimitedProbes = 0
+        verificationConfirmedCandidateFp = null
+        verifying = false
+        verificationAttempt++
         resumeAfterVerification = null
         _state.update { it.copy(screen = if (verificationReturnScreen == Screen.Boot) Screen.Login else verificationReturnScreen) }
-        viewModelScope.launch {
+        verificationCleanupJob = viewModelScope.launch {
             browser.stopSessionRequests()
             browser.restoreClearanceIfVerificationAbandoned()
         }
@@ -7569,14 +8690,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** 验证页加载异常（chrome-error 或数秒内无页面完成），用于提示检查网络或代理。 */
     fun isVerificationPageStalled(): Boolean = browser.isVerificationPageStalled()
 
-    fun verifyPageState(): org.linuxdo.android.net.BrowserSession.VerifyPageState = browser.verifyPageState()
+    fun verifyPageState(): org.linuxdo.android.net.BrowserSession.VerifyPageState =
+        if (verificationMismatch) org.linuxdo.android.net.BrowserSession.VerifyPageState.MISMATCH
+        else browser.verifyPageState()
 
     fun retryVerification() {
-        viewModelScope.launch { browser.beginInteractiveVerification() }
+        verificationMismatch = false
+        verifyCompletionProbeNotBefore = 0L
+        verificationProbeAttempts = 0
+        verificationRateLimitedProbes = 0
+        verificationConfirmedCandidateFp = null
+        verificationUserId = store.currentUserId()
+        verificationSessionGeneration = store.sessionGeneration
+        verifying = false
+        store.requireVerification()
+        verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
+        verificationAttempt++
+        armAppPathProbe()
+        val attempt = verificationAttempt
+        viewModelScope.launch {
+            verificationCleanupJob?.join()
+            if (attempt != verificationAttempt || _state.value.screen != Screen.Verify ||
+                store.sessionGeneration != verificationSessionGeneration || store.currentUserId() != verificationUserId) return@launch
+            store.requireVerification()
+            browser.beginInteractiveVerification()
+        }
     }
 
-    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) =
+    private fun restartVerificationIfNetworkChanged(): Boolean {
+        val generation = container.dohCoordinator.currentEpoch.get().generation
+        if (generation == verificationNetworkGeneration) return false
+        if (TopicRepository.isRateLimitCoolingDown()) return true
+        diagnostics.log("验证期间网络已切换(gen=$verificationNetworkGeneration->$generation)，保留原请求并重新加载验证页")
+        retryVerification()
+        return true
+    }
+
+    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) {
+        if (sessionStorageNeedsRetry) {
+            boot()
+            return
+        }
         loadFeed(_state.value.homeFeed, page, pullRefresh)
+    }
 
     private suspend fun loadFeed(feed: HomeFeedType, page: Int, pullRefresh: Boolean) {
         val requestScopeGeneration = accountScopeGeneration
@@ -7657,7 +8813,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (error: NeedsInteractiveVerification) {
             if (requestScopeGeneration != accountScopeGeneration) return
             settleFeedLoading(feed)
-            enterWebScreen(Screen.Verify, error.message.orEmpty())
+            enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
         } catch (error: HttpStatusException) {
             if (requestScopeGeneration != accountScopeGeneration) return
             val msg = if (error.status == 403 && (_state.value.username == null || (feed == HomeFeedType.Unread || feed == HomeFeedType.Posted))) {
@@ -7711,6 +8867,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
+        private const val MAX_VERIFICATION_CONFIRMATION_PROBES = 3
+        /** 验证复核遇 429 的递增退避档位，合计 56s，覆盖 CF 速率窗口。 */
+        private val VERIFY_RATE_LIMIT_BACKOFF_MS = longArrayOf(10_000L, 18_000L, 28_000L)
+        private const val POST_VERIFY_RUNWAY_MIN_MS = 8_000L
+        private const val POST_VERIFY_RUNWAY_MAX_MS = 10_000L
+        /** 详情页停滑后再等这么久才发 timings（含 CSRF），避免与滚动触发的分页/图片请求叠在同一速率窗口。 */
+        const val READ_REPORT_SCROLL_SETTLE_MS = 2_500L
         /** 长帖切倒序时一次拉取的尾部楼层数,与 fetchPosts 的单批上限一致。 */
         const val TAIL_WINDOW = 20
 

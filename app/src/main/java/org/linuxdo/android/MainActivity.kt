@@ -8,6 +8,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import org.linuxdo.android.ui.AppShell
 import org.linuxdo.android.ui.MainViewModel
+import org.linuxdo.android.ui.LocalEditorSuggestionSource
+import org.linuxdo.android.ui.LocalPostMarkdownLoader
+import org.linuxdo.android.ui.LocalPostRevisionLoader
+import org.linuxdo.android.ui.LocalTopicPreviewLoader
+import androidx.compose.runtime.CompositionLocalProvider
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
@@ -25,9 +30,19 @@ class MainActivity : ComponentActivity() {
         }
         handleNotificationIntent(intent)
         handleDeepLinkIntent(intent)
+        // 在 Activity 尚未进入 RESUMED 前提前初始化 GeckoRuntime，避免首帧合成（已处于 RESUMED）时
+        // GeckoRuntime.init 同步触发 LifecycleListener.onResume 与 GeckoThread 启动产生竞态。
+        org.linuxdo.android.net.gecko.GeckoManager.getOrCreateRuntime(applicationContext)
         val browser = (application as App).container.browser
         setContent {
-            AppShell(viewModel, browser)
+            CompositionLocalProvider(
+                LocalEditorSuggestionSource provides viewModel::searchEditorSuggestions,
+                LocalPostMarkdownLoader provides viewModel::loadPostMarkdown,
+                LocalPostRevisionLoader provides viewModel::loadPostRevision,
+                LocalTopicPreviewLoader provides viewModel::loadTopicPreview,
+            ) {
+                AppShell(viewModel, browser)
+            }
         }
     }
 
@@ -141,6 +156,12 @@ class MainActivity : ComponentActivity() {
         val uri = intent?.data ?: return
         val url = uri.toString()
         if (uri.scheme == "discourse" && uri.host == "auth_redirect") return
+        val miniAppUrl = org.linuxdo.android.data.parseInternalMiniAppUrl(url)
+        if (miniAppUrl != null) {
+            intent.data = null
+            org.linuxdo.android.ui.screen.MiniAppSessionPool.requestOpen(miniAppUrl)
+            return
+        }
         val link = org.linuxdo.android.data.parseInternalTopicUrl(url) ?: return
         intent.data = null
         viewModel.navigateToTopicFromNotification(link.topicId, link.postNumber)
