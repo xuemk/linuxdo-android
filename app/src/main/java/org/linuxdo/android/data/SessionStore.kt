@@ -441,7 +441,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             val bestClearance = structuredClearances
                 .filter { it.expiresAt > now && !isClearanceChallenged(it.value) }
                 .sortedWith(
-                    compareByDescending<Cookie> { it.expiresAt }
+                    // 优先选择正常有效期内（<=7天）的新凭据，防止历史超长效僵尸副本（如 2027 年过期）在重启后压过正常凭据
+                    compareByDescending<Cookie> { (it.expiresAt - now) <= MAX_REASONABLE_CF_CLEARANCE_TTL_MS }
+                        .thenByDescending { it.expiresAt }
                         .thenByDescending { it.hostOnly }
                         .thenByDescending { it.path.length }
                 )
@@ -857,26 +859,66 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     fun clearCookie(name: String): Boolean {
         save(storedCookies() - name)
         val manager = CookieManager.getInstance()
-        // CF 可能以 host-only、linux.do 或 .linux.do 三种形式写入 Cookie,
-        // 每种形式又要覆盖上述四类属性组合。
+        val expiry = "Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        // 1. 结构化逐条删除：按 WebView 里每个同名副本的真实 Domain/Path/Secure/HttpOnly/SameSite/Partitioned 精确覆盖，
+        //    这是唯一能可靠清掉历史长效残留（如 2027 年过期、带 HttpOnly 的旧副本）的方式。
+        val structured = runCatching {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)) return@runCatching emptyList()
+            val baseUrl = Config.BASE_URL.toHttpUrl()
+            CookieManagerCompat.getCookieInfo(manager, Config.BASE_URL).flatMap { raw ->
+                val cookie = Cookie.parse(baseUrl, raw)?.takeIf { it.name == name } ?: return@flatMap emptyList()
+                val flags = raw.split(';').map { it.trim().lowercase() }
+                val domainVariants = if (cookie.hostOnly) listOf(null) else listOf(cookie.domain, ".${cookie.domain.trimStart('.')}")
+                val sameSiteRaw = flags.firstOrNull { it.startsWith("samesite=") }?.substringAfter('=')
+                val sameSiteVariants = if (sameSiteRaw == null) listOf(null) else listOf(
+                    sameSiteRaw,
+                    sameSiteRaw.replaceFirstChar { it.uppercase() },
+                ).distinct()
+                domainVariants.flatMap { dom ->
+                    sameSiteVariants.map { sameSite ->
+                        buildString {
+                            append("$name=; $expiry; Path=${cookie.path}")
+                            if (dom != null) append("; Domain=$dom")
+                            if (cookie.secure) append("; Secure")
+                            if (cookie.httpOnly) append("; HttpOnly")
+                            if (sameSite != null) append("; SameSite=$sameSite")
+                            if ("partitioned" in flags) append("; Partitioned")
+                        }
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+        structured.distinct().forEach { manager.setCookie(Config.BASE_URL, it) }
+        // 2. 兜底穷举：不支持 GET_COOKIE_INFO 的 WebView 上，覆盖 host-only / linux.do / .linux.do 三种域
+        //    与常见属性组合（含 HttpOnly 变体）。
         val domains = listOf(null, Config.HOST, ".${Config.HOST}")
         val attributes = listOf(
             "",
             "; Secure",
+            "; Secure; HttpOnly",
             "; Secure; SameSite=None",
+            "; Secure; HttpOnly; SameSite=None",
+            "; Secure; SameSite=Lax",
+            "; Secure; HttpOnly; SameSite=Lax",
             "; Secure; SameSite=None; Partitioned",
+            "; Secure; HttpOnly; SameSite=None; Partitioned",
         )
         domains.forEach { domain ->
             val domainPart = domain?.let { "; Domain=$it" }.orEmpty()
             attributes.forEach { attribute ->
-                manager.setCookie(
-                    Config.BASE_URL,
-                    "$name=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/$domainPart$attribute",
-                )
+                manager.setCookie(Config.BASE_URL, "$name=; $expiry; Path=/$domainPart$attribute")
             }
         }
         manager.flush()
-        return parseCookieHeader(manager.getCookie(Config.BASE_URL))[name].isNullOrBlank()
+        val diagnostics = org.linuxdo.android.net.NetDiagnostics
+        val remaining = diagnostics.cookieFingerprints(manager.getCookie(Config.BASE_URL).orEmpty(), name)
+        if (remaining.isNotEmpty()) {
+            if (name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true)) {
+                remaining.forEach { fp -> noteClearanceChallenged(fp, source = "clearCookie残留淘汰") }
+            }
+            diagnostics.log("Cookie $name 清除后仍残留 ${remaining.size} 份(fp=${remaining.joinToString(",")})，已拉黑残留指纹(结构化指令 ${structured.size} 条)")
+        }
+        return remaining.isEmpty()
     }
 
     /** 应用 OkHttp 或认证浏览器响应里的 Set-Cookie,同时写入加密存储与 WebView,保证两边一致。 */
@@ -1591,6 +1633,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val MAX_NOTIFICATION_LEVELS = 1000
         private const val MAX_CHALLENGED_CLEARANCES = 16
         private const val CHALLENGED_CLEARANCE_PAUSE_MS = 60_000L
+        private const val MAX_REASONABLE_CF_CLEARANCE_TTL_MS = 7 * 86_400_000L
 
         // ── DoH 相关偏好 ──────────────────────────────────────────────────────────
         const val KEY_DOH_ENABLED = "doh_enabled"

@@ -98,19 +98,21 @@ object Config {
      */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
-          "versionCode": 17,
-          "versionName": "1.5.0",
+          "versionCode": 18,
+          "versionName": "1.6.0",
           "forceUpdate": false,
           "minVersionCode": 1,
-          "title": "LINUX DO Android v1.5.0 正式版更新说明",
+          "title": "LINUX DO Android v1.6.0 正式版更新说明",
           "changelog": [
-            "1、内置免代理直连网络栈，无需系统代理即可直接登录畅刷论坛",
-            "2、新增话题标签（Tags）聚合与精准检索功能，找帖更高效",
-            "3、优化信息流纯净度与滑动性能，精细化打磨列表与详情体验",
-            "4、修复简评真实等级展示、非列表页底部Bar手势返回平滑复位等多项细节"
+            "1、微信式下拉应用广场：自由拖拽排序，完整小程序容器与直连体验",
+            "2、话题暂存工作台：感兴趣的话题随时存放，长帖分段流畅看，想看一键直达",
+            "3、所见即所得发起投票：发帖左下角投票构建器，卡片内即时编辑回显",
+            "4、一键卡片分享：长按预览，双Tab精致卡片一键转发佬友",
+            "5、多媒体与排版升级：音视频帖内内联播放、@/#智能补全与折叠表格渲染",
+            "6、网络稳定性与体验加固：429速率挑战智能退避换线、阅读同步与会话保护"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.5.0/linuxdo-1.5.0-release.apk",
-          "apkSha256": "08347eff53e5b1e98bf874b41df1d9f6e31922c2dad7c77e21666838f476d744"
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.6.0/linuxdo-1.6.0-release.apk",
+          "apkSha256": "f220a65278cee2790bc010d8a5251aade15ed0bc76c68eb4c88f0099466e25f8"
         }
     """
 }

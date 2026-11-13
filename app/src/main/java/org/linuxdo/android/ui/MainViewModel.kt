@@ -924,6 +924,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var topicLiveId: Long? = null
     private val topicLiveAtEnd = mutableSetOf<Long>()
     private val topicLiveScrolling = mutableSetOf<Long>()
+    /** 详情页最近一次停滑时间（elapsedRealtime），timings 据此错峰。 */
+    private val topicScrollSettledAt = mutableMapOf<Long, Long>()
     private val scrollBusySignal = ScrollBusySignal(SCROLL_IDLE_DELAY_MS)
     private var excerptPrefetchJob: Job? = null
     private var previewListVisible = false
@@ -1684,6 +1686,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeTopicIds.remove(topicId)
             topicLiveAtEnd.remove(topicId)
             topicLiveScrolling.remove(topicId)
+            topicScrollSettledAt.remove(topicId)
             if (topicLiveId == topicId) {
                 topicLiveJob?.cancel()
                 topicLiveId = null
@@ -1701,6 +1704,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onTopicViewport(topicId: Long, atLatestEnd: Boolean, scrolling: Boolean) {
         if (atLatestEnd) topicLiveAtEnd.add(topicId) else topicLiveAtEnd.remove(topicId)
+        if (!scrolling && topicId in topicLiveScrolling) topicScrollSettledAt[topicId] = SystemClock.elapsedRealtime()
         if (scrolling) topicLiveScrolling.add(topicId) else topicLiveScrolling.remove(topicId)
         if (!scrolling) topicLiveSessions[topicId]?.updates?.trySend(Unit)
     }
@@ -3180,6 +3184,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 tracker.tick(tickAt)
                 if (readSendJobs[topicId]?.isActive == true) continue
+                // 滑动中及停滑后 2.5s 内只累计停留时间，不发 CSRF + timings，避免与分页/头像请求叠进同一速率窗口。
+                if (topicId in topicLiveScrolling ||
+                    tickAt - (topicScrollSettledAt[topicId] ?: 0L) < READ_REPORT_SCROLL_SETTLE_MS) continue
                 val rush = tracker.hasRush(alreadyReadPostsForTracker(topicId))
                 if (!schedule.canSend(tickAt, rush)) continue
                 val batch = tracker.takeBatch(tickAt, READ_REPORT_POST_CAP) ?: continue
@@ -7835,6 +7842,11 @@ fun openTopicSearch(topicId: Long, title: String) {
                     }
                     if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
                     if (restartVerificationIfNetworkChanged()) return
+                    if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
+                        // 429 只说明限流，不计入复核预算；递增退避并换轻量接口，避免拿重分页硬撞进 MISMATCH。
+                        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + nextVerificationRateLimitWaitMs()
+                        return
+                    }
                     if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) verificationProbeAttempts++
                     val currentCandidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
                     if (candidateFp != currentCandidateFp) {
@@ -7862,6 +7874,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                             scheduleVerificationConfirmation("等待已有冷却结束")
                             return
                         }
+                        TopicRepository.VerificationProbeOutcome.RATE_LIMITED -> return
                     }
                 }
             } else {
@@ -7887,8 +7900,18 @@ fun openTopicSearch(topicId: Long, title: String) {
                 }
                 if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
                 if (restartVerificationIfNetworkChanged()) return
-                // 从响应结束时退避，慢请求或超时后也不紧接着重探。
-                appPathProbeNotBefore = SystemClock.elapsedRealtime() + APP_PATH_PROBE_INTERVAL_MS
+                // 从响应结束时退避，慢请求或超时后也不紧接着重探；旁路探测遇 429 仅切轻量接口并退避，不消耗验证完成后的复核预算。
+                val bypassWaitMs = if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
+                    val lightPath = repository.resolveVerificationProbePath(null)
+                    if (verificationProbePath != lightPath) {
+                        verificationProbePath = lightPath
+                        diagnostics.log("验证页旁路探测遇 429，后续复核改用轻量接口 $lightPath")
+                    }
+                    maxOf(VERIFY_RATE_LIMIT_BACKOFF_MS.first(), TopicRepository.rateLimitRemainingMs())
+                } else {
+                    APP_PATH_PROBE_INTERVAL_MS
+                }
+                appPathProbeNotBefore = SystemClock.elapsedRealtime() + bypassWaitMs
                 val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
                 if (postProbeCooldownMs > 0L) {
                     appPathProbeNotBefore = maxOf(
@@ -7909,9 +7932,13 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationProbePath = null
             verifyCompletionProbeNotBefore = 0L
             verificationProbeAttempts = 0
+            verificationRateLimitedProbes = 0
             verificationConfirmedCandidateFp = null
             repository.clearCachedCsrfToken()
-            unreadChallengeBackoffUntil = 0L
+            // 起飞缓冲：timings 与未读轮询延后 8~10s，让 resume() 的前台读取先单独落地 200。
+            val runwayMs = (POST_VERIFY_RUNWAY_MIN_MS..POST_VERIFY_RUNWAY_MAX_MS).random()
+            repository.armPostVerificationRunway(runwayMs)
+            unreadChallengeBackoffUntil = SystemClock.elapsedRealtime() + runwayMs
             if (verificationFromReadSync || _readSyncVerifyBanner.value) {
                 verificationFromReadSync = false
                 _readSyncVerifyBanner.value = false
@@ -7934,28 +7961,8 @@ fun openTopicSearch(topicId: Long, title: String) {
             return
         }
         val hasSession = cookies.containsKey(Config.SESSION_COOKIE)
+        // Screen.Verify 已在上方分支统一经 completeVerification() 收口并 return，这里只处理登录页。
         when (_state.value.screen) {
-            Screen.Verify -> when {
-                resumeAfterVerification != null -> {
-                    verifying = true
-                    val resume = resumeAfterVerification
-                    resumeAfterVerification = null
-                    diagnostics.log("安全验证完成,恢复中断的操作")
-                    _state.update { it.copy(screen = Screen.List) }
-                    verifying = false
-                    resume?.invoke()
-                }
-                hasSession -> {
-                    verifying = true
-                    diagnostics.log("安全验证完成,重新校验会话")
-                    boot()
-                }
-                // 页面不再被挑战但仍无会话:本来就没登录,回登录页收场,不要在这里干等。
-                else -> {
-                    diagnostics.log("安全验证通过但无会话,回到登录页")
-                    enterWebScreen(Screen.Login)
-                }
-            }
             Screen.Login -> if (hasSession && !verifying) {
                 if (store.isSessionRecoveryPending()) {
                     boot()
@@ -8410,6 +8417,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         topicLiveSessions.clear()
         topicLiveAtEnd.clear()
         topicLiveScrolling.clear()
+        topicScrollSettledAt.clear()
         searchJob?.cancel()
         unreadJob?.cancel()
         reconcileSessionJob?.cancel()
@@ -8549,6 +8557,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
             verifyCompletionProbeNotBefore = 0L
             verificationProbeAttempts = 0
+            verificationRateLimitedProbes = 0
             verificationConfirmedCandidateFp = null
             verificationUserId = store.currentUserId()
             verificationSessionGeneration = store.sessionGeneration
@@ -8579,6 +8588,30 @@ fun openTopicSearch(topicId: Long, title: String) {
     private var verificationUserId = 0L
     private var verificationSessionGeneration = 0L
     private var verificationCleanupJob: Job? = null
+
+    /** 本轮验证复核连续遇到 429 的次数，用于 10s → 18s → 28s 递增退避。 */
+    private var verificationRateLimitedProbes = 0
+
+    /**
+     * 复核遇 429：递增退避并把后续探测切到轻量会话接口（重分页本身就是触发速率规则的元凶）。
+     * 档位用完后才计入复核预算，避免约 55 秒内就被 3 次固定间隔硬撞判成 MISMATCH。
+     */
+    private fun nextVerificationRateLimitWaitMs(): Long {
+        val step = VERIFY_RATE_LIMIT_BACKOFF_MS[verificationRateLimitedProbes.coerceAtMost(VERIFY_RATE_LIMIT_BACKOFF_MS.lastIndex)]
+        verificationRateLimitedProbes++
+        if (verificationRateLimitedProbes > VERIFY_RATE_LIMIT_BACKOFF_MS.size) verificationProbeAttempts++
+        val lightPath = repository.resolveVerificationProbePath(null)
+        if (verificationProbePath != lightPath) {
+            verificationProbePath = lightPath
+            diagnostics.log("验证复核遇 429，后续改用轻量接口 $lightPath 探测")
+        }
+        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+            scheduleVerificationConfirmation("App 请求持续被限流")
+        }
+        val waitMs = maxOf(step, TopicRepository.rateLimitRemainingMs())
+        diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${(waitMs + 999L) / 1_000L}s 后重探")
+        return waitMs
+    }
 
     private fun scheduleVerificationConfirmation(reason: String) {
         if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
@@ -8642,6 +8675,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         verificationProbePath = null
         verifyCompletionProbeNotBefore = 0L
         verificationProbeAttempts = 0
+        verificationRateLimitedProbes = 0
         verificationConfirmedCandidateFp = null
         verifying = false
         verificationAttempt++
@@ -8664,6 +8698,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         verificationMismatch = false
         verifyCompletionProbeNotBefore = 0L
         verificationProbeAttempts = 0
+        verificationRateLimitedProbes = 0
         verificationConfirmedCandidateFp = null
         verificationUserId = store.currentUserId()
         verificationSessionGeneration = store.sessionGeneration
@@ -8833,6 +8868,12 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     private companion object {
         private const val MAX_VERIFICATION_CONFIRMATION_PROBES = 3
+        /** 验证复核遇 429 的递增退避档位，合计 56s，覆盖 CF 速率窗口。 */
+        private val VERIFY_RATE_LIMIT_BACKOFF_MS = longArrayOf(10_000L, 18_000L, 28_000L)
+        private const val POST_VERIFY_RUNWAY_MIN_MS = 8_000L
+        private const val POST_VERIFY_RUNWAY_MAX_MS = 10_000L
+        /** 详情页停滑后再等这么久才发 timings（含 CSRF），避免与滚动触发的分页/图片请求叠在同一速率窗口。 */
+        const val READ_REPORT_SCROLL_SETTLE_MS = 2_500L
         /** 长帖切倒序时一次拉取的尾部楼层数,与 fetchPosts 的单批上限一致。 */
         const val TAIL_WINDOW = 20
 

@@ -350,12 +350,16 @@ internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
             url.encodedPath.startsWith("/svg-sprite/")
         )
 
-/** 公开图片和验证探针的单次挑战不等同于主站 API 凭据失效。 */
+/**
+ * 公开图片和验证探针的单次挑战不等同于主站 API 凭据失效。
+ * 429 + cf-mitigated=challenge 是 WAF 速率规则，凭据本身仍有效，拉黑它只会让后续请求 0 份凭据裸奔撞盾，
+ * 因此只有 403 / 503 交互挑战才判废。
+ */
 internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cfMitigated: String?): Boolean =
     request.url.isHttps && request.url.host == Config.HOST &&
         !isPublicStaticIconUrl(request.url) &&
         request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe != true &&
-        status in setOf(403, 429, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
+        status in setOf(403, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
 
 private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
     request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
@@ -393,15 +397,17 @@ const val IMAGE_AUTO_RETRY_LIMIT = 2
  *
  * 对齐 fluxdo DioHttpClient 三通道并发隔离：
  * - EMOJI 通道 12 槽（KB 级极小图，RTT 主导）
- * - AVATAR 通道 6 槽（对齐 fluxdo contentSemaphore = 6，避免十几张头像瞬时齐发冲破 CF 边缘速率阈值）
+ * - AVATAR 通道 3 槽（刷长帖时头像与主站 API 共享同一出口的 CF 速率额度，6 槽实测会把正文请求挤进 429 挑战）
  * - MEDIA 通道 4 槽（正文上传大图/附件，独立槽位避免饿死头像）
+ *
+ * 主站 [org.linuxdo.android.data.TopicRepository] 处于 429 冷却时，图片与其自动重试同步暂缓，不单独冲锋。
  */
 internal object SiteImageGateInterceptor {
     /** 门禁主动拒绝（排队超时 / 冷却中）。界面据此判定为瞬时失败，冷却后再重试，而不是降级或放弃。 */
     class ThrottledException(message: String) : IOException(message)
 
     private const val EMOJI_CONCURRENT = 12
-    private const val AVATAR_CONCURRENT = 6
+    private const val AVATAR_CONCURRENT = 3
     private const val MEDIA_CONCURRENT = 4
     private const val ACQUIRE_TIMEOUT_MS = 15_000L
     private const val DEFAULT_COOLDOWN_MS = 4_000L
@@ -478,8 +484,11 @@ internal object SiteImageGateInterceptor {
         return response
     }
 
-    fun cooldownRemainingMs(): Long =
-        (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+    /** 图片自身冷却与主站全局 429 冷却取较长者；[retryImageAfterDelay] 的自动重试也据此等待。 */
+    fun cooldownRemainingMs(): Long = maxOf(
+        (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+        org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
+    )
 
     private fun checkCooldown() {
         val remaining = cooldownRemainingMs()

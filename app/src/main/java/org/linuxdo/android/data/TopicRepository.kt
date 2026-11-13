@@ -359,6 +359,25 @@ class TopicRepository(
         return RateLimitException(remaining)
     }
 
+    /** 主站速率型 429 挑战：递增冷却 + 轻提示，凭据保留；连续超档触发换线时同步淘汰旧节点凭据。 */
+    private fun enterChallenge429Cooldown(
+        path: String,
+        retryAfterSeconds: Long?,
+        sentClearanceFp: String = "-",
+    ): RateLimitException {
+        if (requestHost(path) != Config.HOST) return enterRateLimitCooldown(path, retryAfterSeconds, cfChallenge = true)
+        val (remaining, streak, rotated) = Companion.enterChallenge429Cooldown(path, retryAfterSeconds, sessionStore)
+        if (rotated && sentClearanceFp != "-") {
+            noteRequestClearanceChallenged(sentClearanceFp, path)
+            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线并淘汰旧节点凭据(fp=$sentClearanceFp)，冷却 ${(remaining + 999L) / 1_000L}s")
+        } else {
+            diagnostics.log("429 速率挑战(第 $streak 次): $path，保留 cf_clearance，递增冷却 ${(remaining + 999L) / 1_000L}s 后自愈")
+        }
+        return RateLimitException(remaining)
+    }
+
+    fun resetChallenge429Streak() = Companion.resetChallenge429Streak()
+
     /**
      * 阅读进度上报复用的 CSRF Token。
      * 写请求本来每次都要先 GET 一次 /session/csrf.json,统计这种可丢弃的请求不值得为此翻倍;
@@ -734,7 +753,30 @@ class TopicRepository(
 
     private fun markTimingsSynced() {
         timingsCooldownUntil = 0L
+        resetChallenge429Streak()
         onTimingsRecovered?.invoke()
+    }
+
+    /**
+     * timings 是可丢弃统计：遇 429（无论速率挑战还是普通限流）只熔断自己，绝不写主站全局冷却，
+     * 避免一次后台心跳把前台浏览一起锁死。凭据不判废、不弹验证页。
+     */
+    private fun fuseTimingsOn429(result: TransportResult, stage: String) {
+        val cfChallenge = result.challenged ||
+            ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+            isCfChallengeBody(result.body)
+        val retryAfterMs = result.retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L
+        val fuseMs = maxOf(retryAfterMs, if (cfChallenge) TIMINGS_CHALLENGE_429_FUSE_MS else TIMINGS_RATE_LIMIT_FUSE_MS)
+        timingsCooldownUntil = maxOf(timingsCooldownUntil, SystemClock.elapsedRealtime() + fuseMs)
+        diagnostics.log(
+            "阅读进度上报遇 429(${if (cfChallenge) "CF速率挑战" else "限流"}, $stage)，仅熔断阅读同步 ${fuseMs / 1_000L}s，主站请求不受影响",
+        )
+    }
+
+    /** 退出验证页后保留短暂起飞缓冲（替代立即清零），让用户 resume() 的前台读取先单独落地。 */
+    fun armPostVerificationRunway(runwayMs: Long) {
+        timingsCooldownUntil = SystemClock.elapsedRealtime() + runwayMs
+        cachedCsrfToken = null
     }
 
     enum class VerificationProbeOutcome {
@@ -744,8 +786,10 @@ class TopicRepository(
         CLEARED,
         /** 仍被 Cloudflare 挑战拦截。 */
         CHALLENGED,
-        /** 已尝试请求但暂无法判断：429、网络失败、超时或服务端异常。 */
+        /** 已尝试请求但暂无法判断：网络失败、超时或服务端异常。 */
         INCONCLUSIVE,
+        /** 复核被 429 限流（含速率型挑战）：凭据未必失效，调用方应递增退避后换轻量接口重探。 */
+        RATE_LIMITED,
     }
 
     fun resolveVerificationProbePath(probePath: String?): String {
@@ -817,8 +861,10 @@ class TopicRepository(
                 isCfChallengeBody(result.body)
             )
         if (result.status == 429) {
-            enterRateLimitCooldown(targetPath, result.retryAfterSeconds, cfChallenge = challenge429)
-            return VerificationProbeOutcome.INCONCLUSIVE
+            // 速率型挑战只由验证页自身递增退避，不写主站全局冷却；真实业务限流仍需全局退让。
+            if (!challenge429) enterRateLimitCooldown(targetPath, result.retryAfterSeconds)
+            diagnostics.log("$stageLabel(${transport.name}): $targetPath -> 429(${if (challenge429) "速率挑战" else "限流"})，退避后重探")
+            return VerificationProbeOutcome.RATE_LIMITED
         } else if (isRateLimitCoolingDown()) {
             // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
             return VerificationProbeOutcome.INCONCLUSIVE
@@ -845,9 +891,8 @@ class TopicRepository(
         return VerificationProbeOutcome.INCONCLUSIVE
     }
 
-    /** 用户手工过盾后调用：解除熔断并让下一次心跳优先走 WebView 网络栈。 */
+    /** 阅读同步触发的手工过盾完成后调用：下一次心跳优先走 WebView 网络栈（起飞缓冲由 [armPostVerificationRunway] 统一设置）。 */
     fun onManualVerificationCompleted() {
-        timingsCooldownUntil = 0L
         preferWebViewTimings = true
         cachedCsrfToken = null
     }
@@ -944,8 +989,7 @@ class TopicRepository(
                 when {
                     preferred == null -> Unit
                     preferred.status == 429 -> {
-                        val cooldown = enterRateLimitCooldown("/topics/timings", preferred.retryAfterSeconds)
-                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        fuseTimingsOn429(preferred, "${fallbackTransport.name} 优先")
                         return false
                     }
                     preferred.status in 200..299 -> {
@@ -1021,8 +1065,7 @@ class TopicRepository(
             }
 
             if (primaryResult.status == 429) {
-                val cooldown = enterRateLimitCooldown("/topics/timings", primaryResult.retryAfterSeconds)
-                timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                fuseTimingsOn429(primaryResult, "${primaryTransport.name} 主路径")
                 return false
             }
 
@@ -1098,8 +1141,7 @@ class TopicRepository(
                     diagnostics.recordStatus(primaryTransport.name, retryResult.status, "/topics/timings")
                     failureResult = retryResult
                     if (retryResult.status == 429) {
-                        val cooldown = enterRateLimitCooldown("/topics/timings", retryResult.retryAfterSeconds)
-                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        fuseTimingsOn429(retryResult, "补签后重试")
                         return false
                     }
                     if (retryResult.status in 200..299) {
@@ -1119,8 +1161,7 @@ class TopicRepository(
                             " body=${fallbackResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
                     )
                     if (fallbackResult != null && fallbackResult.status == 429) {
-                        val cooldown = enterRateLimitCooldown("/topics/timings", fallbackResult.retryAfterSeconds)
-                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        fuseTimingsOn429(fallbackResult, "${fallbackTransport.name} 兜底")
                         return false
                     }
                     if (fallbackResult != null && fallbackResult.status in 200..299) {
@@ -2623,22 +2664,31 @@ class TopicRepository(
             checkWriteSession(expectedUserId, expectedGeneration)
             diagnostics.recordStatus(transportProvider().name, result.status, path)
             if (result.status == 429) {
-                val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
-                if (requestHost(path) == Config.HOST && challenge429 && !revalidated && sessionStore?.sessionChanging != true) {
-                    cachedCsrfToken = null
-                    noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                    if (isCarriedClearanceStale(result.sentClearanceFp) ||
-                        transportProvider().revalidate(path, result.sentClearanceFp, requestHost = requestHost(path))
-                    ) {
-                        revalidated = true
-                        csrfRefreshed = true
-                        continue
+                val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                    isCfChallengeBody(result.body)
+                if (cfChallenge) {
+                    // 速率型挑战：凭据仍有效。仅在携带过期值时换新值重放，或当前无凭据(sent=-)时静默补签一次，否则递增冷却。
+                    if (requestHost(path) == Config.HOST && !revalidated && sessionStore?.sessionChanging != true) {
+                        if (isCarriedClearanceStale(result.sentClearanceFp)) {
+                            cachedCsrfToken = null
+                            revalidated = true
+                            csrfRefreshed = true
+                            continue
+                        }
+                        if (result.sentClearanceFp == "-" &&
+                            transportProvider().revalidate(path, "-", requestHost = Config.HOST)
+                        ) {
+                            cachedCsrfToken = null
+                            revalidated = true
+                            csrfRefreshed = true
+                            continue
+                        }
                     }
+                    throw enterChallenge429Cooldown(path, result.retryAfterSeconds, result.sentClearanceFp)
                 }
-                val cfChallenge = challenge429 || isCfChallengeBody(result.body)
-                val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds, cfChallenge = cfChallenge)
+                val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds)
                 val waitSec = result.retryAfterSeconds ?: 3L
-                if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                if (!rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
                     rateLimitRetried = true
                     delay(waitSec * 1_000L)
                     continue
@@ -4672,20 +4722,21 @@ class TopicRepository(
             // 换代理/切直连后凭据与出口不一致时，这一步让第一个被挑战的请求就把凭据换掉，用户无感。
             // 必须在串行闸门外做：静默过盾最长 30 秒，占着闸门会把所有 GET 堵死。
             if (!silentRevalidateForGet(path, challenge.failedClearanceFp)) {
+                if (challenge.isFrom429) {
+                    throw enterChallenge429Cooldown(path, null, challenge.failedClearanceFp)
+                }
                 throw challenge
             }
             return try {
-                pacedGet(path, burst, present, allow429Challenge = true, beforeDispatch = beforeDispatch)
+                pacedGet(path, burst, present, allow429Challenge = false, beforeDispatch = beforeDispatch)
             } catch (retryChallenge: NeedsInteractiveVerification) {
-                // P0-4: CLEARED 后重放立撞 403/429挑战 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
+                // P0-4: CLEARED 后重放立撞 403/503 交互挑战 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
                 // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
+                // 速率型 429 挑战在 dispatchGet 已转为递增冷却（RateLimitException），不会走到这里。
                 getRevalidateBlockedUntil = maxOf(
                     getRevalidateBlockedUntil,
                     SystemClock.elapsedRealtime() + CLEARANCE_MISMATCH_COOLDOWN_MS,
                 )
-                if (retryChallenge.isFrom429) {
-                    enterRateLimitCooldown(path, cfChallenge = true)
-                }
                 diagnostics.log(
                     "静默过盾后重放仍被挑战(sent=${retryChallenge.failedClearanceFp})，判定凭据与 OkHttp 出口不匹配，" +
                         "熔断静默过盾 ${CLEARANCE_MISMATCH_COOLDOWN_MS / 1_000L}s: $path",
@@ -4821,31 +4872,29 @@ class TopicRepository(
                         )
                     }
                     result.status == 429 -> {
-                        val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
-                        if (challenge429 && allow429Challenge) {
+                        val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                            isCfChallengeBody(result.body)
+                        if (cfChallenge) {
                             if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
                                 staleReplayed = true
                                 diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
                                 continue
                             }
-                            noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                            notify403OrChallenged(path, "request $path 429-challenge")
-                            throw NeedsInteractiveVerification(
-                                "请求 $path 被 Cloudflare 速率挑战拦截",
-                                failedClearanceFp = result.sentClearanceFp,
-                                isFrom429 = true,
-                                readProbePath = path,
-                            )
+                            if (allow429Challenge && retryAllowed && present && result.sentClearanceFp == "-") {
+                                diagnostics.log("429 CF 挑战当前无有效 cf_clearance(sent=-)，先尝试一次静默补签: $path")
+                                throw NeedsInteractiveVerification(
+                                    "请求 $path 遇到 Cloudflare 速率验证",
+                                    failedClearanceFp = "-",
+                                    isFrom429 = true,
+                                    readProbePath = path,
+                                )
+                            }
+                            // 速率型挑战：凭据仍有效，不判废、不弹验证页，走递增冷却自愈。
+                            throw enterChallenge429Cooldown(path, result.retryAfterSeconds, result.sentClearanceFp)
                         }
-                        val cfChallenge = challenge429 || isCfChallengeBody(result.body)
-                        if (cfChallenge) {
-                            noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                        }
-                        val cooldownEx = enterRateLimitCooldown(
-                            path, result.retryAfterSeconds, cfChallenge = cfChallenge,
-                        )
+                        val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds)
                         val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
-                        if (retryAllowed && present && !cfChallenge && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        if (retryAllowed && present && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
                             val jitterMs = (200L..800L).random()
                             val totalWaitMs = (waitSec * 1_000L) + jitterMs
                             diagnostics.log("前台请求 429 自动等待 ${totalWaitMs}ms (含抖动 ${jitterMs}ms) 后重试(${attempt + 1}/$MAX_RETRIES): $path")
@@ -4859,7 +4908,10 @@ class TopicRepository(
                         if (isMainSite) notify403OrChallenged("request $path 403")
                         throw HttpStatusException(result.status, result.body.take(120))
                     }
-                    result.status in 200..299 -> return result.body
+                    result.status in 200..299 -> {
+                        if (isMainSite) resetChallenge429Streak()
+                        return result.body
+                    }
                     // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
                     result.status == 0 -> throw NetworkTimeoutException()
                     retryAllowed && result.status >= 500 && attempt < MAX_RETRIES -> {
@@ -4992,6 +5044,49 @@ class TopicRepository(
             return remaining
         }
 
+        /** 主站 429 + cf-mitigated=challenge 的连续命中档位；2xx 或长时间无命中后清零。 */
+        private var challenge429Streak = 0
+        private var lastChallenge429At = 0L
+        private var lastChallenge429RotateAt = 0L
+
+        /** 递增冷却连续撞满最高档后的有限度换线（由 AppContainer 注入，轮换 Anycast 优选节点并回收连接）。 */
+        @Volatile var onChallenge429Persistent: ((reason: String) -> Unit)? = null
+
+        /**
+         * 速率型 429 挑战进入递增冷却（12s → 24s → 40s），不判废凭据、不弹验证页。
+         * 返回本次冷却毫秒与是否需要触发换线。
+         */
+        fun enterChallenge429Cooldown(
+            path: String,
+            retryAfterSeconds: Long?,
+            sessionStore: SessionStore?,
+        ): Triple<Long, Int, Boolean> {
+            val now = SystemClock.elapsedRealtime()
+            val (stepMs, streak, rotate) = synchronized(rateLimitLock) {
+                if (now - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS) challenge429Streak = 0
+                lastChallenge429At = now
+                val step = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
+                challenge429Streak++
+                val shouldRotate = challenge429Streak > CHALLENGE_429_STEPS_MS.size &&
+                    now - lastChallenge429RotateAt > CHALLENGE_429_ROTATE_INTERVAL_MS
+                if (shouldRotate) lastChallenge429RotateAt = now
+                Triple(step, challenge429Streak, shouldRotate)
+            }
+            val retryAfterMs = retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L
+            val cooldownSeconds = (maxOf(stepMs, retryAfterMs) + 999L) / 1_000L
+            val remaining = enterRateLimitCooldown(path, cooldownSeconds, sessionStore, cfChallenge = true)
+            if (rotate) {
+                runCatching { onChallenge429Persistent?.invoke("连续 $streak 次 429 速率挑战: $path") }
+            }
+            return Triple(remaining, streak, rotate)
+        }
+
+        fun resetChallenge429Streak() {
+            synchronized(rateLimitLock) {
+                challenge429Streak = 0
+            }
+        }
+
         fun clearRateLimitCooldown(sessionStore: SessionStore? = null) {
             synchronized(rateLimitLock) {
                 rateLimitedUntil = 0L
@@ -5028,6 +5123,17 @@ class TopicRepository(
         const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
         /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
         const val RATE_LIMIT_COOLDOWN_MS = 10_000L
+        /** 速率型 429 挑战的递增冷却档位。 */
+        private val CHALLENGE_429_STEPS_MS = longArrayOf(12_000L, 24_000L, 40_000L)
+        /** 超过该时长无新的 429 挑战，档位从头计。 */
+        private const val CHALLENGE_429_STREAK_RESET_MS = 3 * 60_000L
+        /** 换线降温的最小间隔，避免节点来回漂移本身又引发风控。 */
+        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 10 * 60_000L
+        /** timings 遇 429 挑战时仅自身熔断的时长（不写主站全局冷却）。 */
+        private const val TIMINGS_CHALLENGE_429_FUSE_MS = 60_000L
+        /** timings 遇普通 429 且无 Retry-After 时的自身熔断时长。 */
+        private const val TIMINGS_RATE_LIMIT_FUSE_MS = 30_000L
+
         const val KEY_BLOCKED_USERS = "local_blocked_users_json"
 
         /** 通知分区一次加载的目标条数。 */

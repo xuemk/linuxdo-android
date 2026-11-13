@@ -271,6 +271,16 @@ class AppContainer(context: Context) {
             dohCoordinator.recycleConnections("默认网络切换")
             updateWebViewProxyState()
         }
+        // 递增冷却撞满仍持续 429 速率挑战：有限度换一个 Anycast 节点降温（间隔由 TopicRepository 限定为 10 分钟）。
+        org.linuxdo.android.data.TopicRepository.onChallenge429Persistent = { reason ->
+            val next = anycastPool.rotateWinner()
+            if (next != null) {
+                dohCoordinator.recycleConnections("429 速率挑战换线")
+                diagnostics.log("网络链路: $reason，轮换优选节点降温")
+            } else {
+                diagnostics.log("网络链路: $reason，无可用备选节点，维持当前线路")
+            }
+        }
         updateWebViewProxyState()
     }
 
