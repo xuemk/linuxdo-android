@@ -1,9 +1,11 @@
 package org.linuxdo.android.ui.screen
 
 import android.content.Context
+import android.os.Build
 import android.content.Intent
 import android.content.SharedPreferences
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -30,6 +32,9 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -72,6 +77,7 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -95,6 +101,7 @@ import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
@@ -110,6 +117,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.net.toUri
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
@@ -142,6 +152,31 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 internal const val IN_APP_BOOTSTRAP_PATH = "/robots.txt"
 private const val IN_APP_BOOTSTRAP_URL = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
 const val LINUXDO_APPS_PLAZA_URL = "${Config.BASE_URL}/apps"
+
+internal object LdcStore {
+    const val URL = "https://ldcstore.com/"
+
+    fun matches(value: String?): Boolean {
+        val url = value?.toHttpUrlOrNull() ?: return false
+        return url.scheme == "https" && url.host == "ldcstore.com" && url.port == 443 &&
+            url.username.isEmpty() && url.password.isEmpty()
+    }
+}
+
+internal object InAppViewport {
+    fun isBootstrapUrl(value: String?): Boolean {
+        val url = value?.toHttpUrlOrNull() ?: return false
+        return url.scheme == "https" && url.host == Config.HOST && url.encodedPath == IN_APP_BOOTSTRAP_PATH
+    }
+
+    fun shouldShowPage(bootstrapping: Boolean, ready: Boolean, challenge: Boolean, url: String?): Boolean =
+        challenge || (!bootstrapping && ready && !isBootstrapUrl(url))
+
+    fun bottomClipping(viewTop: Int, viewHeight: Int, visibleBottom: Int): Int {
+        val height = viewHeight.coerceAtLeast(0).toLong()
+        return (viewTop.toLong() + height - visibleBottom).coerceIn(0L, height).toInt()
+    }
+}
 
 private fun isAppsPlazaUrl(value: String): Boolean = isTrustedForumUrl(value) &&
     value.toUri().path?.trimEnd('/') == "/apps"
@@ -1151,6 +1186,7 @@ private fun defaultMiniAppTitle(url: String, initialTitle: String?): String {
     val uri = runCatching { url.toUri() }.getOrNull()
     val path = uri?.path?.lowercase().orEmpty()
     return when {
+        LdcStore.matches(url) -> "LDCstore"
         path == "/apps" || path == "/apps/" -> "小程序"
         path.startsWith("/apps/") -> "小程序"
         else -> uri?.host.orEmpty().ifBlank { "L 站页面" }
@@ -1202,7 +1238,7 @@ object MiniAppSessionPool {
         var targetPainted = false
         var showChallenge by mutableStateOf(false)
         var loadEpoch by mutableStateOf(0)
-        var documentUrl = ""
+        var documentUrl by mutableStateOf("")
         var documentId: String? = null
         var bootstrapPreparing = false
         var appInfo by mutableStateOf<MiniAppEntry?>(null)
@@ -1369,9 +1405,7 @@ object MiniAppSessionPool {
         lateinit var holder: HeldSession
 
         fun isBootstrapLocation(raw: String?): Boolean {
-            val parsed = raw?.toUri() ?: return false
-            return parsed.host?.equals(Config.HOST, ignoreCase = true) == true &&
-                parsed.path == IN_APP_BOOTSTRAP_PATH
+            return InAppViewport.isBootstrapUrl(raw)
         }
 
         fun isCurrentHolder(): Boolean = activeHolder === holder &&
@@ -1417,7 +1451,6 @@ object MiniAppSessionPool {
                 if (isCurrentHolder() && holder.loadEpoch == epoch) {
                     syncClearanceBack(IN_APP_BOOTSTRAP_URL)
                     holder.bootstrapDone = true
-                    holder.bootstrapping = false
                     holder.session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 }
             }
@@ -1439,6 +1472,7 @@ object MiniAppSessionPool {
                 return
             }
             holder.contentReady = phase == "ready" || phase == "permission"
+            if (holder.contentReady) holder.bootstrapping = false
             holder.hasRenderedFirstPage = holder.contentReady && holder.targetPainted
             if (phase == "error" || phase == "unavailable") {
                 holder.mainFrameError = state.optString("detail").ifBlank { "小程序暂时无法启动，请稍后重试" }
@@ -1473,7 +1507,8 @@ object MiniAppSessionPool {
                 }
             },
             onTitleChanged = { newTitle ->
-                if (!isBootstrapLocation(holder.documentUrl) && MiniAppEntry.idFromUrl(holder.entryUrl) == null && newTitle.isNotBlank()) {
+                if (!holder.bootstrapping && !isBootstrapLocation(holder.documentUrl) &&
+                    MiniAppEntry.idFromUrl(holder.entryUrl) == null && newTitle.isNotBlank()) {
                     val cleaned = newTitle
                         .removeSuffix(" - LINUX DO")
                         .removeSuffix(" - Linux Do")
@@ -1506,11 +1541,11 @@ object MiniAppSessionPool {
                 }
             },
             onPageError = { failedUrl, error ->
-                holder.bootstrapping = false
                 if (isBootstrapLocation(failedUrl)) {
                     holder.bootstrapDone = true
                     if (isCurrentHolder()) holder.session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 } else {
+                    holder.bootstrapping = false
                     holder.currentUrl = failedUrl.ifBlank { holder.currentUrl }
                     holder.mainFrameError = describeGeckoLoadError(error)
                 }
@@ -1585,12 +1620,10 @@ object MiniAppSessionPool {
                 if (isCurrentHolder() && !holder.bootstrapDone && !holder.bootstrapPreparing &&
                     !holder.showChallenge && holder.mainFrameError == null) {
                     holder.bootstrapDone = true
-                    holder.bootstrapping = false
                     session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 }
             } else {
                 holder.bootstrapDone = true
-                holder.bootstrapping = false
                 session.loadUri(miniAppLaunchUrl(url))
             }
         }
@@ -1645,12 +1678,13 @@ fun InAppBrowserSheet(
     }
 
     val uri = remember(activeTargetUrl) { runCatching { activeTargetUrl.toUri() }.getOrNull() }
-    val validTrustedUrl = remember(activeTargetUrl) {
-        uri != null && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() && isTrustedForumUrl(activeTargetUrl)
+    val validInAppUrl = remember(activeTargetUrl) {
+        uri != null && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() &&
+            (isTrustedForumUrl(activeTargetUrl) || LdcStore.matches(activeTargetUrl))
     }
 
-    LaunchedEffect(activeTargetUrl, validTrustedUrl) {
-        if (!validTrustedUrl) {
+    LaunchedEffect(activeTargetUrl, validInAppUrl) {
+        if (!validInAppUrl) {
             if (uri == null || uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank()) {
                 Toast.makeText(context, "无法打开此链接", Toast.LENGTH_SHORT).show()
             } else {
@@ -1660,7 +1694,7 @@ fun InAppBrowserSheet(
         }
     }
 
-    if (!validTrustedUrl) return
+    if (!validInAppUrl) return
 
     val (holder, _) = remember(activeTargetUrl) {
         MiniAppSessionPool.acquireOrCreate(
@@ -1698,10 +1732,13 @@ fun InAppBrowserSheet(
         }
     }
 
+    val showPage = InAppViewport.shouldShowPage(
+        holder.bootstrapping, holder.hasRenderedFirstPage, holder.showChallenge, holder.documentUrl,
+    )
     var isTimeout by remember(holder) { mutableStateOf(false) }
-    LaunchedEffect(holder, holder.loadEpoch, holder.hasRenderedFirstPage, holder.showChallenge, holder.mainFrameError) {
+    LaunchedEffect(holder, holder.loadEpoch, showPage, holder.mainFrameError) {
         isTimeout = false
-        if (!holder.hasRenderedFirstPage && !holder.showChallenge && holder.mainFrameError == null) {
+        if (!showPage && holder.mainFrameError == null) {
             delay(15_000)
             isTimeout = true
         }
@@ -1710,11 +1747,51 @@ fun InAppBrowserSheet(
     DisposableEffect(holder, geckoView) {
         MiniAppSessionPool.markContainerEntered()
         (geckoView.parent as? ViewGroup)?.removeView(geckoView)
-        geckoView.alpha = if (holder.hasRenderedFirstPage || holder.showChallenge) 1f else 0f
+        geckoView.alpha = if (showPage) 1f else 0f
         geckoView.setSession(holder.session)
         holder.session.setActive(true)
 
+        val visibleBounds = android.graphics.Rect()
+        val visibleFrame = android.graphics.Rect()
+        val screenLocation = IntArray(2)
+        val rootLocation = IntArray(2)
+        var lastClipping = -1
+        var disposed = false
+        fun updateVisibleViewport() {
+            if (disposed || geckoView.height <= 0 || !geckoView.getGlobalVisibleRect(visibleBounds)) return
+            geckoView.getLocationOnScreen(screenLocation)
+            geckoView.rootView.getLocationOnScreen(rootLocation)
+            visibleBounds.offset(rootLocation[0], rootLocation[1])
+            geckoView.getWindowVisibleDisplayFrame(visibleFrame)
+            val rootInsets = ViewCompat.getRootWindowInsets(geckoView)
+            val safeBottom = if (Build.VERSION.SDK_INT >= 30 && rootInsets != null) {
+                val manager = geckoView.context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val bottomInset = rootInsets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime(),
+                ).bottom
+                manager.currentWindowMetrics.bounds.bottom - bottomInset
+            } else visibleFrame.bottom
+            val clipping = InAppViewport.bottomClipping(
+                screenLocation[1], geckoView.height, minOf(visibleBounds.bottom, safeBottom),
+            )
+            if (clipping != lastClipping) {
+                geckoView.setVerticalClipping(clipping)
+                lastClipping = clipping
+            }
+        }
+        val layoutListener = android.view.ViewTreeObserver.OnGlobalLayoutListener { updateVisibleViewport() }
+        geckoView.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+        geckoView.addWindowInsetsListener("linuxdo-in-app-viewport") { _, insets ->
+            geckoView.post { updateVisibleViewport() }
+            insets
+        }
+        ViewCompat.requestApplyInsets(geckoView)
+
         onDispose {
+            disposed = true
+            if (geckoView.viewTreeObserver.isAlive) geckoView.viewTreeObserver.removeOnGlobalLayoutListener(layoutListener)
+            geckoView.removeWindowInsetsListener("linuxdo-in-app-viewport")
+            geckoView.setVerticalClipping(0)
             runCatching { geckoView.releaseSession() }
             MiniAppSessionPool.markContainerExited(
                 expectedHolder = holder,
@@ -1723,7 +1800,7 @@ fun InAppBrowserSheet(
         }
     }
 
-    val showColdStartOverlay = holder.mainFrameError == null && !holder.showChallenge && !holder.hasRenderedFirstPage
+    val showColdStartOverlay = holder.mainFrameError == null && !showPage
 
     Dialog(
         onDismissRequest = closeApp,
@@ -1732,6 +1809,13 @@ fun InAppBrowserSheet(
             decorFitsSystemWindows = false,
         ),
     ) {
+        val dialogView = LocalView.current
+        DisposableEffect(dialogView) {
+            (dialogView.parent as? DialogWindowProvider)?.window?.setLayout(
+                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            )
+            onDispose { }
+        }
         BackHandler {
             when {
                 actionSheetVisible -> actionSheetVisible = false
@@ -1747,8 +1831,8 @@ fun InAppBrowserSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .background(navBarBg)
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                // 独立窗口按自己的安全区布局，避免复用主界面已消费的 Insets。
+                .padding(WindowInsets.safeDrawing.asPaddingValues()),
         ) {
             Column(Modifier.fillMaxSize()) {
                 // 1. 原生导航栏 (44dp) —— default 模式下显示完整顶栏，custom 模式下隐藏顶栏让视图置顶
@@ -1865,9 +1949,9 @@ fun InAppBrowserSheet(
                     } else {
                         AndroidView(
                             factory = { geckoView },
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxSize().clipToBounds(),
                             update = { view ->
-                                view.alpha = if (holder.hasRenderedFirstPage || holder.showChallenge) 1f else 0f
+                                view.alpha = if (showPage) 1f else 0f
                             },
                         )
                     }

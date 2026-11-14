@@ -59,6 +59,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -1694,7 +1695,7 @@ private fun TopicPreviewDialog(
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(34.dp)
+                                    .heightIn(min = 34.dp)
                                     .clip(RoundedCornerShape(10.dp))
                                     .background(itemBg)
                                     .clickable(enabled = !updating) {
@@ -1802,7 +1803,7 @@ private fun TopicPreviewDialog(
                     ),
                     shape = RoundedCornerShape(20.dp),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                    modifier = Modifier.height(38.dp)
+                    modifier = Modifier.heightIn(min = 38.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         PostActionIcon(PostAction.Reply, false, tint = Color.White, modifier = Modifier.size(13.dp))

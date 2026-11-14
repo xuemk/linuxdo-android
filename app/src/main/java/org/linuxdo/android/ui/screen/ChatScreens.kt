@@ -1143,6 +1143,7 @@ private fun ChatComposerBottomSheet(
                 }
             }
 
+            val editorTextSizePx = with(androidx.compose.ui.platform.LocalDensity.current) { 16.sp.toPx() }
             // 中间输入区域 (圆角灰色底，内嵌原生富文本图文流编辑器)
             Box(
                 modifier = Modifier
@@ -1168,6 +1169,7 @@ private fun ChatComposerBottomSheet(
                             },
                             update = { view ->
                                 view.updateThemeColors(textColorInt, hintColorInt)
+                                view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                                 view.setCompletionSource(completionSource)
                             },
                         )

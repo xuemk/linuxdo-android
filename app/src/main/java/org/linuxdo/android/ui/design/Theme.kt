@@ -16,7 +16,10 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
@@ -43,10 +46,17 @@ object IosTheme {
 fun IosTheme(
     dark: Boolean = isSystemInDarkTheme(),
     skinPreset: SkinPreset = SkinPreset.CLASSIC,
+    fontScale: Float = AppFontScale.DEFAULT,
     content: @Composable () -> Unit,
 ) {
     val skin = resolveAppSkin(skinPreset, isDark = dark)
     val colors = skin.colors
+    val systemDensity = LocalDensity.current
+    val appDensity = remember(systemDensity, fontScale) {
+        val scale = AppFontScale.normalize(fontScale)
+        if (scale == AppFontScale.DEFAULT) systemDensity
+        else Density(systemDensity.density, systemDensity.fontScale * scale)
+    }
     val view = LocalView.current
     SideEffect {
         (view.context as? Activity)?.window?.let { window ->
@@ -61,6 +71,7 @@ fun IosTheme(
         }
     }
     CompositionLocalProvider(
+        LocalDensity provides appDensity,
         LocalIosColors provides colors,
         LocalAppSkin provides skin,
         LocalIosTypography provides DefaultIosTypography,

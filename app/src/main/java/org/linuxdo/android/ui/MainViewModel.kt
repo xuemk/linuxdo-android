@@ -1952,6 +1952,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     } ?: ThemeMode.System)
     val themeMode = _themeMode.asStateFlow()
 
+    private val _fontScale = MutableStateFlow(
+        run {
+            val saved = runCatching { container.preferences.getFloat("font_scale", 1f) }.getOrDefault(1f)
+            val normalized = org.linuxdo.android.ui.design.AppFontScale.normalize(saved)
+            if (saved != normalized) container.preferences.edit { putFloat("font_scale", normalized) }
+            normalized
+        }
+    )
+    val fontScale = _fontScale.asStateFlow()
+
+    fun setFontScale(scale: Float) {
+        val normalized = org.linuxdo.android.ui.design.AppFontScale.normalize(scale)
+        if (_fontScale.value == normalized) return
+        _fontScale.value = normalized
+        container.preferences.edit { putFloat("font_scale", normalized) }
+    }
+
+    private val _showTopicScrollbar = MutableStateFlow(container.preferences.getBoolean("show_topic_scrollbar", true))
+    val showTopicScrollbar = _showTopicScrollbar.asStateFlow()
+
+    fun setShowTopicScrollbar(show: Boolean) {
+        _showTopicScrollbar.value = show
+        container.preferences.edit { putBoolean("show_topic_scrollbar", show) }
+    }
+
     private val _skinPreset = MutableStateFlow(
         run {
             val saved = store.getSkinPresetId()

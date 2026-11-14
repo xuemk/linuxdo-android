@@ -4,6 +4,17 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
+
+object AppFontScale {
+    const val DEFAULT = 1f
+    const val MIN = 0.8f
+    const val MAX = 1.3f
+    const val STEPS = 9
+
+    fun normalize(value: Float): Float =
+        if (value.isFinite()) (value.coerceIn(MIN, MAX) * 20).roundToInt() / 20f else DEFAULT
+}
 
 /**
  * iOS Text Styles 的字号与行高。SF Pro 不能打包(授权),用系统 sans-serif 近似字形,

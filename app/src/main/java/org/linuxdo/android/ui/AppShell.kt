@@ -133,6 +133,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val showWebLoginModal = state.screen == Screen.Login && loginUiState.showWebLoginDialog
     val accountsState by viewModel.accounts.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
+    val fontScale by viewModel.fontScale.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
     val notificationPollInterval by viewModel.notificationPollInterval.collectAsStateWithLifecycle()
@@ -183,7 +184,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
         ThemeMode.Light -> false
         ThemeMode.Dark -> true
     }
-    IosTheme(dark = dark, skinPreset = skinPreset) {
+    IosTheme(dark = dark, skinPreset = skinPreset, fontScale = fontScale) {
         Box(
             Modifier
                 .fillMaxSize()
@@ -557,6 +558,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val floatingBallYRatio by viewModel.floatingBallYRatio.collectAsStateWithLifecycle()
     val floatingBallOnRight by viewModel.floatingBallOnRight.collectAsStateWithLifecycle()
     val treeView by viewModel.treeView.collectAsStateWithLifecycle()
+    val fontScale by viewModel.fontScale.collectAsStateWithLifecycle()
+    val showTopicScrollbar by viewModel.showTopicScrollbar.collectAsStateWithLifecycle()
     val syncReadProgress by viewModel.syncReadProgress.collectAsStateWithLifecycle()
     val showUnreadDot by viewModel.showUnreadDot.collectAsStateWithLifecycle()
     val unreadDotPosition by viewModel.unreadDotPosition.collectAsStateWithLifecycle()
@@ -878,6 +881,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     initialPostNumber = resumePostNumber,
                                     onUnknownTag = { viewModel.diagnostics.log("未知 cooked 标签: $it") },
                                     treeView = treeView,
+                                    showTopicScrollbar = showTopicScrollbar,
                                     showUnreadDot = showUnreadDot,
                                     unreadDotPosition = unreadDotPosition,
                                     onLoadReplies = { viewModel.loadReplies(route.topicId, it) },
@@ -1275,6 +1279,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenFollowing = { state.username?.let { stack.push(Route.FollowList(it)) } },
                                 onOpenChat = { stack.push(Route.Chat) },
                                 onOpenBlacklist = { stack.push(Route.Blacklist) },
+                                onOpenLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.LdcStore.URL },
                                 onOpenUser = { username, primaryAvatar, staticAvatar ->
                                     stack.push(Route.UserProfile(username, primaryAvatar, staticAvatar))
                                 },
@@ -1505,6 +1510,10 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onBack = { stack.pop() },
                                 themeMode = themeMode,
                                 onThemeMode = viewModel::setThemeMode,
+                                fontScale = fontScale,
+                                onFontScale = viewModel::setFontScale,
+                                showTopicScrollbar = showTopicScrollbar,
+                                onShowTopicScrollbar = viewModel::setShowTopicScrollbar,
                                 floatingBallEnabled = floatingBallEnabled,
                                 onFloatingBallEnabled = viewModel::setFloatingBallEnabled,
                                 floatingBallActions = floatingBallActions,

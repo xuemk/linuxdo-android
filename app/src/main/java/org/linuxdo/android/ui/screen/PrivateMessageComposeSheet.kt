@@ -286,6 +286,7 @@ fun PrivateMessageComposeSheet(
                 )
             }
 
+            val editorTextSizePx = with(androidx.compose.ui.platform.LocalDensity.current) { 16.sp.toPx() }
             // 正文内容输入区 (填满剩余空间)
             Box(
                 modifier = Modifier
@@ -307,6 +308,7 @@ fun PrivateMessageComposeSheet(
                     },
                     update = {
                         it.updateThemeColors(textColor, hintColor)
+                        it.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                         it.setCompletionSource(completionSource)
                         it.isEnabled = !sending
                     },

@@ -26,6 +26,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.runtime.key
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -48,6 +49,8 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.pager.HorizontalPager
@@ -90,6 +93,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.text.DateFormat
 import java.util.Date
 import kotlin.math.min
+import kotlin.math.roundToInt
+import org.linuxdo.android.ui.design.AppFontScale
 import org.linuxdo.android.Config
 import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.data.SavedTopic
@@ -496,6 +501,7 @@ fun ProfileScreen(
     onOpenFollowing: () -> Unit = {},
     onOpenChat: () -> Unit = {},
     onOpenBlacklist: () -> Unit = {},
+    onOpenLdcStore: () -> Unit = {},
     onOpenUser: (username: String, primaryAvatar: String?, staticAvatar: String?) -> Unit = { _, _, _ -> },
     onComposePrivateMessage: (String) -> Unit = {},
     onOpenUserReplies: ((String) -> Unit)? = null,
@@ -1011,82 +1017,15 @@ fun ProfileScreen(
                         )
                     }
 
-                    // 5. 常用快捷卡片组 (实时聊天 与 本地拉黑用户)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        // 卡片 1: 实时聊天
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(IosTheme.colors.card)
-                                .border(
-                                    1.dp,
-                                    if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
-                                    RoundedCornerShape(16.dp)
-                                )
-                                .clickable(onClick = onOpenChat)
-                                .padding(horizontal = 14.dp, vertical = 10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text("💬", fontSize = 16.sp)
-                                        Text("实时聊天频道", style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold))
-                                    }
-                                    Text("与佬友在线互动畅聊", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
-                                }
-                                Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel.copy(alpha = 0.6f))
-                            }
-                        }
-                        // 卡片 2: 本地黑名单 (严格对齐文案规范与单行排版)
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(IosTheme.colors.card)
-                                .border(
-                                    1.dp,
-                                    if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
-                                    RoundedCornerShape(16.dp)
-                                )
-                                .clickable(onClick = onOpenBlacklist)
-                                .padding(horizontal = 14.dp, vertical = 10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text("🚫", fontSize = 16.sp)
-                                        Text("本地黑名单", style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold))
-                                    }
-                                    Text(
-                                        text = "本机屏蔽话题、评论",
-                                        style = IosTheme.type.caption.copy(fontSize = 11.sp),
-                                        color = IosTheme.colors.secondaryLabel,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel.copy(alpha = 0.6f))
-                            }
-                        }
+                        ProfileQuickLink("实时聊天", "💬", onOpenChat, Modifier.weight(1f).fillMaxHeight())
+                        ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
                     }
+
+                    ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, value = "ldcstore.com")
 
                     // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
                     UserBadgesSectionCard(
@@ -1365,6 +1304,39 @@ fun ProfileScreen(
             badge = badge,
             onDismiss = { selectedBadge = null },
         )
+    }
+}
+
+@Composable
+private fun ProfileQuickLink(
+    title: String,
+    icon: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    value: String? = null,
+) {
+    Row(
+        modifier.fillMaxWidth().heightIn(min = 44.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(IosTheme.colors.card)
+            .border(1.dp, IosTheme.colors.separator.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(icon, fontSize = 16.sp)
+        Text(
+            title,
+            style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold),
+            modifier = Modifier.weight(1f),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (value != null) {
+            Text(value, style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+        }
+        Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel)
     }
 }
 
@@ -2082,6 +2054,10 @@ fun SettingsScreen(
     onSkinPreset: (org.linuxdo.android.ui.design.SkinPreset) -> Unit = {},
     isSelfHealing: Boolean = false,
     onSelfHealNetwork: () -> Unit = {},
+    fontScale: Float = AppFontScale.DEFAULT,
+    onFontScale: (Float) -> Unit = {},
+    showTopicScrollbar: Boolean = true,
+    onShowTopicScrollbar: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     var showSyncConfirmDialog by remember { mutableStateOf(false) }
@@ -2289,9 +2265,77 @@ fun SettingsScreen(
         }
 
         // ── 2. 阅读与浏览 ──
+        if (page == SettingsPage.Reading) item("font-size") {
+            SectionTitle("字体大小")
+            IosGroupCard {
+                Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "字体大小 · ${(fontScale * 100).roundToInt()}%",
+                            style = IosTheme.type.body.copy(fontSize = 14.5.sp),
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            onClick = { onFontScale(AppFontScale.DEFAULT) },
+                            enabled = fontScale != AppFontScale.DEFAULT,
+                        ) {
+                            Text("恢复默认", style = IosTheme.type.footnote, maxLines = 1)
+                        }
+                    }
+                    Text(
+                        "调整应用内的文字大小，默认 100%。",
+                        style = IosTheme.type.footnote,
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    Slider(
+                        value = fontScale,
+                        onValueChange = onFontScale,
+                        valueRange = AppFontScale.MIN..AppFontScale.MAX,
+                        steps = AppFontScale.STEPS,
+                        colors = SliderDefaults.colors(
+                            thumbColor = IosTheme.colors.accent,
+                            activeTrackColor = IosTheme.colors.accent,
+                            inactiveTrackColor = IosTheme.colors.separator,
+                        ),
+                        modifier = Modifier.fillMaxWidth().semantics { contentDescription = "字体大小" },
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("较小 · 80%", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        Text("较大 · 130%", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(IosTheme.colors.groupedBackground).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("字号预览", style = IosTheme.type.headline)
+                        Text("在 LINUX DO 分享见闻，阅读话题与回复。", style = IosTheme.type.body)
+                        Text("设置立即生效，并在下次打开时保留。", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    }
+                }
+            }
+        }
         if (page == SettingsPage.Reading) item("group-reading") {
             SectionTitle("列表与阅读偏好")
             IosGroupCard {
+                IosRow(onClick = { onShowTopicScrollbar(!showTopicScrollbar) }) {
+                    SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
+                        SettingBookIcon(tint = IosTheme.colors.accent)
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text("右侧楼层导航条", style = IosTheme.type.body.copy(fontSize = 14.5.sp))
+                        Text(
+                            "半透明悬浮于右侧，按下后显示清晰，拖动并松手跳转楼层",
+                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                    IosSwitch(checked = showTopicScrollbar, onCheckedChange = onShowTopicScrollbar)
+                }
+                IosDivider()
                 // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
                 // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
                 if (false) {
@@ -8342,6 +8386,7 @@ fun TopicCreatorSheet(
         // 正文编辑区（所见即所得图文流：基于原生 EditText + ReplacementSpan，全光标连续穿越）
         val textColorInt = IosTheme.colors.label.toArgb()
         val hintColorInt = IosTheme.colors.tertiaryLabel.toArgb()
+        val editorTextSizePx = with(LocalDensity.current) { 16.sp.toPx() }
 
         Box(
             modifier = Modifier
@@ -8367,6 +8412,7 @@ fun TopicCreatorSheet(
                 },
                 update = { view ->
                     view.updateThemeColors(textColorInt, hintColorInt)
+                    view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                     view.setCompletionSource(completionSource, categoryId = state.categoryId)
                     view.setOnEditPollListener { span, spec ->
                         editingPollTarget = Pair(span, spec)

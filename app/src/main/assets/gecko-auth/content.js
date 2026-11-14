@@ -2,6 +2,25 @@
 
 (() => {
   if (window.top !== window || location.origin !== "https://linux.do") return;
+  // 初始化纯文本不参与展示；只遮盖 pre，真实的安全验证表单仍可见。
+  if (location.pathname === "/robots.txt") {
+    const hideBootstrapText = () => {
+      if (!document.documentElement) return false;
+      if (!document.getElementById("linuxdo-bootstrap-cover")) {
+        const style = document.createElement("style");
+        style.id = "linuxdo-bootstrap-cover";
+        style.textContent = "body > pre { visibility: hidden !important; }";
+        document.documentElement.append(style);
+      }
+      return true;
+    };
+    if (!hideBootstrapText()) {
+      const observer = new MutationObserver(() => {
+        if (hideBootstrapText()) observer.disconnect();
+      });
+      observer.observe(document, { childList: true, subtree: true });
+    }
+  }
   const port = browser.runtime.connectNative("linuxdoAuth");
   const page = window.wrappedJSObject;
   const callbackNames = [
