@@ -16,6 +16,8 @@ data class TransportResult(
     val cfMitigated: String? = null,
     /** null 表示通道未记录；空串表示这次请求明确没有发送 _t。 */
     val sentSessionTokenHash: String? = null,
+    /** 响应抵达时的系统单调时钟（elapsedRealtime）；0 表示未采集。 */
+    val receivedAtElapsedMs: Long = 0L,
 )
 
 interface Transport {
@@ -92,6 +94,11 @@ class NeedsInteractiveVerification(
     val failedClearanceFp: String = "-",
     val isFrom429: Boolean = false,
     val readProbePath: String? = null,
+    val requestRound: Long = -1L,
+    val requestGeneration: Long = -1L,
+    val receivedAtElapsedMs: Long = 0L,
+    /** 原始 429 响应携带的服务端等待秒数，转为冷却时必须原样透传。 */
+    val retryAfterSeconds: Long? = null,
 ) : Exception(message)
 
 /**
@@ -120,8 +127,13 @@ class HttpStatusException(val status: Int, detail: String = "", val retryAfterSe
     Exception("HTTP $status $detail".trim())
 
 /** 服务端已明确限流。调用方应等待冷却结束，不能把它当作需要过盾的验证失败。 */
-class RateLimitException(val retryAfterMs: Long) :
-    Exception("请求过于频繁，请在 ${((retryAfterMs + 999L) / 1_000L).coerceAtLeast(1L)} 秒后重试")
+class RateLimitException(
+    val retryAfterMs: Long,
+    val round: Long = -1L,
+    val sessionGeneration: Long = -1L,
+    val receivedAtElapsedMs: Long = 0L,
+    val alreadyRecorded: Boolean = false,
+) : Exception("请求过于频繁，请在 ${((retryAfterMs + 999L) / 1_000L).coerceAtLeast(1L)} 秒后重试")
 
 object ChallengeDetector {
     private val challengeTitles = listOf(

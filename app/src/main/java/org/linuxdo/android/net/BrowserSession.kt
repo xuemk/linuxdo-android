@@ -1237,8 +1237,18 @@ class BrowserSession(
             if (submissionGeneration != authSubmissionGeneration) return@launch
             TopicRepository.postGate.withLock {
                 if (submissionGeneration != authSubmissionGeneration) return@withLock
+                if (TopicRepository.isRateLimitCoolingDown()) {
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
+                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                    return@withLock
+                }
                 TopicRepository.throttlePost(burst = true)
                 if (submissionGeneration != authSubmissionGeneration) return@withLock
+                if (TopicRepository.isRateLimitCoolingDown()) {
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
+                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                    return@withLock
+                }
 
                 currentSubmissionId = submissionId
                 currentSubmissionCallback = submissionCallback
@@ -1329,14 +1339,17 @@ class BrowserSession(
         authSubmitJob = scope.launch(Dispatchers.IO) {
             previousJob?.join()
             TopicRepository.postGate.withLock {
-                if (TopicRepository.isRateLimitCoolingDown()) {
-                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                suspend fun abortIfCoolingDown(): Boolean {
+                    if (!TopicRepository.isRateLimitCoolingDown()) return false
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
                     withContext(Dispatchers.Main) {
                         submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
                     }
-                    return@withLock
+                    return true
                 }
+                if (abortIfCoolingDown()) return@withLock
                 TopicRepository.throttlePost(burst = true)
+                if (abortIfCoolingDown()) return@withLock
                 try {
                     // 1. 获取 CSRF Token
                     diagnostics.log("Native 登录第 1 步: 请求 /session/csrf...")
@@ -1399,6 +1412,7 @@ class BrowserSession(
 
                     // 2. 兑换 hCaptcha token (若有)
                     if (!hcaptchaToken.isNullOrBlank()) {
+                        if (abortIfCoolingDown()) return@launch
                         diagnostics.log("Native 登录第 2 步: 兑换 hCaptcha token...")
                         val endpoints = listOf("/captcha/hcaptcha/create.json", "/hcaptcha/create.json")
                         var hOk = false
@@ -1406,6 +1420,7 @@ class BrowserSession(
                         var isCfEncountered = false
 
                         for (ep in endpoints) {
+                            if (abortIfCoolingDown()) return@launch
                             val hBody = FormBody.Builder()
                                 .add("token", hcaptchaToken)
                                 .build()
@@ -1460,6 +1475,7 @@ class BrowserSession(
                     }
 
                     // 3. 提交登录 /session.json 或 发送邮件 /u/email-login.json
+                    if (abortIfCoolingDown()) return@launch
                     if (isEmailMode) {
                         val email = cachedEmailSend.orEmpty()
                         diagnostics.log("Native 登录第 3 步: 提交发送登录邮件 $email (/u/email-login.json)...")

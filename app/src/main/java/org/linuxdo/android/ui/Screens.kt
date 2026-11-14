@@ -3190,34 +3190,38 @@ fun SettingsScreen(
             var editingServer by remember { mutableStateOf<DohServer?>(null) }
             var showResetConfirmDialog by remember { mutableStateOf(false) }
 
-            val isVpnActive = remember(context) {
-                runCatching {
-                    val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-                    cm?.allNetworks?.any { network ->
-                        cm.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
-                    } ?: false
-                }.getOrDefault(false)
+            val netSecurityState = remember(context) {
+                runCatching { org.linuxdo.android.net.NetworkStateMonitor(context).detect() }
+                    .getOrDefault(org.linuxdo.android.net.NetworkSecurityState())
             }
+            val keepingDohOverVpn = netSecurityState.isVpn && !netSecurityState.isProxy && dohForceOverProxy
 
             SectionTitle("DoH 安全直连")
             IosGroupCard {
-                // VPN 开启提示
-                if (isVpnActive) {
+                // VPN / 系统代理开启提示
+                if (netSecurityState.shouldPauseDoh) {
                     IosRow(onClick = {}) {
-                        SettingIconBadge(bgColor = if (dohForceOverProxy) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)) {
-                            SettingInfoIcon(tint = if (dohForceOverProxy) Color(0xFF4CAF50) else Color(0xFFFF9500))
+                        SettingIconBadge(bgColor = if (keepingDohOverVpn) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)) {
+                            SettingInfoIcon(tint = if (keepingDohOverVpn) Color(0xFF4CAF50) else Color(0xFFFF9500))
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(
-                                if (dohForceOverProxy) "已检测到 VPN (已强制保持 DoH)" else "已检测到 VPN / 系统代理",
+                                when {
+                                    netSecurityState.isProxy -> "已检测到系统 HTTP 代理 (已让渡代理)"
+                                    keepingDohOverVpn -> "已检测到 VPN (已强制保持 DoH)"
+                                    else -> "已检测到 VPN / 系统代理"
+                                },
                                 style = IosTheme.type.body.copy(fontSize = 14.5.sp),
                                 fontWeight = FontWeight.SemiBold,
-                                color = if (dohForceOverProxy) Color(0xFF4CAF50) else Color(0xFFFF9500),
+                                color = if (keepingDohOverVpn) Color(0xFF4CAF50) else Color(0xFFFF9500),
                             )
                             Text(
-                                if (dohForceOverProxy) "已保持原生 DoH + ECH 隧道，可防止代理分流规则设为直连时的明文 SNI 阻断"
-                                else "若代理分流规则将 L 站设为了直连，可能导致打不开；建议开启下方「代理环境保持 DoH」",
+                                when {
+                                    netSecurityState.isProxy -> "系统 HTTP 代理下 Gecko 验证与业务请求统一走系统代理，避免双出口引发风控"
+                                    keepingDohOverVpn -> "已保持原生 DoH + ECH 隧道，可防止代理分流规则设为直连时的明文 SNI 阻断"
+                                    else -> "若 VPN 分流规则将 L 站设为了直连，可能导致打不开；可开启下方「代理环境保持 DoH」（系统 HTTP 代理下不生效）"
+                                },
                                 style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                                 modifier = Modifier.padding(top = 2.dp),
@@ -3291,7 +3295,7 @@ fun SettingsScreen(
                                 style = IosTheme.type.body.copy(fontSize = 14.5.sp),
                             )
                             Text(
-                                "开启 VPN/代理且分流规则直连 L 站时强制保持 DoH，防止明文 SNI 阻断",
+                                "仅对 VPN 生效：分流规则直连 L 站时保持 DoH，防止明文 SNI 阻断；系统 HTTP 代理下始终走代理，保持验证与业务同一出口",
                                 style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                                 modifier = Modifier.padding(top = 2.dp),

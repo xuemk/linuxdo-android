@@ -1499,7 +1499,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     /** 是否在开启系统代理/VPN 时强制保持 DoH + ECH 直连（防止直连分流规则导致阻断，默认关闭由系统让渡） */
-    fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
+    override fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
 
     fun setDohForceOverProxyEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_DOH_FORCE_OVER_PROXY, enabled).apply()

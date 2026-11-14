@@ -153,7 +153,7 @@ class AppContainer(context: Context) {
         store = sessionStore,
         diagnostics = diagnostics,
         httpClientProvider = { dohCoordinator.currentClient },
-        isProxyOrVpnActiveProvider = { networkMonitor.detect().shouldPauseDoh },
+        isProxyOrVpnActiveProvider = { networkMonitor.detect().shouldYieldToSystem(sessionStore.isDohForceOverProxyEnabled()) },
     )
 
     val networkMonitor = NetworkStateMonitor(context) {
@@ -290,7 +290,7 @@ class AppContainer(context: Context) {
      * 并在代理与直连状态切换时，自动清除旧网络出口下的 cf_clearance，避免携带异地 IP 凭据撞盾。
      */
     fun updateWebViewProxyState() {
-        val shouldPause = networkMonitor.detect().shouldPauseDoh
+        val shouldPause = networkMonitor.detect().shouldYieldToSystem(sessionStore.isDohForceOverProxyEnabled())
         val previousPause = lastShouldPauseDoh
         if (previousPause != null && previousPause != shouldPause) {
             val oldFp = sessionStore.currentCfClearanceFp()

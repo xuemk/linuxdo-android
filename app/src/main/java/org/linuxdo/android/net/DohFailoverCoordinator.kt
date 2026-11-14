@@ -133,13 +133,16 @@ class DohFailoverCoordinator(
     val currentClient: OkHttpClient
         get() = currentEpoch.get().client
 
+    private fun shouldPauseDohForProxy(state: NetworkSecurityState = networkMonitor.detect()): Boolean =
+        state.shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+
     /**
      * 判断异常是否符合故障转移触发资格。
      */
     fun isFailoverEligible(error: Throwable): Boolean {
         // 如果未开启自动故障切换，或 DoH 本身已关闭，或当前处于 VPN/系统代理暂停中，则不触发切换
         if (!store.isDohEnabled() || !store.isDohAutoFailoverEnabled()) return false
-        if (networkMonitor.detect().shouldPauseDoh) return false
+        if (shouldPauseDohForProxy()) return false
 
         return isDefinitiveDohEchError(error) || isJitterError(error)
     }
@@ -343,8 +346,8 @@ class DohFailoverCoordinator(
     }
 
     private fun buildEpoch(gen: Long, server: DohServer): TransportEpoch {
-        // VPN / 系统代理享有最高优先级：整体让渡系统网络，不做任何直连或 DoH 特殊处理。
-        val shouldYieldToSystem = networkMonitor.detect().shouldPauseDoh
+        // VPN / 系统代理默认让渡系统网络；仅当用户显式开启「代理环境保持 DoH」时才继续维持 DoH + ECH 直连。
+        val shouldYieldToSystem = shouldPauseDohForProxy()
         // 「直连优先」：无 VPN 时**始终**建立原生传输层。它用内置 ECH 公钥握手，不依赖 DoH
         // 可达性（见 native 的 ech.rs），因此设置里的 DoH 开关只决定 A 记录解析源，
         // 不再决定直连能力的存亡 —— 旧实现把 transport 绑在 isDohEnabled 上，用户一关开关
@@ -443,8 +446,8 @@ class DohFailoverCoordinator(
         }
 
         val netState = networkMonitor.detect()
-        if (netState.shouldPauseDoh) {
-            val summary = if (netState.isVpn) "VPN 已开启，直连已让渡系统网络" else "系统代理已开启，直连已让渡系统网络"
+        if (shouldPauseDohForProxy(netState)) {
+            val summary = if (netState.isProxy) "系统代理已开启，直连已让渡系统网络" else "VPN 已开启，直连已让渡系统网络"
             latestSmartSummary.set(summary)
             onSmartRouteUpdated?.invoke(activeRouteMode.get(), -1L, -1L, summary)
             return

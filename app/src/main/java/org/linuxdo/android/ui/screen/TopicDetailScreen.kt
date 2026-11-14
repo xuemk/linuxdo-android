@@ -727,7 +727,7 @@ fun TopicDetailScreen(
         }
     }
     val hasSideNavigation = showTopicScrollbar && effectiveFloorTotal > 1 && rows.isNotEmpty()
-    val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView) {
+    val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView, state.descending) {
         derivedStateOf {
             val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
             val visibleRows = rows.filter { it.post.id in visibleIds }
@@ -735,7 +735,9 @@ fun TopicDetailScreen(
                 val first = rows.firstOrNull()?.post?.postNumber ?: 1
                 ReadingFloorIndicator(rootFloor = first, subFloor = null, total = effectiveFloorTotal)
             } else {
-                val activeRow = visibleRows.last()
+                val firstPostVisible = visibleRows.any { it.post.postNumber == 1 }
+                val atTopicTop = !list.canScrollBackward || (firstPostVisible && list.firstVisibleItemIndex <= 1)
+                val activeRow = if (!state.descending && atTopicTop) visibleRows.first() else visibleRows.last()
                 val rootPost = if (activeRow.depth == 0) {
                     activeRow.post
                 } else {
@@ -786,12 +788,9 @@ fun TopicDetailScreen(
     val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
     val topErrorCount = if (showTopError && state.error != null) 1 else 0
 
-    // 1 楼（主帖）是话题的起点，物理上其上方绝无更早的可见楼层。
-    // 若列表中已包含 1 楼，前序残留的 previousIds 仅为服务端历史流水中的被删帖或系统幽灵 ID。
-    // 此时坚决收口关闭前序缺口，彻底避免因占位反复插入与重排引发的楼层横跳。
-    // 从后序楼层跳进来且未加载到 1 楼时，hasHeadPost 为 false，缺口仍正常展示供向上回溯加载。
-    val hasHeadPost = rows.any { it.post.postNumber == 1 }
-    val showPreviousGap = state.previousIds.isNotEmpty() && !hasHeadPost
+    // 从后序楼层（如 #46）跳入时列表为 [#1, #28..#46]，必须保留前序缺口供向上补齐。是否连续只看 stream、窗口起点与 consumedIds（即 previousIds）：树形回复可能提前载入 #2，
+    // 仅凭"1 楼下方是 #2"会把 [#1, #2, #28…] 误判为连续，漏掉 #3～#27。倒序时 previousIds 恒为空。
+    val showPreviousGap = state.previousIds.isNotEmpty()
 
     fun lazyIndexOf(rowIndex: Int, partIndex: Int = 0): Int {
         val afterHead = rowIndex >= headRows.size
@@ -896,6 +895,11 @@ fun TopicDetailScreen(
 
     val performJumpToFloor: (Int) -> Unit = performJumpToFloor@{ targetFloor ->
         val clamped = targetFloor.coerceIn(1, effectiveFloorTotal)
+        if (clamped == 1 && !state.descending && showPreviousGap) {
+            scope.launch { list.scrollToItem(0) }
+            onReloadFromStart()
+            return@performJumpToFloor
+        }
         if (treeView) {
             // 楼中楼模式: 目标只对齐到主楼(depth == 0)
             val rootRows = rows.filter { it.depth == 0 }
@@ -1007,9 +1011,9 @@ fun TopicDetailScreen(
     var upwardAnchor by remember { mutableStateOf<Triple<Long, Int, Int>?>(null) }
     var upwardPrevRowCount by remember { mutableIntStateOf(0) }
     val triggerLoadPrevious = {
-        // 已包含 1 楼时不存在"更早的可见楼层"，前序仅剩被删除/占位的幽灵 id。
-        // 再触发只会让列表围绕锚点重排，产生顶部反复跳动。
-        if (!hasHeadPost && !state.loading && state.previousIds.isNotEmpty()) {
+        // 仅当窗口起点之前仍有未取楼层时才拉取；每批完成后窗口起点前移到本批首个 ID，
+        // 服务端未返回的已删楼层不会被重复请求。
+        if (showPreviousGap && !state.loading && state.previousIds.isNotEmpty()) {
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
             val anchorItem = list.layoutInfo.visibleItemsInfo.firstOrNull { info ->
                 val key = postIdFromListKey(info.key) ?: return@firstOrNull false
@@ -1037,13 +1041,22 @@ fun TopicDetailScreen(
             if (!showPreviousGap) return@derivedStateOf false
             val info = list.layoutInfo.visibleItemsInfo
             val hasGap = info.any { it.key == "load-previous" }
-            val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
-            val firstPostAtTop = firstPostId != null && postIdFromListKey(info.firstOrNull()?.key) == firstPostId
-            hasGap && !firstPostAtTop && list.isScrollInProgress
+            hasGap && located && pendingTargetFloor == null && (list.isScrollInProgress || !list.canScrollBackward)
         }
     }
-    LaunchedEffect(active, nearGapFromBelow, state.loading, state.previousIds.size, state.error) {
-        if (active && nearGapFromBelow && showPreviousGap && !state.loading && state.error == null && state.previousIds.isNotEmpty()) {
+    // 自动补页预算：每次用户拖动只放行一批。静止在顶部且缺口持续可见时，不会每批完成后自动连拉整段前序楼层；
+    // 程序滚动（锚点恢复）不产生拖动交互，不会重置预算。点击缺口按钮属于明确操作，不受此限制。
+    var previousAutoBatches by remember { mutableIntStateOf(0) }
+    LaunchedEffect(list) {
+        list.interactionSource.interactions.collect { interaction ->
+            if (interaction is androidx.compose.foundation.interaction.DragInteraction.Start) previousAutoBatches = 0
+        }
+    }
+    LaunchedEffect(active, nearGapFromBelow, state.loading, state.previousIds.size, state.error, previousAutoBatches) {
+        if (active && nearGapFromBelow && showPreviousGap && !state.loading && state.error == null &&
+            state.previousIds.isNotEmpty() && previousAutoBatches < MAX_AUTO_PREVIOUS_BATCHES_PER_DRAG
+        ) {
+            previousAutoBatches++
             triggerLoadPrevious()
         }
     }
@@ -1617,7 +1630,12 @@ fun TopicDetailScreen(
                                 onOpenSavedTopics = onOpenSavedTopics,
                                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                                 onScrollToTop = {
-                                    if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                                    if (firstPostLoaded && !showPreviousGap) {
+                                        scope.launch { list.animateScrollToItem(0) }
+                                    } else {
+                                        scope.launch { list.scrollToItem(0) }
+                                        onReloadFromStart()
+                                    }
                                 },
                                 onOpenJumpBar = {
                                     showJumpBar = !showJumpBar
@@ -3888,6 +3906,9 @@ private fun AuthorBadge() {
 
 /** 未读蓝点停留多久才算"读过"并开始淡出。 */
 private const val UNREAD_DOT_DWELL_MS = 1_200L
+
+/** 每次拖动最多自动补齐的前序批次数（每批 20 层）。 */
+private const val MAX_AUTO_PREVIOUS_BATCHES_PER_DRAG = 1
 
 /**
  * 楼层号右侧的未读小蓝点。变为已读时淡出并收起宽度,

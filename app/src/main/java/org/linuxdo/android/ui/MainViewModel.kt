@@ -1369,6 +1369,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         store.setDohForceOverProxyEnabled(enabled)
         _dohForceOverProxy.value = enabled
         container.dohCoordinator.refresh()
+        container.updateWebViewProxyState()
+        container.dohCoordinator.triggerSmartRouteEvaluation()
     }
 
     // ── 智能双轨调度状态 ─────────────────────────────────────────────────────────────
@@ -1505,8 +1507,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun testDohServer(server: org.linuxdo.android.net.DohServer) {
         viewModelScope.launch(Dispatchers.IO) {
             val netState = container.networkMonitor.detect()
-            if (netState.shouldPauseDoh && !store.isDohForceOverProxyEnabled()) {
-                val reason = if (netState.isVpn) "VPN 已开启，直连已暂停" else "系统代理已开启，直连已暂停"
+            if (netState.shouldYieldToSystem(store.isDohForceOverProxyEnabled())) {
+                val reason = if (netState.isProxy) "系统代理已开启，直连已暂停" else "VPN 已开启，直连已暂停"
                 _dohLatencies.update { it + (server.id to -1L) }
                 _dohSummaries.update { it + (server.id to reason) }
                 return@launch
@@ -1525,8 +1527,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isTestingAllDoh.value = true
             try {
                 val netState = container.networkMonitor.detect()
-                if (netState.shouldPauseDoh && !store.isDohForceOverProxyEnabled()) {
-                    val reason = if (netState.isVpn) "VPN 已开启，直连已暂停" else "系统代理已开启，直连已暂停"
+                if (netState.shouldYieldToSystem(store.isDohForceOverProxyEnabled())) {
+                    val reason = if (netState.isProxy) "系统代理已开启，直连已暂停" else "VPN 已开启，直连已暂停"
                     val mapLatency = _dohServers.value.associate { it.id to -1L }
                     val mapSummary = _dohServers.value.associate { it.id to reason }
                     _dohLatencies.update { it + mapLatency }
@@ -4671,7 +4673,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val latest = mergeRealtimePosts(original, posts.filter { post -> post.id in original.realtimePostIds })
                         it + (id to latest.copy(
                             posts = (latest.posts + posts).distinctBy { post -> post.id }.sortedBy { post -> post.postNumber },
-                            consumedIds = latest.consumedIds + posts.map { post -> post.id },
+                            consumedIds = latest.consumedIds + posts.map { post -> post.id } + if (previous) requested else emptyList(),
                             windowStartId = if (previous) requested.first() else current.windowStartId,
                             error = null, failedLoad = DetailLoad.Topic,
                         ))
@@ -7685,14 +7687,16 @@ fun openTopicSearch(topicId: Long, title: String) {
         reconcileSessionJob?.cancel()
         reconcileSessionJob = viewModelScope.launch {
             try {
+                if (repository.isRateLimitCoolingDown()) return@launch
                 val currentGen = store.sessionGeneration
-                var realUser = repository.fetchCurrentUserDetails()
+                var realUser = repository.fetchCurrentUserDetails(present = false)
                 if (store.currentUserId() != expectedUserId || store.sessionGeneration != currentGen) return@launch
                 if (realUser == null) {
+                    if (repository.isRateLimitCoolingDown()) return@launch
                     diagnostics.log("后台复核初次未获取到用户，从 WebView 规范化对账后二次复核")
                     withContext(Dispatchers.Main) { store.syncFromWebView() }
-                    if (store.currentUserId() == expectedUserId && store.sessionGeneration == currentGen) {
-                        realUser = repository.fetchCurrentUserDetails()
+                    if (store.currentUserId() == expectedUserId && store.sessionGeneration == currentGen && !repository.isRateLimitCoolingDown()) {
+                        realUser = repository.fetchCurrentUserDetails(present = false)
                     }
                 }
                 if (store.currentUserId() != expectedUserId || store.sessionGeneration != currentGen) return@launch
@@ -7761,7 +7765,8 @@ fun openTopicSearch(topicId: Long, title: String) {
         val requestScopeGeneration = accountScopeGeneration
         pageJobs["sync:categories"] = viewModelScope.launch {
             try {
-                val updated = repository.refreshCategoriesFromServer()
+                if (repository.isRateLimitCoolingDown()) return@launch
+                val updated = repository.refreshCategoriesFromServer(present = false)
                 if (requestScopeGeneration != accountScopeGeneration) return@launch
                 val known = repository.cachedCategoryMap()
                 if (updated != null) {
@@ -7783,7 +7788,8 @@ fun openTopicSearch(topicId: Long, title: String) {
         val requestScopeGeneration = accountScopeGeneration
         pageJobs["sync:tags"] = viewModelScope.launch {
             try {
-                val updated = repository.refreshTagsFromServer()
+                if (repository.isRateLimitCoolingDown()) return@launch
+                val updated = repository.refreshTagsFromServer(present = false)
                 if (requestScopeGeneration != accountScopeGeneration) return@launch
                 if (updated != null) {
                     val (freshList, rawJson) = updated
@@ -8512,7 +8518,9 @@ fun openTopicSearch(topicId: Long, title: String) {
         }
         viewModelScope.launch {
             runCatching {
-                val fresh = repository.fetchFollowing(cleanUser)
+                delay(1_500L)
+                if (repository.isRateLimitCoolingDown()) return@runCatching
+                val fresh = repository.fetchFollowing(cleanUser, present = false)
                 if (isCurrentAccountUsername(cleanUser)) {
                     followedUsernames.value = fresh.map { it.username.lowercase() }.toSet()
                 }
@@ -8993,6 +9001,15 @@ fun openTopicSearch(topicId: Long, title: String) {
             if (requestScopeGeneration != accountScopeGeneration) return
             settleFeedLoading(feed)
             enterWebScreen(Screen.Verify, error.message.orEmpty(), error.readProbePath)
+        } catch (error: RateLimitException) {
+            if (requestScopeGeneration != accountScopeGeneration) return
+            val current = _feedStates.value[feed] ?: TopicListUiState()
+            if (current.items.isNotEmpty()) {
+                diagnostics.log("列表受限流冷却保护，继续展示本地缓存: ${error.message}")
+                settleFeedLoading(feed, null)
+            } else {
+                settleFeedLoading(feed, error.message)
+            }
         } catch (error: HttpStatusException) {
             if (requestScopeGeneration != accountScopeGeneration) return
             val msg = if (error.status == 403 && (_state.value.username == null || (feed == HomeFeedType.Unread || feed == HomeFeedType.Posted))) {

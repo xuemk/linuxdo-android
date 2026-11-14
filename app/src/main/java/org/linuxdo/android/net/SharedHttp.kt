@@ -118,11 +118,11 @@ fun resolveActiveHttpClient(
 
     val userAgent = org.linuxdo.android.AppContainer.resolveUserAgent(context, sessionStore)
     val isDohSwitchOn = sessionStore.isDohEnabled()
-    val isVpnOrProxyActive = NetworkStateMonitor(context).detect().shouldPauseDoh
     val forceOverProxy = sessionStore.isDohForceOverProxyEnabled()
+    val yieldToSystem = NetworkStateMonitor(context).detect().shouldYieldToSystem(forceOverProxy)
 
-    // 综合判断：只有设置开启且（无 VPN/代理直连，或用户开启了代理下保持 DoH）时，才走 DoH + ECH
-    val shouldUseDoh = isDohSwitchOn && (!isVpnOrProxyActive || forceOverProxy)
+    // 综合判断：设置开启且未让渡系统网络时才走 DoH + ECH；系统 HTTP 代理下总是让渡，保持三条链路同一出口
+    val shouldUseDoh = isDohSwitchOn && !yieldToSystem
 
     val transport = if (shouldUseDoh) {
         buildActiveDohTransport(sessionStore)

@@ -52,7 +52,7 @@ object GeckoManager {
         val store = container?.sessionStore
         val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
         val useDoh = store?.isDohEnabled() != false &&
-            (container?.networkMonitor?.detect()?.shouldPauseDoh != true || store?.isDohForceOverProxyEnabled() == true)
+            container?.networkMonitor?.detect()?.shouldYieldToSystem(store?.isDohForceOverProxyEnabled() == true) != true
         val trrMode = if (useDoh) GeckoRuntimeSettings.TRR_MODE_ONLY else GeckoRuntimeSettings.TRR_MODE_DISABLED
         runtime?.let {
             it.settings.setTrustedRecursiveResolverUri(dohUri)
@@ -106,7 +106,8 @@ object GeckoManager {
         val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
         val pauseDoh = container?.networkMonitor?.detect()?.shouldPauseDoh == true
         val forceOverProxy = store?.isDohForceOverProxyEnabled() == true
-        val useDoh = store?.isDohEnabled() != false && (!pauseDoh || forceOverProxy)
+        val useDoh = store?.isDohEnabled() != false &&
+            container?.networkMonitor?.detect()?.shouldYieldToSystem(forceOverProxy) != true
         val trrLabel = if (useDoh) "ONLY(DoH+ECH)" else "DISABLED(系统/代理)"
         val dohHost = runCatching { Uri.parse(dohUri).host }.getOrNull() ?: "-"
         return "TRR=$trrLabel doh=$dohHost pauseDoh=$pauseDoh forceOverProxy=$forceOverProxy"
