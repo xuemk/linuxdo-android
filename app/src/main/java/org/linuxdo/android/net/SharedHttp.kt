@@ -262,7 +262,11 @@ private class SessionHeaderInterceptor(
             builder.header("Cookie", cookieHeader)
         }
         val outgoing = builder.build()
-        SiteImageGateInterceptor.checkRecovery(outgoing.url, store)
+        SiteImageGateInterceptor.checkRecovery(
+            outgoing.url,
+            store,
+            isSignature = outgoing.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null,
+        )
         if ((original.tag(org.linuxdo.android.push.PushSessionProvider::class.java)
                 ?.backgroundRequestDelayMs() ?: 0L) > 0L) {
             throw IOException("后台通知请求暂缓，等待验证或限流结束")
@@ -358,11 +362,13 @@ internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
 internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cfMitigated: String?): Boolean =
     request.url.isHttps && request.url.host == Config.HOST &&
         !isPublicStaticIconUrl(request.url) &&
+        request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) == null &&
         request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe != true &&
         status in setOf(403, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
 
 private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
     request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
+    request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null -> "签名图片"
     isPublicStaticIconUrl(request.url) -> "公开图片"
     else -> "普通API"
 }
@@ -386,7 +392,12 @@ suspend fun awaitImageRetrySlot(attempt: Int) {
     val backoffMs = 2_000L shl attempt.coerceIn(0, 3)
     val jitterMs = kotlin.random.Random.nextLong(400L, 1_800L)
     kotlinx.coroutines.delay(maxOf(SiteImageGateInterceptor.cooldownRemainingMs(), backoffMs) + jitterMs)
-    SiteImageGateInterceptor.awaitClearanceRecovery()
+    while (true) {
+        SiteImageGateInterceptor.awaitClearanceRecovery()
+        val remaining = SiteImageGateInterceptor.cooldownRemainingMs()
+        if (remaining <= 0L) return
+        kotlinx.coroutines.delay(minOf(remaining, 1_000L))
+    }
 }
 
 /** 每张图自动重试的上限，超过后停在占位，等用户手动重载或重新进入页面。 */
@@ -406,6 +417,9 @@ internal object SiteImageGateInterceptor {
     /** 门禁主动拒绝（排队超时 / 冷却中）。界面据此判定为瞬时失败，冷却后再重试，而不是降级或放弃。 */
     class ThrottledException(message: String) : IOException(message)
 
+    /** 签名地址不一定有图片后缀或固定路径，显式标记后仍须经过图片门禁。 */
+    data object SignatureRequest
+
     private const val EMOJI_CONCURRENT = 12
     private const val AVATAR_CONCURRENT = 3
     private const val MEDIA_CONCURRENT = 4
@@ -416,6 +430,8 @@ internal object SiteImageGateInterceptor {
     private const val SVG_PREFIX = "/svg-sprite/"
     private val avatarPrefixes = listOf("/user_avatar/", "/letter_avatar")
     private const val UPLOADS_PREFIX = "/uploads/"
+    private const val IMAGES_PREFIX = "/images/"
+    private val mediaExtensions = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".ico")
 
     private val emojiPermits = java.util.concurrent.Semaphore(EMOJI_CONCURRENT, true)
     private val avatarPermits = java.util.concurrent.Semaphore(AVATAR_CONCURRENT, true)
@@ -427,20 +443,26 @@ internal object SiteImageGateInterceptor {
         NONE, EMOJI, AVATAR, MEDIA
     }
 
-    private fun categorize(url: okhttp3.HttpUrl): ImageCategory {
-        val host = url.host
-        if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return ImageCategory.NONE
+    private fun categorize(url: okhttp3.HttpUrl, isSignature: Boolean = false): ImageCategory {
+        val host = url.host.lowercase().trimEnd('.')
+        val isLinuxDo = host == Config.HOST || host.endsWith(".${Config.HOST}")
+        val isLdStatic = host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+        if (!isLinuxDo && !isLdStatic) return ImageCategory.NONE
         val path = url.encodedPath
+        val lowerPath = path.lowercase()
         return when {
             path.startsWith(EMOJI_PREFIX) || path.startsWith(SVG_PREFIX) -> ImageCategory.EMOJI
             avatarPrefixes.any { path.startsWith(it) } -> ImageCategory.AVATAR
-            path.startsWith(UPLOADS_PREFIX) -> ImageCategory.MEDIA
+            isSignature -> ImageCategory.MEDIA
+            path.startsWith(UPLOADS_PREFIX) || path.startsWith(IMAGES_PREFIX) -> ImageCategory.MEDIA
+            mediaExtensions.any { lowerPath.endsWith(it) } -> ImageCategory.MEDIA
+            isLdStatic -> ImageCategory.MEDIA
             else -> ImageCategory.NONE
         }
     }
 
-    fun checkRecovery(url: okhttp3.HttpUrl, store: SessionStore) {
-        if (categorize(url) == ImageCategory.NONE) return
+    fun checkRecovery(url: okhttp3.HttpUrl, store: SessionStore, isSignature: Boolean = false) {
+        if (categorize(url, isSignature) == ImageCategory.NONE) return
         recoveryStore = store
         if (store.isClearanceRecoveryInProgress()) {
             throw ThrottledException("站内图片暂缓，等待安全验证完成")
@@ -455,9 +477,10 @@ internal object SiteImageGateInterceptor {
 
     fun intercept(chain: Interceptor.Chain, store: SessionStore): Response {
         val request = chain.request()
-        val category = categorize(request.url)
+        val isSignature = request.tag(SignatureRequest::class.java) != null
+        val category = categorize(request.url, isSignature)
         if (category == ImageCategory.NONE) return chain.proceed(request)
-        checkRecovery(request.url, store)
+        checkRecovery(request.url, store, isSignature)
         checkCooldown()
         val semaphore = when (category) {
             ImageCategory.EMOJI -> emojiPermits
@@ -470,7 +493,7 @@ internal object SiteImageGateInterceptor {
         }
         val response = try {
             if (chain.call().isCanceled()) throw IOException("Canceled")
-            checkRecovery(request.url, store)
+            checkRecovery(request.url, store, isSignature)
             checkCooldown()
             chain.proceed(request)
         } finally {
@@ -487,7 +510,7 @@ internal object SiteImageGateInterceptor {
     /** 图片自身冷却与主站全局 429 冷却取较长者；[retryImageAfterDelay] 的自动重试也据此等待。 */
     fun cooldownRemainingMs(): Long = maxOf(
         (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
-        org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
+        org.linuxdo.android.data.TopicRepository.mainSiteGateWaitMs(),
     )
 
     private fun checkCooldown() {
@@ -517,6 +540,21 @@ internal object SiteImageGateInterceptor {
         NetDiagnostics.log(
             "站内图片限流(${if (cfChallenge) "CF质询" else "429"}): ${response.request.url.encodedPath}，" +
                 "图片暂停 ${cooldownMs / 1_000L}s (与主API隔离)",
+        )
+    }
+
+    /** 供站内签名/媒体加载器在遇到 429 或 CF 质询时同步站内图片冷却，不污染主站 API 冷却池。 */
+    fun recordImageCooldownMs(durationMs: Long, path: String = "/signature", cfChallenge: Boolean = false) {
+        val safeMs = durationMs.coerceAtLeast(1_000L)
+        val now = android.os.SystemClock.elapsedRealtime()
+        val first = synchronized(this) {
+            val wasCooling = now < cooldownUntil
+            cooldownUntil = maxOf(cooldownUntil, now + safeMs)
+            !wasCooling
+        }
+        if (!first) return
+        NetDiagnostics.log(
+            "站内图片限流(${if (cfChallenge) "CF质询" else "429"}): $path，图片暂停 ${safeMs / 1_000L}s (与主API隔离)",
         )
     }
 }

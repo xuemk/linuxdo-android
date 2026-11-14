@@ -802,6 +802,9 @@ class TopicRepository(
     /** timings 重新同步成功，横幅可以收起。 */
     var onTimingsRecovered: (() -> Unit)? = null
 
+    /** 会话接口同步到网页端「启用签名」(see_signatures) 偏好时回调。 */
+    var onUserSeeSignaturesSynced: ((userId: Long, enabled: Boolean) -> Unit)? = null
+
     private fun markTimingsSynced() {
         timingsCooldownUntil = 0L
         Companion.stepDownChallenge429Streak()
@@ -878,10 +881,12 @@ class TopicRepository(
         checkSiteSession(userId, generation)
         val targetPath = resolveVerificationProbePath(probePath)
         val stageLabel = if (afterCompletion) "验证后凭据复核" else "验证页旁路探测"
-        if (isRateLimitCoolingDown()) {
+        if (isRateLimitCoolingDown() || (!afterCompletion && isMainSiteGateBusy())) {
+            val remSec = (rateLimitRemainingMs() + 999L) / 1_000L
             diagnostics.logThrottled(
                 "verify-probe-cooldown",
-                "$stageLabel: 429 冷却还剩 ${(rateLimitRemainingMs() + 999L) / 1_000L}s，跳过探测 $targetPath",
+                if (remSec > 0L) "$stageLabel: 429 冷却还剩 ${remSec}s，跳过探测 $targetPath"
+                else "$stageLabel: 主站正处单探针或低速恢复期，让行跳过旁路探测 $targetPath",
             )
             return VerificationProbeOutcome.DEFERRED
         }
@@ -2537,25 +2542,29 @@ class TopicRepository(
                 }
             }
             val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
-            checkWriteSession(expectedUserId, expectedGeneration)
-            diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
-            if (result.status == 429) {
-                val cfChallenge = isCfChallengeBody(result.body)
-                val cooldownEx = enterRateLimitCooldown(
-                    path = "/uploads.json",
-                    retryAfterSeconds = result.retryAfterSeconds,
-                    cfChallenge = cfChallenge,
-                    requestRound = roundSnapshot,
-                    requestGeneration = expectedGeneration ?: -1L,
-                    receivedAtElapsedMs = receivedAt,
-                )
-                val waitSec = result.retryAfterSeconds ?: 3L
-                if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                    rateLimitRetried = true
-                    delay(waitSec * 1_000L)
-                    continue
+            try {
+                checkWriteSession(expectedUserId, expectedGeneration)
+                diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
+                if (result.status == 429) {
+                    val cfChallenge = isCfChallengeBody(result.body)
+                    val cooldownEx = enterRateLimitCooldown(
+                        path = "/uploads.json",
+                        retryAfterSeconds = result.retryAfterSeconds,
+                        cfChallenge = cfChallenge,
+                        requestRound = roundSnapshot,
+                        requestGeneration = expectedGeneration ?: -1L,
+                        receivedAtElapsedMs = receivedAt,
+                    )
+                    val waitSec = result.retryAfterSeconds ?: 3L
+                    if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        rateLimitRetried = true
+                        delay(waitSec * 1_000L)
+                        continue
+                    }
+                    throw cooldownEx
                 }
-                throw cooldownEx
+            } finally {
+                if (result.status == 429) releaseGetProbeForRound(roundSnapshot)
             }
             if (result.challenged) {
                 cachedCsrfToken = null
@@ -2761,56 +2770,58 @@ class TopicRepository(
                 }
             }
             val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
-            checkWriteSession(expectedUserId, expectedGeneration)
-            diagnostics.recordStatus(transportProvider().name, result.status, path)
-            if (result.status == 429) {
-                val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
-                    isCfChallengeBody(result.body)
-                if (cfChallenge) {
-                    // 速率型挑战：凭据仍有效。仅在携带过期值时换新值重放，或当前无凭据(sent=-)时静默补签一次，否则递增冷却。
-                    // 服务端已给出等待时间时不换值重放、不补签，直接按截止时间冷却。
-                    val serverWait = (result.retryAfterSeconds ?: 0L) > 0L
-                    if (requestHost(path) == Config.HOST && !revalidated && !serverWait && sessionStore?.sessionChanging != true) {
-                        if (isCarriedClearanceStale(result.sentClearanceFp)) {
-                            releaseGetProbeForRound(roundSnapshot)
-                            cachedCsrfToken = null
-                            revalidated = true
-                            csrfRefreshed = true
-                            continue
+            try {
+                checkWriteSession(expectedUserId, expectedGeneration)
+                diagnostics.recordStatus(transportProvider().name, result.status, path)
+                if (result.status == 429) {
+                    val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                        isCfChallengeBody(result.body)
+                    if (cfChallenge) {
+                        // 速率型挑战：凭据仍有效。仅在携带过期值时换新值重放，或当前无凭据(sent=-)时静默补签一次，否则递增冷却。
+                        // 服务端已给出等待时间时不换值重放、不补签，直接按截止时间冷却。
+                        val serverWait = (result.retryAfterSeconds ?: 0L) > 0L
+                        if (requestHost(path) == Config.HOST && !revalidated && !serverWait && sessionStore?.sessionChanging != true) {
+                            if (isCarriedClearanceStale(result.sentClearanceFp)) {
+                                cachedCsrfToken = null
+                                revalidated = true
+                                csrfRefreshed = true
+                                continue
+                            }
+                            if (result.sentClearanceFp == "-" && !isRateLimitCoolingDown() &&
+                                transportProvider().revalidate(path, "-", requestHost = Config.HOST)
+                            ) {
+                                cachedCsrfToken = null
+                                revalidated = true
+                                csrfRefreshed = true
+                                continue
+                            }
                         }
-                        if (result.sentClearanceFp == "-" && !isRateLimitCoolingDown() &&
-                            transportProvider().revalidate(path, "-", requestHost = Config.HOST)
-                        ) {
-                            releaseGetProbeForRound(roundSnapshot)
-                            cachedCsrfToken = null
-                            revalidated = true
-                            csrfRefreshed = true
-                            continue
-                        }
+                        throw enterChallenge429Cooldown(
+                            path = path,
+                            retryAfterSeconds = result.retryAfterSeconds,
+                            sentClearanceFp = result.sentClearanceFp,
+                            requestRound = roundSnapshot,
+                            requestGeneration = expectedGeneration ?: -1L,
+                            receivedAtElapsedMs = receivedAt,
+                        )
                     }
-                    throw enterChallenge429Cooldown(
+                    val cooldownEx = enterRateLimitCooldown(
                         path = path,
                         retryAfterSeconds = result.retryAfterSeconds,
-                        sentClearanceFp = result.sentClearanceFp,
                         requestRound = roundSnapshot,
                         requestGeneration = expectedGeneration ?: -1L,
                         receivedAtElapsedMs = receivedAt,
                     )
+                    val waitSec = result.retryAfterSeconds ?: 3L
+                    if (!rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        rateLimitRetried = true
+                        delay(waitSec * 1_000L)
+                        continue
+                    }
+                    throw cooldownEx
                 }
-                val cooldownEx = enterRateLimitCooldown(
-                    path = path,
-                    retryAfterSeconds = result.retryAfterSeconds,
-                    requestRound = roundSnapshot,
-                    requestGeneration = expectedGeneration ?: -1L,
-                    receivedAtElapsedMs = receivedAt,
-                )
-                val waitSec = result.retryAfterSeconds ?: 3L
-                if (!rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                    rateLimitRetried = true
-                    delay(waitSec * 1_000L)
-                    continue
-                }
-                throw cooldownEx
+            } finally {
+                if (result.status == 429 && mainSite) releaseGetProbeForRound(roundSnapshot)
             }
             if (result.challenged || (result.status == 403 && ChallengeDetector.isChallenge(result.status, "", result.body))) {
                 if (requestHost(path) != Config.HOST) {
@@ -3904,6 +3915,13 @@ class TopicRepository(
         }
         if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
         if (generation != null) withContext(Dispatchers.Main) { sessionStore?.normalizeVerifiedAuthCookies(generation) }
+        val customFields = user["custom_fields"] as? JsonObject
+        val seeSignatures = parseBooleanField(user["see_signatures"])
+            ?: parseBooleanField(customFields?.get("see_signatures"))
+        if (seeSignatures != null) {
+            sessionStore?.setSeeSignaturesEnabled(id, seeSignatures)
+            onUserSeeSignaturesSynced?.invoke(id, seeSignatures)
+        }
         val animatedFromSession = user["animated_avatar"]?.jsonPrimitive?.contentOrNull?.takeIf(::isAnimatedAvatarPath)
         val animated = animatedFromSession
             ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
@@ -3918,7 +3936,18 @@ class TopicRepository(
             avatarTemplate = user["avatar_template"]?.jsonPrimitive?.contentOrNull,
             animatedAvatar = animated,
             trustLevel = user["trust_level"]?.jsonPrimitive?.intOrNull,
+            seeSignatures = seeSignatures,
         )
+    }
+
+    private fun parseBooleanField(element: JsonElement?): Boolean? {
+        val primitive = element as? JsonPrimitive ?: return null
+        primitive.booleanOrNull?.let { return it }
+        return when (primitive.contentOrNull?.trim()?.lowercase()) {
+            "true", "t", "1", "yes" -> true
+            "false", "f", "0", "no" -> false
+            else -> null
+        }
     }
 
     suspend fun fetchTrustReport(present: Boolean = false): TrustReport? {
@@ -4148,7 +4177,7 @@ class TopicRepository(
                             try {
                                 executeCall(round).also { status = it.status }
                             } catch (rateLimited: RateLimitException) {
-                                status = 429
+                                if (rateLimited.alreadyRecorded) status = 429
                                 throw rateLimited
                             }
                         }
@@ -4171,7 +4200,7 @@ class TopicRepository(
                     try {
                         executeCall(round).also { status = it.status }
                     } catch (rateLimited: RateLimitException) {
-                        status = 429
+                        if (rateLimited.alreadyRecorded) status = 429
                         throw rateLimited
                     }
                 }
@@ -5447,7 +5476,9 @@ class TopicRepository(
 
         /** 仅当 [round] 正是当前探针持有者时释放；其他请求（包括迟到的旧轮次响应）无权清除探针。 */
         private fun releaseProbeOwnerLocked(round: Long) {
-            if (round > 0L && rateLimitProbeOwner == round) rateLimitProbeOwner = 0L
+            if (round > 0L && rateLimitProbeOwner == round) {
+                rateLimitProbeOwner = 0L
+            }
         }
 
         /**
@@ -5661,11 +5692,13 @@ class TopicRepository(
             val now = SystemClock.elapsedRealtime()
             synchronized(rateLimitLock) {
                 val currentGen = sessionStore?.sessionGeneration ?: -1L
-                if (sessionStore != null && ticket.sessionGeneration >= 0L && ticket.sessionGeneration != currentGen) {
-                    return
-                }
+                val isStaleGeneration = sessionStore != null &&
+                    ticket.sessionGeneration >= 0L &&
+                    ticket.sessionGeneration != currentGen
                 if (ticket.isProbe && rateLimitProbeOwner == ticket.round) {
-                    rateLimitProbeOwner = 0L
+                    releaseProbeOwnerLocked(ticket.round)
+                    // 跨账号/旧会话探针完成时必须先归还探针锁，再保留当前会话的探针验证要求。
+                    if (isStaleGeneration) return
                     // 探针在途期间若有迟到 429 延长了截止时间，本次成功只交还探针，不解除新一段冷却后的探针要求。
                     if (ticket.deadlineVersion != rateLimitDeadlineVersion || now < rateLimitedUntil) return
                     rateLimitProbeRequired = false
@@ -5673,14 +5706,15 @@ class TopicRepository(
                     activeCooldownStreak = -1
                     rateLimitRound++
                     rateLimitRecoveryUntil = now + RATE_LIMIT_RECOVERY_MS
-                    if (challenge429Streak > 0) {
-                        challenge429Streak = (challenge429Streak - 1).coerceAtLeast(0)
-                        lastChallenge429StepDownAt = now
-                    }
+                    // 探针刚通过时不立即降档 challenge429Streak，防止 20s 低速恢复期内再撞 429 时卡死在第一档(12s)；
+                    // 待恢复期平稳结束后，再按 CHALLENGE_429_STEP_DOWN_INTERVAL_MS 逐级退档。
+                    lastChallenge429StepDownAt = now
                 } else if (
+                    !isStaleGeneration &&
                     !ticket.isProbe &&
                     activeCooldownRound < 0L &&
                     now >= rateLimitedUntil &&
+                    now >= rateLimitRecoveryUntil &&
                     ticket.round == rateLimitRound &&
                     challenge429Streak > 0 &&
                     now - lastChallenge429StepDownAt >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS &&
@@ -5713,6 +5747,7 @@ class TopicRepository(
                 if (
                     activeCooldownRound < 0L &&
                     now >= rateLimitedUntil &&
+                    now >= rateLimitRecoveryUntil &&
                     challenge429Streak > 0 &&
                     now - lastChallenge429StepDownAt >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS &&
                     now - lastChallenge429At >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS
@@ -5910,13 +5945,14 @@ class TopicRepository(
                     if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
                     return null
                 }
+                val generation = sessionGenerationProvider()
                 rateLimitRound++
                 rateLimitProbeOwner = rateLimitRound
                 mainSiteInFlight++
                 lastRecoveryClaimAt = now
                 return GetSlotTicket(
                     round = rateLimitRound,
-                    sessionGeneration = sessionGenerationProvider(),
+                    sessionGeneration = generation,
                     isProbe = true,
                     deadlineVersion = rateLimitDeadlineVersion,
                     countsInFlight = true,
@@ -5927,11 +5963,12 @@ class TopicRepository(
                     if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
                     return null
                 }
+                val generation = sessionGenerationProvider()
                 mainSiteInFlight++
                 lastRecoveryClaimAt = now
                 return GetSlotTicket(
                     round = rateLimitRound,
-                    sessionGeneration = sessionGenerationProvider(),
+                    sessionGeneration = generation,
                     isProbe = false,
                     countsInFlight = true,
                 )
@@ -5947,6 +5984,16 @@ class TopicRepository(
         fun isMainSiteGateBusy(): Boolean = synchronized(rateLimitLock) {
             val now = SystemClock.elapsedRealtime()
             now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil
+        }
+
+        /** 图片等被动请求只等待业务探针和恢复期结束，不领取探针票据。 */
+        fun mainSiteGateWaitMs(): Long = synchronized(rateLimitLock) {
+            val now = SystemClock.elapsedRealtime()
+            maxOf(
+                (rateLimitedUntil - now).coerceAtLeast(0L),
+                (rateLimitRecoveryUntil - now).coerceAtLeast(0L),
+                if (rateLimitProbeRequired) PROBE_WAIT_BACKOFF_MS else 0L,
+            )
         }
 
         /**
@@ -5987,11 +6034,14 @@ class TopicRepository(
             block: suspend (round: Long) -> T,
         ): T {
             val ticket = acquireWriteTicket { sessionStore?.sessionGeneration ?: -1L }
+            var responseReturned = false
             return try {
-                block(ticket.round)
+                block(ticket.round).also { responseReturned = true }
             } finally {
                 val st = statusOf()
-                if (st == 429) releaseInFlight(ticket) else settleWriteTicket(ticket, st, sessionStore)
+                // 只有正常返回的 429 才将所有权交给调用方继续记录冷却；异常/取消必须在此兜底归还。
+                if (st == 429 && responseReturned) releaseInFlight(ticket)
+                else settleWriteTicket(ticket, if (responseReturned) st else -1, sessionStore)
             }
         }
 
@@ -6008,14 +6058,15 @@ class TopicRepository(
                 present = present,
                 allowClaimProbe = true,
             ) { sessionStore?.sessionGeneration ?: -1L }
+            var responseReturned = false
             return try {
-                block(ticket.round)
+                block(ticket.round).also { responseReturned = true }
             } finally {
                 val st = statusOf()
                 if (isMainSite) {
-                    if (st == 429) {
-                        // 429 已由内部调用 enterRateLimitCooldown / enterChallenge429Cooldown 按轮次结算
-                    } else if (st in 200..299) {
+                    if (st == 429 && responseReturned) {
+                        // 正常返回的 429 由调用方按轮次记录冷却；异常退出则走下面的兜底释放。
+                    } else if (st in 200..299 && responseReturned) {
                         onMainSiteGetSucceeded(ticket, sessionStore)
                     } else {
                         releaseGetProbeIfAborted(ticket)

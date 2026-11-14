@@ -1195,6 +1195,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val treeView = _treeView.asStateFlow()
     private val _showUnreadDot = MutableStateFlow(container.preferences.getBoolean("show_post_unread_dot", true))
     val showUnreadDot = _showUnreadDot.asStateFlow()
+    private val _seeSignatures = MutableStateFlow(store.isSeeSignaturesEnabled())
+    val seeSignatures = _seeSignatures.asStateFlow()
+    private val _signatureSyncBusy = MutableStateFlow(false)
+    val signatureSyncBusy = _signatureSyncBusy.asStateFlow()
+    private val _signatureSyncNotice = MutableStateFlow<String?>(null)
+    val signatureSyncNotice = _signatureSyncNotice.asStateFlow()
+    private var signatureSyncJob: Job? = null
+    private var lastSignatureSyncAttemptElapsed = 0L
     private val _unreadDotPosition = MutableStateFlow(
         UnreadDotPosition.fromId(container.preferences.getString("post_unread_dot_position", "avatar"))
     )
@@ -3112,6 +3120,88 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setShowUnreadDot(enabled: Boolean) {
         _showUnreadDot.value = enabled
         container.preferences.edit { putBoolean("show_post_unread_dot", enabled) }
+    }
+
+    fun clearSignatureSyncNotice() {
+        _signatureSyncNotice.value = null
+    }
+
+    /**
+     * 从 `/session/current.json` 主动同步网页端「启用签名」(see_signatures) 偏好。
+     * 与普通列表/进帖请求分离并施加冷却节流，避免手动连续点击或频繁开关网页设置触发 429 风控。
+     */
+    fun syncSignaturePreference(fromWebPreferences: Boolean = false) {
+        val currentUserId = store.currentUserId()
+        if (_state.value.username.isNullOrBlank() || currentUserId <= 0L) {
+            _seeSignatures.value = false
+            if (!fromWebPreferences) {
+                _signatureSyncNotice.value = "请先登录后再同步网页端签名设置"
+            }
+            return
+        }
+        if (signatureSyncJob?.isActive == true) return
+        val rateRemaining = repository.rateLimitRemainingMs()
+        if (rateRemaining > 0L) {
+            if (!fromWebPreferences) {
+                _signatureSyncNotice.value = "请求冷却中，请 ${(rateRemaining + 999L) / 1000L} 秒后再试"
+            }
+            return
+        }
+        val minIntervalMs = if (fromWebPreferences) 3_000L else 10_000L
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (lastSignatureSyncAttemptElapsed > 0L && nowElapsed - lastSignatureSyncAttemptElapsed < minIntervalMs) {
+            if (!fromWebPreferences) {
+                _signatureSyncNotice.value = "刚刚已同步，请稍后再试"
+            }
+            return
+        }
+        val expectedGeneration = store.sessionGeneration
+        val expectedScopeGen = accountScopeGeneration
+        signatureSyncJob = viewModelScope.launch {
+            _signatureSyncBusy.value = true
+            try {
+                if (fromWebPreferences) delay(350L)
+                if (store.currentUserId() != currentUserId ||
+                    store.sessionGeneration != expectedGeneration ||
+                    accountScopeGeneration != expectedScopeGen
+                ) {
+                    return@launch
+                }
+                val stillCoolingMs = repository.rateLimitRemainingMs()
+                if (stillCoolingMs > 0L) {
+                    if (!fromWebPreferences) {
+                        _signatureSyncNotice.value = "请求冷却中，请 ${(stillCoolingMs + 999L) / 1000L} 秒后再试"
+                    }
+                    return@launch
+                }
+                lastSignatureSyncAttemptElapsed = SystemClock.elapsedRealtime()
+                val user = repository.fetchCurrentUserDetails(present = !fromWebPreferences)
+                if (store.currentUserId() != currentUserId ||
+                    store.sessionGeneration != expectedGeneration ||
+                    accountScopeGeneration != expectedScopeGen
+                ) {
+                    return@launch
+                }
+                val enabled = user?.seeSignatures ?: store.isSeeSignaturesEnabled(currentUserId)
+                _seeSignatures.value = enabled
+                _signatureSyncNotice.value = if (enabled) {
+                    "已与网页端同步：签名展示已开启"
+                } else {
+                    "已与网页端同步：签名展示已关闭"
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (rateLimited: org.linuxdo.android.net.RateLimitException) {
+                val sec = ((maxOf(rateLimited.retryAfterMs, repository.rateLimitRemainingMs()) + 999L) / 1000L).coerceAtLeast(1L)
+                _signatureSyncNotice.value = "触发站内限流冷却，请 ${sec} 秒后再试"
+            } catch (verify: NeedsInteractiveVerification) {
+                _signatureSyncNotice.value = verify.message ?: "需要先完成安全验证后再同步"
+            } catch (error: Exception) {
+                _signatureSyncNotice.value = "同步失败：${error.message ?: "请稍后重试"}"
+            } finally {
+                _signatureSyncBusy.value = false
+            }
+        }
     }
 
     fun setUnreadDotPosition(position: UnreadDotPosition) {
@@ -7516,6 +7606,11 @@ fun openTopicSearch(topicId: Long, title: String) {
             _readSyncVerifyBanner.value = false
             readSyncVerificationProbePath = null
         }
+        repository.onUserSeeSignaturesSynced = { syncedUserId, enabled ->
+            if (syncedUserId > 0L && store.currentUserId() == syncedUserId) {
+                _seeSignatures.value = enabled
+            }
+        }
         NotificationHelper.ensureNotificationChannels(app)
         if (store.isBackgroundNotificationEnabled()) {
             NotificationWorker.enqueue(app)
@@ -8578,9 +8673,19 @@ fun openTopicSearch(topicId: Long, title: String) {
         val blocked = repository.getBlockedUsers(userId)
         _blockedUsers.value = blocked
         blockedUsernames.value = blocked.map { it.username.lowercase() }.toSet()
+        _seeSignatures.value = store.isSeeSignaturesEnabled(userId)
+        _signatureSyncNotice.value = null
+        lastSignatureSyncAttemptElapsed = 0L
     }
 
     private fun clearAccountScopedState() {
+        signatureSyncJob?.cancel()
+        signatureSyncJob = null
+        _signatureSyncBusy.value = false
+        _signatureSyncNotice.value = null
+        _seeSignatures.value = false
+        lastSignatureSyncAttemptElapsed = 0L
+        org.linuxdo.android.ui.screen.SignatureMediaLoader.clearAccountScopedCache()
         accountScopeGeneration += 1
         verificationAttempt++
         verificationProbePath = null

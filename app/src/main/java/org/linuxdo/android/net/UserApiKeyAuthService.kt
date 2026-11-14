@@ -369,7 +369,7 @@ class UserApiKeyAuthService(
                             try {
                                 execute(round).also { status = it.status }
                             } catch (rateLimited: RateLimitException) {
-                                status = 429
+                                if (rateLimited.alreadyRecorded) status = 429
                                 throw rateLimited
                             }
                         }
@@ -389,7 +389,7 @@ class UserApiKeyAuthService(
                         try {
                             execute(round).also { status = if (it.challenged) 403 else it.status }
                         } catch (rateLimited: RateLimitException) {
-                            status = 429
+                            if (rateLimited.alreadyRecorded) status = 429
                             throw rateLimited
                         }
                     }

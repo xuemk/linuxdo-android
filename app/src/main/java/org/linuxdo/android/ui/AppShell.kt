@@ -563,6 +563,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val syncReadProgress by viewModel.syncReadProgress.collectAsStateWithLifecycle()
     val showUnreadDot by viewModel.showUnreadDot.collectAsStateWithLifecycle()
     val unreadDotPosition by viewModel.unreadDotPosition.collectAsStateWithLifecycle()
+    val seeSignatures by viewModel.seeSignatures.collectAsStateWithLifecycle()
+    val signatureSyncBusy by viewModel.signatureSyncBusy.collectAsStateWithLifecycle()
+    val signatureSyncNotice by viewModel.signatureSyncNotice.collectAsStateWithLifecycle()
     val showTopicUnreadDot by viewModel.showTopicUnreadDot.collectAsStateWithLifecycle()
     val topicUnreadDotPosition by viewModel.topicUnreadDotPosition.collectAsStateWithLifecycle()
     val isBottomBarVisible by viewModel.isBottomBarVisible.collectAsStateWithLifecycle()
@@ -884,6 +887,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     showTopicScrollbar = showTopicScrollbar,
                                     showUnreadDot = showUnreadDot,
                                     unreadDotPosition = unreadDotPosition,
+                                    showSignatures = seeSignatures,
                                     onLoadReplies = { viewModel.loadReplies(route.topicId, it) },
                                     onReact = { postId, reaction -> viewModel.react(route.topicId, postId, reaction) },
                                     onBoost = { postId, raw -> viewModel.createBoost(route.topicId, postId, raw) },
@@ -1507,6 +1511,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onShowTopicUnreadDot = viewModel::setShowTopicUnreadDot,
                                 topicUnreadDotPosition = topicUnreadDotPosition,
                                 onTopicUnreadDotPosition = viewModel::setTopicUnreadDotPosition,
+                                seeSignatures = seeSignatures,
+                                signatureSyncBusy = signatureSyncBusy,
+                                signatureSyncNotice = signatureSyncNotice,
+                                onSyncSeeSignatures = { viewModel.syncSignaturePreference(fromWebPreferences = false) },
+                                onOpenWebSignaturePreferences = {
+                                    viewModel.clearSignatureSyncNotice()
+                                    globalBrowserUrl = "${org.linuxdo.android.Config.BASE_URL}/my/preferences/profile"
+                                },
                                 onBack = { stack.pop() },
                                 themeMode = themeMode,
                                 onThemeMode = viewModel::setThemeMode,
@@ -1777,7 +1789,16 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         )
     }
     globalBrowserUrl?.let { url ->
-        InAppBrowserSheet(url = url, onDismiss = { globalBrowserUrl = null })
+        InAppBrowserSheet(
+            url = url,
+            onDismiss = {
+                val closedUrl = globalBrowserUrl
+                globalBrowserUrl = null
+                if (closedUrl?.contains("/my/preferences") == true) {
+                    viewModel.syncSignaturePreference(fromWebPreferences = true)
+                }
+            },
+        )
     }
     if (userCard.loading || userCard.user != null || userCard.error != null) {
         UserCardBottomSheet(

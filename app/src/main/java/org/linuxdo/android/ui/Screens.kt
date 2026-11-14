@@ -2058,6 +2058,11 @@ fun SettingsScreen(
     onFontScale: (Float) -> Unit = {},
     showTopicScrollbar: Boolean = true,
     onShowTopicScrollbar: (Boolean) -> Unit = {},
+    seeSignatures: Boolean = false,
+    signatureSyncBusy: Boolean = false,
+    signatureSyncNotice: String? = null,
+    onSyncSeeSignatures: () -> Unit = {},
+    onOpenWebSignaturePreferences: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var showSyncConfirmDialog by remember { mutableStateOf(false) }
@@ -2065,6 +2070,7 @@ fun SettingsScreen(
     var showAutoRefreshIntervalDialog by remember { mutableStateOf(false) }
     var showNotificationScopeDialog by remember { mutableStateOf(false) }
     var showTestPushLabDialog by remember { mutableStateOf(false) }
+    var showSignatureSyncDialog by remember { mutableStateOf(false) }
 
     val prefs = remember { context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE) }
     var devOptionsUnlocked by remember {
@@ -2574,6 +2580,42 @@ fun SettingsScreen(
                             Text("✓", color = IosTheme.colors.accent, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         }
                     }
+                }
+
+                IosDivider()
+
+                // 2.18 显示用户签名（小尾巴，与网页端开关保持一致）
+                IosRow(onClick = { showSignatureSyncDialog = true }) {
+                    SettingIconBadge(bgColor = Color(0xFFEAF7EE)) {
+                        SettingPictureIcon(tint = Color(0xFF2E7D32))
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text("显示用户签名（小尾巴）", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Normal)
+                        Text(
+                            "与网页端「启用签名」设置保持一致，支持动画 SVG / GIF",
+                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                        if (!signatureSyncNotice.isNullOrBlank()) {
+                            Text(
+                                signatureSyncNotice,
+                                style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                                color = IosTheme.colors.accent,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        text = when {
+                            signatureSyncBusy -> "同步中…"
+                            seeSignatures -> "已开启 ›"
+                            else -> "已关闭 ›"
+                        },
+                        style = IosTheme.type.subheadline.copy(fontSize = 13.sp),
+                        color = if (seeSignatures && !signatureSyncBusy) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                    )
                 }
 
                 IosDivider()
@@ -3980,6 +4022,82 @@ fun SettingsScreen(
                 onLogout()
             },
         )
+    }
+
+    if (showSignatureSyncDialog) {
+        Dialog(onDismissRequest = { showSignatureSyncDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 280.dp, max = 340.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(IosTheme.colors.card)
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("用户签名（小尾巴）", style = IosTheme.type.headline, fontWeight = FontWeight.Bold)
+                Text(
+                    "当前网页端状态：${if (seeSignatures) "已开启" else "已关闭"}。\nAPP 严格遵循 linux.do 网页端「个人偏好 → 个人资料 → 启用签名」开关，并在登录、切换账号及关闭网页偏好页后低频同步，避免额外请求触发 429。",
+                    style = IosTheme.type.caption,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+                if (!signatureSyncNotice.isNullOrBlank()) {
+                    Text(
+                        signatureSyncNotice,
+                        style = IosTheme.type.caption,
+                        color = IosTheme.colors.accent,
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.accent.copy(alpha = 0.12f))
+                            .clickable {
+                                showSignatureSyncDialog = false
+                                onOpenWebSignaturePreferences()
+                            }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "前往网页端开启或关闭 ›",
+                            style = IosTheme.type.body,
+                            fontWeight = FontWeight.SemiBold,
+                            color = IosTheme.colors.accent,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.groupedBackground)
+                            .clickable(enabled = !signatureSyncBusy) { onSyncSeeSignatures() }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (signatureSyncBusy) "正在从网页端同步…" else "立即从网页端同步状态",
+                            style = IosTheme.type.body,
+                            color = if (signatureSyncBusy) IosTheme.colors.secondaryLabel else IosTheme.colors.label,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Text(
+                        "关闭",
+                        style = IosTheme.type.body,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { showSignatureSyncDialog = false }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                }
+            }
+        }
     }
 
     if (showAutoRefreshIntervalDialog) {

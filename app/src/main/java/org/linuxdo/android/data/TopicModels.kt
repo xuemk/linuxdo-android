@@ -500,6 +500,8 @@ data class DiscourseUser(
     @SerialName("animated_avatar") val animatedAvatar: String? = null,
     /** 信任等级(Lv0~Lv4)。列表接口在 users[] 里下发,话题详情的楼层里没有。 */
     @SerialName("trust_level") val trustLevel: Int? = null,
+    /** 网页端个人偏好「启用签名」(discourse-signatures see_signatures)，默认关闭。 */
+    @SerialName("see_signatures") val seeSignatures: Boolean? = null,
 )
 
 @Serializable
@@ -1025,6 +1027,8 @@ data class Post(
     @SerialName("can_view_edit_history") val canViewEditHistory: Boolean = false,
     @SerialName("bookmarked") val bookmarked: Boolean = false,
     @SerialName("bookmark_id") val bookmarkId: Long? = null,
+    /** 帖子签名 URL（由服务端 discourse-signatures 插件在帖子数据中下发，不触发额外接口请求）。 */
+    @SerialName("user_signature") val userSignature: String? = null,
     /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
     val raw: String? = null,
 ) {
@@ -1651,6 +1655,86 @@ data class TopicDetail(
 ) {
     val canReply: Boolean get() = details.canCreatePost && !closed && !archived
     val isPrivateMessage: Boolean get() = archetype == "private_message"
+}
+
+/**
+ * 用户签名（「小尾巴」）解析与域名白名单策略，对齐 linux.do 网页端 `discourse-signatures` 插件行为：
+ * 仅放行官方允许的签名宿主与主站上传域的 HTTPS 链接，防止加载来路不明的外链资源或跟踪像素。
+ */
+internal object SignaturePolicy {
+    private val IMG_SRC_REGEX = Regex(
+        """<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val ALLOWED_EXACT_HOSTS = setOf(
+        "cdn3.ldstatic.com",
+        "cdn.ldstatic.com",
+        "prompt.iwooji.com",
+        "idcflare.com",
+        "app.acfun.win",
+        "greeting.app.acfun.win",
+    )
+    private val RASTER_EXTENSIONS = setOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif")
+
+    fun isAllowedHost(host: String): Boolean {
+        val normalized = host.trim().lowercase().trimEnd('.')
+        if (normalized.isEmpty()) return false
+        return normalized in ALLOWED_EXACT_HOSTS ||
+            normalized == Config.HOST ||
+            normalized.endsWith(".${Config.HOST}") ||
+            normalized == "ldstatic.com" ||
+            normalized.endsWith(".ldstatic.com")
+    }
+
+    fun isAllowedImageUrl(url: okhttp3.HttpUrl): Boolean =
+        url.isHttps && url.username.isEmpty() && url.password.isEmpty() && isAllowedHost(url.host)
+
+    /** 是否属于走应用共享直连/DoH 通道的站内及静态资源域（含 ldstatic.com）。 */
+    fun isSiteHostUrl(url: String): Boolean {
+        val host = url.toHttpUrlOrNull()?.host?.lowercase()?.trimEnd('.') ?: return false
+        return host == Config.HOST ||
+            host.endsWith(".${Config.HOST}") ||
+            host == "ldstatic.com" ||
+            host.endsWith(".ldstatic.com")
+    }
+
+    fun resolveSignatureImageUrl(rawSignature: String?): String? {
+        val raw = rawSignature?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        val extracted = if (raw.startsWith("<")) {
+            val match = IMG_SRC_REGEX.find(raw) ?: return null
+            (match.groupValues[1].ifEmpty { match.groupValues[2].ifEmpty { match.groupValues[3] } })
+                .replace("&amp;", "&", ignoreCase = true)
+                .trim()
+        } else {
+            raw
+        }
+        if (extracted.isEmpty() ||
+            extracted.equals("null", ignoreCase = true) ||
+            extracted.equals("undefined", ignoreCase = true) ||
+            extracted.startsWith("data:", ignoreCase = true)
+        ) {
+            return null
+        }
+        val candidate = when {
+            extracted.startsWith("//") -> "https:$extracted"
+            extracted.startsWith("/") -> "${Config.BASE_URL}$extracted"
+            else -> extracted
+        }
+        val parsed = candidate.toHttpUrlOrNull() ?: return null
+        if (!isAllowedImageUrl(parsed)) return null
+        return parsed.toString()
+    }
+
+    fun isKnownRasterUrl(url: String): Boolean {
+        val path = url.toHttpUrlOrNull()?.encodedPath?.lowercase() ?: return false
+        return RASTER_EXTENSIONS.any { path.endsWith(it) }
+    }
+
+    fun isKnownSvgUrl(url: String): Boolean {
+        val path = url.toHttpUrlOrNull()?.encodedPath?.lowercase() ?: return false
+        return path.endsWith(".svg")
+    }
 }
 
 data class SearchPage(

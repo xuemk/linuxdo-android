@@ -184,7 +184,9 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.LruCache
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.widget.Toast
@@ -200,23 +202,39 @@ import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import coil.size.Size
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.net.URLDecoder
+import java.util.concurrent.ConcurrentHashMap
 import org.jsoup.Jsoup
 import kotlin.math.min
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import org.linuxdo.android.App
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Post
 import org.linuxdo.android.data.Boost
 import org.linuxdo.android.data.PostFlagReason
+import org.linuxdo.android.data.SignaturePolicy
+import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.effectiveReplyToPostNumber
 import org.linuxdo.android.data.flatPostRows
 import org.linuxdo.android.data.BoostLength
@@ -241,6 +259,8 @@ import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
 import org.linuxdo.android.ui.html.isImageLinkUrl
 import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
+import org.linuxdo.android.net.HttpHeaderUtils
+import org.linuxdo.android.net.SiteImageGateInterceptor
 import org.linuxdo.android.net.awaitImageRetrySlot
 import org.linuxdo.android.net.isTransientImageError
 
@@ -464,6 +484,7 @@ fun TopicDetailScreen(
     signedIn: Boolean = false,
     showUnreadDot: Boolean = true,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     initialPostNumber: Int? = null,
     onPostsVisible: (List<Int>) -> Unit = {},
     onLiveViewport: (Boolean, Boolean) -> Unit = { _, _ -> },
@@ -1108,6 +1129,7 @@ fun TopicDetailScreen(
                     showReplyToHint = !treeView,
                     unreadDotVisible = unreadDotVisible,
                     unreadDotPosition = unreadDotPosition,
+                    showSignatures = showSignatures,
                     onPicture = { list, idx -> pictureGallery = list to idx },
                     reactions = state.topic?.validReactions.orEmpty(),
                     emojiUrls = state.emojiUrls,
@@ -1202,6 +1224,7 @@ fun TopicDetailScreen(
                         isTopicAuthor = isTopicAuthor,
                         unreadDotVisible = unreadDotVisible,
                         unreadDotPosition = unreadDotPosition,
+                        showSignatures = showSignatures,
                         onPicture = { list, idx -> pictureGallery = list to idx },
                         reactions = state.topic?.validReactions.orEmpty(),
                         emojiUrls = state.emojiUrls,
@@ -3941,6 +3964,7 @@ private fun PostRow(
     showReplyToHint: Boolean = true,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -4088,6 +4112,12 @@ private fun PostRow(
         }
         if (slice.body == null) PreparingPostBody()
         else CookedContent(blocks, onPicture, postImages = slice.body.images, pollPost = post)
+        if (slice.last && slice.body != null && showSignatures) {
+            PostSignatureBlock(
+                rawSignature = post.userSignature,
+                maxHeight = 150.dp,
+            )
+        }
         if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
@@ -4127,6 +4157,7 @@ private fun SubReplyRow(
     isTopicAuthor: Boolean,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -4249,6 +4280,13 @@ private fun SubReplyRow(
         }
         if (slice.body == null) PreparingPostBody()
         else CookedContent(blocks, onPicture, postImages = slice.body.images, subReply = true, pollPost = post)
+        if (slice.last && slice.body != null && showSignatures) {
+            PostSignatureBlock(
+                rawSignature = post.userSignature,
+                maxHeight = 96.dp,
+                compact = true,
+            )
+        }
         if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
@@ -5573,8 +5611,13 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
 
 private val SVG_SCRIPT_REGEX = Regex("<script\\b[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE)
 private val SVG_EVENT_ATTR_REGEX = Regex("\\s+on[a-z0-9_]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)", RegexOption.IGNORE_CASE)
-private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)(?:javascript|vbscript|file)\\s*:")
+private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)\\b(?:javascript|vbscript|file)\\s*:")
 private val SVG_ANIMATION_REGEX = Regex("(?i)(@keyframes|-webkit-keyframes|\\banimation\\s*:|\\banimation-name\\s*:|<animate\\b|<animateTransform\\b|<animateMotion\\b|<animateColor\\b|<set\\b)")
+
+private fun formatSvgDimension(value: Float): String {
+    val asInt = value.toInt()
+    return if (kotlin.math.abs(value - asInt.toFloat()) < 0.001f) asInt.toString() else value.toString()
+}
 
 private fun sanitizeSvgMarkup(raw: String): String {
     val startIdx = raw.indexOf("<svg", ignoreCase = true)
@@ -5590,8 +5633,25 @@ private fun sanitizeSvgMarkup(raw: String): String {
     val tagEnd = svg.indexOf('>')
     if (tagEnd > 0) {
         val openTag = svg.substring(0, tagEnd)
-        if (!openTag.contains("xmlns=", ignoreCase = true)) {
-            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg xmlns=\"http://www.w3.org/2000/svg\"")
+        val extraAttrs = buildString {
+            if (!openTag.contains("xmlns=", ignoreCase = true)) {
+                append(" xmlns=\"http://www.w3.org/2000/svg\"")
+            }
+            if (svg.contains("xlink:", ignoreCase = true) && !openTag.contains("xmlns:xlink=", ignoreCase = true)) {
+                append(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"")
+            }
+            if (!openTag.contains("viewBox=", ignoreCase = true)) {
+                val intrinsic = extractSvgIntrinsicDp(svg)
+                if (intrinsic != null && intrinsic.first > 0f && intrinsic.second > 0f) {
+                    append(" viewBox=\"0 0 ${formatSvgDimension(intrinsic.first)} ${formatSvgDimension(intrinsic.second)}\"")
+                }
+            }
+            if (!openTag.contains("preserveAspectRatio=", ignoreCase = true)) {
+                append(" preserveAspectRatio=\"xMidYMid meet\"")
+            }
+        }
+        if (extraAttrs.isNotEmpty()) {
+            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg$extraAttrs")
         }
     }
     return svg
@@ -5627,14 +5687,18 @@ private fun InlineSvgView(
     svgMarkup: String,
     modifier: Modifier = Modifier,
 ) {
-    val html = remember(svgMarkup) {
+    val encodedHtml = remember(svgMarkup) {
         val clean = sanitizeSvgMarkup(svgMarkup)
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+        val html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
             "<style>" +
-            "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;display:flex;align-items:center;justify-content:center;}" +
-            "svg{width:100%!important;height:100%!important;max-width:100%;max-height:100%;display:block;object-fit:contain;}" +
+            "html,body{margin:0;padding:0;width:100%;background:transparent;overflow:hidden;}" +
+            "svg{width:100%!important;height:auto!important;max-width:100%;display:block;}" +
             "</style></head><body>$clean</body></html>"
+        android.util.Base64.encodeToString(
+            html.toByteArray(StandardCharsets.UTF_8),
+            android.util.Base64.NO_WRAP,
+        )
     }
     AndroidView(
         modifier = modifier,
@@ -5654,14 +5718,16 @@ private fun InlineSvgView(
                     setSupportZoom(false)
                     defaultTextEncodingName = "UTF-8"
                 }
-                tag = html
-                loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+                onResume()
+                tag = encodedHtml
+                loadData(encodedHtml, "text/html; charset=utf-8", "base64")
             }
         },
         update = { webView ->
-            if (webView.tag != html) {
-                webView.tag = html
-                webView.loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            webView.onResume()
+            if (webView.tag != encodedHtml) {
+                webView.tag = encodedHtml
+                webView.loadData(encodedHtml, "text/html; charset=utf-8", "base64")
             }
         },
     )
@@ -6120,6 +6186,15 @@ private val externalMediaCallFactory: okhttp3.Call.Factory by lazy {
     okhttp3.OkHttpClient.Builder()
         .followRedirects(true)
         .followSslRedirects(true)
+        .build()
+}
+
+private val externalNoRedirectCallFactory: okhttp3.Call.Factory by lazy {
+    (externalMediaCallFactory as okhttp3.OkHttpClient).newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .retryOnConnectionFailure(false)
+        .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 }
 
@@ -9672,4 +9747,458 @@ private fun PreparingPostBody() {
                 .clip(RoundedCornerShape(5.dp)).background(IosTheme.colors.separator.copy(alpha = 0.35f)))
         }
     }
+}
+
+private val SVG_OPEN_TAG_REGEX = Regex("<svg\\b([^>]*)>", RegexOption.IGNORE_CASE)
+private val SVG_ATTR_WIDTH_REGEX = Regex("\\bwidth\\s*=\\s*[\"']\\s*([0-9]+(?:\\.[0-9]+)?)(?:px)?\\s*[\"']", RegexOption.IGNORE_CASE)
+private val SVG_ATTR_HEIGHT_REGEX = Regex("\\bheight\\s*=\\s*[\"']\\s*([0-9]+(?:\\.[0-9]+)?)(?:px)?\\s*[\"']", RegexOption.IGNORE_CASE)
+
+private fun extractSvgIntrinsicDp(svg: String): Pair<Float, Float>? {
+    val attrs = SVG_OPEN_TAG_REGEX.find(svg)?.groupValues?.getOrNull(1) ?: return null
+    val width = SVG_ATTR_WIDTH_REGEX.find(attrs)?.groupValues?.getOrNull(1)?.toFloatOrNull()?.takeIf { it > 0f } ?: return null
+    val height = SVG_ATTR_HEIGHT_REGEX.find(attrs)?.groupValues?.getOrNull(1)?.toFloatOrNull()?.takeIf { it > 0f } ?: return null
+    return width to height
+}
+
+internal sealed interface SignatureMediaState {
+    data object Loading : SignatureMediaState
+    data class Svg(
+        val sanitizedMarkup: String,
+        val aspectRatio: Float?,
+        val intrinsicWidthDp: Float?,
+        val intrinsicHeightDp: Float?,
+    ) : SignatureMediaState
+    data class Raster(val bytes: ByteArray) : SignatureMediaState
+    data class Cooldown(val untilElapsedMs: Long, val retryWhenReady: Boolean = false) : SignatureMediaState
+}
+
+/**
+ * 签名媒体单飞缓存与 429 防护加载器：
+ * 1. 同帖/跨帖相同签名 URL 共享单飞请求与内存 LRU 缓存，避免列表滑动与多楼层重复发起 HTTP 请求；
+ * 2. SVG 与位图都只下载一次，分别交给 InlineSvgView 或 Coil 解码，重定向及取消遵循同一规则；
+ * 3. 冷请求限制 2 并发与 60ms 节拍；只有发送前门禁暂缓才自动等待，HTTP 失败不主动重试。
+ */
+internal object SignatureMediaLoader {
+    private const val MAX_CACHE_ENTRIES = 128
+    private const val MAX_CACHE_BYTES = 8 * 1_048_576
+    private const val MAX_SVG_BYTES = 1_048_576
+    private const val MAX_MEDIA_BYTES = 4 * 1_048_576
+    private const val COLD_PACE_MS = 60L
+    private const val DEFAULT_RATE_LIMIT_COOLDOWN_SEC = 60L
+    private const val FAILURE_COOLDOWN_MS = 35_000L
+    private const val MAIN_SITE_BUSY_DEFER_MS = 3_000L
+    private const val MAX_SIGNATURE_REDIRECTS = 3
+
+    private class InFlightEntry(val generation: Long) {
+        val deferred = CompletableDeferred<SignatureMediaState>()
+        lateinit var job: Job
+    }
+
+    private data class DownloadResponse(
+        val status: Int,
+        val url: okhttp3.HttpUrl,
+        val headers: okhttp3.Headers,
+        val bytes: ByteArray?,
+    )
+
+    private val loaderScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cacheGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    private val _generationFlow = kotlinx.coroutines.flow.MutableStateFlow(0L)
+    val generationFlow: kotlinx.coroutines.flow.StateFlow<Long> = _generationFlow
+    private val memoryCache = object : LruCache<String, SignatureMediaState>(MAX_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: SignatureMediaState): Int {
+            val bytes = when (value) {
+                is SignatureMediaState.Raster -> value.bytes.size
+                is SignatureMediaState.Svg -> value.sanitizedMarkup.length * 2
+                else -> 0
+            }
+            // 每项至少按 64 KiB 计入，缓存同时受 8 MiB 和 128 项约束。
+            return bytes.coerceAtLeast(MAX_CACHE_BYTES / MAX_CACHE_ENTRIES)
+        }
+    }
+    private val hostCooldownUntilMs = ConcurrentHashMap<String, Long>()
+    private val inFlight = ConcurrentHashMap<String, InFlightEntry>()
+    private val inFlightLock = Any()
+    private val coldSemaphore = Semaphore(permits = 2)
+    private val paceMutex = Mutex()
+    private var lastColdFetchAtElapsed = 0L
+
+    fun peek(url: String): SignatureMediaState {
+        val now = SystemClock.elapsedRealtime()
+        val cached = synchronized(inFlightLock) { memoryCache.get(url) }
+        if (cached != null) {
+            if (cached !is SignatureMediaState.Cooldown || now < cached.untilElapsedMs) {
+                return cached
+            }
+        }
+        return activeNetworkCooldown(url, now) ?: SignatureMediaState.Loading
+    }
+
+    suspend fun loadOrAwait(
+        url: String,
+        container: org.linuxdo.android.AppContainer,
+        expectedGeneration: Long = cacheGeneration.get(),
+    ): SignatureMediaState {
+        val entry = synchronized(inFlightLock) {
+            if (cacheGeneration.get() != expectedGeneration) return SignatureMediaState.Cooldown(0L)
+            val initial = peek(url)
+            if (initial !is SignatureMediaState.Loading) return initial
+            inFlight[url] ?: InFlightEntry(expectedGeneration).also { created ->
+                val sessionGeneration = container.sessionStore.sessionGeneration
+                created.job = loaderScope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        val result = try {
+                            fetchOnce(url, container, created.generation, sessionGeneration)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (_: SiteImageGateInterceptor.ThrottledException) {
+                            SignatureMediaState.Cooldown(
+                                SystemClock.elapsedRealtime() + MAIN_SITE_BUSY_DEFER_MS,
+                                retryWhenReady = true,
+                            )
+                        } catch (_: Exception) {
+                            recordFailureCooldown(url, created.generation, FAILURE_COOLDOWN_MS)
+                        }
+                        synchronized(inFlightLock) {
+                            created.deferred.complete(
+                                if (cacheGeneration.get() == created.generation) result else SignatureMediaState.Cooldown(0L),
+                            )
+                        }
+                    } finally {
+                        synchronized(inFlightLock) {
+                            created.deferred.complete(SignatureMediaState.Cooldown(0L))
+                            if (inFlight[url] === created) inFlight.remove(url)
+                        }
+                    }
+                }
+                inFlight[url] = created
+            }
+        }
+        entry.job.start()
+        return entry.deferred.await()
+    }
+
+    fun markRasterError(url: String, expectedGeneration: Long) {
+        recordFailureCooldown(url, expectedGeneration, FAILURE_COOLDOWN_MS)
+    }
+
+    fun clearAccountScopedCache() {
+        val cancelledEntries = synchronized(inFlightLock) {
+            val nextGen = cacheGeneration.incrementAndGet()
+            memoryCache.evictAll()
+            val list = inFlight.values.toList()
+            inFlight.clear()
+            _generationFlow.value = nextGen
+            list
+        }
+        val fallback = SignatureMediaState.Cooldown(0L)
+        cancelledEntries.forEach { entry ->
+            entry.job.cancel()
+            entry.deferred.complete(fallback)
+        }
+    }
+
+    private fun activeNetworkCooldown(url: String, nowElapsed: Long): SignatureMediaState.Cooldown? {
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        val host = parsed.host.lowercase()
+        val perHost = hostCooldownUntilMs[host]?.takeIf { nowElapsed < it } ?: 0L
+        if (perHost > 0L) return SignatureMediaState.Cooldown(perHost)
+        if (!SignaturePolicy.isSiteHostUrl(url)) return null
+        val siteWait = SiteImageGateInterceptor.cooldownRemainingMs()
+        return if (siteWait > 0L) SignatureMediaState.Cooldown(nowElapsed + siteWait, retryWhenReady = true) else null
+    }
+
+    private suspend fun executeCancellable(
+        callFactory: okhttp3.Call.Factory,
+        request: Request,
+    ): DownloadResponse = suspendCancellableCoroutine { continuation ->
+        val call = callFactory.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                if (continuation.isActive) continuation.resumeWith(Result.failure(e))
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!continuation.isActive) {
+                    response.close()
+                    return
+                }
+                // 响应体在回调内读完并关闭，取消同时覆盖等待响应头和读取 body 的阶段。
+                val result = runCatching {
+                    response.use {
+                        DownloadResponse(
+                            status = response.code,
+                            url = response.request.url,
+                            headers = response.headers,
+                            bytes = if (response.isSuccessful) readBoundedBytes(response.body) else null,
+                        )
+                    }
+                }
+                if (continuation.isActive) continuation.resumeWith(result)
+            }
+        })
+    }
+
+    private suspend fun fetchOnce(
+        url: String,
+        container: org.linuxdo.android.AppContainer,
+        expectedGen: Long,
+        expectedSessionGeneration: Long,
+    ): SignatureMediaState = coldSemaphore.withPermit {
+        val recheck = peek(url)
+        if (recheck !is SignatureMediaState.Loading) return recheck
+
+        paceMutex.withLock {
+            val now = SystemClock.elapsedRealtime()
+            val wait = COLD_PACE_MS - (now - lastColdFetchAtElapsed)
+            if (wait > 0L) delay(wait)
+            lastColdFetchAtElapsed = SystemClock.elapsedRealtime()
+        }
+
+        val postPace = peek(url)
+        if (postPace !is SignatureMediaState.Loading) return postPace
+
+        var currentUrl = url.toHttpUrlOrNull() ?: return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+        repeat(MAX_SIGNATURE_REDIRECTS + 1) { redirects ->
+            currentCoroutineContext().ensureActive()
+            if (cacheGeneration.get() != expectedGen) {
+                return SignatureMediaState.Cooldown(0L)
+            }
+            if (!SignaturePolicy.isAllowedImageUrl(currentUrl)) {
+                return recordFailureCooldown(url, expectedGen, 300_000L)
+            }
+            val isSite = SignaturePolicy.isSiteHostUrl(currentUrl.toString())
+            if (container.sessionStore.sessionGeneration != expectedSessionGeneration ||
+                container.sessionStore.sessionChanging || container.sessionStore.isSessionRecoveryPending() ||
+                (isSite && container.sessionStore.isClearanceRecoveryInProgress())
+            ) {
+                return SignatureMediaState.Cooldown(
+                    SystemClock.elapsedRealtime() + MAIN_SITE_BUSY_DEFER_MS,
+                    retryWhenReady = true,
+                )
+            }
+            activeNetworkCooldown(currentUrl.toString(), SystemClock.elapsedRealtime())?.let { return it }
+            val factory: okhttp3.Call.Factory = if (isSite) {
+                container.httpClient.newBuilder()
+                    .followRedirects(false)
+                    .followSslRedirects(false)
+                    .retryOnConnectionFailure(false)
+                    .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .apply {
+                        // 故障拦截器会换用另一个客户端重发，不能让它绕过逐跳校验或当前 Call 的取消。
+                        interceptors().removeAll { it is org.linuxdo.android.net.DohFailoverInterceptor }
+                    }
+                    .build()
+            } else {
+                externalNoRedirectCallFactory
+            }
+            val request = Request.Builder()
+                .url(currentUrl)
+                .header("User-Agent", container.sessionStore.userAgentOrNull() ?: container.userAgent)
+                .header("Accept", "image/svg+xml,image/*;q=0.9,*/*;q=0.1")
+                .tag(
+                    org.linuxdo.android.net.ActiveSessionRequest::class.java,
+                    org.linuxdo.android.net.ActiveSessionRequest(expectedSessionGeneration),
+                )
+                .tag(SiteImageGateInterceptor.SignatureRequest::class.java, SiteImageGateInterceptor.SignatureRequest)
+                .build()
+
+            val response = executeCancellable(factory, request)
+            currentCoroutineContext().ensureActive()
+            if (response.status in setOf(301, 302, 303, 307, 308)) {
+                val location = response.headers["Location"]?.trim()?.takeIf { it.isNotEmpty() }
+                val target = location?.let { response.url.resolve(it) }
+                if (redirects >= MAX_SIGNATURE_REDIRECTS || target == null || !SignaturePolicy.isAllowedImageUrl(target)) {
+                    return recordFailureCooldown(url, expectedGen, 300_000L)
+                }
+                currentUrl = target
+            } else {
+                val cfChallenge = response.headers["cf-mitigated"]
+                    ?.contains("challenge", ignoreCase = true) == true
+                if (response.status == 429 || (response.status in setOf(403, 503) && cfChallenge)) {
+                    val waitMs = HttpHeaderUtils.rateLimitCooldownMs(
+                        HttpHeaderUtils.parseRetryAfter(response.headers["Retry-After"]),
+                        DEFAULT_RATE_LIMIT_COOLDOWN_SEC * 1_000L,
+                    )
+                    return recordHostAndUrlRateLimit(url, expectedGen, waitMs, response.url, cfChallenge)
+                }
+                if (response.status !in 200..299) {
+                    return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                }
+                val contentType = response.headers["Content-Type"]?.lowercase().orEmpty()
+                val bodyBytes = response.bytes?.takeIf { it.isNotEmpty() }
+                    ?: return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                val prefix = String(bodyBytes, 0, minOf(bodyBytes.size, 2_048), StandardCharsets.UTF_8).trimStart()
+                val isSvg = contentType.contains("svg") ||
+                    prefix.contains("<svg", ignoreCase = true)
+                if (isSvg) {
+                    if (bodyBytes.size > MAX_SVG_BYTES) return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                    val sanitized = sanitizeSvgMarkup(bodyBytes.toString(StandardCharsets.UTF_8))
+                    if (!sanitized.contains("</svg>", ignoreCase = true) || sanitized.length <= 32) {
+                        return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                    }
+                    val intrinsic = extractSvgIntrinsicDp(sanitized)
+                    val ratio = extractSvgAspectRatio(sanitized)
+                        ?: intrinsic?.let { (w, h) -> if (h > 0f) w / h else null }
+                    val state = SignatureMediaState.Svg(
+                        sanitizedMarkup = sanitized,
+                        aspectRatio = ratio,
+                        intrinsicWidthDp = intrinsic?.first,
+                        intrinsicHeightDp = intrinsic?.second,
+                    )
+                    cacheIfCurrent(url, expectedGen, state)
+                    return state
+                }
+                return if (contentType.startsWith("image/") || contentType.isEmpty() || SignaturePolicy.isKnownRasterUrl(url)) {
+                    SignatureMediaState.Raster(bodyBytes).also {
+                        cacheIfCurrent(url, expectedGen, it)
+                    }
+                } else {
+                    recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                }
+            }
+        }
+        recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+    }
+
+    private fun readBoundedBytes(body: okhttp3.ResponseBody?): ByteArray? {
+        if (body == null) return null
+        val contentLength = body.contentLength()
+        if (contentLength > MAX_MEDIA_BYTES) return null
+        val buffer = ByteArray(8192)
+        val out = ByteArrayOutputStream()
+        body.byteStream().use { input ->
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                total += read
+                if (total > MAX_MEDIA_BYTES) return null
+                out.write(buffer, 0, read)
+            }
+        }
+        return out.toByteArray()
+    }
+
+    private fun recordFailureCooldown(url: String, expectedGen: Long, cooldownMs: Long): SignatureMediaState.Cooldown {
+        val state = SignatureMediaState.Cooldown(SystemClock.elapsedRealtime() + cooldownMs)
+        cacheIfCurrent(url, expectedGen, state)
+        return state
+    }
+
+    private fun cacheIfCurrent(url: String, expectedGen: Long, state: SignatureMediaState) {
+        synchronized(inFlightLock) {
+            if (cacheGeneration.get() == expectedGen) memoryCache.put(url, state)
+        }
+    }
+
+    private fun recordHostAndUrlRateLimit(
+        url: String,
+        expectedGen: Long,
+        waitMs: Long,
+        responseUrl: okhttp3.HttpUrl,
+        cfChallenge: Boolean,
+    ): SignatureMediaState.Cooldown {
+        val now = SystemClock.elapsedRealtime()
+        val until = now + waitMs
+        hostCooldownUntilMs.merge(responseUrl.host.lowercase(), until) { old, incoming -> maxOf(old, incoming) }
+        if (SignaturePolicy.isSiteHostUrl(responseUrl.toString())) {
+            SiteImageGateInterceptor.recordImageCooldownMs(waitMs, responseUrl.encodedPath, cfChallenge)
+        }
+        val state = SignatureMediaState.Cooldown(until)
+        cacheIfCurrent(url, expectedGen, state)
+        return state
+    }
+}
+
+@Composable
+private fun PostSignatureBlock(
+    rawSignature: String?,
+    maxHeight: Dp,
+    compact: Boolean = false,
+) {
+    val resolvedUrl = remember(rawSignature) { SignaturePolicy.resolveSignatureImageUrl(rawSignature) } ?: return
+    val context = LocalContext.current
+    val container = remember(context) { (context.applicationContext as App).container }
+    val loaderGen by SignatureMediaLoader.generationFlow.collectAsState()
+    var mediaState by remember(resolvedUrl, loaderGen) { mutableStateOf(SignatureMediaLoader.peek(resolvedUrl)) }
+    var rasterFailed by remember(resolvedUrl, loaderGen) { mutableStateOf(false) }
+
+    LaunchedEffect(resolvedUrl, loaderGen) {
+        while (true) {
+            val latest = SignatureMediaLoader.loadOrAwait(resolvedUrl, container, loaderGen)
+            mediaState = latest
+            if (latest !is SignatureMediaState.Cooldown || !latest.retryWhenReady) break
+            delay((latest.untilElapsedMs - SystemClock.elapsedRealtime()).coerceIn(250L, 3_000L))
+        }
+    }
+
+    when (val current = mediaState) {
+        is SignatureMediaState.Svg -> {
+            val screenWidthDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp
+            val availWidthDp = (screenWidthDp - if (compact) 56 else 32).coerceAtLeast(120).toFloat()
+            val maxH = maxHeight.value.coerceAtLeast(24f)
+            val ratio = (current.aspectRatio ?: 4.5f).coerceIn(0.5f, 16f)
+            val effectiveWidthDp = current.intrinsicWidthDp?.let { minOf(availWidthDp, it) } ?: availWidthDp
+            val fullWidthHeight = effectiveWidthDp / ratio
+            val svgModifier = if (fullWidthHeight <= maxH) {
+                if (current.intrinsicWidthDp != null && current.intrinsicWidthDp < availWidthDp) {
+                    Modifier.width(current.intrinsicWidthDp.dp).aspectRatio(ratio)
+                } else {
+                    Modifier.fillMaxWidth().aspectRatio(ratio)
+                }
+            } else {
+                Modifier.height(maxHeight).aspectRatio(ratio, matchHeightConstraintsFirst = true)
+            }
+            Column(modifier = Modifier.fillMaxWidth()) {
+                SignatureSeparator(compact = compact)
+                InlineSvgView(
+                    svgMarkup = current.sanitizedMarkup,
+                    modifier = svgModifier,
+                )
+            }
+        }
+        is SignatureMediaState.Raster -> {
+            if (!rasterFailed) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    SignatureSeparator(compact = compact)
+                    AsyncImage(
+                        model = remember(resolvedUrl, loaderGen, current, context) {
+                            ImageRequest.Builder(context)
+                                .data(current.bytes)
+                                .memoryCacheKey("signature:$loaderGen:$resolvedUrl")
+                                .crossfade(false)
+                                .build()
+                        },
+                        contentDescription = "用户签名",
+                        contentScale = ContentScale.Fit,
+                        alignment = Alignment.CenterStart,
+                        onError = {
+                            rasterFailed = true
+                            SignatureMediaLoader.markRasterError(resolvedUrl, loaderGen)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .widthIn(max = 700.dp)
+                            .heightIn(min = 24.dp, max = maxHeight)
+                            .clip(RoundedCornerShape(6.dp)),
+                    )
+                }
+            }
+        }
+        SignatureMediaState.Loading, is SignatureMediaState.Cooldown -> Unit
+    }
+}
+
+@Composable
+private fun SignatureSeparator(compact: Boolean) {
+    Spacer(Modifier.height(if (compact) 4.dp else 6.dp))
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(0.5.dp)
+            .background(IosTheme.colors.separator.copy(alpha = 0.45f)),
+    )
+    Spacer(Modifier.height(if (compact) 6.dp else 8.dp))
 }
