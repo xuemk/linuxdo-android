@@ -42,6 +42,7 @@ android {
     }
 
     packaging {
+        resources.pickFirsts += setOf("META-INF/LICENSE.md", "META-INF/NOTICE.md")
         jniLibs {
             useLegacyPackaging = true
         }
@@ -72,6 +73,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // 邮件协议及 MIME 由成熟实现处理，邮件 Socket 独立于论坛 HTTP 通道。
+    implementation("org.eclipse.angus:jakarta.mail:2.0.5")
+    implementation("org.eclipse.angus:angus-activation:2.0.3")
 
     // 头像与帖内图片:必须复用带固定 UA + Cookie 的 OkHttpClient,否则图片会被 Cloudflare 拦。
     implementation("io.coil-kt:coil-compose:2.7.0")

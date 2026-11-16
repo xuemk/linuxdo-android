@@ -80,9 +80,32 @@ class App : Application(), ImageLoaderFactory {
                         override fun hasSession(): Boolean = store.hasSession()
                         override fun isBackgroundNotificationEnabled(): Boolean = store.isBackgroundNotificationEnabled()
                         override fun backgroundRequestDelayMs(): Long = maxOf(
-                            org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
-                            if (store.isClearanceRecoveryInProgress() || store.sessionChanging) 1_000L else 0L,
+                            org.linuxdo.android.data.TopicRepository.mainSiteGateWaitMs(),
+                            org.linuxdo.android.data.ApiQuotaPool.UNREAD_POLL.penaltyRemainingMs(),
+                            if (org.linuxdo.android.data.TopicRepository.isSilentRevalidating() ||
+                                store.isClearanceRecoveryInProgress() ||
+                                store.sessionChanging ||
+                                store.shouldPauseBackgroundForChallengedClearance()
+                            ) 1_000L else 0L,
                         )
+                        override suspend fun tryAcquireBackgroundPoll(includeUnreadQuota: Boolean): Boolean {
+                            if (backgroundRequestDelayMs() > 0L) return false
+                            val force = !store.getPendingTestReplayTag().isNullOrBlank()
+                            if (includeUnreadQuota && !org.linuxdo.android.data.ApiQuotaPool.UNREAD_POLL.tryAcquire(force = force)) {
+                                return false
+                            }
+                            return org.linuxdo.android.data.TopicRepository.tryAcquireBackgroundGetSlot(store)
+                        }
+                        override fun recordBackgroundPollResponse(
+                            path: String,
+                            status: Int,
+                            cfMitigated: String?,
+                            retryAfterSeconds: Long?,
+                            sentClearanceFp: String,
+                        ): Long {
+                            val repo = (ctx.applicationContext as? App)?.container?.topicRepository ?: container.topicRepository
+                            return repo.recordBackgroundPollHttpResult(path, status, cfMitigated, retryAfterSeconds, sentClearanceFp)
+                        }
                         override fun getCookie(): String = store.storedCookies().entries.joinToString("; ") { "${it.key}=${it.value}" }
                         override fun getUserAgent(): String = container.userAgent
                         override fun getUserId(): Long = store.currentUserId()
@@ -161,6 +184,7 @@ class AppContainer(context: Context) {
         dohCoordinator.refresh()
         // VPN / 系统代理智能让渡：有真实 VPN 时清除 WebView 代理，无 VPN 时挂载本地代理
         updateWebViewProxyState()
+        org.linuxdo.android.net.gecko.GeckoManager.refreshNetworkSettings(context)
         dohCoordinator.startSmartRouteMonitoring()
     }
 

@@ -2180,3 +2180,48 @@ data class LdcUserInfo(
             return kotlin.math.round(score - settled).toInt()
         }
 }
+
+@Serializable
+data class NativeMailCredentials(
+    val address: String,
+    val username: String,
+    val password: String,
+) {
+    override fun toString(): String = "NativeMailCredentials(address=$address, password=[redacted])"
+}
+
+data class NativeMailSummary(
+    val uid: Long,
+    val uidValidity: Long,
+    val subject: String,
+    val sender: String,
+    val dateMillis: Long,
+    val seen: Boolean,
+)
+
+data class NativeMailPage(
+    val messages: List<NativeMailSummary>,
+    val total: Int,
+    val nextSequence: Int,
+    val uidValidity: Long,
+)
+
+data class NativeMailBody(
+    val summary: NativeMailSummary,
+    val recipients: String,
+    val replyTo: String,
+    val messageId: String?,
+    val references: String?,
+    val text: String,
+    val html: String?,
+    val attachments: List<String>,
+    val truncated: Boolean,
+)
+
+data class NativeMailDraft(
+    val recipients: String,
+    val subject: String,
+    val text: String,
+    val inReplyTo: String? = null,
+    val references: String? = null,
+)

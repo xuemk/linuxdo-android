@@ -16,7 +16,7 @@
   ],
   "background": { "scripts": ["background.js"] },
   "content_scripts": [{
-    "matches": ["https://linux.do/*"],
+    "matches": ["https://linux.do/*", "https://*.linux.do/*"],
     "js": ["content.js"],
     "run_at": "document_start",
     "all_frames": false

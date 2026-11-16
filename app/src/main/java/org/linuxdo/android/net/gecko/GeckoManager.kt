@@ -42,6 +42,24 @@ object GeckoManager {
         "COALESCE(originAttributes, '') NOT LIKE '%privateBrowsingId=%'"
     private var runtime: GeckoRuntime? = null
 
+    fun refreshNetworkSettings(context: Context) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Handler(Looper.getMainLooper()).post { refreshNetworkSettings(context.applicationContext) }
+            return
+        }
+        val rt = runtime ?: return
+        val container = (context.applicationContext as? App)?.container ?: return
+        val store = container.sessionStore
+        val dohUri = store.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
+        val useDoh = store.isDohEnabled() &&
+            !container.networkMonitor.detect().shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+        rt.settings.setTrustedRecursiveResolverUri(dohUri)
+        rt.settings.setTrustedRecursiveResolverMode(
+            if (useDoh) GeckoRuntimeSettings.TRR_MODE_ONLY else GeckoRuntimeSettings.TRR_MODE_DISABLED,
+        )
+        org.linuxdo.android.net.NetDiagnostics.log("Gecko 网络设置已同步 " + runtimeNetworkSummary(context))
+    }
+
     /**
      * 获取或初始化全局单例 GeckoRuntime，使用 Gecko 自身的 DoH 与 ECH。
      */

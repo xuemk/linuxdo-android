@@ -142,7 +142,7 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
   const tabId = sender.tab && sender.tab.id;
   if (request.command === "prepareIsolatedInAppSession") {
     if (!Number.isInteger(tabId) || tabId < 0 || typeof request.contextId !== "string" ||
-        !/^linuxdo-h5-(store|mail)-[0-9]+$/.test(request.contextId)) {
+        !/^linuxdo-h5-[a-z0-9-]+-[0-9]+$/.test(request.contextId)) {
       throw new Error("Unsupported isolated authentication context");
     }
     isolatedAuthTabs.set(tabId, {

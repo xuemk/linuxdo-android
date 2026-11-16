@@ -429,6 +429,43 @@ class TopicRepository(
 
     fun resetChallenge429Streak() = Companion.resetChallenge429Streak()
 
+    fun recordBackgroundPollHttpResult(
+        path: String,
+        status: Int,
+        cfMitigated: String?,
+        retryAfterSeconds: Long?,
+        sentClearanceFp: String,
+    ): Long {
+        if (status in 200..299) {
+            ApiQuotaPool.UNREAD_POLL.onSuccess()
+            onBackgroundMainSiteGetSucceeded(sessionStore)
+            return 0L
+        }
+        val challenged = ChallengeDetector.isChallenge429(status, cfMitigated, "") ||
+            cfMitigated?.contains("challenge", ignoreCase = true) == true
+        if (status == 429) {
+            val ex = if (challenged) {
+                enterChallenge429Cooldown(
+                    path = path,
+                    retryAfterSeconds = retryAfterSeconds,
+                    sentClearanceFp = sentClearanceFp,
+                )
+            } else {
+                enterRateLimitCooldown(
+                    path = path,
+                    retryAfterSeconds = retryAfterSeconds,
+                    cfChallenge = false,
+                )
+            }
+            return ex.retryAfterMs
+        }
+        if (challenged && status in listOf(403, 503)) {
+            ApiQuotaPool.onServerRateLimited(60_000L, cfChallenge = true)
+            return 60_000L
+        }
+        return 0L
+    }
+
     /**
      * 阅读进度上报复用的 CSRF Token。
      * 写请求本来每次都要先 GET 一次 /session/csrf.json,统计这种可丢弃的请求不值得为此翻倍;
@@ -6158,6 +6195,42 @@ class TopicRepository(
             },
         )
 
+        suspend fun tryAcquireBackgroundGetSlot(sessionStore: SessionStore?): Boolean {
+            if (mainSiteGateWaitMs() > 0L || isSilentRevalidating()) return false
+            return getRateLimiterLock.withLock {
+                val now = SystemClock.elapsedRealtime()
+                while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
+                    getRequestTimestamps.removeFirst()
+                }
+                if (getRequestTimestamps.size >= GET_WINDOW_MAX_REQUESTS) return@withLock false
+                val lastReq = getRequestTimestamps.lastOrNull() ?: 0L
+                if (now - lastReq < MIN_GET_SPACING_MS) return@withLock false
+                val ticket = runCatching {
+                    tryClaimGetSlotLocked(
+                        isMainSite = true,
+                        present = false,
+                        now = now,
+                        allowClaimProbe = false,
+                    ) { sessionStore?.sessionGeneration ?: -1L }
+                }.getOrNull() ?: return@withLock false
+                getRequestTimestamps.addLast(now)
+                releaseInFlight(ticket)
+                true
+            }
+        }
+
+        fun onBackgroundMainSiteGetSucceeded(sessionStore: SessionStore?) {
+            val currentRound = synchronized(rateLimitLock) { rateLimitRound }
+            onMainSiteGetSucceeded(
+                GetSlotTicket(
+                    round = currentRound,
+                    sessionGeneration = sessionStore?.sessionGeneration ?: -1L,
+                    isProbe = false,
+                ),
+                sessionStore,
+            )
+        }
+
         /** 写轨道 (POST) 串行安全节流 */
         suspend fun throttlePost(burst: Boolean = false) {
             val interval = if (burst) Config.BURST_REQUEST_INTERVAL_MS else Config.MIN_REQUEST_INTERVAL_MS
@@ -6168,5 +6241,424 @@ class TopicRepository(
         fun markPostCompleted() {
             lastPostRequestAt = SystemClock.elapsedRealtime()
         }
+    }
+}
+
+/** 邮件使用独立 TLS Socket，不携带论坛 Cookie，也不进入 Cloudflare HTTP 通道。 */
+class NativeMailRepository(
+    context: android.content.Context,
+    private val accountId: Long,
+    private val accountGeneration: Long,
+) : java.io.Closeable {
+    private val appContext = context.applicationContext
+    private val container = (appContext as org.linuxdo.android.App).container
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val sockets = ConcurrentHashMap.newKeySet<java.net.Socket>()
+    private val services = ConcurrentHashMap.newKeySet<jakarta.mail.Service>()
+    private val operationLock = Mutex()
+
+    companion object {
+        const val HOST = "mail.linux.do"
+        const val IMAP_PORT = 993
+        const val SMTP_PORT = 465
+        private const val PAGE_SIZE = 40
+        internal const val IO_TIMEOUT_MS = 15_000
+    }
+
+    private fun ensureOwner() {
+        val store = container.sessionStore
+        if (closed.get() || store.currentUserId() != accountId || store.sessionGeneration != accountGeneration) {
+            throw CancellationException("邮箱所属账号已切换或页面已关闭")
+        }
+    }
+
+    private fun socketFactory(port: Int): javax.net.SocketFactory {
+        ensureOwner()
+        val store = container.sessionStore
+        val network = container.networkMonitor.detect()
+        val useDoh = store.isDohEnabled() && !network.shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+        val dns = if (useDoh) {
+            org.linuxdo.android.net.AdaptiveDohDns(
+                servers = org.linuxdo.android.net.loadDohServers(store),
+                bootstrapClient = OkHttpClient.Builder()
+                    .proxy(java.net.Proxy.NO_PROXY)
+                    .cookieJar(CookieJar.NO_COOKIES)
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(6, TimeUnit.SECONDS)
+                    .callTimeout(8, TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(false)
+                    .build(),
+                autoFailover = store.isDohAutoFailoverEnabled(),
+            ).apply { primaryServerId = store.getDohServerUrl() ?: org.linuxdo.android.net.DohPresets.DEFAULT.id }
+        } else okhttp3.Dns.SYSTEM
+        val route = if (network.isProxy) "系统代理" else if (useDoh) "DoH解析+邮件TLS" else "系统网络+邮件TLS"
+        val proxy = if (network.isProxy) java.net.ProxySelector.getDefault()
+            ?.select(URI("https://$HOST:$port"))?.firstOrNull() ?: throw IOException("系统代理无法提供邮件连接") else null
+        NetDiagnostics.log("邮箱连接准备 route=$route server=$HOST port=$port")
+        return object : javax.net.SocketFactory() {
+            override fun createSocket(): java.net.Socket {
+                ensureOwner()
+                val socket = NativeMailSocket(dns, proxy, port) { sockets.remove(it) }
+                sockets.add(socket)
+                if (closed.get()) {
+                    socket.close()
+                    ensureOwner()
+                }
+                return socket
+            }
+            override fun createSocket(host: String, port: Int): java.net.Socket = createSocket().apply {
+                require(host == HOST)
+                connect(java.net.InetSocketAddress.createUnresolved(host, port), IO_TIMEOUT_MS)
+            }
+            override fun createSocket(host: java.net.InetAddress, port: Int): java.net.Socket = createSocket(HOST, port)
+            override fun createSocket(host: String, port: Int, local: java.net.InetAddress, localPort: Int): java.net.Socket =
+                throw java.net.SocketException("邮件连接不支持指定本地地址")
+            override fun createSocket(host: java.net.InetAddress, port: Int, local: java.net.InetAddress, localPort: Int): java.net.Socket =
+                throw java.net.SocketException("邮件连接不支持指定本地地址")
+        }
+    }
+
+    private fun session(): jakarta.mail.Session {
+        val properties = java.util.Properties()
+        for (protocol in listOf("imaps", "smtps")) {
+            properties["mail.$protocol.socketFactory"] = socketFactory(if (protocol == "imaps") IMAP_PORT else SMTP_PORT)
+            properties.setProperty("mail.$protocol.socketFactory.fallback", "false")
+            properties.setProperty("mail.$protocol.ssl.enable", "true")
+            properties.setProperty("mail.$protocol.ssl.checkserveridentity", "true")
+            properties.setProperty("mail.$protocol.connectiontimeout", IO_TIMEOUT_MS.toString())
+            properties.setProperty("mail.$protocol.timeout", IO_TIMEOUT_MS.toString())
+            properties.setProperty("mail.$protocol.writetimeout", IO_TIMEOUT_MS.toString())
+            val tlsProtocols = javax.net.ssl.SSLContext.getDefault().supportedSSLParameters.protocols
+                .filter { it == "TLSv1.3" || it == "TLSv1.2" }.joinToString(" ")
+            properties.setProperty("mail.$protocol.ssl.protocols", tlsProtocols)
+        }
+        properties.setProperty("mail.imaps.peek", "true")
+        properties.setProperty("mail.imaps.fetchsize", "16384")
+        properties.setProperty("mail.smtps.auth", "true")
+        properties.setProperty("mail.smtps.quitwait", "false")
+        properties.setProperty("mail.smtps.sendpartial", "false")
+        return jakarta.mail.Session.getInstance(properties).apply { debug = false }
+    }
+
+    private fun <T> withStore(credentials: NativeMailCredentials, block: (jakarta.mail.Store) -> T): T {
+        ensureOwner()
+        val mailStore = session().getStore("imaps")
+        services.add(mailStore)
+        try {
+            ensureOwner()
+            mailStore.connect(HOST, IMAP_PORT, credentials.username, credentials.password)
+            ensureOwner()
+            return block(mailStore)
+        } finally {
+            runCatching { mailStore.close() }
+            services.remove(mailStore)
+        }
+    }
+
+    suspend fun inbox(
+        credentials: NativeMailCredentials,
+        beforeSequence: Int = 0,
+        expectedUidValidity: Long = 0L,
+    ): NativeMailPage = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
+            withStore(credentials) { mailStore ->
+                val folder = mailStore.getFolder("INBOX")
+                folder.open(jakarta.mail.Folder.READ_ONLY)
+                try {
+                    val uidFolder = folder as jakarta.mail.UIDFolder
+                    val validity = uidFolder.uidValidity
+                    if (expectedUidValidity != 0L && validity != expectedUidValidity) {
+                        throw IOException("邮箱目录已更新，请重新刷新收件箱")
+                    }
+                    val total = folder.messageCount
+                    val last = if (beforeSequence > 0) beforeSequence.coerceAtMost(total) else total
+                    val first = (last - PAGE_SIZE + 1).coerceAtLeast(1)
+                    val messages = if (last < 1) emptyList() else {
+                        val batch = folder.getMessages(first, last)
+                        folder.fetch(batch, jakarta.mail.FetchProfile().apply {
+                            add(jakarta.mail.FetchProfile.Item.ENVELOPE)
+                            add(jakarta.mail.FetchProfile.Item.FLAGS)
+                            add(jakarta.mail.UIDFolder.FetchProfileItem.UID)
+                        })
+                        batch.reversed().filterNot { it.isExpunged }.map {
+                            NativeMailMime.summary(it, uidFolder.getUID(it), validity)
+                        }
+                    }
+                    ensureOwner()
+                    NativeMailPage(messages, total, if (last > 0) first - 1 else 0, validity)
+                } finally {
+                    runCatching { folder.close(false) }
+                }
+            }
+        }
+    }
+
+    suspend fun read(credentials: NativeMailCredentials, summary: NativeMailSummary): NativeMailBody = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
+            withStore(credentials) { mailStore ->
+                val folder = mailStore.getFolder("INBOX")
+                folder.open(jakarta.mail.Folder.READ_WRITE)
+                try {
+                    val uidFolder = folder as jakarta.mail.UIDFolder
+                    if (uidFolder.uidValidity != summary.uidValidity) throw IOException("邮箱目录已更新，请刷新后再打开邮件")
+                    val message = uidFolder.getMessageByUID(summary.uid) ?: throw IOException("这封邮件已移走，请刷新收件箱")
+                    val body = NativeMailMime.body(message, summary)
+                    ensureOwner()
+                    message.setFlag(jakarta.mail.Flags.Flag.SEEN, true)
+                    body.copy(summary = summary.copy(seen = true))
+                } finally {
+                    runCatching { folder.close(false) }
+                }
+            }
+        }
+    }
+
+    /** 返回已发送副本的提示；SMTP 成功后副本失败绝不重发邮件。 */
+    suspend fun send(credentials: NativeMailCredentials, draft: NativeMailDraft): String? = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            ensureOwner()
+            currentCoroutineContext().ensureActive()
+            val mailSession = session()
+            val message = NativeMailMime.outgoing(mailSession, credentials, draft)
+            val transport = mailSession.getTransport("smtps")
+            services.add(transport)
+            try {
+                transport.connect(HOST, SMTP_PORT, credentials.username, credentials.password)
+                ensureOwner()
+                transport.sendMessage(message, message.allRecipients)
+                NetDiagnostics.log("邮箱 SMTP 已接受发送")
+            } finally {
+                runCatching { transport.close() }
+                services.remove(transport)
+            }
+            try {
+                withStore(credentials) { mailStore ->
+                    val folders = mailStore.defaultFolder.list("*")
+                    val sent = folders.firstOrNull {
+                        it is org.eclipse.angus.mail.imap.IMAPFolder && it.attributes.contains("\\Sent")
+                    } ?: folders.firstOrNull { it.name.lowercase() in setOf("sent", "sent messages", "sent items", "已发送") }
+                    if (sent == null) "邮件已发送，未找到已发送文件夹；可到网页邮箱查看" else {
+                        message.setFlag(jakarta.mail.Flags.Flag.SEEN, true)
+                        sent.appendMessages(arrayOf(message))
+                        null
+                    }
+                }
+            } catch (error: Exception) {
+                NetDiagnostics.log("邮箱已发送副本保存失败 type=${error.javaClass.simpleName}")
+                "邮件已发送，已发送副本未保存；请勿重复发送"
+            }
+        }
+    }
+
+    suspend fun probe(): String = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            listOf("收信" to IMAP_PORT, "发信" to SMTP_PORT).joinToString("\n") { (label, port) ->
+                ensureOwner()
+                try {
+                    socketFactory(port).createSocket(HOST, port).use { raw ->
+                        val tlsFactory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+                        (tlsFactory.createSocket(raw, HOST, port, true) as javax.net.ssl.SSLSocket).use { tls ->
+                            tls.soTimeout = IO_TIMEOUT_MS
+                            tls.sslParameters = tls.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
+                            tls.startHandshake()
+                            "$label $port：${tls.session.protocol} 连接正常"
+                        }
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    "$label $port：${describeNativeMailError(error)}"
+                }
+            }.also { ensureOwner(); NetDiagnostics.log("邮箱无凭据连接检测：$it") }
+        }
+    }
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        sockets.toList().forEach { runCatching { it.close() } }
+        services.toList().forEach { runCatching { it.close() } }
+        sockets.clear()
+        services.clear()
+    }
+}
+
+private class NativeMailSocket(
+    private val dns: okhttp3.Dns,
+    private val proxy: java.net.Proxy?,
+    private val expectedPort: Int,
+    private val onClose: (java.net.Socket) -> Unit,
+) : java.net.Socket(proxy?.takeIf { it.type() == java.net.Proxy.Type.SOCKS } ?: java.net.Proxy.NO_PROXY) {
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    init {
+        soTimeout = NativeMailRepository.IO_TIMEOUT_MS
+    }
+
+    override fun connect(endpoint: java.net.SocketAddress, timeout: Int) {
+        try {
+            connectMail(endpoint, timeout)
+        } catch (failure: Exception) {
+            runCatching { close() }
+            throw failure
+        }
+    }
+
+    private fun connectMail(endpoint: java.net.SocketAddress, timeout: Int) {
+        val target = endpoint as? java.net.InetSocketAddress ?: throw java.net.SocketException("邮件连接地址无效")
+        require(target.port == expectedPort)
+        if (closed.get()) throw java.net.SocketException("邮件连接已关闭")
+        if (proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS) {
+            super.connect(java.net.InetSocketAddress.createUnresolved(NativeMailRepository.HOST, target.port), timeout)
+            return
+        }
+        val proxyAddress = proxy?.takeIf { it.type() == java.net.Proxy.Type.HTTP }?.address() as? java.net.InetSocketAddress
+        val addresses = if (proxyAddress != null) okhttp3.Dns.SYSTEM.lookup(proxyAddress.hostString)
+            else dns.lookup(NativeMailRepository.HOST)
+        val address = addresses.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }.firstOrNull()
+            ?: throw java.net.UnknownHostException(NativeMailRepository.HOST)
+        // 保留真实 SocketImpl，Android TLS 包装需要从该 Socket 获取底层文件描述符。
+        super.connect(java.net.InetSocketAddress(address, proxyAddress?.port ?: target.port), timeout)
+        if (proxyAddress != null) {
+            val authority = "${NativeMailRepository.HOST}:${target.port}"
+            getOutputStream().write("CONNECT $authority HTTP/1.1\r\nHost: $authority\r\n\r\n".toByteArray(Charsets.UTF_8))
+            getOutputStream().flush()
+            val header = java.io.ByteArrayOutputStream()
+            var suffix = 0
+            while (header.size() < 8192 && suffix != 0x0d0a0d0a) {
+                val value = getInputStream().read()
+                if (value < 0) throw IOException("邮件代理连接提前结束")
+                header.write(value)
+                suffix = (suffix shl 8) or value
+            }
+            val status = header.toString(Charsets.UTF_8.name()).lineSequence().firstOrNull().orEmpty()
+            if (suffix != 0x0d0a0d0a || !Regex("^HTTP/\\d(?:\\.\\d)? 200(?: |$)").containsMatchIn(status)) {
+                throw IOException("系统代理未允许邮件端口 CONNECT")
+            }
+        }
+    }
+
+    override fun connect(endpoint: java.net.SocketAddress) = connect(endpoint, NativeMailRepository.IO_TIMEOUT_MS)
+    override fun close() {
+        if (closed.compareAndSet(false, true)) {
+            try { super.close() } finally { onClose(this) }
+        }
+    }
+}
+
+internal object NativeMailMime {
+    private const val MAX_BODY_BYTES = 1024 * 1024
+    private const val MAX_PARTS = 80
+
+    fun summary(message: jakarta.mail.Message, uid: Long, validity: Long): NativeMailSummary = NativeMailSummary(
+        uid, validity, message.subject?.take(500)?.ifBlank { "（无主题）" } ?: "（无主题）",
+        readableAddresses { message.from }.joinToString { addressLabel(it) }.take(500).ifBlank { "未知发件人" },
+        (message.sentDate ?: message.receivedDate)?.time ?: 0L,
+        message.isSet(jakarta.mail.Flags.Flag.SEEN),
+    )
+
+    private fun addressLabel(address: jakarta.mail.Address): String = if (address is jakarta.mail.internet.InternetAddress)
+        address.toUnicodeString() else address.toString()
+
+    private fun readableAddresses(read: () -> Array<out jakarta.mail.Address>?): List<jakarta.mail.Address> =
+        try { read()?.toList().orEmpty() } catch (_: jakarta.mail.internet.AddressException) { emptyList() }
+
+    fun body(message: jakarta.mail.Message, summary: NativeMailSummary): NativeMailBody {
+        var plain: String? = null
+        var html: String? = null
+        var truncated = false
+        var visited = 0
+        var remaining = MAX_BODY_BYTES
+        val attachments = mutableListOf<String>()
+        fun visit(part: jakarta.mail.Part, depth: Int) {
+            if (++visited > MAX_PARTS || depth > 12 || remaining <= 0) { truncated = true; return }
+            if (part.disposition.equals(jakarta.mail.Part.ATTACHMENT, true) || !part.fileName.isNullOrBlank()) {
+                attachments += runCatching { jakarta.mail.internet.MimeUtility.decodeText(part.fileName ?: "附件") }
+                    .getOrDefault("附件").take(200)
+                return
+            }
+            if (part.isMimeType("multipart/*")) {
+                val multipart = part.content as? jakarta.mail.Multipart ?: return
+                if (multipart.count > MAX_PARTS) truncated = true
+                for (index in 0 until minOf(multipart.count, MAX_PARTS)) visit(multipart.getBodyPart(index), depth + 1)
+            } else if (part.isMimeType("text/plain") || part.isMimeType("text/html")) {
+                val bytes = part.inputStream.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (output.size() < remaining) {
+                        val count = input.read(buffer, 0, minOf(buffer.size, remaining - output.size()))
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                    if (output.size() == remaining) truncated = true
+                    output.toByteArray()
+                }
+                remaining -= bytes.size
+                val charsetName = runCatching { jakarta.mail.internet.ContentType(part.contentType).getParameter("charset") }
+                    .getOrNull() ?: "UTF-8"
+                val charset = runCatching { java.nio.charset.Charset.forName(jakarta.mail.internet.MimeUtility.javaCharset(charsetName)) }
+                    .getOrDefault(Charsets.UTF_8)
+                val text = String(bytes, charset)
+                if (part.isMimeType("text/plain") && plain == null) plain = text
+                if (part.isMimeType("text/html") && html == null) html = sanitizeHtml(text)
+            }
+        }
+        visit(message, 0)
+        val text = plain ?: html?.let {
+            Jsoup.parse(it).apply { select("br").append("\\n"); select("p,div,li,tr").prepend("\\n") }
+                .text().replace("\\n", "\n")
+        } ?: "这封邮件没有可显示的正文"
+        return NativeMailBody(
+            summary, readableAddresses { message.getRecipients(jakarta.mail.Message.RecipientType.TO) }.joinToString { addressLabel(it) },
+            readableAddresses { message.replyTo }.filterIsInstance<jakarta.mail.internet.InternetAddress>().joinToString { it.address },
+            message.getHeader("Message-ID")?.firstOrNull()?.take(998),
+            message.getHeader("References")?.firstOrNull()?.takeLast(2000), text, html, attachments, truncated,
+        )
+    }
+
+    fun sanitizeHtml(raw: String): String {
+        val document = Jsoup.parse(raw)
+        document.select("script,style,iframe,object,embed,form,input,button,svg,math,link,meta,base,img,audio,video,source").remove()
+        val allowed = org.jsoup.safety.Safelist.basic().removeTags("img")
+        return Jsoup.clean(document.body().html(), allowed)
+    }
+
+    fun outgoing(
+        session: jakarta.mail.Session,
+        credentials: NativeMailCredentials,
+        draft: NativeMailDraft,
+    ): jakarta.mail.internet.MimeMessage {
+        require(draft.recipients.isNotBlank() && draft.recipients.none { it == '\r' || it == '\n' }) { "请输入有效的收件人地址" }
+        require(draft.subject.none { it == '\r' || it == '\n' }) { "主题不能包含换行" }
+        require(draft.text.isNotBlank() && draft.text.toByteArray(Charsets.UTF_8).size <= MAX_BODY_BYTES) { "正文不能为空且不能超过 1 MB" }
+        val recipients = jakarta.mail.internet.InternetAddress.parse(draft.recipients, true)
+        require(recipients.isNotEmpty() && recipients.size <= 30) { "收件人最多 30 个" }
+        recipients.forEach { it.validate() }
+        val sender = jakarta.mail.internet.InternetAddress(credentials.address, true).apply { validate() }
+        return jakarta.mail.internet.MimeMessage(session).apply {
+            setFrom(sender)
+            setRecipients(jakarta.mail.Message.RecipientType.TO, recipients)
+            setSubject(draft.subject.ifBlank { "（无主题）" }, "UTF-8")
+            setText(draft.text, "UTF-8")
+            sentDate = java.util.Date()
+            draft.inReplyTo?.takeIf { it.none { char -> char == '\r' || char == '\n' } }?.let { setHeader("In-Reply-To", it) }
+            draft.references?.takeIf { it.none { char -> char == '\r' || char == '\n' } }?.let { setHeader("References", it) }
+            saveChanges()
+        }
+    }
+}
+
+fun describeNativeMailError(error: Throwable): String {
+    val causes = generateSequence(error) { it.cause?.takeIf { cause -> cause !== it } }.take(8).toList()
+    return when {
+        causes.any { it is jakarta.mail.AuthenticationFailedException } -> "邮箱认证失败，请检查独立邮箱密码和登录名"
+        causes.any { it is java.net.UnknownHostException } -> "域名解析失败，请检查应用 DoH 设置"
+        causes.any { it is java.net.SocketTimeoutException } -> "连接超时，请重试或切换网络"
+        causes.any { it is javax.net.ssl.SSLException } -> "TLS 连接或证书校验失败，请切换网络后重试"
+        causes.any { it.message?.startsWith("系统代理") == true } -> "系统代理无法建立邮件 CONNECT 通道（993/465）"
+        error is IllegalArgumentException -> error.message ?: "邮箱配置或邮件内容无效"
+        error is jakarta.mail.internet.AddressException -> "邮箱地址格式不正确"
+        causes.any { it is IOException } -> "邮件服务器连接失败，请刷新或切换网络"
+        else -> "邮箱操作失败（${error.javaClass.simpleName}），请重试"
     }
 }

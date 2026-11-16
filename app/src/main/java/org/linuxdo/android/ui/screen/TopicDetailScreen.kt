@@ -6640,7 +6640,7 @@ private fun SandboxedGeckoPreview(
         }
 
         fun syncClearanceBack(pageUrl: String) {
-            if (disposed || !isTrustedForumUrl(pageUrl)) return
+            if (disposed || !isMainForumSyncUrl(pageUrl)) return
             scope.launch {
                 val clearances = runCatching { bridgeRef?.readCfClearances() }.getOrNull()
                     ?.takeIf { it.isNotEmpty() }
@@ -6707,7 +6707,6 @@ private fun SandboxedGeckoPreview(
                                     bridgeRef?.prepareInAppSessionCookies(cookies, challenged)
                                 }
                                 if (!disposed) {
-                                    syncClearanceBack(readyUrl)
                                     bootstrapping = false
                                     geckoView.alpha = 1f
                                     session.loadUri(url)

@@ -47,8 +47,10 @@ class GeckoAuthBridge private constructor(
                 override fun onConnect(port: WebExtension.Port) {
                     val sender = port.sender
                     val origin = Uri.parse(sender.url)
+                    val host = origin.host
+                    val isAllowedHost = host == Config.HOST || host?.endsWith(".${Config.HOST}") == true
                     if (closed || sender.session !== session || !sender.isTopLevel ||
-                        origin.scheme != "https" || origin.host != Config.HOST
+                        origin.scheme != "https" || !isAllowedHost
                     ) {
                         port.disconnect()
                         return
@@ -63,7 +65,7 @@ class GeckoAuthBridge private constructor(
                             if (closed || activePort !== port) return
                             val payload = message as? JSONObject ?: return
                             when (payload.optString("type")) {
-                                "ready" -> onReady(sender.url)
+                                "ready" -> onReady(payload.optString("url").ifBlank { sender.url })
                                 "callback" -> onCallback(payload.optString("name"), payload.optString("payload"))
                                 "response" -> {
                                     val result = pending.remove(payload.optString("id")) ?: return
@@ -180,6 +182,25 @@ class GeckoAuthBridge private constructor(
 
     /** 用 Gecko 自己的网络栈请求 /cdn-cgi/trace，供与 OkHttp 出口对照。 */
     suspend fun readEgressTrace(): String = JSONTokener(request("trace")).nextValue()?.toString().orEmpty()
+
+    data class WebmailFillResult(val filled: Boolean, val submitted: Boolean)
+
+    suspend fun fillWebmailLogin(address: String, password: String, autoSubmit: Boolean): WebmailFillResult {
+        val raw = request(
+            "fillWebmailLogin",
+            JSONObject()
+                .put("address", address)
+                .put("password", password)
+                .put("autoSubmit", autoSubmit),
+        )
+        return runCatching {
+            val json = JSONObject(raw)
+            WebmailFillResult(
+                filled = json.optBoolean("filled"),
+                submitted = json.optBoolean("submitted"),
+            )
+        }.getOrDefault(WebmailFillResult(filled = false, submitted = false))
+    }
 
     /** WebExtension 内容脚本端口是否已与当前同源文档建立连接。 */
     fun isConnected(): Boolean = !closed && activePort != null

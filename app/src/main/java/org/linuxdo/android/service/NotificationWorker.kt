@@ -79,6 +79,19 @@ class NotificationWorker(
             override fun backgroundRequestDelayMs(): Long =
                 if (isCurrent()) delegate.backgroundRequestDelayMs() else 1_000L
 
+            override suspend fun tryAcquireBackgroundPoll(includeUnreadQuota: Boolean): Boolean =
+                if (isCurrent()) delegate.tryAcquireBackgroundPoll(includeUnreadQuota) else false
+
+            override fun recordBackgroundPollResponse(
+                path: String,
+                status: Int,
+                cfMitigated: String?,
+                retryAfterSeconds: Long?,
+                sentClearanceFp: String,
+            ): Long = if (isCurrent()) {
+                delegate.recordBackgroundPollResponse(path, status, cfMitigated, retryAfterSeconds, sentClearanceFp)
+            } else 0L
+
             override fun saveUserId(id: Long) = commit { delegate.saveUserId(id) }
             override fun setLastSeenNotificationId(id: Long) = commit { delegate.setLastSeenNotificationId(id) }
             override fun setLastBadgeCount(count: Int, force: Boolean) = commit { delegate.setLastBadgeCount(count, force) }
@@ -97,12 +110,27 @@ class NotificationWorker(
             return true
         }
 
-        private fun deferAfterResponse(context: Context, response: Response): Boolean {
-            val challenged = response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+        private fun deferAfterResponse(
+            context: Context,
+            sessionStore: PollSessionProvider,
+            response: Response,
+        ): Boolean {
+            val cfMitigated = response.header("cf-mitigated")
+            val challenged = cfMitigated?.contains("challenge", ignoreCase = true) == true
+            val retryAfter = HttpHeaderUtils.parseRetryAfter(response.header("Retry-After"))
+            val sentClearanceFp = response.request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
+            val path = response.request.url.encodedPath
+            val repoCooldownMs = sessionStore.recordBackgroundPollResponse(
+                path = path,
+                status = response.code,
+                cfMitigated = cfMitigated,
+                retryAfterSeconds = retryAfter,
+                sentClearanceFp = sentClearanceFp,
+            )
             if (response.code != 429 && !(challenged && response.code in listOf(403, 503))) return false
-            val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(
-                HttpHeaderUtils.parseRetryAfter(response.header("Retry-After")),
-                if (challenged) 60_000L else 10_000L,
+            val cooldownMs = maxOf(
+                repoCooldownMs,
+                HttpHeaderUtils.rateLimitCooldownMs(retryAfter, if (challenged) 60_000L else 10_000L),
             )
             serverRetryUntil = maxOf(serverRetryUntil, SystemClock.elapsedRealtime() + cooldownMs)
             NotificationHelper.logDiagnostic(
@@ -201,9 +229,10 @@ class NotificationWorker(
                     .header("X-Requested-With", "XMLHttpRequest")
                     .build()
                 if (shouldDeferPoll(context, sessionStore)) return null
+                if (!runBlocking { sessionStore.tryAcquireBackgroundPoll(includeUnreadQuota = false) }) return null
                 fastClient.newCall(req).execute().use { resp ->
                     sessionStore.checkCurrent()
-                    if (deferAfterResponse(context, resp)) return null
+                    if (deferAfterResponse(context, sessionStore, resp)) return null
                     if (!resp.isSuccessful) return null
                     val body = resp.body?.string() ?: return null
                     sessionStore.checkCurrent()
@@ -267,7 +296,7 @@ class NotificationWorker(
             return NativePushCore.countUnread(types, reads, scope)
         }
 
-        private fun pollOnceExclusive(
+        private suspend fun pollOnceExclusive(
             context: Context,
             sessionStore: PollSessionProvider,
             isFinalAttempt: Boolean,
@@ -289,13 +318,17 @@ class NotificationWorker(
                     .build()
 
                 if (shouldDeferPoll(context, sessionStore)) return true
+                if (!sessionStore.tryAcquireBackgroundPoll(includeUnreadQuota = !isFinalAttempt)) {
+                    NotificationHelper.logDiagnostic(context, "push.defer", "[后台拉取] 主站统一频率或限流冷却退让，暂缓本轮")
+                    return true
+                }
                 httpClient.newCall(request).execute().use { response ->
                     sessionStore.checkCurrent()
                     NotificationHelper.logDiagnostic(
                         context, "push.http",
                         "[后台拉取] 通知接口 HTTP=${response.code} 最后尝试=$isFinalAttempt",
                     )
-                    if (deferAfterResponse(context, response)) return true
+                    if (deferAfterResponse(context, sessionStore, response)) return true
                     if (response.code in listOf(401, 403, 503)) {
                         val isLast = isFinalAttempt || response.code == 401
                         val blockedTag = if (isLast) sessionStore.getPendingTestReplayTag() else null

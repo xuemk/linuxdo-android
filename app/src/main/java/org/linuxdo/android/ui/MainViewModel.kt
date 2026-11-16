@@ -1347,12 +1347,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         store.setDohEnabled(enabled)
         _dohEnabled.value = enabled
         container.rebuildHttpClient()
+        org.linuxdo.android.net.gecko.GeckoManager.refreshNetworkSettings(getApplication())
     }
 
     fun setDohServerSelected(server: org.linuxdo.android.net.DohServer) {
         store.setDohServerUrl(server.url)
         _selectedDohServerUrl.value = server.url
         container.dohCoordinator.manualSelect(server)
+        org.linuxdo.android.net.gecko.GeckoManager.refreshNetworkSettings(getApplication())
     }
 
     fun setDohAutoFailover(enabled: Boolean) {
@@ -1378,6 +1380,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _dohForceOverProxy.value = enabled
         container.dohCoordinator.refresh()
         container.updateWebViewProxyState()
+        org.linuxdo.android.net.gecko.GeckoManager.refreshNetworkSettings(getApplication())
         container.dohCoordinator.triggerSmartRouteEvaluation()
     }
 
