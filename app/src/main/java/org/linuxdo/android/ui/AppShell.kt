@@ -820,6 +820,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onNavigateToConnect = { showConnectSheet = true },
                                 onNavigateToChat = { stack.push(Route.Chat) },
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
+                                onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
+                                onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1106,6 +1108,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
+                                onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
+                                onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1200,6 +1204,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
+                                onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
+                                onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {
@@ -1283,7 +1289,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenFollowing = { state.username?.let { stack.push(Route.FollowList(it)) } },
                                 onOpenChat = { stack.push(Route.Chat) },
                                 onOpenBlacklist = { stack.push(Route.Blacklist) },
-                                onOpenLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.LdcStore.URL },
+                                onOpenLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
+                                onOpenLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
                                 onOpenUser = { username, primaryAvatar, staticAvatar ->
                                     stack.push(Route.UserProfile(username, primaryAvatar, staticAvatar))
                                 },
@@ -1437,6 +1444,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToConnect = { showConnectSheet = true },
                                     onNavigateToChat = { stack.push(Route.Chat) },
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
+                                onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
+                                onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
                                     onNavigateToBookmarks = {
                                         val username = state.username
                                         if (!username.isNullOrBlank()) {

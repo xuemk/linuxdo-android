@@ -228,6 +228,8 @@ fun TopicListScreen(
     onNavigateToConnect: (() -> Unit)? = null,
     onNavigateToChat: (() -> Unit)? = null,
     onNavigateToApps: (() -> Unit)? = null,
+    onNavigateToLdcStore: (() -> Unit)? = null,
+    onNavigateToLdcMail: (() -> Unit)? = null,
     onNavigateToBookmarks: (() -> Unit)? = null,
     onNavigateToFollowing: (() -> Unit)? = null,
     onNavigateToLikes: (() -> Unit)? = null,
@@ -903,6 +905,8 @@ fun TopicListScreen(
                                 FloatingAction.Connect -> onNavigateToConnect?.invoke()
                                 FloatingAction.Chat -> onNavigateToChat?.invoke()
                                 FloatingAction.Apps -> onNavigateToApps?.invoke()
+                                FloatingAction.LdcStore -> onNavigateToLdcStore?.invoke()
+                                FloatingAction.LdcMail -> onNavigateToLdcMail?.invoke()
                             }
                         },
                         modifier = Modifier.fillMaxSize(),
@@ -4178,6 +4182,8 @@ private fun floatingActionColor(action: FloatingAction): Color = when (action) {
     FloatingAction.Connect -> Color(0xFF1E88E5)     // LinuxDo 极客蓝
     FloatingAction.Chat -> Color(0xFFE91E63)        // 活力珊瑚粉
     FloatingAction.Apps -> Color(0xFF07C160)        // 微信小程序绿
+    FloatingAction.LdcStore -> Color(0xFFF59E0B)
+    FloatingAction.LdcMail -> Color(0xFF007AFF)
 }
 
 /** 辅助悬浮按钮各功能的纯矢量精致手绘图标。 */
@@ -4394,6 +4400,20 @@ private fun FloatingActionIcon(
                         size = Size(11f, 11f),
                         style = stroke,
                     )
+                }
+                FloatingAction.LdcStore -> {
+                    val bag = Path().apply {
+                        moveTo(5f, 8f); lineTo(19f, 8f); lineTo(20.5f, 20f); lineTo(3.5f, 20f); close()
+                    }
+                    drawPath(bag, tint, style = stroke)
+                    drawArc(tint, 180f, 180f, false, Offset(8f, 3f), Size(8f, 10f), style = stroke)
+                }
+                FloatingAction.LdcMail -> {
+                    drawRoundRect(tint, Offset(3.5f, 5.5f), Size(17f, 13f), CornerRadius(2f, 2f), style = stroke)
+                    val flap = Path().apply {
+                        moveTo(4.5f, 7f); lineTo(12f, 13f); lineTo(19.5f, 7f)
+                    }
+                    drawPath(flap, tint, style = stroke)
                 }
             }
         }

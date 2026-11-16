@@ -204,7 +204,9 @@ enum class FloatingAction(
     Drafts("drafts", "草稿", "草稿", "查看与编辑草稿"),
     Search("search", "搜索", "搜索", "全站快捷搜索"),
     Categories("categories", "分类", "分类", "浏览全部话题分类"),
-    Apps("apps", "应用广场", "应用", "进入 L 站应用广场小程序");
+    Apps("apps", "应用广场", "应用", "进入 L 站应用广场小程序"),
+    LdcStore("ldc_store", "LDCstore", "商店", "打开 LDCstore 商店"),
+    LdcMail("ldc_mail", "专属邮箱", "邮箱", "打开 L 站 H5 邮箱");
 
     companion object {
         const val MAX_ACTIONS = 5

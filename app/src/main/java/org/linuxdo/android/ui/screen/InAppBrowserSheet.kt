@@ -141,6 +141,7 @@ import org.linuxdo.android.data.MiniAppEntry
 import org.linuxdo.android.data.MiniAppLibraryState
 import org.linuxdo.android.data.MiniAppSort
 import org.linuxdo.android.net.gecko.GeckoAuthBridge
+import org.linuxdo.android.net.gecko.LINKED_H5_CONTEXT_PREFIX
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.linuxdo.android.ui.design.IosTheme
@@ -153,13 +154,22 @@ internal const val IN_APP_BOOTSTRAP_PATH = "/robots.txt"
 private const val IN_APP_BOOTSTRAP_URL = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
 const val LINUXDO_APPS_PLAZA_URL = "${Config.BASE_URL}/apps"
 
-internal object LdcStore {
-    const val URL = "https://ldcstore.com/"
+internal enum class ProfileWebApp(val url: String, val title: String) {
+    Store("https://ldcstore.com/", "LDCstore"),
+    Mail("https://webmail.linux.do/", "专属邮箱");
 
-    fun matches(value: String?): Boolean {
-        val url = value?.toHttpUrlOrNull() ?: return false
-        return url.scheme == "https" && url.host == "ldcstore.com" && url.port == 443 &&
-            url.username.isEmpty() && url.password.isEmpty()
+    fun contextId(accountId: Long): String = "$LINKED_H5_CONTEXT_PREFIX${name.lowercase()}-${accountId.coerceAtLeast(0L)}"
+
+    companion object {
+        fun fromUrl(value: String?): ProfileWebApp? {
+            val parsed = value?.toHttpUrlOrNull() ?: return null
+            if (!parsed.isHttps || parsed.port != 443 || parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
+            return entries.firstOrNull { it.url.toHttpUrlOrNull()?.host == parsed.host }
+        }
+
+        fun isServiceHost(host: String?): Boolean = entries.any {
+            it.url.toHttpUrlOrNull()?.host == host?.lowercase()?.trimEnd('.')
+        }
     }
 }
 
@@ -1183,10 +1193,10 @@ fun isLinuxDoMiniAppUrl(rawUrl: String?): Boolean {
 
 private fun defaultMiniAppTitle(url: String, initialTitle: String?): String {
     if (!initialTitle.isNullOrBlank()) return initialTitle
+    ProfileWebApp.fromUrl(url)?.let { return it.title }
     val uri = runCatching { url.toUri() }.getOrNull()
     val path = uri?.path?.lowercase().orEmpty()
     return when {
-        LdcStore.matches(url) -> "LDCstore"
         path == "/apps" || path == "/apps/" -> "小程序"
         path.startsWith("/apps/") -> "小程序"
         else -> uri?.host.orEmpty().ifBlank { "L 站页面" }
@@ -1401,6 +1411,10 @@ object MiniAppSessionPool {
         val container = (appContext as? App)?.container
         val sessionStore = container?.sessionStore
         val browserSession = container?.browser
+        val webApp = ProfileWebApp.fromUrl(url)
+        val oneWayAuth = webApp != null
+        val accountId = sessionStore?.currentUserId() ?: 0L
+        val accountGeneration = sessionStore?.sessionGeneration ?: 0L
 
         lateinit var holder: HeldSession
 
@@ -1413,7 +1427,8 @@ object MiniAppSessionPool {
             (sessionStore?.sessionGeneration ?: 0L) == holder.accountGeneration
 
         fun syncClearanceBack(pageUrl: String) {
-            if (!isCurrentHolder() || !isTrustedForumUrl(pageUrl)) return
+            // 商店/邮箱的整个授权链只接收主站登录态，bootstrap 和回跳也不回传 Cookie。
+            if (oneWayAuth || !isCurrentHolder() || !isTrustedForumUrl(pageUrl)) return
             poolScope.launch {
                 val clearances = runCatching { holder.bridge?.readCfClearances() }.getOrNull()
                     ?.takeIf { it.isNotEmpty() }
@@ -1481,6 +1496,7 @@ object MiniAppSessionPool {
 
         val session = GeckoManager.createChallengeSession(
             context = appContext,
+            contextId = webApp?.contextId(accountId),
             onLocationChanged = { navUrl ->
                 holder.documentUrl = navUrl
                 if (!isBootstrapLocation(navUrl)) {
@@ -1554,7 +1570,10 @@ object MiniAppSessionPool {
                 val target = targetUri.toUri()
                 val scheme = target.scheme?.lowercase().orEmpty()
                 val targetAppId = MiniAppEntry.idFromUrl(targetUri)
-                if (isAppsPlazaUrl(targetUri) || (targetAppId != null && targetAppId != MiniAppEntry.idFromUrl(holder.entryUrl))) {
+                if (!oneWayAuth && ProfileWebApp.fromUrl(targetUri) != null) {
+                    requestOpen(targetUri)
+                    true
+                } else if (isAppsPlazaUrl(targetUri) || (targetAppId != null && targetAppId != MiniAppEntry.idFromUrl(holder.entryUrl))) {
                     requestOpen(miniAppPublicUrl(targetUri))
                     true
                 } else if (targetAppId != null && target.getQueryParameter("embed_mode") != "true") {
@@ -1581,8 +1600,8 @@ object MiniAppSessionPool {
             key = key,
             entryUrl = url,
             session = session,
-            accountId = sessionStore?.currentUserId() ?: 0L,
-            accountGeneration = sessionStore?.sessionGeneration ?: 0L,
+            accountId = accountId,
+            accountGeneration = accountGeneration,
         ).apply {
             this.title = defaultMiniAppTitle(url, initialTitle)
             this.injectCss = injectCss
@@ -1680,7 +1699,8 @@ fun InAppBrowserSheet(
     val uri = remember(activeTargetUrl) { runCatching { activeTargetUrl.toUri() }.getOrNull() }
     val validInAppUrl = remember(activeTargetUrl) {
         uri != null && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() &&
-            (isTrustedForumUrl(activeTargetUrl) || LdcStore.matches(activeTargetUrl))
+            if (ProfileWebApp.isServiceHost(uri.host)) ProfileWebApp.fromUrl(activeTargetUrl) != null
+            else isTrustedForumUrl(activeTargetUrl)
     }
 
     LaunchedEffect(activeTargetUrl, validInAppUrl) {

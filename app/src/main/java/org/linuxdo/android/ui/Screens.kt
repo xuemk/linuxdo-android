@@ -502,6 +502,7 @@ fun ProfileScreen(
     onOpenChat: () -> Unit = {},
     onOpenBlacklist: () -> Unit = {},
     onOpenLdcStore: () -> Unit = {},
+    onOpenLdcMail: () -> Unit = {},
     onOpenUser: (username: String, primaryAvatar: String?, staticAvatar: String?) -> Unit = { _, _, _ -> },
     onComposePrivateMessage: (String) -> Unit = {},
     onOpenUserReplies: ((String) -> Unit)? = null,
@@ -1021,11 +1022,17 @@ fun ProfileScreen(
                         modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
+                        ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, Modifier.weight(1f).fillMaxHeight())
+                        ProfileQuickLink("专属邮箱", "✉️", onOpenLdcMail, Modifier.weight(1f).fillMaxHeight())
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
                         ProfileQuickLink("实时聊天", "💬", onOpenChat, Modifier.weight(1f).fillMaxHeight())
                         ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
                     }
-
-                    ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, value = "ldcstore.com")
 
                     // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
                     UserBadgesSectionCard(
@@ -1313,7 +1320,6 @@ private fun ProfileQuickLink(
     icon: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    value: String? = null,
 ) {
     Row(
         modifier.fillMaxWidth().heightIn(min = 44.dp)
@@ -1333,9 +1339,6 @@ private fun ProfileQuickLink(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
-        if (value != null) {
-            Text(value, style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
-        }
         Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel)
     }
 }
@@ -10606,6 +10609,8 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
         FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f) to Color(0xFF1E88E5)
         FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f) to Color(0xFFE91E63)
         FloatingAction.Apps -> Color(0xFF07C160).copy(alpha = 0.15f) to Color(0xFF07C160)
+        FloatingAction.LdcStore -> Color(0xFFF59E0B).copy(alpha = 0.15f) to Color(0xFFF59E0B)
+        FloatingAction.LdcMail -> Color(0xFF007AFF).copy(alpha = 0.15f) to Color(0xFF007AFF)
     }
 
     Box(
@@ -10722,6 +10727,20 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
                     FloatingAction.Apps -> {
                         drawArc(color = actionTint, startAngle = 120f, sweepAngle = 250f, useCenter = false, topLeft = Offset(3.5f, 3.5f), size = Size(11f, 11f), style = stroke)
                         drawArc(color = actionTint, startAngle = -60f, sweepAngle = 250f, useCenter = false, topLeft = Offset(9.5f, 9.5f), size = Size(11f, 11f), style = stroke)
+                    }
+                    FloatingAction.LdcStore -> {
+                        val bag = Path().apply {
+                            moveTo(5f, 8f); lineTo(19f, 8f); lineTo(20.5f, 20f); lineTo(3.5f, 20f); close()
+                        }
+                        drawPath(bag, actionTint, style = stroke)
+                        drawArc(actionTint, 180f, 180f, false, Offset(8f, 3f), Size(8f, 10f), style = stroke)
+                    }
+                    FloatingAction.LdcMail -> {
+                        drawRoundRect(actionTint, Offset(3.5f, 5.5f), Size(17f, 13f), CornerRadius(2f, 2f), style = stroke)
+                        val flap = Path().apply {
+                            moveTo(4.5f, 7f); lineTo(12f, 13f); lineTo(19.5f, 7f)
+                        }
+                        drawPath(flap, actionTint, style = stroke)
                     }
                 }
             }

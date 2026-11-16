@@ -19,7 +19,6 @@ import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
-import org.mozilla.geckoview.StorageController
 import org.mozilla.geckoview.WebRequestError
 import java.io.File
 import java.io.Closeable
@@ -27,19 +26,20 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
-import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 object GeckoManager {
     private const val TAG = "GeckoManager"
+    private const val MAIN_COOKIE_CONTEXT_FILTER =
+        "COALESCE(originAttributes, '') NOT LIKE '%geckoViewSessionContextId=%' AND " +
+        "COALESCE(originAttributes, '') NOT LIKE '%userContextId=%' AND " +
+        "COALESCE(originAttributes, '') NOT LIKE '%privateBrowsingId=%'"
     private var runtime: GeckoRuntime? = null
 
     /**
@@ -224,12 +224,14 @@ object GeckoManager {
         onPageError: (String, WebRequestError) -> Unit = { _, _ -> },
         onExternalRequest: ((uri: String) -> Boolean)? = null,
         returnErrorPageHtml: Boolean = true,
+        contextId: String? = null,
         onDiagnostic: (String) -> Unit = {},
         onContentPainted: (url: String) -> Unit = {},
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
-            .usePrivateMode(false) // 非无痕模式，确保 Cookie 落地到 cookies.sqlite
+            .usePrivateMode(false)
+            .contextId(contextId) // H5 按账号与站点持久隔离；关闭 Session 不删除登录数据。
             .build()
 
         val session = GeckoSession(sessionSettings)
@@ -392,25 +394,11 @@ object GeckoManager {
     }
 
     /**
-     * 经 Gecko 自身的 StorageController 清掉主站（含 .linux.do 域 Cookie）的全部 Cookie，迫使 CF 重新挑战并签发新凭据。
+     * 只清理主站默认容器（含 .linux.do 域 Cookie），保留商店/邮箱等隔离容器的登录数据。
      * 不能直接改 cookies.sqlite：Gecko 以内存中的 Cookie 为准，删库后旧值仍会被发出并写回。
      * 会一并清掉 Gecko 侧的 _t/_forum_session，登录流程每次都会重建，验证页不依赖它们。
      */
-    suspend fun clearSiteCookies(context: Context): Boolean = withContext(Dispatchers.Main) {
-        val result = getOrCreateRuntime(context).storageController
-            .clearDataFromHost(Config.HOST, StorageController.ClearFlags.COOKIES)
-        withTimeoutOrNull(5_000L) {
-            suspendCancellableCoroutine<Boolean> { continuation ->
-                result.accept(
-                    { if (continuation.isActive) continuation.resume(true) },
-                    { error ->
-                        Log.w(TAG, "清理 Gecko 站点 Cookie 失败: ${error?.message}")
-                        if (continuation.isActive) continuation.resume(false)
-                    },
-                )
-            }
-        } ?: false
-    }
+    suspend fun clearSiteCookies(context: Context): Boolean = GeckoAuthBridge.clearMainSiteCookies(context)
 
     /**
      * 从 GeckoView 的 moz_cookies SQLite 数据库中提取 linux.do 的凭据 (如 cf_clearance, _t, _forum_session)
@@ -443,13 +431,14 @@ object GeckoManager {
             db.use {
                 val cursor = try {
                     it.rawQuery(
-                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%' ORDER BY lastAccessed ASC, expiry ASC",
-                        null
+                        "SELECT name, value FROM moz_cookies WHERE (host = ? OR host = ?) AND " +
+                            MAIN_COOKIE_CONTEXT_FILTER + " ORDER BY lastAccessed ASC, expiry ASC",
+                        arrayOf(Config.HOST, ".${Config.HOST}")
                     )
                 } catch (_: Throwable) {
                     it.rawQuery(
-                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
-                        null
+                        "SELECT name, value FROM moz_cookies WHERE (host = ? OR host = ?) AND " + MAIN_COOKIE_CONTEXT_FILTER,
+                        arrayOf(Config.HOST, ".${Config.HOST}")
                     )
                 }
                 cursor.use { c ->

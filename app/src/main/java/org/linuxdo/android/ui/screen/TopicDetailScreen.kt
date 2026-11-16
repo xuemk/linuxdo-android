@@ -5734,6 +5734,7 @@ private fun InlineSvgView(
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 internal fun CookedContent(
     blocks: List<CookedBlock>,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
@@ -5742,6 +5743,7 @@ internal fun CookedContent(
     subReply: Boolean = false,
     pollPost: Post? = null,
 ) {
+    val openLinkedImage = rememberLinkedImageOpener()
     CompositionLocalProvider(
         LocalSelectionPost provides pollPost,
         LocalOpenPicture provides onPicture,
@@ -5891,16 +5893,20 @@ internal fun CookedContent(
                     )
 
                     val activeSvgMarkup = inlineSvgContent
+                    val imageActions = if (block.linkUrl != null) {
+                        Modifier.combinedClickable(
+                            onClick = { openLinkedImage(block) },
+                            onLongClick = if (block.svgMarkup == null) ({ onPicture(imageList, clickedIndex) }) else null,
+                        )
+                    } else if (block.svgMarkup == null) {
+                        Modifier.clickable { onPicture(imageList, clickedIndex) }
+                    } else Modifier
                     Box(
                         modifier = ratioModifier.background(IosTheme.colors.fieldBackground),
                         contentAlignment = Alignment.Center,
                     ) {
                         if (activeSvgMarkup != null) {
-                            val clickMod = if (block.svgMarkup == null) {
-                                Modifier.fillMaxSize().clickable { onPicture(imageList, clickedIndex) }
-                            } else {
-                                Modifier.fillMaxSize()
-                            }
+                            val clickMod = Modifier.fillMaxSize().then(imageActions)
                             Box(modifier = clickMod, contentAlignment = Alignment.Center) {
                                 InlineSvgView(
                                     svgMarkup = activeSvgMarkup,
@@ -5917,7 +5923,7 @@ internal fun CookedContent(
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .clickable { onPicture(imageList, clickedIndex) },
+                                    .then(imageActions),
                                 onLoading = {
                                     isLoading = true
                                     isError = false
@@ -5978,6 +5984,9 @@ internal fun CookedContent(
                                 }
                             }
                             }
+                        }
+                        if (block.linkUrl != null) {
+                            LinkedImageBadge(Modifier.align(Alignment.BottomEnd)) { openLinkedImage(block) }
                         }
                     }
                 }
@@ -6062,25 +6071,61 @@ private fun DetailsCard(
 }
 
 @Composable
+private fun rememberLinkedImageOpener(): (CookedBlock.Picture) -> Unit {
+    val context = LocalContext.current
+    val openTopic = LocalOpenTopic.current
+    val openUrl = LocalOpenExternalUrl.current
+    return remember(context, openTopic, openUrl) {
+        { picture ->
+            picture.linkUrl?.let { link ->
+                val topic = parseInternalTopicUrl(link)
+                if (topic != null && openTopic != null) {
+                    openTopic(topic.topicId, "话题 #${topic.topicId}", topic.postNumber)
+                } else if (isTrustedForumUrl(link)) {
+                    openUrl(link)
+                } else {
+                    openExternal(context, link)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LinkedImageBadge(modifier: Modifier, onClick: () -> Unit) {
+    Text("↗", color = IosTheme.colors.accent, fontSize = 16.sp,
+        modifier = modifier.padding(6.dp).clip(RoundedCornerShape(6.dp))
+            .background(IosTheme.colors.card.copy(alpha = 0.92f)).clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 2.dp).semantics { contentDescription = "打开图片链接" })
+}
+
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun PictureGrid(block: CookedBlock.ImageGrid, onPicture: (List<ImageViewerItem>, Int) -> Unit, postImages: List<ImageViewerItem>) {
     val gallery = postImages.ifEmpty { extractPostImages(block.pictures) }
+    val openLinkedImage = rememberLinkedImageOpener()
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         block.pictures.chunked(block.columns).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 row.forEach { picture ->
                     var imageUrl by remember(picture.url) { mutableStateOf(picture.url) }
-                    SubcomposeAsyncImage(
-                        model = imageUrl,
-                        contentDescription = picture.description,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp))
-                            .background(IosTheme.colors.fieldBackground).clickable {
-                                onPicture(gallery, gallery.indexOfFirst { it.url == picture.originalUrl }.coerceAtLeast(0))
-                            },
-                        loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IosActivityIndicator(diameter = 18.dp) } },
-                        error = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("查看图片", style = IosTheme.type.caption) } },
-                        onError = { if (imageUrl != picture.originalUrl) imageUrl = picture.originalUrl },
-                    )
+                    val preview = { onPicture(gallery, gallery.indexOfFirst { it.url == picture.originalUrl }.coerceAtLeast(0)) }
+                    val actions = if (picture.linkUrl != null) {
+                        Modifier.combinedClickable(onClick = { openLinkedImage(picture) }, onLongClick = preview)
+                    } else Modifier.clickable(onClick = preview)
+                    Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp))
+                        .background(IosTheme.colors.fieldBackground).then(actions)) {
+                        SubcomposeAsyncImage(
+                            model = imageUrl,
+                            contentDescription = picture.description,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                            loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IosActivityIndicator(diameter = 18.dp) } },
+                            error = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("查看图片", style = IosTheme.type.caption) } },
+                            onError = { if (imageUrl != picture.originalUrl) imageUrl = picture.originalUrl },
+                        )
+                        if (picture.linkUrl != null) LinkedImageBadge(Modifier.align(Alignment.BottomEnd)) { openLinkedImage(picture) }
+                    }
                 }
                 repeat(block.columns - row.size) { Spacer(Modifier.weight(1f)) }
             }
