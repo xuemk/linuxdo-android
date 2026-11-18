@@ -6081,8 +6081,8 @@ private fun rememberLinkedImageOpener(): (CookedBlock.Picture) -> Unit {
                 val topic = parseInternalTopicUrl(link)
                 if (topic != null && openTopic != null) {
                     openTopic(topic.topicId, "话题 #${topic.topicId}", topic.postNumber)
-                } else if (isTrustedForumUrl(link)) {
-                    openUrl(link)
+                } else if (shouldOpenInAppBrowser(link)) {
+                    openUrl(normalizeInAppTargetUrl(link) ?: link)
                 } else {
                     openExternal(context, link)
                 }
@@ -6487,7 +6487,7 @@ private fun SandboxedWebPreview(
     allowTouchIntercept: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    if (isTrustedForumUrl(url)) {
+    if (shouldOpenInAppBrowser(url)) {
         SandboxedGeckoPreview(
             url = url,
             active = active,
@@ -6794,8 +6794,9 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
         val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
         (scheme == "http" || scheme == "https") && internalTopic == null
     }
-    val isMiniAppOnebox = remember(onebox.url) { isLinuxDoMiniAppUrl(onebox.url) }
-    val isTrustedOnebox = remember(onebox.url) { isTrustedForumUrl(onebox.url) }
+    val miniAppBadgeLabel = remember(onebox.url) { miniAppBadgeLabelForUrl(onebox.url) }
+    val isMiniAppOnebox = miniAppBadgeLabel != null
+    val isTrustedOnebox = remember(onebox.url) { shouldOpenInAppBrowser(onebox.url) }
     var expanded by rememberSaveable(onebox.url) { mutableStateOf(!isMiniAppOnebox && isAutoPreviewDemoOnebox(onebox)) }
     var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
     var visible by remember(onebox.url) { mutableStateOf(true) }
@@ -6816,8 +6817,8 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                         onebox.title.ifBlank { "话题 #${internalTopic.topicId}" },
                         internalTopic.postNumber,
                     )
-                } else if (isTrustedForumUrl(onebox.url)) {
-                    openUrl(onebox.url)
+                } else if (shouldOpenInAppBrowser(onebox.url)) {
+                    openUrl(normalizeInAppTargetUrl(onebox.url) ?: onebox.url)
                 } else {
                     openExternal(context, onebox.url)
                 }
@@ -6871,7 +6872,7 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                if (isMiniAppOnebox) "linux.do · 小程序" else Uri.parse(onebox.url).host.orEmpty(),
+                miniAppBadgeLabel ?: Uri.parse(onebox.url).host.orEmpty(),
                 style = IosTheme.type.caption,
                 color = if (isMiniAppOnebox) Color(0xFF07C160) else IosTheme.colors.accent,
                 maxLines = 1,
@@ -8164,7 +8165,9 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                 } else {
                                     val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
                                     val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()
-                                    if (host.isNotBlank() && !isTrustedForumHost(host)) {
+                                    if (shouldOpenInAppBrowser(link)) {
+                                        updatedOpenExternal(normalizeInAppTargetUrl(link) ?: link)
+                                    } else if (host.isNotBlank() && !isTrustedForumHost(host)) {
                                         openExternal(context, link)
                                     } else {
                                         updatedOpenExternal(link)

@@ -1215,6 +1215,26 @@ private fun MiniAppSearchField(
         })
 }
 
+fun normalizeInAppTargetUrl(rawUrl: String?): String? {
+    val parsed = rawUrl?.trim()?.takeIf { it.isNotEmpty() }?.toHttpUrlOrNull() ?: return null
+    if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
+    val standardPort = (parsed.isHttps && parsed.port == 443) || (parsed.scheme == "http" && parsed.port == 80)
+    if (!standardPort) return null
+    val candidate = (if (parsed.isHttps) parsed else parsed.newBuilder().scheme("https").port(443).build()).toString()
+    return if (ProfileWebApp.fromUrl(candidate) != null || isTrustedForumUrl(candidate)) candidate else null
+}
+
+fun miniAppBadgeLabelForUrl(rawUrl: String?): String? {
+    val normalized = normalizeInAppTargetUrl(rawUrl) ?: return null
+    ProfileWebApp.fromUrl(normalized)?.let { return "${it.title} · 小程序" }
+    if (isLinuxDoMiniAppUrl(normalized)) return "linux.do · 小程序"
+    return null
+}
+
+fun isInAppMiniAppUrl(rawUrl: String?): Boolean = miniAppBadgeLabelForUrl(rawUrl) != null
+
+fun shouldOpenInAppBrowser(rawUrl: String?): Boolean = normalizeInAppTargetUrl(rawUrl) != null
+
 fun isLinuxDoMiniAppUrl(rawUrl: String?): Boolean {
     if (!isTrustedForumUrl(rawUrl)) return false
     val path = rawUrl?.toUri()?.path?.lowercase().orEmpty()
@@ -1801,16 +1821,17 @@ fun InAppBrowserSheet(
     injectCss: String? = null,
     preferNativeMail: Boolean = false,
 ) {
-    val entry = url.toHttpUrlOrNull()
-    if (preferNativeMail && ProfileWebApp.fromUrl(url) == ProfileWebApp.Mail &&
+    val initialNormalizedUrl = remember(url) { normalizeInAppTargetUrl(url) ?: url }
+    val entry = initialNormalizedUrl.toHttpUrlOrNull()
+    if (preferNativeMail && ProfileWebApp.fromUrl(initialNormalizedUrl) == ProfileWebApp.Mail &&
         entry?.encodedPath == "/" && entry.encodedQuery == null && entry.encodedFragment == null) {
         NativeMailboxSheet(onDismiss)
         return
     }
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    var activeTargetUrl by remember(url) { mutableStateOf(url) }
-    var targetTitle by remember(url) { mutableStateOf(initialTitle) }
+    var activeTargetUrl by remember(initialNormalizedUrl) { mutableStateOf(initialNormalizedUrl) }
+    var targetTitle by remember(initialNormalizedUrl) { mutableStateOf(initialTitle) }
     var returnToLauncher by remember(url) { mutableStateOf(isAppsPlazaUrl(url)) }
     var actionSheetVisible by remember(activeTargetUrl) { mutableStateOf(false) }
     var keepFloatingOnExit by remember(activeTargetUrl) { mutableStateOf(false) }
