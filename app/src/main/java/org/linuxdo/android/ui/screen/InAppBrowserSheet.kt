@@ -1482,7 +1482,7 @@ object MiniAppSessionPool {
                     ?.takeIf { it.isNotEmpty() }
                     ?: withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(appContext).toList() }
                 if (isCurrentHolder()) {
-                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "小程序容器")
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "小程序容器", holder.session)
                     val pageHost = runCatching { android.net.Uri.parse(pageUrl).host }.getOrNull().orEmpty()
                     org.linuxdo.android.net.NetDiagnostics.log(
                         "小程序容器页面完成(Gecko) host=$pageHost title=${holder.title.take(30)} Cookie清单: " +

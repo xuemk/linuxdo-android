@@ -173,9 +173,35 @@ class BrowserSession(
 
     /** 本轮验证页超时未加载完成的诊断是否已记录，避免界面每 150ms 轮询时重复写日志。 */
     @Volatile private var verifyStallLogged = false
+    @Volatile private var verifyStallReason: String? = null
+    @Volatile private var lastVerifyEgressTraceAt: Long = 0L
 
     /** 本轮验证页首次到达源站（Discourse 404）的时间，0 表示尚未到达。 */
     @Volatile private var verifyOriginReachedAt = 0L
+    @Volatile private var lastAuthenticatedUser: org.linuxdo.android.data.DiscourseUser? = null
+
+    fun consumeAuthenticatedUser(): org.linuxdo.android.data.DiscourseUser? =
+        lastAuthenticatedUser.also { lastAuthenticatedUser = null }
+
+    private fun parseAuthenticatedUser(userObj: JSONObject?): org.linuxdo.android.data.DiscourseUser? {
+        if (userObj == null) return null
+        val id = userObj.optLong("id", 0L)
+        val username = userObj.optString("username").trim()
+        if (id <= 0L || username.isBlank()) return null
+        val anim = userObj.optString("animated_avatar").takeIf { it.isNotBlank() }
+        val seeSignatures = if (userObj.has("see_signatures") && !userObj.isNull("see_signatures")) {
+            userObj.optBoolean("see_signatures")
+        } else null
+        return org.linuxdo.android.data.DiscourseUser(
+            id = id,
+            username = username,
+            name = userObj.optString("name").takeIf { it.isNotBlank() },
+            avatarTemplate = userObj.optString("avatar_template").takeIf { it.isNotBlank() },
+            animatedAvatar = anim,
+            trustLevel = if (userObj.has("trust_level") && !userObj.isNull("trust_level")) userObj.optInt("trust_level") else null,
+            seeSignatures = seeSignatures,
+        )
+    }
 
     /** 进入本轮验证前已存在的 cf_clearance，再次读到它们不算新签发。 */
     private var verifyStaleClearances: Set<String> = emptySet()
@@ -646,6 +672,7 @@ class BrowserSession(
                             awaitingSecondFactorLogin = false
                             cb(false, error, false)
                         } else if (isSuccessfulSessionAuthResult(obj, has2faToken)) {
+                            lastAuthenticatedUser = parseAuthenticatedUser(resObj?.optJSONObject("user"))
                             awaitingSecondFactorLogin = false
                             cb(true, null, false)
                         } else {
@@ -1026,12 +1053,39 @@ class BrowserSession(
      * 内置同域网页 / 帖内预览页面完成时，若 Gecko 持有未判废的新 cf_clearance，同步回 SessionStore。
      * 只搬未判废的 cf_clearance，不动 _t / _forum_session，防止挑战页或匿名页冲掉主站登录态。
      */
-    fun syncFreshClearanceFromInAppGecko(candidates: Collection<String>, source: String) {
+    fun syncFreshClearanceFromInAppGecko(
+        candidates: Collection<String>,
+        source: String,
+        session: GeckoSession? = null,
+    ) {
         val fresh = candidates.lastOrNull { it.isNotBlank() && !store.isClearanceChallenged(it) } ?: return
         val current = currentCfClearance()
-        if (fresh != current) {
+        if (fresh == current) return
+        val generation = store.sessionGeneration
+        val knownGeckoUa = mainGeckoUserAgent
+        if (!knownGeckoUa.isNullOrBlank()) {
+            if (store.userAgentOrNull() != knownGeckoUa) {
+                store.saveUserAgent(knownGeckoUa)
+                webViewInstance?.settings?.userAgentString = knownGeckoUa
+                authWebView?.settings?.userAgentString = knownGeckoUa
+                diagnostics.log("内置 Gecko 页面同步凭据前已对齐缓存 UA ($source)")
+            }
             adoptGeckoClearance(fresh)
             diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            return
+        }
+        if (session == null) {
+            adoptGeckoClearance(fresh)
+            diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            return
+        }
+        scope.launch(Dispatchers.Main) {
+            val stillCurrent = { !store.sessionChanging && store.sessionGeneration == generation }
+            runCatching { synchronizeGeckoUserAgent(session, source, stillCurrent) }
+            if (stillCurrent() && !store.isClearanceChallenged(fresh) && fresh != currentCfClearance()) {
+                adoptGeckoClearance(fresh)
+                diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            }
         }
     }
 
@@ -1709,6 +1763,7 @@ class BrowserSession(
                                     awaitingSecondFactorLogin = false
                                     submissionCallback(false, error, false)
                                 } else if (resp.isSuccessful || !user.isNullOrBlank()) {
+                                    lastAuthenticatedUser = parseAuthenticatedUser(resObj?.optJSONObject("user"))
                                     awaitingSecondFactorLogin = false
                                     CookieManager.getInstance().flush()
                                     diagnostics.log("Native 登录成功！用户: ${user ?: cachedLogin}")
@@ -2648,11 +2703,13 @@ class BrowserSession(
 
     fun logVerifyClientIdentity(stage: String) {
         val appUserAgent = store.userAgentOrNull()
+        val context = attachedActivityContext ?: appContext
         diagnostics.log(
             "验证身份对照[$stage]: AppUA=${NetDiagnostics.fingerprint(appUserAgent)} " +
                 "GeckoUA=${NetDiagnostics.fingerprint(mainGeckoUserAgent)} " +
                 "一致=${mainGeckoUserAgent?.let { it == appUserAgent } ?: "未读取"} " +
-                "clearance=${store.currentCfClearanceFp()}",
+                "clearance=${store.currentCfClearanceFp()} " +
+                GeckoManager.runtimeNetworkSummary(context),
         )
     }
 
@@ -3170,6 +3227,7 @@ class BrowserSession(
             } catch (error: Exception) {
                 if (stillCurrent()) {
                     verifyLoadFailed = true
+                    verifyStallReason = "验证组件初始化异常 (${error.javaClass.simpleName})，请重试"
                     activeChallengeDetectedAt = 0L
                     verificationNeedsInteraction = false
                     view.alpha = 0f
@@ -3183,6 +3241,7 @@ class BrowserSession(
         verificationPageLoaded = false
         verifyLoadFailed = false
         verifyStallLogged = false
+        verifyStallReason = null
         verifyOriginReachedAt = 0L
         verificationNeedsInteraction = false
         verificationSawChallenge = false
@@ -3205,6 +3264,7 @@ class BrowserSession(
         if (runCatching { Uri.parse(url).host }.getOrNull() == Config.HOST) {
             verificationPageLoaded = true
             verifyLoadFailed = false
+            verifyStallReason = null
             diagnostics.log("验证页 Gecko 加载完成: ${GeckoManager.diagnosticUrl(url)}")
         }
     }
@@ -3212,6 +3272,20 @@ class BrowserSession(
     private fun onVerifyGeckoLoadError(view: GeckoView, url: String, error: org.mozilla.geckoview.WebRequestError) {
         if (mainGeckoView !== view || verifyPhase != VerifyPhase.RUNNING) return
         verifyLoadFailed = true
+        verifyStallReason = when (error.code) {
+            org.mozilla.geckoview.WebRequestError.ERROR_UNKNOWN_HOST ->
+                "无法解析验证服务地址 (DNS 失败)，请检查网络或 DoH 设置后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_NET_TIMEOUT ->
+                "连接验证服务超时，请检查网络或代理设置后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_OFFLINE ->
+                "当前网络已断开，请连接网络后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_SECURITY_SSL,
+            org.mozilla.geckoview.WebRequestError.ERROR_SECURITY_BAD_CERT,
+            org.mozilla.geckoview.WebRequestError.ERROR_BAD_HSTS_CERT ->
+                "安全连接握手失败 (SSL/TLS 异常)，请检查网络环境或设备时间后重试"
+            else ->
+                "验证页面加载失败 (错误码 ${error.category}/${error.code})，请检查网络后重试"
+        }
         activeChallengeDetectedAt = 0L
         verificationNeedsInteraction = false
         view.alpha = 0f
@@ -3413,6 +3487,9 @@ class BrowserSession(
     /** 记录 Gecko 网络栈的出口摘要，用于和 OkHttp 的同名记录对照凭据为何不通用。 */
     suspend fun logVerifyGeckoEgress() = withContext(Dispatchers.Main) {
         if (TopicRepository.isRateLimitCoolingDown()) return@withContext
+        val now = SystemClock.elapsedRealtime()
+        if (lastVerifyEgressTraceAt != 0L && now - lastVerifyEgressTraceAt < 60_000L) return@withContext
+        lastVerifyEgressTraceAt = now
         val view = mainGeckoView
         val generation = store.sessionGeneration
         val bridge = view?.let { geckoBridges[it] }
@@ -3634,6 +3711,9 @@ class BrowserSession(
         !verificationPageLoaded && SystemClock.elapsedRealtime() - verificationStartedAt > VERIFY_STALL_MS -> {
             if (!verifyStallLogged) {
                 verifyStallLogged = true
+                if (verifyStallReason == null) {
+                    verifyStallReason = "验证页面超过 ${VERIFY_STALL_MS / 1_000L} 秒仍未加载完成，请检查网络或切换代理后重试"
+                }
                 val view = mainGeckoView
                 val bridge = view?.let { geckoBridges[it] }
                 diagnostics.log(
@@ -3665,6 +3745,8 @@ class BrowserSession(
 
     /** 验证页加载异常：Gecko 主框架报错，或打开后 [VERIFY_STALL_MS] 内一页都没加载完。 */
     fun isVerificationPageStalled(): Boolean = verifyPageState() == VerifyPageState.STALLED
+
+    fun verifyStallReason(): String? = verifyStallReason
 
     /** 验证页已收口（取得新凭据，或已回源但等不到新凭据）。凭据是否真能用由上层用 OkHttp 复核。 */
     fun interactiveVerificationComplete(): Boolean = verifyPhase == VerifyPhase.DONE
@@ -3968,11 +4050,12 @@ class BrowserSession(
         val brands = evalString(
             "(navigator.userAgentData && navigator.userAgentData.brands) ? navigator.userAgentData.brands.map(function(b){return b.brand+'/'+b.version}).join(',') : 'none'",
         )
+        val effectiveUa = store.userAgentOrNull() ?: userAgent
         val chromeVersion = { ua: String -> Regex("Chrome/([\\d.]+)").find(ua)?.groupValues?.get(1) ?: "-" }
         diagnostics.log(
-            "[诊断] 环境: 固定UA Chrome=${chromeVersion(userAgent)} 页面UA Chrome=${chromeVersion(pageUa)}" +
-                " 系统WebView Chrome=${chromeVersion(systemUa)} 页面UA与固定UA一致=${pageUa == userAgent}" +
-                " ClientHints=$brands uaFp=${NetDiagnostics.fingerprint(userAgent)}",
+            "[诊断] 环境: 固定UA Chrome=${chromeVersion(effectiveUa)} 页面UA Chrome=${chromeVersion(pageUa)}" +
+                " 系统WebView Chrome=${chromeVersion(systemUa)} 页面UA与固定UA一致=${pageUa == effectiveUa}" +
+                " ClientHints=$brands uaFp=${NetDiagnostics.fingerprint(effectiveUa)}",
         )
     }
 

@@ -5343,7 +5343,13 @@ fun UnreadBell(count: Int, onClick: () -> Unit) {
 
 /** 登录/验证页顶部的说明条;WebView 本体由 AppShell 抬到它下方显示。 */
 @Composable
-fun WebTopBar(screen: Screen, onCancel: () -> Unit = {}, onRetry: () -> Unit = {}) {
+fun WebTopBar(
+    screen: Screen,
+    onCancel: () -> Unit = {},
+    onRetry: () -> Unit = {},
+    retryEnabled: Boolean = true,
+    retryRemainingSeconds: Long = 0L,
+) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -5357,7 +5363,16 @@ fun WebTopBar(screen: Screen, onCancel: () -> Unit = {}, onRetry: () -> Unit = {
             color = IosTheme.colors.label,
         )
         androidx.compose.material3.TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterStart)) { Text("返回") }
-        androidx.compose.material3.TextButton(onClick = onRetry, modifier = Modifier.align(Alignment.CenterEnd)) { Text("重试") }
+        androidx.compose.material3.TextButton(
+            onClick = onRetry,
+            enabled = retryEnabled,
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            Text(
+                if (!retryEnabled && retryRemainingSeconds > 0L) "重试(${retryRemainingSeconds}s)"
+                else "重试",
+            )
+        }
     }
 }
 

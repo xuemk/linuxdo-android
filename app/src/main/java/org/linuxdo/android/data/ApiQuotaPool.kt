@@ -113,7 +113,7 @@ enum class ApiQuotaPool(
     private val penaltyBaseMs: Long,
 ) {
     /** 前台未读角标 / 通知分类轮询。 */
-    UNREAD_POLL("未读轮询", 15_000L, true, 30_000L),
+    UNREAD_POLL("未读轮询", 20_000L, true, 30_000L),
 
     /** 列表顶部"有 N 条新话题"的静默探测。 */
     INCOMING_PROBE("新话题探测", 10_000L, true, 40_000L),

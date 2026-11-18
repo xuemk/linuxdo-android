@@ -295,6 +295,27 @@ class DohFailoverCoordinator(
         }
     }
 
+    /** 主动清理空闲/半开连接，并在直连 Anycast 模式下轮换优选节点（供幂等单次重试恢复）。 */
+    fun onIdempotentSingleFailureRetry(epochGen: Long) {
+        val epoch = currentEpoch.get()
+        if (epoch.generation != epochGen) return
+        runCatching { epoch.client.connectionPool.evictAll() }
+        if (epoch.transport != null && (!store.isDohEnabled() || epoch.routeMode == NetworkRouteMode.DIRECT)) {
+            anycastPool?.rotateWinner()
+        }
+    }
+
+    /** 进程启动或冷态预热 Anycast 节点池，避免首个业务请求盲选未探测节点超时。 */
+    fun warmUpAnycastIfNeeded() {
+        val pool = anycastPool ?: return
+        if (pool.hasHealthyProbedNode() || shouldPauseDohForProxy()) return
+        scope.launch {
+            if (!pool.hasHealthyProbedNode() && !shouldPauseDohForProxy()) {
+                runCatching { pool.refresh() }
+            }
+        }
+    }
+
     /** 清除所有惩罚（供用户重置使用） */
     fun clearAllPenalties() {
         penalties.clear()

@@ -886,6 +886,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val verificationProbeFeedback = _verificationProbeFeedback.asStateFlow()
     private var verificationConfirmedUserAgent: String? = null
     private var verificationConnectionsRefreshed = false
+    private var verificationAnycastRotated = false
     private var verificationDiagnosticJob: Job? = null
     private val _accounts = MutableStateFlow(
         container.accountManager.snapshot().let { snapshot ->
@@ -907,6 +908,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private var bootJob: Job? = null
+    private var healMissingUserJob: Job? = null
     private var sessionStorageNeedsRetry = false
     private var autoJob: Job? = null
     private var reconcileSessionJob: Job? = null
@@ -917,6 +919,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var unreadJob: Job? = null
     private var unreadFailures = 0
     private var nextUnreadRefreshAt = 0L
+    private var lastUnreadSuccessAt = 0L
     /**
      * 未读刷新撞 CF 挑战后的退避截止时间。force 刷新（回前台、切页）也不越过它：
      * 每 10 秒拿同一枚 cf_clearance 去撞，会拖低它的评分，连带 /topics/timings 被挑战。
@@ -1016,6 +1019,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val ldcFetchGate = Mutex()
     private var ldcLastAttempt: Pair<Long, Result<LdcUserInfo>>? = null
 
+    private var lastUserBadgesFetchAt = 0L
+    private var lastCustomSectionSyncAt = 0L
+    private var customSectionSyncJob: Job? = null
+
     private fun connectSessionCheck(username: String): () -> Unit {
         val userId = store.currentUserId()
         val generation = store.sessionGeneration
@@ -1053,14 +1060,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return result
     }
 
-    private suspend fun fetchAuthorizedLdc(username: String, checkSession: () -> Unit): LdcUserInfo {
+    private suspend fun fetchAuthorizedLdc(
+        username: String,
+        checkSession: () -> Unit,
+        includeRemoteGamification: Boolean = false,
+    ): LdcUserInfo {
         val queuedAt = SystemClock.elapsedRealtime()
         return ldcFetchGate.withLock {
             checkSession()
             // 同一轮已排队请求共享成功或失败，避免预热失败后手动请求紧接着重复 OAuth。
             ldcLastAttempt?.takeIf { it.first >= queuedAt }?.let { return@withLock it.second.getOrThrow() }
             try {
-                val info = readSiteWithAuthorization(checkSession, { repository.fetchLdcUserInfo() }, { repository.authorizeLdc() })
+                val info = readSiteWithAuthorization(
+                    checkSession,
+                    { repository.fetchLdcUserInfo(includeRemoteGamification = includeRemoteGamification) },
+                    { repository.authorizeLdc() },
+                )
                 check(info.username.equals(username, ignoreCase = true)) { "积分账号与当前账号不一致，请重新授权" }
                 ldcLastAttempt = SystemClock.elapsedRealtime() to Result.success(info)
                 info
@@ -1130,10 +1145,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repeat(2) { round ->
                 awaitQuietWindow()
                 var retryAfterMs = 0L
+                var didNetworkCall = false
                 val now = System.currentTimeMillis()
                 val cachedTrust = repository.getCachedTrustReport(username)
                 if (cachedTrust == null || now - cachedTrust.second >= Config.TRUST_REPORT_CACHE_TTL_MS) {
                     if (now >= connectSilentBackoffUntil) {
+                        didNetworkCall = true
                         try {
                             val fresh = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
                             checkSession()
@@ -1144,6 +1161,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         } catch (e: CancellationException) {
                             throw e
+                        } catch (e: org.linuxdo.android.net.RateLimitException) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            connectSilentBackoffUntil = System.currentTimeMillis() + pause
+                            diagnostics.log("等级预热遇限流，本轮预热提前退避")
+                            return@launch
                         } catch (e: Exception) {
                             checkSession()
                             val pause = siteFailureDelayMs(e)
@@ -1154,14 +1177,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // 两个接口之间错峰间隔 6 秒，杜绝并发特征
-                delay(6_000L)
+                // 若前一步发起了跨站请求，拉长间隔到 25 秒再继续下一个子站，防止连环 OAuth 触发 429
+                delay(if (didNetworkCall) 25_000L else 6_000L)
+                if (repository.isRateLimitCoolingDown()) {
+                    diagnostics.log("检测到主站限流冷却，中止本轮后台等级与积分预热")
+                    return@launch
+                }
                 awaitQuietWindow()
 
                 // 2. 检查等级积分是否超过 6 小时
+                var didLdcNetworkCall = false
                 val cachedLdc = repository.getCachedLdcUserInfo(username)
-                if (cachedLdc == null || now - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
+                if (cachedLdc == null || System.currentTimeMillis() - cachedLdc.second >= Config.LDC_USER_INFO_CACHE_TTL_MS) {
                     if (System.currentTimeMillis() >= ldcBackoffUntil) {
+                        didLdcNetworkCall = true
                         try {
                             val fresh = fetchAuthorizedLdc(username, checkSession)
                             checkSession()
@@ -1170,6 +1199,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
                         } catch (e: CancellationException) {
                             throw e
+                        } catch (e: org.linuxdo.android.net.RateLimitException) {
+                            checkSession()
+                            val pause = siteFailureDelayMs(e)
+                            ldcBackoffUntil = System.currentTimeMillis() + pause
+                            _ldcState.update { it.copy(error = "积分预热暂缓: ${e.message}") }
+                            diagnostics.log("积分预热遇限流，中止本轮后续社区分预热: ${e.message}")
+                            return@launch
                         } catch (e: Exception) {
                             checkSession()
                             val pause = siteFailureDelayMs(e)
@@ -1181,15 +1217,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // 两个接口之间同样错峰 6 秒，再取社区分
-                delay(6_000L)
+                // LDC OAuth/读取后与 CDK OAuth 错峰至少 25 秒，且若刚进入冷却立即收手
+                delay(if (didLdcNetworkCall) 25_000L else 6_000L)
+                if (repository.isRateLimitCoolingDown()) {
+                    diagnostics.log("检测到主站限流冷却，跳过本轮 CDK 社区分预热")
+                    return@launch
+                }
                 awaitQuietWindow()
                 loadCdkScore(fromWarmup = true)
                 cdkScoreJob?.join()
                 checkSession()
                 val cdkRemaining = cdkScoreBackoffUntil - System.currentTimeMillis()
                 if (cdkRemaining in 1L..60_000L) retryAfterMs = maxOf(retryAfterMs, cdkRemaining)
-                if (round > 0 || retryAfterMs <= 0L) return@launch
+                if (round > 0 || retryAfterMs <= 0L || repository.isRateLimitCoolingDown()) return@launch
                 delay(maxOf(30_000L, retryAfterMs))
             }
         }
@@ -2716,6 +2756,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             android.webkit.CookieManager.getInstance().flush()
                             store.syncFromWebView()
                             if (u.isNotBlank()) store.saveCredentials(u, p, rememberPassword)
+                            browser.consumeAuthenticatedUser()?.let { applyAuthenticatedUserSeed(it) }
                         } catch (error: org.linuxdo.android.data.EncryptedStorageUnavailableException) {
                             _loginUiState.update { it.copy(loading = false, error = error.message) }
                             return@launch
@@ -4322,7 +4363,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
         viewModelScope.launch {
             try {
-                val info = fetchAuthorizedLdc(username, checkSession)
+                val info = fetchAuthorizedLdc(username, checkSession, includeRemoteGamification = refresh)
                 checkSession()
                 ldcBackoffUntil = 0L
                 val updateTime = System.currentTimeMillis()
@@ -4356,9 +4397,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadProfile(section: ProfileSection, refresh: Boolean = false, more: Boolean = false) {
-        val username = _state.value.username ?: return
+        val username = _state.value.username ?: run {
+            healMissingUsernameIfNeeded()
+            return
+        }
         if (section == ProfileSection.Summary && !more) {
-            loadDrafts(refresh = refresh, silent = true)
             prewarmCurrentUserAvatar(username)
             loadUserBadges(username, refresh = refresh)
         }
@@ -4398,11 +4441,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!refresh && loadUserBadgesJob?.isActive == true) {
             return
         }
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (!refresh && _userBadges.value != null && lastUserBadgesFetchAt > 0L &&
+            nowElapsed - lastUserBadgesFetchAt < 600_000L
+        ) {
+            return
+        }
         if (!refresh && _userBadges.value != null) {
             loadUserBadgesJob = viewModelScope.launch {
                 try {
                     val list = repository.fetchUserBadges(targetUser, forceRefresh = false)
                     _userBadges.value = list
+                    if (list.isNotEmpty()) lastUserBadgesFetchAt = SystemClock.elapsedRealtime()
                 } catch (_: Exception) {}
             }
             return
@@ -4412,6 +4462,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val list = repository.fetchUserBadges(targetUser, forceRefresh = refresh)
                 _userBadges.value = list
+                if (list.isNotEmpty()) lastUserBadgesFetchAt = SystemClock.elapsedRealtime()
             } catch (e: Exception) {
                 // 加载失败静默处理
             } finally {
@@ -5023,10 +5074,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshUnread(force: Boolean = false, reloadNotifications: Boolean = true) {
         if (unreadJob?.isActive == true || _state.value.screen != Screen.List) return
         if (SystemClock.elapsedRealtime() < unreadChallengeBackoffUntil) return
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (force && reloadNotifications && lastUnreadSuccessAt > 0L && nowElapsed - lastUnreadSuccessAt < 8_000L) {
+            return
+        }
         if (force) {
             nextUnreadRefreshAt = 0L
             unreadFailures = 0
-        } else if (SystemClock.elapsedRealtime() < nextUnreadRefreshAt) {
+        } else if (nowElapsed < nextUnreadRefreshAt) {
             return
         }
         // 独立计量池准入：冷却 / 惩罚期 / 前台让行时静默跳过，不再每轮抛 RateLimitException 刷屏
@@ -5040,6 +5095,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ApiQuotaPool.UNREAD_POLL.onSuccess()
                 unreadFailures = 0
                 nextUnreadRefreshAt = 0L
+                val settledAt = SystemClock.elapsedRealtime()
+                lastUnreadSuccessAt = settledAt
+                if (summary.recentEntries.isNotEmpty()) {
+                    val cachedPage = ProfileUiState(
+                        content = ProfilePage(
+                            entries = summary.recentEntries,
+                            hasMore = summary.hasMore,
+                            nextCursor = 1,
+                        ),
+                        loaded = true,
+                        loadedAt = settledAt,
+                        unreadAtLoad = summary.unreadByFilter[NotificationFilter.All] ?: 0,
+                    )
+                    notificationCache[NotificationFilter.All] = cachedPage
+                }
                 _state.update { it.copy(
                     unreadCount = summary.count,
                     unreadFilters = summary.unreadFilters,
@@ -6709,10 +6779,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 若 PC 端有配置自定义版块，自动拉取下来；
      * 若 PC 端已删除，且本地版块之前绑定过 serverId，则同步清理本地。
      */
-    fun syncCustomSectionFromServer() {
-        viewModelScope.launch {
+    fun syncCustomSectionFromServer(force: Boolean = false) {
+        if (_state.value.username.isNullOrBlank()) return
+        if (repository.isRateLimitCoolingDown()) return
+        if (customSectionSyncJob?.isActive == true) return
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (!force && lastCustomSectionSyncAt > 0L && nowElapsed - lastCustomSectionSyncAt < 600_000L) return
+        val generation = accountScopeGeneration
+        customSectionSyncJob = viewModelScope.launch {
             try {
                 val remoteSection = repository.fetchCustomSidebarSection()
+                if (generation != accountScopeGeneration) return@launch
+                lastCustomSectionSyncAt = SystemClock.elapsedRealtime()
                 if (remoteSection != null) {
                     store.saveCustomSection(remoteSection)
                     _customSection.value = remoteSection
@@ -6723,6 +6801,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         _customSection.value = null
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 diagnostics.log("同步远端自定义版块失败: ${e.message}")
             }
@@ -7656,6 +7736,42 @@ fun openTopicSearch(topicId: Long, title: String) {
         )
     }
 
+    private fun applyAuthenticatedUserSeed(user: org.linuxdo.android.data.DiscourseUser) {
+        if (user.id <= 0L || user.username.isBlank()) return
+        store.saveCurrentUserId(user.id)
+        container.reading.switchUser(user.id)
+        container.historyStore.switchUser(user.id)
+        restoreAccountScopedLocalState(user.id)
+        rememberCurrentAccount(user)
+        container.preferences.edit {
+            putString("cached_username", user.username)
+            putLong("cached_username_user_id", user.id)
+        }
+        _state.update { it.copy(username = user.username) }
+        diagnostics.log("已写入登录身份种子: ${user.username}")
+    }
+
+    private fun healMissingUsernameIfNeeded() {
+        if (!_state.value.username.isNullOrBlank()) return
+        if (!store.hasSessionCookie()) return
+        if (healMissingUserJob?.isActive == true || repository.isRateLimitCoolingDown()) return
+        val expectedGen = store.sessionGeneration
+        healMissingUserJob = viewModelScope.launch {
+            try {
+                val user = repository.fetchCurrentUserDetails(present = false)
+                if (user == null || store.sessionGeneration != expectedGen) return@launch
+                applyAuthenticatedUserSeed(user)
+                scheduleIdleConnectWarmup()
+                if (_profile.value[ProfileSection.Summary]?.loaded != true) {
+                    loadProfile(ProfileSection.Summary)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     fun boot() {
         if (repository.cachedCategoryList() == null) {
             container.preferences.getString("cached_categories_json", null)?.let { rawJson ->
@@ -7690,6 +7806,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                     enterWebScreen(Screen.Login)
                     return@launch
                 }
+                browser.consumeAuthenticatedUser()?.let { applyAuthenticatedUserSeed(it) }
                 val cachedUser = container.preferences.getString("cached_username", null)?.takeIf {
                     it.isNotBlank() && store.currentUserId() > 0L &&
                         container.preferences.getLong("cached_username_user_id", 0L) == store.currentUserId()
@@ -8162,12 +8279,14 @@ fun openTopicSearch(topicId: Long, title: String) {
                             }
                         }
                         TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
-                            refreshVerificationIdleConnections()
+                            refreshVerificationIdleConnections(allowAnycastRotate = verificationProbeAttempts >= 2)
                             scheduleVerificationConfirmation("App 请求仍受挑战", probeResult)
                             return
                         }
                         TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
-                            refreshVerificationIdleConnections()
+                            refreshVerificationIdleConnections(
+                                allowAnycastRotate = verificationProbeAttempts >= 2 && (probeResult.status ?: 0) == 0,
+                            )
                             scheduleVerificationConfirmation("App 请求暂未确认恢复", probeResult)
                             return
                         }
@@ -8740,6 +8859,13 @@ fun openTopicSearch(topicId: Long, title: String) {
         topicScrollSettledAt.clear()
         searchJob?.cancel()
         unreadJob?.cancel()
+        healMissingUserJob?.cancel()
+        healMissingUserJob = null
+        lastUnreadSuccessAt = 0L
+        lastUserBadgesFetchAt = 0L
+        lastCustomSectionSyncAt = 0L
+        customSectionSyncJob?.cancel()
+        customSectionSyncJob = null
         reconcileSessionJob?.cancel()
         highestVisiblePostByTopic.forEach { (topicId, postNumber) ->
             container.reading.recordLastSeenPost(topicId, postNumber)
@@ -8926,21 +9052,45 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationProbePath = lightPath
             diagnostics.log("验证复核遇 429，后续改用轻量接口 $lightPath 探测")
         }
-        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
-            scheduleVerificationConfirmation("App 请求持续被限流")
-        }
         val waitMs = maxOf(step, TopicRepository.rateLimitRemainingMs(), serverWaitMs)
         val waitSeconds = waitMs / 1_000L + if (waitMs % 1_000L == 0L) 0L else 1L
-        diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${waitSeconds}s 后重探")
+        if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
+            scheduleVerificationConfirmation(
+                "App 请求持续被限流",
+                TopicRepository.VerificationProbeResult(
+                    TopicRepository.VerificationProbeOutcome.RATE_LIMITED,
+                    status = 429,
+                    retryAfterSeconds = waitSeconds,
+                    detail = "连续触发 429 速率限制",
+                ),
+            )
+        }
+        if (verificationMismatch) {
+            diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，已停止自动复核，${waitSeconds}s 冷却后可手动重试")
+        } else {
+            diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${waitSeconds}s 后重探")
+        }
         return waitMs
     }
 
-    private fun refreshVerificationIdleConnections() {
-        if (verificationConnectionsRefreshed || TopicRepository.isRateLimitCoolingDown()) return
+    private fun refreshVerificationIdleConnections(allowAnycastRotate: Boolean = false) {
+        if (TopicRepository.isRateLimitCoolingDown()) return
+        var rotatedIp: String? = null
+        if (allowAnycastRotate && !verificationAnycastRotated) {
+            val epoch = container.dohCoordinator.currentEpoch.get()
+            if (epoch.transport != null && (!store.isDohEnabled() || epoch.routeMode == org.linuxdo.android.net.NetworkRouteMode.DIRECT)) {
+                verificationAnycastRotated = true
+                rotatedIp = runCatching { container.anycastPool.rotateWinner() }.getOrNull()
+            }
+        }
+        if (verificationConnectionsRefreshed && rotatedIp == null) return
         verificationConnectionsRefreshed = true
-        // 推进网络代次会让验证页重新加载；这里只回收空闲连接，保留当前线路和候选凭据。
+        // 推进网络代次会让验证页重新加载；这里只回收空闲连接（且仅在第 2 次失败后最多轮换 1 次 Anycast 节点），保留当前线路和复核预算。
         runCatching { container.httpClient.connectionPool.evictAll() }
-            .onSuccess { diagnostics.log("验证复核暂未恢复，已清理空闲连接，沿用当前线路和复核预算") }
+            .onSuccess {
+                val note = if (rotatedIp != null) "并切换备选直连节点" else ""
+                diagnostics.log("验证复核暂未恢复，已清理空闲连接$note，沿用当前线路和复核预算")
+            }
             .onFailure { diagnostics.log("验证复核清理空闲连接失败: ${it.javaClass.simpleName}") }
     }
 
@@ -8948,6 +9098,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         _verificationProbeFeedback.value = null
         verificationConfirmedUserAgent = null
         verificationConnectionsRefreshed = false
+        verificationAnycastRotated = false
         verificationDiagnosticJob?.cancel()
         verificationDiagnosticJob = null
     }
@@ -9054,6 +9205,21 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     /** 验证页加载异常（chrome-error 或数秒内无页面完成），用于提示检查网络或代理。 */
     fun isVerificationPageStalled(): Boolean = browser.isVerificationPageStalled()
+
+    fun verifyStallReason(): String? = browser.verifyStallReason()
+
+    fun verificationRetryRemainingSeconds(): Long {
+        val now = SystemClock.elapsedRealtime()
+        val rateRemMs = TopicRepository.rateLimitRemainingMs()
+        val probeWaitRemMs = if (
+            _verificationProbeFeedback.value?.outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED ||
+            (_verificationProbeFeedback.value?.retryAfterMillis ?: 0L) > 0L
+        ) {
+            (maxOf(verifyCompletionProbeNotBefore, appPathProbeNotBefore) - now).coerceAtLeast(0L)
+        } else 0L
+        val totalMs = maxOf(rateRemMs, probeWaitRemMs)
+        return if (totalMs <= 0L) 0L else (totalMs + 999L) / 1_000L
+    }
 
     fun verifyPageState(): org.linuxdo.android.net.BrowserSession.VerifyPageState =
         if (verificationMismatch) org.linuxdo.android.net.BrowserSession.VerifyPageState.MISMATCH
@@ -9193,6 +9359,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                 _state.update { it.copy(latest = newState) }
             }
             refreshCookieInfo()
+            healMissingUsernameIfNeeded()
         } catch (error: CancellationException) {
             throw error
         } catch (error: NeedsInteractiveVerification) {

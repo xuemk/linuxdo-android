@@ -6645,7 +6645,7 @@ private fun SandboxedGeckoPreview(
                         org.linuxdo.android.net.gecko.GeckoManager.cfClearancesFromDb(context).toList()
                     }
                 if (!disposed) {
-                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览")
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览", sessionRef)
                 }
             }
         }

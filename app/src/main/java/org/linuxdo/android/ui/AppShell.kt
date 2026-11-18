@@ -160,6 +160,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
     var verifyPageState by remember(showWeb) { mutableStateOf(BrowserSession.VerifyPageState.LOADING) }
     var verifyRetryAllowed by remember(showWeb) { mutableStateOf(true) }
+    var verifyRetryRemainingSec by remember(showWeb) { mutableStateOf(0L) }
+    var verifyStallReason by remember(showWeb) { mutableStateOf<String?>(null) }
     val verificationProbeFeedback by viewModel.verificationProbeFeedback.collectAsStateWithLifecycle()
     LaunchedEffect(showWeb) {
         if (showWeb) {
@@ -170,6 +172,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 while (showWeb) {
                     verifyPageState = viewModel.verifyPageState()
                     verifyRetryAllowed = viewModel.canRetryVerification()
+                    verifyRetryRemainingSec = viewModel.verificationRetryRemainingSeconds()
+                    verifyStallReason = viewModel.verifyStallReason()
                     delay(150)
                 }
             }
@@ -254,7 +258,13 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     ) {
                         val context = LocalContext.current
                         if (showWeb) {
-                            WebTopBar(state.screen, viewModel::cancelVerification, viewModel::retryVerification)
+                            WebTopBar(
+                                screen = state.screen,
+                                onCancel = viewModel::cancelVerification,
+                                onRetry = viewModel::retryVerification,
+                                retryEnabled = verifyRetryAllowed,
+                                retryRemainingSeconds = verifyRetryRemainingSec,
+                            )
                         }
                         val webReady = !showWeb || verifyPageState == BrowserSession.VerifyPageState.READY
                         Box(
@@ -280,7 +290,9 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                                 VerifyLoadingLayer(
                                     state = verifyPageState,
                                     feedback = verificationProbeFeedback,
+                                    stallReason = verifyStallReason,
                                     retryEnabled = verifyRetryAllowed,
+                                    retryRemainingSeconds = verifyRetryRemainingSec,
                                     onRetry = viewModel::retryVerification,
                                     modifier = Modifier
                                         .fillMaxSize()
@@ -367,7 +379,9 @@ private fun ReadSyncVerifyBanner(
 private fun VerifyLoadingLayer(
     state: BrowserSession.VerifyPageState,
     feedback: TopicRepository.VerificationProbeResult?,
+    stallReason: String?,
     retryEnabled: Boolean,
+    retryRemainingSeconds: Long,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -377,18 +391,34 @@ private fun VerifyLoadingLayer(
         verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
     ) {
         val failure = when (state) {
-            BrowserSession.VerifyPageState.STALLED -> "验证未完成" to "验证页面或组件尚未准备好，请检查网络后重试"
+            BrowserSession.VerifyPageState.STALLED -> "验证未完成" to (stallReason ?: "验证页面或组件尚未准备好，请检查网络后重试")
             BrowserSession.VerifyPageState.MISMATCH -> when (feedback?.outcome) {
                 TopicRepository.VerificationProbeOutcome.CHALLENGED ->
-                    "App 请求仍需验证" to "验证页面已结束，但 App 请求仍被站点安全验证拦截。请重试；持续出现时可切换网络。"
+                    "App 请求仍被安全验证拦截" to
+                        "网页验证已通过（${feedback.detail ?: "复核被拦截"}），但 App 数据通道仍被 Cloudflare 拦截。\n" +
+                        "原因多为验证页与 App 通道的网络出口、代理分流或 DoH/直连节点不一致。\n" +
+                        "请点击「重试」；若持续出现，请切换网络、关闭冲突代理或调整 DoH 设置。"
                 TopicRepository.VerificationProbeOutcome.RATE_LIMITED ->
-                    "站点暂时限流" to "请等待冷却结束后重试，避免连续点击验证。"
+                    "触发请求速率限制" to buildString {
+                        append(feedback.detail ?: "站点暂时限流")
+                        if (retryRemainingSeconds > 0L) {
+                            append("，请等待约 ")
+                            append(retryRemainingSeconds)
+                            append(" 秒冷却结束后重试，避免连续点击加重风控。")
+                        } else {
+                            append("，冷却已结束，现在可点击「重试」。")
+                        }
+                    }
                 TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> if ((feedback.status ?: 0) >= 500) {
-                    "站点服务暂不可用" to "连接复核收到服务异常，请稍后重试。"
+                    "站点服务暂不可用 (HTTP ${feedback.status})" to
+                        "网页验证已通过，但复核时${feedback.detail ?: "收到服务端异常"}。\n" +
+                        "已保留当前验证凭据，请稍后点击「重试」直接重新确认连接。"
                 } else {
-                    "连接尚未确认恢复" to "连接复核超时、中断或未得到有效响应，请检查网络后重试。"
+                    "连接尚未确认恢复" to
+                        "网页验证已通过，但复核时${feedback.detail ?: "请求超时或网络中断"}。\n" +
+                        "已保留当前验证凭据，点击「重试」将直接重新检查连接（无需重过验证码）。"
                 }
-                else -> "App 连接尚未恢复" to "尚未确认 App 连接恢复，请稍后重试。"
+                else -> "App 连接尚未恢复" to "尚未确认 App 连接恢复（${feedback?.detail ?: "请稍后重试"}）。"
             }
             else -> null
         }
@@ -407,16 +437,24 @@ private fun VerifyLoadingLayer(
                 modifier = Modifier.padding(top = 8.dp),
             )
             TextButton(onClick = onRetry, enabled = retryEnabled, modifier = Modifier.padding(top = 12.dp)) {
-                Text(if (retryEnabled) "重试" else "等待后重试", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    if (retryEnabled) "重试" else if (retryRemainingSeconds > 0L) "等待后重试 (${retryRemainingSeconds}s)" else "等待后重试",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                )
             }
         } else {
             IosActivityIndicator(diameter = 28.dp)
             Text(
                 text = if (state == BrowserSession.VerifyPageState.CONFIRMING) {
                     when (feedback?.outcome) {
-                        TopicRepository.VerificationProbeOutcome.RATE_LIMITED -> "站点暂时限流，正在等待后再检查连接。"
-                        TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> "连接复核尚未得到有效结果，稍后会自动再试。"
-                        TopicRepository.VerificationProbeOutcome.CHALLENGED -> "App 请求仍需安全验证，正在再次确认连接。"
+                        TopicRepository.VerificationProbeOutcome.RATE_LIMITED ->
+                            if (retryRemainingSeconds > 0L) "触发请求速率限制，约 ${retryRemainingSeconds} 秒后自动重探连接。"
+                            else "站点暂时限流，正在等待后再检查连接。"
+                        TopicRepository.VerificationProbeOutcome.INCONCLUSIVE ->
+                            "连接复核暂未成功（${feedback.detail ?: "网络波动或超时"}），稍后会自动再试。"
+                        TopicRepository.VerificationProbeOutcome.CHALLENGED ->
+                            "App 请求仍被拦截（${feedback.detail ?: "需安全验证"}），正在换连重试确认。"
                         else -> "正在确认 App 连接。\n遇到限流时会等待后复核。"
                     }
                 } else "正在连接安全验证服务…",

@@ -887,6 +887,7 @@ class TopicRepository(
         val outcome: VerificationProbeOutcome,
         val status: Int? = null,
         val retryAfterSeconds: Long? = null,
+        val detail: String? = null,
     ) {
         val retryAfterMillis: Long
             get() {
@@ -943,7 +944,10 @@ class TopicRepository(
                 if (remSec > 0L) "$stageLabel: 429 冷却还剩 ${remSec}s，跳过探测 $targetPath"
                 else "$stageLabel: 主站正处单探针或低速恢复期，让行跳过旁路探测 $targetPath",
             )
-            return VerificationProbeResult(VerificationProbeOutcome.DEFERRED)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.DEFERRED,
+                detail = if (remSec > 0L) "处于 429 冷却期 (${remSec}s)" else "主站正处恢复让行期",
+            )
         }
         val transport = transportProvider()
         val result = try {
@@ -958,12 +962,18 @@ class TopicRepository(
                 "verify-probe-error",
                 "$stageLabel(${transport.name}): $targetPath 异常(${error.javaClass.simpleName})，暂无法判断",
             )
-            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                detail = "网络请求异常 (${error.javaClass.simpleName})",
+            )
         }
         checkSiteSession(userId, generation)
         if (result == null) {
             diagnostics.logThrottled("verify-probe-timeout", "$stageLabel(${transport.name}): $targetPath 探测超时，继续等待")
-            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                detail = "复核请求超时 (${VERIFY_PROBE_TIMEOUT_MS / 1_000L}s)",
+            )
         }
         diagnostics.recordStatus(transport.name, result.status, targetPath)
         val challenge429 = result.status == 429 && (
@@ -975,10 +985,20 @@ class TopicRepository(
             // 速率型挑战只由验证页自身递增退避，不写主站全局冷却；真实业务限流仍需全局退让。
             if (!challenge429) enterRateLimitCooldown(targetPath, result.retryAfterSeconds)
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> 429(${if (challenge429) "速率挑战" else "限流"})，退避后重探")
-            return VerificationProbeResult(VerificationProbeOutcome.RATE_LIMITED, result.status, result.retryAfterSeconds)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.RATE_LIMITED,
+                result.status,
+                result.retryAfterSeconds,
+                detail = if (challenge429) "Cloudflare 速率限制 (HTTP 429)" else "站点请求限流 (HTTP 429)",
+            )
         } else if (isRateLimitCoolingDown()) {
             // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
-            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE, result.status, result.retryAfterSeconds)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                result.status,
+                result.retryAfterSeconds,
+                detail = "当前处于 429 限流冷却等待期",
+            )
         }
         if (result.challenged) {
             if (afterCompletion) {
@@ -989,7 +1009,12 @@ class TopicRepository(
                     "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true，继续等待验证页",
                 )
             }
-            return VerificationProbeResult(VerificationProbeOutcome.CHALLENGED, result.status, result.retryAfterSeconds)
+            return VerificationProbeResult(
+                VerificationProbeOutcome.CHALLENGED,
+                result.status,
+                result.retryAfterSeconds,
+                detail = "HTTP ${result.status} 安全验证拦截",
+            )
         }
         if (result.status in 200..499) {
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status}，已放行")
@@ -999,7 +1024,18 @@ class TopicRepository(
             "verify-probe-inconclusive",
             "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=false，暂无法判断",
         )
-        return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE, result.status, result.retryAfterSeconds)
+        val failureDetail = if (result.status == 0) {
+            val summary = result.body.lineSequence().firstOrNull()?.trim()?.take(48).orEmpty()
+            if (summary.isNotBlank()) "网络连接失败 ($summary)" else "网络连接中断或超时"
+        } else {
+            "源站服务异常 (HTTP ${result.status})"
+        }
+        return VerificationProbeResult(
+            VerificationProbeOutcome.INCONCLUSIVE,
+            result.status,
+            result.retryAfterSeconds,
+            detail = failureDetail,
+        )
     }
 
     /** 阅读同步触发的手工过盾完成后调用：下一次心跳优先走 WebView 网络栈（起飞缓冲由 [armPostVerificationRunway] 统一设置）。 */
@@ -1582,6 +1618,7 @@ class TopicRepository(
         if (!cached.isNullOrBlank() && isAnimatedAvatarPath(cached)) {
             return cached
         }
+        if (AvatarCache.isNonAnimated(cleanUser)) return null
 
         // 1. /u/search/users.json?term= (精准匹配 BasicUser)
         val fromSearch = runCatching {
@@ -2750,10 +2787,16 @@ class TopicRepository(
         val byFilter = NotificationFilter.entries.associateWith { filter ->
             unreadByType.entries.filter { filter.includes(it.key) }.sumOf { it.value }
         }
+        val recentEntries = runCatching {
+            json.parseToJsonElement(payload).jsonObject.objects("notifications")
+                .map(::toNotificationEntry)
+        }.getOrDefault(emptyList())
         return UnreadSummary(
             count = count,
             unreadFilters = byFilter.filterValues { it > 0 }.keys,
             unreadByFilter = byFilter,
+            recentEntries = recentEntries,
+            hasMore = page.hasMore(0, NOTIFICATION_SCAN_LIMIT),
         )
     }
 
@@ -3345,11 +3388,11 @@ class TopicRepository(
     private suspend fun getAllBadgesRaw(): JsonObject? {
         val now = SystemClock.elapsedRealtime()
         cachedAllBadgesRaw?.let { (time, data) ->
-            if (now - time < 120_000L && data != null) return data
+            if (now - time < 1_800_000L && data != null) return data
         }
         return allBadgesGate.withLock {
             val second = cachedAllBadgesRaw
-            if (second != null && now - second.first < 120_000L && second.second != null) {
+            if (second != null && SystemClock.elapsedRealtime() - second.first < 1_800_000L && second.second != null) {
                 return@withLock second.second
             }
             val fetched = runCatching { objectRequest("/badges.json", present = false, retryAllowed = false) }.getOrNull()
@@ -3365,9 +3408,9 @@ class TopicRepository(
 
     /**
      * 获取用户徽章数据：
-     * 1. 内存 30s 缓存防刷 + In-flight Single-Flight 去重，避免同屏重复拉取；
+     * 1. 内存 10m 缓存防刷 + In-flight Single-Flight 去重，避免切 Tab 重复拉取触发 429；
      * 2. 请求官方接口 /user-badges/{username}.json?grouped=true 获取用户已获得的徽章；
-     * 3. 请求全站徽章池 /badges.json (带 120s 内存缓存) 补全未获得的徽章；
+     * 3. 请求全站徽章池 /badges.json (带 30m 内存缓存) 补全未获得的徽章；
      * 4. 严格使用官方名称、描述 (HTML 清洗) 与图标/图片；
      * 5. 优先排序已获取的徽章，后排未获取的徽章。
      */
@@ -3376,7 +3419,7 @@ class TopicRepository(
         val now = SystemClock.elapsedRealtime()
         if (!forceRefresh) {
             userBadgesMemoryCache[key]?.let { (time, list) ->
-                if (now - time < 30_000L && list.isNotEmpty()) {
+                if (now - time < 600_000L && list.isNotEmpty()) {
                     return@withContext list
                 }
             }
@@ -3638,6 +3681,8 @@ class TopicRepository(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
+                throw error
+            } catch (error: RateLimitException) {
                 throw error
             } catch (error: Exception) {
                 diagnostics.log("优先通知列表加载回退: ${error.message}")
@@ -3978,11 +4023,11 @@ class TopicRepository(
             onUserSeeSignaturesSynced?.invoke(id, seeSignatures)
         }
         val animatedFromSession = user["animated_avatar"]?.jsonPrimitive?.contentOrNull?.takeIf(::isAnimatedAvatarPath)
-        val animated = animatedFromSession
-            ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
-            ?: resolveAnimatedAvatar(username, present = false)
+        val animated = animatedFromSession ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
         if (!animated.isNullOrBlank()) {
             AvatarCache.record(username, animated)
+        } else {
+            AvatarCache.recordNonAnimated(username)
         }
         return DiscourseUser(
             id = id,
@@ -4042,15 +4087,32 @@ class TopicRepository(
     suspend fun fetchGamificationScore(username: String, present: Boolean = false): Int? {
         val cleanUser = username.trim().removePrefix("@")
         if (cleanUser.isBlank()) return null
-        val score = runCatching {
-            val root = objectRequest("/u/${encode(cleanUser)}/card.json", burst = true, present = present, retryAllowed = false)
+        if (isRateLimitCoolingDown()) return getCachedGamificationScore(cleanUser)
+        val fetchFromCard = try {
+            val root = objectRequest("/u/${encode(cleanUser)}/card.json", burst = false, present = present, retryAllowed = false)
             val user = root["user"] as? JsonObject ?: root
             (user["gamification_score"] as? JsonPrimitive)?.intOrNull
-        }.getOrNull() ?: runCatching {
-            val root = objectRequest("/u/${encode(cleanUser)}.json", burst = true, present = present, retryAllowed = false)
-            val user = root["user"] as? JsonObject ?: root
-            (user["gamification_score"] as? JsonPrimitive)?.intOrNull
-        }.getOrNull()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: RateLimitException) {
+            return getCachedGamificationScore(cleanUser)
+        } catch (error: NeedsInteractiveVerification) {
+            return getCachedGamificationScore(cleanUser)
+        } catch (_: Exception) {
+            null
+        }
+        val score = fetchFromCard ?: run {
+            if (isRateLimitCoolingDown()) return getCachedGamificationScore(cleanUser)
+            try {
+                val root = objectRequest("/u/${encode(cleanUser)}.json", burst = false, present = present, retryAllowed = false)
+                val user = root["user"] as? JsonObject ?: root
+                (user["gamification_score"] as? JsonPrimitive)?.intOrNull
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+        }
         if (score != null) {
             saveCachedGamificationScore(cleanUser, score)
         }
@@ -4098,7 +4160,7 @@ class TopicRepository(
      * 获取 LINUX DO Credit 用户积分信息。
      * GET https://credit.linux.do/api/v1/oauth/user-info
      */
-    suspend fun fetchLdcUserInfo(): LdcUserInfo {
+    suspend fun fetchLdcUserInfo(includeRemoteGamification: Boolean = false): LdcUserInfo {
         val raw = request("https://credit.linux.do/api/v1/oauth/user-info", present = false)
         val root = json.parseToJsonElement(raw).jsonObject
         val dataElem = root["data"] as? JsonObject ?: throw IllegalStateException("LDC 响应缺少 data 字段")
@@ -4108,7 +4170,11 @@ class TopicRepository(
         fun readBool(key: String): Boolean = (dataElem[key] as? JsonPrimitive)?.booleanOrNull ?: (readStr(key).toBooleanStrictOrNull() ?: false)
         val ldcUsername = readStr("username")
         val todayIncome = fetchLdcTodayIncome(ldcUsername)
-        val gamificationScore = fetchGamificationScore(ldcUsername, present = false)
+        val gamificationScore = if (includeRemoteGamification) {
+            fetchGamificationScore(ldcUsername, present = false)
+        } else {
+            getCachedGamificationScore(ldcUsername)
+        }
         return LdcUserInfo(
             id = readLong("id"),
             username = ldcUsername,
@@ -4503,7 +4569,9 @@ class TopicRepository(
      */
     suspend fun fetchCustomSidebarSection(): CustomSection? {
         val raw = try {
-            request("/sidebar_sections.json")
+            request("/sidebar_sections.json", present = false, retryAllowed = false)
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Exception) {
             diagnostics.log("拉取自定义侧边栏分区失败: ${error.message}")
             return null

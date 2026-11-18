@@ -306,6 +306,7 @@ class AppContainer(context: Context) {
             }
         }
         updateWebViewProxyState()
+        dohCoordinator.warmUpAnycastIfNeeded()
     }
 
     /**

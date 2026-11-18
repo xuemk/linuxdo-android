@@ -1824,6 +1824,8 @@ data class UnreadSummary(
      * 用 count 会让点赞分类永远判定为没变化。
      */
     val unreadByFilter: Map<NotificationFilter, Int> = emptyMap(),
+    val recentEntries: List<ProfileEntry> = emptyList(),
+    val hasMore: Boolean = false,
 )
 
 data class ProfileEntry(
