@@ -19,6 +19,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import org.linuxdo.android.data.InternalTopicLink
+import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.parseTopicLinkFromText
 import android.graphics.Color as AndroidColor
 import android.graphics.drawable.GradientDrawable
@@ -158,6 +159,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     }
 
     var verifyPageState by remember(showWeb) { mutableStateOf(BrowserSession.VerifyPageState.LOADING) }
+    var verifyRetryAllowed by remember(showWeb) { mutableStateOf(true) }
+    val verificationProbeFeedback by viewModel.verificationProbeFeedback.collectAsStateWithLifecycle()
     LaunchedEffect(showWeb) {
         if (showWeb) {
             verifyPageState = BrowserSession.VerifyPageState.LOADING
@@ -166,6 +169,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 // 或数秒仍未加载完则换成异常提示。
                 while (showWeb) {
                     verifyPageState = viewModel.verifyPageState()
+                    verifyRetryAllowed = viewModel.canRetryVerification()
                     delay(150)
                 }
             }
@@ -275,6 +279,8 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                             if (!webReady) {
                                 VerifyLoadingLayer(
                                     state = verifyPageState,
+                                    feedback = verificationProbeFeedback,
+                                    retryEnabled = verifyRetryAllowed,
                                     onRetry = viewModel::retryVerification,
                                     modifier = Modifier
                                         .fillMaxSize()
@@ -360,6 +366,8 @@ private fun ReadSyncVerifyBanner(
 @Composable
 private fun VerifyLoadingLayer(
     state: BrowserSession.VerifyPageState,
+    feedback: TopicRepository.VerificationProbeResult?,
+    retryEnabled: Boolean,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -369,9 +377,19 @@ private fun VerifyLoadingLayer(
         verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
     ) {
         val failure = when (state) {
-            BrowserSession.VerifyPageState.STALLED -> "验证未完成" to "验证页面加载失败，请检查网络后重试"
-            BrowserSession.VerifyPageState.MISMATCH ->
-                "App 连接尚未恢复" to "请稍后重试。"
+            BrowserSession.VerifyPageState.STALLED -> "验证未完成" to "验证页面或组件尚未准备好，请检查网络后重试"
+            BrowserSession.VerifyPageState.MISMATCH -> when (feedback?.outcome) {
+                TopicRepository.VerificationProbeOutcome.CHALLENGED ->
+                    "App 请求仍需验证" to "验证页面已结束，但 App 请求仍被站点安全验证拦截。请重试；持续出现时可切换网络。"
+                TopicRepository.VerificationProbeOutcome.RATE_LIMITED ->
+                    "站点暂时限流" to "请等待冷却结束后重试，避免连续点击验证。"
+                TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> if ((feedback.status ?: 0) >= 500) {
+                    "站点服务暂不可用" to "连接复核收到服务异常，请稍后重试。"
+                } else {
+                    "连接尚未确认恢复" to "连接复核超时、中断或未得到有效响应，请检查网络后重试。"
+                }
+                else -> "App 连接尚未恢复" to "尚未确认 App 连接恢复，请稍后重试。"
+            }
             else -> null
         }
         if (failure != null) {
@@ -388,14 +406,19 @@ private fun VerifyLoadingLayer(
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 modifier = Modifier.padding(top = 8.dp),
             )
-            TextButton(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
-                Text("重试", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            TextButton(onClick = onRetry, enabled = retryEnabled, modifier = Modifier.padding(top = 12.dp)) {
+                Text(if (retryEnabled) "重试" else "等待后重试", fontSize = 15.sp, fontWeight = FontWeight.Medium)
             }
         } else {
             IosActivityIndicator(diameter = 28.dp)
             Text(
                 text = if (state == BrowserSession.VerifyPageState.CONFIRMING) {
-                    "网页验证已完成，正在确认 App 连接。\n遇到限流时会等待后复核。"
+                    when (feedback?.outcome) {
+                        TopicRepository.VerificationProbeOutcome.RATE_LIMITED -> "站点暂时限流，正在等待后再检查连接。"
+                        TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> "连接复核尚未得到有效结果，稍后会自动再试。"
+                        TopicRepository.VerificationProbeOutcome.CHALLENGED -> "App 请求仍需安全验证，正在再次确认连接。"
+                        else -> "正在确认 App 连接。\n遇到限流时会等待后复核。"
+                    }
                 } else "正在连接安全验证服务…",
                 color = IosTheme.colors.secondaryLabel,
                 fontSize = 14.sp,

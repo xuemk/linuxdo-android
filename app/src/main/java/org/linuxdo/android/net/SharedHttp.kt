@@ -191,7 +191,8 @@ private class SessionHeaderInterceptor(
         }
         checkSession()
 
-        val builder = original.newBuilder().header("User-Agent", store.userAgentOrNull() ?: userAgent)
+        var requestUserAgent = store.userAgentOrNull() ?: userAgent
+        val builder = original.newBuilder()
         val siteReferer = when (host) {
             "credit.linux.do" -> "https://credit.linux.do/home"
             "cdk.linux.do" -> "https://cdk.linux.do/dashboard"
@@ -210,7 +211,7 @@ private class SessionHeaderInterceptor(
         val encodedPath = original.url.encodedPath
         val isPublicStaticIcon = isPublicStaticIconUrl(original.url)
         var rawWebCookieHeader = ""
-        val cookieHeader = if (!sendCookies) {
+        var cookieHeader = if (!sendCookies) {
             ""
         } else if (isPublicStaticIcon) {
             // 对齐 fluxdo：公开静态头像/表情仅只读携带 cf_clearance 等过盾与匿名 Cookie，
@@ -245,11 +246,21 @@ private class SessionHeaderInterceptor(
         } else {
             runBlocking(Dispatchers.Main) {
                 checkSession()
+                requestUserAgent = store.userAgentOrNull() ?: userAgent
                 rawWebCookieHeader = CookieManager.getInstance().getCookie(original.url.toString()).orEmpty()
                 if (host == Config.HOST) SessionStore.toCookieHeader(store.syncFromWebView())
                 else rawWebCookieHeader
             }
         }
+        val currentUserAgent = store.userAgentOrNull() ?: userAgent
+        if (currentUserAgent != requestUserAgent) {
+            // 标识切换不能把上一身份的安全凭据和新 UA 组合发送；登录 Cookie 仍保留。
+            requestUserAgent = currentUserAgent
+            cookieHeader = SessionStore.toCookieHeader(
+                SessionStore.parseCookieHeader(cookieHeader).filterKeys { !isCloudflareCookie(it) },
+            )
+        }
+        builder.header("User-Agent", requestUserAgent)
         val sentClearance = SessionStore.parseCookieHeader(cookieHeader)[Config.CF_CLEARANCE_COOKIE]
         original.tag(ActiveSessionRequest::class.java)?.sentClearanceFp = NetDiagnostics.fingerprint(sentClearance)
         original.tag(ActiveSessionRequest::class.java)?.sentSessionTokenHash =
@@ -272,7 +283,11 @@ private class SessionHeaderInterceptor(
             throw IOException("后台通知请求暂缓，等待验证或限流结束")
         }
         val response = chain.proceed(outgoing)
+        val responseMatchesUserAgent = runCatching {
+            requestUserAgent == (store.userAgentOrNull() ?: userAgent)
+        }.getOrDefault(false)
         if (
+            responseMatchesUserAgent &&
             !sentClearance.isNullOrBlank() &&
             shouldInvalidateClearance(outgoing, response.code, response.header("cf-mitigated"))
         ) {
@@ -308,8 +323,13 @@ private class SessionHeaderInterceptor(
             // 每次重定向都在进入下一跳前落 Cookie；普通 API 和 OAuth 共用此入口。
             runBlocking(Dispatchers.Main) {
                 checkSession()
+                val responseCookies = Cookie.parseAll(original.url, response.headers)
+                val sameUserAgent = requestUserAgent == (store.userAgentOrNull() ?: userAgent)
+                if (!sameUserAgent && responseCookies.any { isCloudflareCookie(it.name) }) {
+                    NetDiagnostics.log("忽略浏览器标识切换前的响应安全 Cookie，保留登录凭据更新")
+                }
                 store.applyResponseCookies(
-                    Cookie.parseAll(original.url, response.headers),
+                    if (sameUserAgent) responseCookies else responseCookies.filterNot { isCloudflareCookie(it.name) },
                     requestUrl = original.url.toString(),
                     requestGeneration = generation,
                     sentCookies = SessionStore.parseCookieHeader(cookieHeader),
@@ -321,6 +341,10 @@ private class SessionHeaderInterceptor(
             throw error
         }
     }
+
+    private fun isCloudflareCookie(name: String): Boolean =
+        name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) ||
+            name.startsWith("__cf", ignoreCase = true) || name.startsWith("_cf", ignoreCase = true)
 
     private fun shouldTraceCfFlow(path: String, status: Int): Boolean =
         status in setOf(401, 403, 429) ||

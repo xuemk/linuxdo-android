@@ -61,6 +61,7 @@ import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.net.gecko.GeckoAuthBridge
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.GeckoSession
 import kotlinx.coroutines.SupervisorJob
 import okhttp3.Cookie
 import okhttp3.FormBody
@@ -204,6 +205,7 @@ class BrowserSession(
     /** 最近一次成功完成 CF 验证/重验证的时间戳（elapsedRealtime），用于并发过盾锁内去重合并。 */
     @Volatile private var lastClearedAtElapsed: Long = 0L
     private var verificationClearance: String? = null
+    private var verificationClearanceUserAgent: String? = null
 
     private var onAuthCallback: ((success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit)? = null
     private var cachedLogin: String = ""
@@ -257,6 +259,7 @@ class BrowserSession(
     private var authGeckoSession: org.mozilla.geckoview.GeckoSession? = null
     private var mainGeckoView: org.mozilla.geckoview.GeckoView? = null
     private var mainGeckoSession: org.mozilla.geckoview.GeckoSession? = null
+    private var mainGeckoUserAgent: String? = null
     private val geckoBridges = mutableMapOf<View, GeckoAuthBridge>()
     private var authGeckoInitJob: Job? = null
     private var cfGeckoInitJob: Job? = null
@@ -954,6 +957,7 @@ class BrowserSession(
         cfGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
                 if (!stillCurrent()) return@launch
+                synchronizeGeckoUserAgent(geckoSession, "登录安全验证", stillCurrent)
                 val bridge = GeckoAuthBridge.create(
                     context,
                     geckoSession,
@@ -2613,6 +2617,45 @@ class BrowserSession(
     private fun clearanceFingerprint(value: String?): String =
         if (value.isNullOrBlank()) "无" else "${value.take(8)}…(${value.length}字符)"
 
+    private suspend fun synchronizeGeckoUserAgent(
+        session: GeckoSession,
+        source: String,
+        stillCurrent: () -> Boolean,
+    ): String = withContext(Dispatchers.Main) {
+        if (!stillCurrent()) throw CancellationException("验证会话已切换")
+        val browserUserAgent = withTimeoutOrNull(10_000L) {
+            suspendCancellableCoroutine<String?> { continuation ->
+                session.userAgent.accept(
+                    { value -> if (continuation.isActive) continuation.resume(value) },
+                    { _ -> if (continuation.isActive) continuation.resume(null) },
+                )
+            }
+        }?.takeIf { it.isNotBlank() } ?: error("无法读取验证浏览器标识")
+        if (!stillCurrent()) throw CancellationException("验证会话已切换")
+        val previousUserAgent = store.userAgentOrNull()
+        if (previousUserAgent != browserUserAgent) {
+            store.saveUserAgent(browserUserAgent)
+            webViewInstance?.settings?.userAgentString = browserUserAgent
+            authWebView?.settings?.userAgentString = browserUserAgent
+        }
+        if (session === mainGeckoSession) mainGeckoUserAgent = browserUserAgent
+        diagnostics.log(
+            "验证浏览器身份同步[$source]: AppUA=${NetDiagnostics.fingerprint(store.userAgentOrNull())} " +
+                "GeckoUA=${NetDiagnostics.fingerprint(browserUserAgent)} 更新=${previousUserAgent != browserUserAgent}",
+        )
+        browserUserAgent
+    }
+
+    fun logVerifyClientIdentity(stage: String) {
+        val appUserAgent = store.userAgentOrNull()
+        diagnostics.log(
+            "验证身份对照[$stage]: AppUA=${NetDiagnostics.fingerprint(appUserAgent)} " +
+                "GeckoUA=${NetDiagnostics.fingerprint(mainGeckoUserAgent)} " +
+                "一致=${mainGeckoUserAgent?.let { it == appUserAgent } ?: "未读取"} " +
+                "clearance=${store.currentCfClearanceFp()}",
+        )
+    }
+
 
     /**
      * 认证/登录视图：使用独立的可见 GeckoView (Firefox Necko+NSS，支持 DoH+ECH)，
@@ -2658,21 +2701,7 @@ class BrowserSession(
         authGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
                 if (!stillCurrent()) return@launch
-                val browserUserAgent = withTimeoutOrNull(10_000L) {
-                    suspendCancellableCoroutine<String?> { continuation ->
-                        geckoSession.userAgent.accept(
-                            { value -> if (continuation.isActive) continuation.resume(value) },
-                            { _ -> if (continuation.isActive) continuation.resume(null) },
-                        )
-                    }
-                }?.takeIf { it.isNotBlank() } ?: error("无法读取认证浏览器标识")
-                if (!stillCurrent()) return@launch
-                if (store.userAgentOrNull() != browserUserAgent) {
-                    store.saveUserAgent(browserUserAgent)
-                    webViewInstance?.settings?.userAgentString = browserUserAgent
-                    authWebView?.settings?.userAgentString = browserUserAgent
-                    diagnostics.log("接口与认证浏览器的 User-Agent 已同步")
-                }
+                synchronizeGeckoUserAgent(geckoSession, "密码登录", stillCurrent)
                 Log.d("GeckoAuthBridge", "认证会话 User-Agent 已对齐")
                 val bridge = GeckoAuthBridge.create(
                     activityContext,
@@ -2979,10 +3008,21 @@ class BrowserSession(
         verifyProbeJob = scope.launch(Dispatchers.Main) {
             val recoveryId = store.beginClearanceRecovery()
             try {
+                val generation = store.sessionGeneration
+                val session = view.session ?: return@launch
+                val stillCurrent = {
+                    !store.sessionChanging && generation == store.sessionGeneration &&
+                        mainGeckoView === view && mainGeckoSession === session &&
+                        verifyPhase != VerifyPhase.RUNNING && authGeckoView == null &&
+                        !isInCfMode && !awaitingSecondFactorLogin && currentCfClearance() == null
+                }
+                if (!stillCurrent()) return@launch
+                synchronizeGeckoUserAgent(session, "后台预热", stillCurrent)
                 val context = attachedActivityContext ?: appContext
                 val geckoStale = withContext(Dispatchers.IO) {
                     GeckoManager.cfClearancesFromDb(context)
                 }
+                if (!stillCurrent()) return@launch
                 val staleSet = (geckoStale + store.cfClearancesForVerification()).toMutableSet()
                 if (
                     mainGeckoView !== view ||
@@ -3067,6 +3107,10 @@ class BrowserSession(
                         return@launch
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                diagnostics.log("Gecko 后台预热准备失败: ${error.javaClass.simpleName}")
             } finally {
                 store.endClearanceRecovery(recoveryId)
             }
@@ -3083,6 +3127,7 @@ class BrowserSession(
         mainGeckoView?.releaseSession()
         mainGeckoSession?.close()
         mainGeckoSession = null
+        mainGeckoUserAgent = null
         mainGeckoView = null
     }
 
@@ -3094,24 +3139,43 @@ class BrowserSession(
         verifyProbeJob?.cancel()
         resetVerifyPageFlags()
         verifyProbeJob = scope.launch(Dispatchers.Main) {
-            val context = attachedActivityContext ?: appContext
-            GeckoManager.getOrCreateRuntime(context)
-            view.session?.stop()
-            val geckoStale = withContext(Dispatchers.IO) {
-                GeckoManager.cfClearancesFromDb(context)
+            val generation = store.sessionGeneration
+            val session = view.session ?: return@launch
+            val stillCurrent = {
+                !store.sessionChanging && generation == store.sessionGeneration &&
+                    mainGeckoView === view && mainGeckoSession === session && verifyPhase == VerifyPhase.RUNNING
             }
-            verifyStaleClearances = verifyStaleClearances + geckoStale + setOfNotNull(verificationClearance)
-            if (!org.linuxdo.android.net.gecko.GeckoManager.clearSiteCookies(context)) {
-                diagnostics.log("验证页清理 Gecko 旧凭据失败，继续以旧值为基线判定新签发")
+            try {
+                synchronizeGeckoUserAgent(session, "常规安全验证", stillCurrent)
+                val context = attachedActivityContext ?: appContext
+                GeckoManager.getOrCreateRuntime(context)
+                session.stop()
+                val geckoStale = withContext(Dispatchers.IO) {
+                    GeckoManager.cfClearancesFromDb(context)
+                }
+                if (!stillCurrent()) return@launch
+                verifyStaleClearances = verifyStaleClearances + geckoStale + setOfNotNull(verificationClearance)
+                if (!GeckoManager.clearSiteCookies(context)) {
+                    diagnostics.log("验证页清理 Gecko 旧凭据失败，继续以旧值为基线判定新签发")
+                }
+                if (!stillCurrent()) return@launch
+                diagnostics.log(
+                    "正在用 GeckoView 打开安全验证页 (排除旧凭据 ${verifyStaleClearances.size} 枚, " +
+                        "${GeckoManager.runtimeNetworkSummary(context)})",
+                )
+                session.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+                runVerifyProbe(view)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (stillCurrent()) {
+                    verifyLoadFailed = true
+                    activeChallengeDetectedAt = 0L
+                    verificationNeedsInteraction = false
+                    view.alpha = 0f
+                    diagnostics.log("安全验证准备失败: ${error.javaClass.simpleName}")
+                }
             }
-            if (mainGeckoView !== view || verifyPhase != VerifyPhase.RUNNING) return@launch
-            GeckoManager.getOrCreateRuntime(context)
-            diagnostics.log(
-                "正在用 GeckoView 打开安全验证页 (排除旧凭据 ${verifyStaleClearances.size} 枚, " +
-                    "${GeckoManager.runtimeNetworkSummary(context)})",
-            )
-            view.session?.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
-            runVerifyProbe(view)
         }
     }
 
@@ -3286,6 +3350,7 @@ class BrowserSession(
             adoptGeckoClearance(clearance)
             lastClearedAtElapsed = SystemClock.elapsedRealtime()
             verificationClearance = null
+            verificationClearanceUserAgent = null
         }
         verifyPhase = VerifyPhase.DONE
         verificationNeedsInteraction = false
@@ -3347,7 +3412,10 @@ class BrowserSession(
 
     /** 记录 Gecko 网络栈的出口摘要，用于和 OkHttp 的同名记录对照凭据为何不通用。 */
     suspend fun logVerifyGeckoEgress() = withContext(Dispatchers.Main) {
-        val bridge = mainGeckoView?.let { geckoBridges[it] }
+        if (TopicRepository.isRateLimitCoolingDown()) return@withContext
+        val view = mainGeckoView
+        val generation = store.sessionGeneration
+        val bridge = view?.let { geckoBridges[it] }
         val summary = if (bridge == null) {
             "验证页脚本桥不可用"
         } else {
@@ -3359,7 +3427,9 @@ class BrowserSession(
                 "读取失败: ${error.message.orEmpty().take(60)}"
             }
         }
-        diagnostics.log("[诊断] 出口对照 Gecko验证页: $summary")
+        if (generation == store.sessionGeneration && mainGeckoView === view && !store.sessionChanging) {
+            diagnostics.log("[诊断] 出口对照 Gecko验证页: $summary")
+        }
     }
 
     suspend fun openUrl(url: String) = withContext(Dispatchers.Main) {
@@ -3528,7 +3598,10 @@ class BrowserSession(
         prewarmJob = null
         // 重试时现场已无 clearance，保留首次进入时记下的那枚，供放弃验证时回填
         verifyStaleClearances = store.cfClearancesForVerification()
-        store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let { verificationClearance = it }
+        store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let {
+            verificationClearance = it
+            verificationClearanceUserAgent = store.userAgentOrNull()
+        }
         verifyPhase = VerifyPhase.RUNNING
         verificationStartedAt = SystemClock.elapsedRealtime()
         resetVerifyPageFlags()
@@ -3586,6 +3659,7 @@ class BrowserSession(
         if (verifyPhase != VerifyPhase.RUNNING || isVerifyChallengeActive() || TopicRepository.isRateLimitCoolingDown()) return false
         verifyProbeJob?.cancel()
         verificationClearance = null
+        verificationClearanceUserAgent = null
         return finishVerify(null, "App 请求通道已不被 Cloudflare 挑战")
     }
 
@@ -3595,6 +3669,10 @@ class BrowserSession(
     /** 验证页已收口（取得新凭据，或已回源但等不到新凭据）。凭据是否真能用由上层用 OkHttp 复核。 */
     fun interactiveVerificationComplete(): Boolean = verifyPhase == VerifyPhase.DONE
 
+    fun canReconfirmVerification(): Boolean =
+        verifyPhase == VerifyPhase.DONE && mainGeckoUserAgent != null &&
+            mainGeckoUserAgent == store.userAgentOrNull() && currentCfClearance() != null
+
     /**
      * 用户放弃验证时：若没拿到新 clearance，就把进入验证前的那枚回填。
      * beginInteractiveVerification 为检测换发会先删掉旧 clearance，验证页又打不开（DoH 直连）时
@@ -3602,9 +3680,15 @@ class BrowserSession(
      */
     suspend fun restoreClearanceIfVerificationAbandoned() = withContext(Dispatchers.Main) {
         val previous = verificationClearance?.takeIf { it.isNotBlank() } ?: return@withContext
+        val previousUserAgent = verificationClearanceUserAgent
         verificationClearance = null
+        verificationClearanceUserAgent = null
         val current = store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]
         if (!current.isNullOrBlank()) return@withContext
+        if (previousUserAgent != store.userAgentOrNull()) {
+            diagnostics.log("验证已取消，旧 cf_clearance 的浏览器标识已变化，不回填不匹配的安全凭据")
+            return@withContext
+        }
         CookieManager.getInstance().apply {
             setCookie(
                 Config.BASE_URL,
@@ -3732,7 +3816,7 @@ class BrowserSession(
                 onDiagnostic = { message ->
                     diagnostics.log("Headless GeckoSession $message")
                 },
-            ).also { it.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH") }
+            )
         } ?: run {
             lastSilentOutcome = SilentOutcome.CHALLENGE
             return false
@@ -3743,6 +3827,14 @@ class BrowserSession(
         val deadline = startedAt + effectiveTimeoutMs
         var outcome = SilentOutcome.TIMEOUT
         try {
+            withContext(Dispatchers.Main) {
+                synchronizeGeckoUserAgent(headlessSession, "静默补签") {
+                    generation == store.sessionGeneration && !store.sessionChanging && verifyPhase != VerifyPhase.RUNNING
+                }
+                if (SystemClock.elapsedRealtime() < deadline) {
+                    headlessSession.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+                }
+            }
             while (SystemClock.elapsedRealtime() < deadline) {
                 delay(POLL_INTERVAL_MS)
                 if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
@@ -3797,6 +3889,9 @@ class BrowserSession(
         } catch (cancelled: CancellationException) {
             diagnostics.log("[诊断] 静默补签 cf_clearance 被取消(+${SystemClock.elapsedRealtime() - startedAt}ms)")
             throw cancelled
+        } catch (error: Exception) {
+            diagnostics.log("静默安全验证准备失败: ${error.javaClass.simpleName}")
+            outcome = SilentOutcome.UNREACHABLE
         } finally {
             withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
                 headlessSession.close()

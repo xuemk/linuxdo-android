@@ -882,6 +882,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
+    private val _verificationProbeFeedback = MutableStateFlow<TopicRepository.VerificationProbeResult?>(null)
+    val verificationProbeFeedback = _verificationProbeFeedback.asStateFlow()
+    private var verificationConfirmedUserAgent: String? = null
+    private var verificationConnectionsRefreshed = false
+    private var verificationDiagnosticJob: Job? = null
     private val _accounts = MutableStateFlow(
         container.accountManager.snapshot().let { snapshot ->
             AccountUiState(accounts = snapshot.accounts, activeUserId = snapshot.activeUserId, error = snapshot.error)
@@ -8107,14 +8112,17 @@ fun openTopicSearch(topicId: Long, title: String) {
                 }
                 if (now < verifyCompletionProbeNotBefore) return
                 val candidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
-                if (verificationConfirmedCandidateFp != candidateFp) {
+                val candidateUserAgent = runCatching { store.userAgentOrNull() }.getOrNull()
+                if (verificationConfirmedCandidateFp != candidateFp || verificationConfirmedUserAgent != candidateUserAgent) {
                     verificationConfirmedCandidateFp = null
+                    verificationConfirmedUserAgent = null
                     if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
                         scheduleVerificationConfirmation("本轮复核预算已用完")
                         return
                     }
                     verifying = true
-                    val outcome = try {
+                    runCatching { browser.logVerifyClientIdentity("复核 ${verificationProbeAttempts + 1}") }
+                    val probeResult = try {
                         repository.probeClearanceAfterVerification(probePath)
                     } catch (cancelled: CancellationException) {
                         if (attempt != verificationAttempt || store.sessionGeneration != verificationSessionGeneration ||
@@ -8125,20 +8133,28 @@ fun openTopicSearch(topicId: Long, title: String) {
                     }
                     if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
                     if (restartVerificationIfNetworkChanged()) return
+                    val outcome = probeResult.outcome
                     if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
+                        _verificationProbeFeedback.value = probeResult
                         // 429 只说明限流，不计入复核预算；递增退避并换轻量接口，避免拿重分页硬撞进 MISMATCH。
-                        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + nextVerificationRateLimitWaitMs()
+                        val waitMs = nextVerificationRateLimitWaitMs(probeResult.retryAfterMillis)
+                        verifyCompletionProbeNotBefore = probeResult.retryAtElapsedMillis(SystemClock.elapsedRealtime(), waitMs)
                         return
                     }
                     if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) verificationProbeAttempts++
                     val currentCandidateFp = runCatching { store.currentCfClearanceFp() }.getOrDefault("-")
-                    if (candidateFp != currentCandidateFp) {
-                        scheduleVerificationConfirmation("候选凭据已更新，忽略旧请求结果")
+                    val currentUserAgent = runCatching { store.userAgentOrNull() }.getOrNull()
+                    if (candidateFp != currentCandidateFp || candidateUserAgent != currentUserAgent) {
+                        scheduleVerificationConfirmation("候选凭据或浏览器标识已更新，忽略旧请求结果")
                         return
+                    }
+                    if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) {
+                        _verificationProbeFeedback.value = probeResult
                     }
                     when (outcome) {
                         TopicRepository.VerificationProbeOutcome.CLEARED -> {
                             verificationConfirmedCandidateFp = candidateFp
+                            verificationConfirmedUserAgent = candidateUserAgent
                             val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
                             if (postProbeCooldownMs > 0L) {
                                 verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + postProbeCooldownMs
@@ -8146,11 +8162,13 @@ fun openTopicSearch(topicId: Long, title: String) {
                             }
                         }
                         TopicRepository.VerificationProbeOutcome.CHALLENGED -> {
-                            scheduleVerificationConfirmation("App 请求仍受挑战")
+                            refreshVerificationIdleConnections()
+                            scheduleVerificationConfirmation("App 请求仍受挑战", probeResult)
                             return
                         }
                         TopicRepository.VerificationProbeOutcome.INCONCLUSIVE -> {
-                            scheduleVerificationConfirmation("App 请求暂未确认恢复")
+                            refreshVerificationIdleConnections()
+                            scheduleVerificationConfirmation("App 请求暂未确认恢复", probeResult)
                             return
                         }
                         TopicRepository.VerificationProbeOutcome.DEFERRED -> {
@@ -8176,13 +8194,19 @@ fun openTopicSearch(topicId: Long, title: String) {
                 }
                 appPathProbeNotBefore = now + APP_PATH_PROBE_INTERVAL_MS
                 verifying = true
-                val outcome = try {
+                val probeUserAgent = runCatching { store.userAgentOrNull() }.getOrNull()
+                val probeResult = try {
                     repository.probeAppPathDuringVerification(probePath)
                 } finally {
                     if (attempt == verificationAttempt) verifying = false
                 }
                 if (attempt != verificationAttempt || _state.value.screen != Screen.Verify) return
                 if (restartVerificationIfNetworkChanged()) return
+                if (probeUserAgent != runCatching { store.userAgentOrNull() }.getOrNull()) return
+                val outcome = probeResult.outcome
+                if (outcome != TopicRepository.VerificationProbeOutcome.DEFERRED) {
+                    _verificationProbeFeedback.value = probeResult
+                }
                 // 从响应结束时退避，慢请求或超时后也不紧接着重探；旁路探测遇 429 仅切轻量接口并退避，不消耗验证完成后的复核预算。
                 val bypassWaitMs = if (outcome == TopicRepository.VerificationProbeOutcome.RATE_LIMITED) {
                     val lightPath = repository.resolveVerificationProbePath(null)
@@ -8190,11 +8214,11 @@ fun openTopicSearch(topicId: Long, title: String) {
                         verificationProbePath = lightPath
                         diagnostics.log("验证页旁路探测遇 429，后续复核改用轻量接口 $lightPath")
                     }
-                    maxOf(VERIFY_RATE_LIMIT_BACKOFF_MS.first(), TopicRepository.rateLimitRemainingMs())
+                    maxOf(VERIFY_RATE_LIMIT_BACKOFF_MS.first(), TopicRepository.rateLimitRemainingMs(), probeResult.retryAfterMillis)
                 } else {
                     APP_PATH_PROBE_INTERVAL_MS
                 }
-                appPathProbeNotBefore = SystemClock.elapsedRealtime() + bypassWaitMs
+                appPathProbeNotBefore = probeResult.retryAtElapsedMillis(SystemClock.elapsedRealtime(), bypassWaitMs)
                 val postProbeCooldownMs = TopicRepository.rateLimitRemainingMs()
                 if (postProbeCooldownMs > 0L) {
                     appPathProbeNotBefore = maxOf(
@@ -8217,6 +8241,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationProbeAttempts = 0
             verificationRateLimitedProbes = 0
             verificationConfirmedCandidateFp = null
+            resetVerificationFeedback()
             repository.clearCachedCsrfToken()
             // 起飞缓冲：timings 与未读轮询延后 8~10s，让 resume() 的前台读取先单独落地 200。
             val runwayMs = (POST_VERIFY_RUNWAY_MIN_MS..POST_VERIFY_RUNWAY_MAX_MS).random()
@@ -8848,6 +8873,7 @@ fun openTopicSearch(topicId: Long, title: String) {
             verificationReturnScreen = _state.value.screen
             verificationDismissed = false
             verificationMismatch = false
+            resetVerificationFeedback()
             verificationProbePath = repository.resolveVerificationProbePath(probePath)
             verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
             verifyCompletionProbeNotBefore = 0L
@@ -8891,7 +8917,7 @@ fun openTopicSearch(topicId: Long, title: String) {
      * 复核遇 429：递增退避并把后续探测切到轻量会话接口（重分页本身就是触发速率规则的元凶）。
      * 档位用完后才计入复核预算，避免约 55 秒内就被 3 次固定间隔硬撞判成 MISMATCH。
      */
-    private fun nextVerificationRateLimitWaitMs(): Long {
+    private fun nextVerificationRateLimitWaitMs(serverWaitMs: Long): Long {
         val step = VERIFY_RATE_LIMIT_BACKOFF_MS[verificationRateLimitedProbes.coerceAtMost(VERIFY_RATE_LIMIT_BACKOFF_MS.lastIndex)]
         verificationRateLimitedProbes++
         if (verificationRateLimitedProbes > VERIFY_RATE_LIMIT_BACKOFF_MS.size) verificationProbeAttempts++
@@ -8903,20 +8929,63 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
             scheduleVerificationConfirmation("App 请求持续被限流")
         }
-        val waitMs = maxOf(step, TopicRepository.rateLimitRemainingMs())
-        diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${(waitMs + 999L) / 1_000L}s 后重探")
+        val waitMs = maxOf(step, TopicRepository.rateLimitRemainingMs(), serverWaitMs)
+        val waitSeconds = waitMs / 1_000L + if (waitMs % 1_000L == 0L) 0L else 1L
+        diagnostics.log("验证复核遇 429(第 $verificationRateLimitedProbes 次)，${waitSeconds}s 后重探")
         return waitMs
     }
 
-    private fun scheduleVerificationConfirmation(reason: String) {
+    private fun refreshVerificationIdleConnections() {
+        if (verificationConnectionsRefreshed || TopicRepository.isRateLimitCoolingDown()) return
+        verificationConnectionsRefreshed = true
+        // 推进网络代次会让验证页重新加载；这里只回收空闲连接，保留当前线路和候选凭据。
+        runCatching { container.httpClient.connectionPool.evictAll() }
+            .onSuccess { diagnostics.log("验证复核暂未恢复，已清理空闲连接，沿用当前线路和复核预算") }
+            .onFailure { diagnostics.log("验证复核清理空闲连接失败: ${it.javaClass.simpleName}") }
+    }
+
+    private fun resetVerificationFeedback() {
+        _verificationProbeFeedback.value = null
+        verificationConfirmedUserAgent = null
+        verificationConnectionsRefreshed = false
+        verificationDiagnosticJob?.cancel()
+        verificationDiagnosticJob = null
+    }
+
+    private fun scheduleVerificationConfirmation(reason: String, probeResult: TopicRepository.VerificationProbeResult? = null) {
+        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
+        val now = SystemClock.elapsedRealtime()
+        val retryAt = probeResult?.retryAtElapsedMillis(now, waitMs) ?: (now + waitMs)
+        verifyCompletionProbeNotBefore = retryAt
         if (verificationProbeAttempts >= MAX_VERIFICATION_CONFIRMATION_PROBES) {
-            verificationMismatch = true
-            diagnostics.log("App 连接复核 ${verificationProbeAttempts} 次仍未确认，停止自动复核，保留手动重试")
+            if (!verificationMismatch) {
+                verificationMismatch = true
+                val feedback = _verificationProbeFeedback.value
+                diagnostics.log("App 连接复核 ${verificationProbeAttempts} 次仍未确认，结果=${feedback?.outcome} 状态=${feedback?.status}，停止自动复核，保留手动重试")
+                runCatching { browser.logVerifyClientIdentity("停止复核") }
+                if (feedback?.outcome in setOf(TopicRepository.VerificationProbeOutcome.CHALLENGED, TopicRepository.VerificationProbeOutcome.INCONCLUSIVE) &&
+                    feedback?.retryAfterMillis == 0L &&
+                    !TopicRepository.isRateLimitCoolingDown()) {
+                    val attempt = verificationAttempt
+                    val generation = verificationSessionGeneration
+                    val userId = verificationUserId
+                    verificationDiagnosticJob = viewModelScope.launch {
+                        if (attempt != verificationAttempt || _state.value.screen != Screen.Verify ||
+                            generation != store.sessionGeneration || userId != store.currentUserId()) return@launch
+                        try {
+                            browser.logVerifyGeckoEgress()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            diagnostics.log("验证出口诊断未完成: ${error.javaClass.simpleName}")
+                        }
+                    }
+                }
+            }
             return
         }
-        val waitMs = TopicRepository.rateLimitRemainingMs().coerceAtLeast(APP_PATH_PROBE_INTERVAL_MS)
-        verifyCompletionProbeNotBefore = SystemClock.elapsedRealtime() + waitMs
-        diagnostics.log("$reason (${verificationProbeAttempts}/$MAX_VERIFICATION_CONFIRMATION_PROBES)，保留候选凭据，${(waitMs + 999L) / 1_000L}s 后复核")
+        val remainingMs = retryAt - now
+        diagnostics.log("$reason (${verificationProbeAttempts}/$MAX_VERIFICATION_CONFIRMATION_PROBES)，保留候选凭据，${remainingMs / 1_000L}s 后复核")
     }
 
     /**
@@ -8967,6 +9036,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         verificationFromReadSync = false
         verificationDismissed = true
         verificationMismatch = false
+        resetVerificationFeedback()
         verificationProbePath = null
         verifyCompletionProbeNotBefore = 0L
         verificationProbeAttempts = 0
@@ -8989,8 +9059,23 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (verificationMismatch) org.linuxdo.android.net.BrowserSession.VerifyPageState.MISMATCH
         else browser.verifyPageState()
 
+    fun canRetryVerification(): Boolean =
+        !verifying && !TopicRepository.isRateLimitCoolingDown() &&
+            ((_verificationProbeFeedback.value?.outcome != TopicRepository.VerificationProbeOutcome.RATE_LIMITED &&
+                (_verificationProbeFeedback.value?.retryAfterMillis ?: 0L) == 0L) ||
+                SystemClock.elapsedRealtime() >= maxOf(verifyCompletionProbeNotBefore, appPathProbeNotBefore))
+
     fun retryVerification() {
+        if (!canRetryVerification()) {
+            diagnostics.logThrottled("verify-retry-cooldown", "验证复核进行中或仍处冷却等待期，暂缓手动重试")
+            return
+        }
+        val reconfirm = _verificationProbeFeedback.value?.outcome == TopicRepository.VerificationProbeOutcome.INCONCLUSIVE &&
+            verificationUserId == store.currentUserId() && verificationSessionGeneration == store.sessionGeneration &&
+            verificationNetworkGeneration == container.dohCoordinator.currentEpoch.get().generation &&
+            browser.canReconfirmVerification()
         verificationMismatch = false
+        resetVerificationFeedback()
         verifyCompletionProbeNotBefore = 0L
         verificationProbeAttempts = 0
         verificationRateLimitedProbes = 0
@@ -9002,6 +9087,11 @@ fun openTopicSearch(topicId: Long, title: String) {
         verificationNetworkGeneration = container.dohCoordinator.currentEpoch.get().generation
         verificationAttempt++
         armAppPathProbe()
+        if (reconfirm) {
+            refreshVerificationIdleConnections()
+            diagnostics.log("App 连接复核暂未得到有效结果，保留已取得的验证凭据并重新检查连接")
+            return
+        }
         val attempt = verificationAttempt
         viewModelScope.launch {
             verificationCleanupJob?.join()

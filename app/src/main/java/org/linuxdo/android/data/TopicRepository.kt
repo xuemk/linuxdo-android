@@ -883,6 +883,24 @@ class TopicRepository(
         RATE_LIMITED,
     }
 
+    data class VerificationProbeResult(
+        val outcome: VerificationProbeOutcome,
+        val status: Int? = null,
+        val retryAfterSeconds: Long? = null,
+    ) {
+        val retryAfterMillis: Long
+            get() {
+                val seconds = (retryAfterSeconds ?: 0L).coerceAtLeast(0L)
+                return if (seconds > Long.MAX_VALUE / 1_000L) Long.MAX_VALUE else seconds * 1_000L
+            }
+
+        fun retryAtElapsedMillis(now: Long, minimumWaitMs: Long): Long {
+            val elapsed = now.coerceAtLeast(0L)
+            val waitMs = maxOf(minimumWaitMs.coerceAtLeast(0L), retryAfterMillis)
+            return elapsed + waitMs.coerceAtMost(Long.MAX_VALUE - elapsed)
+        }
+    }
+
     fun resolveVerificationProbePath(probePath: String?): String {
         val candidate = probePath?.trim().orEmpty()
         return if (candidate.startsWith("/") && !candidate.startsWith("//")) {
@@ -897,7 +915,7 @@ class TopicRepository(
      * 验证页走 Gecko 自己的 DoH/ECH 与 TLS 栈，签发的 cf_clearance 不一定被 CF 认作同一访客；
      * 区分“放行 / 挑战 / 暂时无法判断(0、429、5xx)”，并对 429 落实 Retry-After 与全局限流冷却。
      */
-    suspend fun probeClearanceAfterVerification(probePath: String? = null): VerificationProbeOutcome =
+    suspend fun probeClearanceAfterVerification(probePath: String? = null): VerificationProbeResult =
         probeVerificationTarget(probePath = probePath, afterCompletion = true)
 
     /**
@@ -906,13 +924,13 @@ class TopicRepository(
      * 不能再依赖页面 DOM 标记或 Gecko 新签发凭据来判定完成。
      * 严格遵守 429 冷却，且只有拿到明确非挑战的 2xx..4xx（非 429）响应才判为 CLEARED。
      */
-    suspend fun probeAppPathDuringVerification(probePath: String? = null): VerificationProbeOutcome =
+    suspend fun probeAppPathDuringVerification(probePath: String? = null): VerificationProbeResult =
         probeVerificationTarget(probePath = probePath, afterCompletion = false)
 
     private suspend fun probeVerificationTarget(
         probePath: String?,
         afterCompletion: Boolean,
-    ): VerificationProbeOutcome {
+    ): VerificationProbeResult {
         val userId = sessionStore?.currentUserId()
         val generation = sessionStore?.sessionGeneration
         checkSiteSession(userId, generation)
@@ -925,7 +943,7 @@ class TopicRepository(
                 if (remSec > 0L) "$stageLabel: 429 冷却还剩 ${remSec}s，跳过探测 $targetPath"
                 else "$stageLabel: 主站正处单探针或低速恢复期，让行跳过旁路探测 $targetPath",
             )
-            return VerificationProbeOutcome.DEFERRED
+            return VerificationProbeResult(VerificationProbeOutcome.DEFERRED)
         }
         val transport = transportProvider()
         val result = try {
@@ -940,12 +958,12 @@ class TopicRepository(
                 "verify-probe-error",
                 "$stageLabel(${transport.name}): $targetPath 异常(${error.javaClass.simpleName})，暂无法判断",
             )
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE)
         }
         checkSiteSession(userId, generation)
         if (result == null) {
             diagnostics.logThrottled("verify-probe-timeout", "$stageLabel(${transport.name}): $targetPath 探测超时，继续等待")
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE)
         }
         diagnostics.recordStatus(transport.name, result.status, targetPath)
         val challenge429 = result.status == 429 && (
@@ -957,10 +975,10 @@ class TopicRepository(
             // 速率型挑战只由验证页自身递增退避，不写主站全局冷却；真实业务限流仍需全局退让。
             if (!challenge429) enterRateLimitCooldown(targetPath, result.retryAfterSeconds)
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> 429(${if (challenge429) "速率挑战" else "限流"})，退避后重探")
-            return VerificationProbeOutcome.RATE_LIMITED
+            return VerificationProbeResult(VerificationProbeOutcome.RATE_LIMITED, result.status, result.retryAfterSeconds)
         } else if (isRateLimitCoolingDown()) {
             // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE, result.status, result.retryAfterSeconds)
         }
         if (result.challenged) {
             if (afterCompletion) {
@@ -971,17 +989,17 @@ class TopicRepository(
                     "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true，继续等待验证页",
                 )
             }
-            return VerificationProbeOutcome.CHALLENGED
+            return VerificationProbeResult(VerificationProbeOutcome.CHALLENGED, result.status, result.retryAfterSeconds)
         }
         if (result.status in 200..499) {
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status}，已放行")
-            return VerificationProbeOutcome.CLEARED
+            return VerificationProbeResult(VerificationProbeOutcome.CLEARED, result.status)
         }
         diagnostics.logThrottled(
             "verify-probe-inconclusive",
             "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=false，暂无法判断",
         )
-        return VerificationProbeOutcome.INCONCLUSIVE
+        return VerificationProbeResult(VerificationProbeOutcome.INCONCLUSIVE, result.status, result.retryAfterSeconds)
     }
 
     /** 阅读同步触发的手工过盾完成后调用：下一次心跳优先走 WebView 网络栈（起飞缓冲由 [armPostVerificationRunway] 统一设置）。 */
