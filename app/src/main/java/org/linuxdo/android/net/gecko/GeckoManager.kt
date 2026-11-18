@@ -245,6 +245,7 @@ object GeckoManager {
         contextId: String? = null,
         onDiagnostic: (String) -> Unit = {},
         onContentPainted: (url: String) -> Unit = {},
+        onExternalResponse: ((org.mozilla.geckoview.WebResponse) -> Unit)? = null,
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
@@ -353,6 +354,17 @@ object GeckoManager {
                     onDiagnostic("页面标题 ${title.take(40)}")
                 }
             }
+
+            override fun onExternalResponse(session: GeckoSession, response: org.mozilla.geckoview.WebResponse) {
+                val respUri = response.uri.orEmpty()
+                Log.d(TAG, "Gecko onExternalResponse: status=${response.statusCode} uri=${diagnosticUrl(respUri)}")
+                onDiagnostic("收到附件/外部响应 status=${response.statusCode} ${diagnosticUrl(respUri)}")
+                if (onExternalResponse != null) {
+                    onExternalResponse.invoke(response)
+                } else {
+                    runCatching { response.body?.close() }
+                }
+            }
         }
 
         session.open(rt)
@@ -438,6 +450,13 @@ object GeckoManager {
         .filter { (name, _) -> name.equals("cf_clearance", ignoreCase = true) }
         .map { (_, value) -> value }
         .toSet()
+
+    /** 合并读取 Gecko 内存/响应头实时 cf_clearance 与 SQLite 持久库，消除落盘延迟。 */
+    suspend fun liveCfClearances(context: Context): Set<String> {
+        val fromMemory = runCatching { GeckoAuthBridge.readMainSiteCfClearances(context) }.getOrDefault(emptyList())
+        val fromDb = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { cfClearancesFromDb(context) }
+        return (fromMemory + fromDb).filter { it.isNotBlank() }.toSet()
+    }
 
     private fun readCookiesFromDb(context: Context): List<Pair<String, String>> {
         val result = mutableListOf<Pair<String, String>>()

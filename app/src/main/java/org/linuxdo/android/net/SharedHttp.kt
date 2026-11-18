@@ -277,6 +277,7 @@ private class SessionHeaderInterceptor(
             outgoing.url,
             store,
             isSignature = outgoing.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null,
+            isExplicitDownload = outgoing.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null,
         )
         if ((original.tag(org.linuxdo.android.push.PushSessionProvider::class.java)
                 ?.backgroundRequestDelayMs() ?: 0L) > 0L) {
@@ -379,19 +380,26 @@ internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
         )
 
 /**
- * 公开图片和验证探针的单次挑战不等同于主站 API 凭据失效。
+ * 公开图片、验证探针以及带独立路径级 WAF 规则的接口（附件 `/uploads/` 前缀、显式下载、子站 OAuth `/session/sso_provider`）
+ * 的单次 403/503 挑战不等同于主站 API 凭据失效，绝不能据此拉黑健康的 `cf_clearance`。
  * 429 + cf-mitigated=challenge 是 WAF 速率规则，凭据本身仍有效，拉黑它只会让后续请求 0 份凭据裸奔撞盾，
- * 因此只有 403 / 503 交互挑战才判废。
+ * 因此只有主站普通 API 的 403 / 503 交互挑战才判废。
  */
 internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cfMitigated: String?): Boolean =
     request.url.isHttps && request.url.host == Config.HOST &&
         !isPublicStaticIconUrl(request.url) &&
         request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) == null &&
+        request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) == null &&
+        !request.url.encodedPath.startsWith("/uploads/") &&
+        request.url.encodedPath != "/session/sso_provider" &&
         request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe != true &&
         status in setOf(403, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
 
 private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
     request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
+    request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null -> "显式下载"
+    request.url.encodedPath.startsWith("/uploads/") -> "附件资源"
+    request.url.encodedPath == "/session/sso_provider" -> "SSO授权"
     request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null -> "签名图片"
     isPublicStaticIconUrl(request.url) -> "公开图片"
     else -> "普通API"
@@ -444,6 +452,9 @@ internal object SiteImageGateInterceptor {
     /** 签名地址不一定有图片后缀或固定路径，显式标记后仍须经过图片门禁。 */
     data object SignatureRequest
 
+    /** 用户主动点击触发的显式文件/附件下载，不进列表图片门禁排队与冷却。 */
+    data object ExplicitDownloadRequest
+
     private const val EMOJI_CONCURRENT = 12
     private const val AVATAR_CONCURRENT = 3
     private const val MEDIA_CONCURRENT = 4
@@ -485,8 +496,13 @@ internal object SiteImageGateInterceptor {
         }
     }
 
-    fun checkRecovery(url: okhttp3.HttpUrl, store: SessionStore, isSignature: Boolean = false) {
-        if (categorize(url, isSignature) == ImageCategory.NONE) return
+    fun checkRecovery(
+        url: okhttp3.HttpUrl,
+        store: SessionStore,
+        isSignature: Boolean = false,
+        isExplicitDownload: Boolean = false,
+    ) {
+        if (isExplicitDownload || categorize(url, isSignature) == ImageCategory.NONE) return
         recoveryStore = store
         if (store.isClearanceRecoveryInProgress()) {
             throw ThrottledException("站内图片暂缓，等待安全验证完成")
@@ -501,6 +517,7 @@ internal object SiteImageGateInterceptor {
 
     fun intercept(chain: Interceptor.Chain, store: SessionStore): Response {
         val request = chain.request()
+        if (request.tag(ExplicitDownloadRequest::class.java) != null) return chain.proceed(request)
         val isSignature = request.tag(SignatureRequest::class.java) != null
         val category = categorize(request.url, isSignature)
         if (category == ImageCategory.NONE) return chain.proceed(request)

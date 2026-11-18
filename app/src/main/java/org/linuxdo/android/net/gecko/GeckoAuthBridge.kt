@@ -55,6 +55,7 @@ class GeckoAuthBridge private constructor(
                         port.disconnect()
                         return
                     }
+                    if (activePort === port) return
                     activePort?.let { oldPort ->
                         disconnect(oldPort)
                         oldPort.disconnect()
@@ -92,9 +93,12 @@ class GeckoAuthBridge private constructor(
     private fun disconnect(port: WebExtension.Port) {
         if (activePort !== port) return
         activePort = null
-        pending.values.forEach { it.completeExceptionally(IllegalStateException("认证页面已切换")) }
+        val waiting = pending.values.toList()
         pending.clear()
-        connection = CompletableDeferred()
+        val oldConnection = connection
+        if (!closed) connection = CompletableDeferred()
+        oldConnection.cancel(CancellationException("认证页面已切换"))
+        waiting.forEach { it.completeExceptionally(IllegalStateException("认证页面已切换")) }
     }
 
     private suspend fun request(command: String, arguments: JSONObject = JSONObject()): String =
@@ -102,6 +106,7 @@ class GeckoAuthBridge private constructor(
             check(!closed) { "认证会话已关闭" }
             withTimeout(10_000L) {
                 val port = connection.await()
+                check(!closed && activePort === port) { "认证页面已切换或关闭" }
                 val requestId = UUID.randomUUID().toString()
                 val result = CompletableDeferred<String>()
                 pending[requestId] = result
@@ -208,13 +213,15 @@ class GeckoAuthBridge private constructor(
     fun close() {
         if (closed) return
         closed = true
-        session.webExtensionController.setMessageDelegate(extension, null, NATIVE_APP)
-        activePort?.disconnect()
+        val port = activePort
         activePort = null
-        connection.cancel()
-        pending.values.forEach { it.cancel() }
+        val waiting = pending.values.toList()
         pending.clear()
+        connection.cancel()
+        waiting.forEach { it.cancel() }
         scope.cancel()
+        session.webExtensionController.setMessageDelegate(extension, null, NATIVE_APP)
+        port?.disconnect()
     }
 
     companion object {
@@ -226,7 +233,7 @@ class GeckoAuthBridge private constructor(
         private var cookieExtension: WebExtension? = null
         private var cookiePort: WebExtension.Port? = null
         private var cookieConnection = CompletableDeferred<WebExtension.Port>()
-        private val cookieRequests = mutableMapOf<String, CompletableDeferred<Boolean>>()
+        private val cookieRequests = mutableMapOf<String, CompletableDeferred<JSONObject>>()
 
         private suspend fun installedExtension(context: Context): WebExtension {
             val controller = GeckoManager.getOrCreateRuntime(context).webExtensionController
@@ -259,7 +266,7 @@ class GeckoAuthBridge private constructor(
             cookieConnection = CompletableDeferred()
             val waiting = cookieRequests.values.toList()
             cookieRequests.clear()
-            waiting.forEach { it.complete(false) }
+            waiting.forEach { it.complete(JSONObject().put("value", false)) }
         }
 
         private fun bindCookieControl(extension: WebExtension) {
@@ -281,7 +288,7 @@ class GeckoAuthBridge private constructor(
                         override fun onPortMessage(message: Any, port: WebExtension.Port) {
                             if (cookiePort !== port) return
                             val response = message as? JSONObject ?: return
-                            cookieRequests.remove(response.optString("id"))?.complete(response.optBoolean("value", false))
+                            cookieRequests.remove(response.optString("id"))?.complete(response)
                         }
 
                         override fun onDisconnect(port: WebExtension.Port) = disconnectCookieControl(port)
@@ -291,26 +298,60 @@ class GeckoAuthBridge private constructor(
             }, COOKIE_CONTROL_APP)
         }
 
-        suspend fun clearMainSiteCookies(context: Context): Boolean = withContext(Dispatchers.Main.immediate) {
+        private suspend fun sendCookieControlCommand(
+            context: Context,
+            payload: JSONObject,
+            timeoutMs: Long = 5_000L,
+        ): JSONObject? = withContext(Dispatchers.Main.immediate) {
             try {
-                withTimeoutOrNull(5_000L) {
+                withTimeoutOrNull(timeoutMs) {
                     installedExtension(context)
                     val port = cookieConnection.await()
                     val id = UUID.randomUUID().toString()
-                    val response = CompletableDeferred<Boolean>()
+                    val response = CompletableDeferred<JSONObject>()
                     cookieRequests[id] = response
                     try {
-                        port.postMessage(JSONObject().put("id", id).put("command", "clearSiteCookies"))
+                        port.postMessage(JSONObject(payload.toString()).put("id", id))
                         response.await()
                     } finally {
                         cookieRequests.remove(id)
                     }
-                } ?: false
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.w(TAG, "清理主站默认容器 Cookie 失败: ${error.message}")
-                false
+                Log.w(TAG, "Gecko Cookie 控制命令失败 (${payload.optString("command")}): ${error.message}")
+                null
+            }
+        }
+
+        suspend fun clearMainSiteCookies(context: Context): Boolean =
+            sendCookieControlCommand(context, JSONObject().put("command", "clearSiteCookies"))
+                ?.optBoolean("value", false) == true
+
+        /** 清理主站默认容器里的旧 cf_clearance 并注入会话 Cookie，供具体目标 URL 静默补签携带登录态。 */
+        suspend fun prepareTargetChallengeCookies(
+            context: Context,
+            cookies: Map<String, String>,
+        ): Boolean = sendCookieControlCommand(
+            context,
+            JSONObject()
+                .put("command", "prepareTargetChallenge")
+                .put("cookies", JSONObject(cookies)),
+        )?.optBoolean("value", false) == true
+
+        /** 优先从 Gecko 内存 Cookie 与响应头实时拦截记录中读取主站 cf_clearance，避免苦等 SQLite 异步落盘。 */
+        suspend fun readMainSiteCfClearances(context: Context): List<String> {
+            val response = sendCookieControlCommand(
+                context,
+                JSONObject().put("command", "readCfClearances"),
+                timeoutMs = 2_500L,
+            ) ?: return emptyList()
+            val array = response.optJSONArray("clearances") ?: return emptyList()
+            return buildList {
+                for (index in 0 until array.length()) {
+                    array.optString(index).trim().takeIf { it.isNotEmpty() }?.let(::add)
+                }
             }
         }
 

@@ -2,6 +2,7 @@
 
 const FORUM_ORIGIN = "https://linux.do";
 const isolatedAuthTabs = new Map();
+let latestHeaderCfClearance = "";
 
 function isForumUrl(value) {
   try {
@@ -54,18 +55,35 @@ browser.webRequest.onBeforeSendHeaders.addListener(details => {
   return { requestHeaders: result };
 }, { urls: [FORUM_ORIGIN + "/*"] }, ["blocking", "requestHeaders"]);
 
-// 只接纳主站响应签发的令牌更新，不能把 H5 脚本写入的同名 Cookie 当成授权凭据。
+// 只接纳主站响应签发的令牌更新，不能把 H5 脚本写入的同名 Cookie 当成授权凭据；同时记录主站响应里刚签发的 cf_clearance。
 browser.webRequest.onHeadersReceived.addListener(details => {
+  if (isForumUrl(details.url)) {
+    for (const header of details.responseHeaders || []) {
+      if (header.name.toLowerCase() !== "set-cookie") continue;
+      for (const line of String(header.value || "").split(/\r?\n/)) {
+        const pair = line.split(";", 1)[0];
+        const separator = pair.indexOf("=");
+        if (separator < 1) continue;
+        const name = pair.slice(0, separator).trim();
+        const value = pair.slice(separator + 1).trim();
+        if (name.toLowerCase() === "cf_clearance" && value) {
+          latestHeaderCfClearance = value;
+        }
+      }
+    }
+  }
   const authorization = isolatedAuthTabs.get(details.tabId);
   if (!authorization || !isAuthorizationRequest(details)) return;
   for (const header of details.responseHeaders || []) {
     if (header.name.toLowerCase() !== "set-cookie") continue;
-    const pair = (header.value || "").split(";", 1)[0];
-    const separator = pair.indexOf("=");
-    if (pair.slice(0, separator).trim() !== "_t") continue;
-    const value = pair.slice(separator + 1).trim();
-    if (!value) authorization.cookies.delete("_t");
-    else if (validCookieEntries({ _t: value }).length) authorization.cookies.set("_t", value);
+    for (const line of String(header.value || "").split(/\r?\n/)) {
+      const pair = line.split(";", 1)[0];
+      const separator = pair.indexOf("=");
+      if (separator < 1 || pair.slice(0, separator).trim() !== "_t") continue;
+      const value = pair.slice(separator + 1).trim();
+      if (!value) authorization.cookies.delete("_t");
+      else if (validCookieEntries({ _t: value }).length) authorization.cookies.set("_t", value);
+    }
   }
 }, { urls: [FORUM_ORIGIN + "/*"] }, ["responseHeaders"]);
 
@@ -118,10 +136,47 @@ function connectCookieControl() {
     port.onMessage.addListener(async request => {
       cookieControlAttempts = 0;
       try {
-        if (request.command !== "clearSiteCookies") throw new Error("Unsupported cookie control command");
-        const cookies = await cookiesInStore("firefox-default");
-        for (const cookie of cookies) await removeCookie(cookie, "firefox-default");
-        port.postMessage({ id: request.id, value: true });
+        if (request.command === "clearSiteCookies") {
+          latestHeaderCfClearance = "";
+          const cookies = await cookiesInStore("firefox-default");
+          for (const cookie of cookies) await removeCookie(cookie, "firefox-default");
+          port.postMessage({ id: request.id, value: true });
+        } else if (request.command === "prepareTargetChallenge") {
+          latestHeaderCfClearance = "";
+          const store = "firefox-default";
+          const scope = { storeId: store };
+          const cookies = await cookiesInStore(store);
+          for (const cookie of cookies) {
+            if (cookie.name && cookie.name.toLowerCase() === "cf_clearance") {
+              try { await removeCookie(cookie, store); } catch (error) {}
+            }
+          }
+          for (const [name, value] of validCookieEntries(request.cookies)) {
+            if (/^(cf_|__?cf)/i.test(name)) continue;
+            if (cookies.some(cookie => cookie.name === name && cookie.value === value)) continue;
+            for (const old of cookies.filter(cookie => cookie.name === name)) {
+              try { await removeCookie(old, store); } catch (error) {}
+            }
+            try {
+              await browser.cookies.set({
+                url: FORUM_ORIGIN + "/", name, value, path: "/", secure: true,
+                httpOnly: name === "_t" || name === "_forum_session", ...scope
+              });
+            } catch (error) {}
+          }
+          port.postMessage({ id: request.id, value: true });
+        } else if (request.command === "readCfClearances") {
+          const cookies = await cookiesInStore("firefox-default");
+          const values = cookies
+            .filter(cookie => cookie.name && cookie.name.toLowerCase() === "cf_clearance" && cookie.value)
+            .map(cookie => cookie.value);
+          if (latestHeaderCfClearance && !values.includes(latestHeaderCfClearance)) {
+            values.push(latestHeaderCfClearance);
+          }
+          port.postMessage({ id: request.id, value: true, clearances: values });
+        } else {
+          throw new Error("Unsupported cookie control command");
+        }
       } catch (error) {
         port.postMessage({ id: request.id, error: String(error.message || error), value: false });
       }

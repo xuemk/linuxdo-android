@@ -186,6 +186,7 @@ import android.os.Environment
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.LruCache
+import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.widget.Toast
@@ -256,6 +257,7 @@ import org.linuxdo.android.ui.format.RelativeTime
 import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
+import org.linuxdo.android.ui.html.isDownloadableAttachmentUrl
 import org.linuxdo.android.ui.html.isImageLinkUrl
 import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
 import org.linuxdo.android.net.HttpHeaderUtils
@@ -6782,14 +6784,16 @@ private fun SandboxedGeckoPreview(
 @Composable
 private fun OneboxCard(onebox: CookedBlock.Onebox) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val openTopic = LocalOpenTopic.current
     val openUrl = LocalOpenExternalUrl.current
     val view = LocalView.current
     val pageActive = LocalPostPageActive.current
     val internalTopic = remember(onebox.url) { parseInternalTopicUrl(onebox.url) }
-    val canPreview = remember(onebox.url) {
+    val isAttachmentOnebox = remember(onebox.url) { isDownloadableAttachmentUrl(onebox.url) }
+    val canPreview = remember(onebox.url, isAttachmentOnebox) {
         val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
-        (scheme == "http" || scheme == "https") && internalTopic == null
+        (scheme == "http" || scheme == "https") && internalTopic == null && !isAttachmentOnebox
     }
     val miniAppBadgeLabel = remember(onebox.url) { miniAppBadgeLabelForUrl(onebox.url) }
     val isMiniAppOnebox = miniAppBadgeLabel != null
@@ -6808,7 +6812,18 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                 visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
             }
             .clickable {
-                if (internalTopic != null && openTopic != null) {
+                if (isAttachmentOnebox) {
+                    Toast.makeText(context, "正在下载文件…", Toast.LENGTH_SHORT).show()
+                    scope.launch {
+                        val result = saveMediaToPublicStorage(
+                            context = context,
+                            url = onebox.url,
+                            suggestedName = onebox.title.trim(),
+                            asImage = false,
+                        )
+                        Toast.makeText(context, result, Toast.LENGTH_LONG).show()
+                    }
+                } else if (internalTopic != null && openTopic != null) {
                     openTopic(
                         internalTopic.topicId,
                         onebox.title.ifBlank { "话题 #${internalTopic.topicId}" },
@@ -9283,89 +9298,198 @@ private suspend fun saveMediaToPublicStorage(
     val app = context.applicationContext as App
     val container = app.container
     withContext(Dispatchers.Main) { container.sessionStore.syncFromWebView() }
+    fun buildDownloadRequest(targetUrl: String = url): Request {
+        val activeTag = org.linuxdo.android.net.ActiveSessionRequest(
+            generation = container.sessionStore.sessionGeneration,
+            sendCookies = true,
+        )
+        return Request.Builder()
+            .url(targetUrl)
+            .get()
+            .tag(org.linuxdo.android.net.ActiveSessionRequest::class.java, activeTag)
+            .tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java, SiteImageGateInterceptor.ExplicitDownloadRequest)
+            .build()
+    }
+    fun writeStreamToPublicStorage(
+        inputStream: java.io.InputStream,
+        disposition: String?,
+        finalUrl: String,
+        contentType: String?,
+    ): String {
+        val headerMime = contentType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
+        val fileName = resolveDownloadFileName(
+            disposition = disposition,
+            finalUrl = finalUrl,
+            suggestedName = suggestedName,
+            mimeType = headerMime,
+            asImage = asImage,
+        )
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val resolvedMime = headerMime
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: if (asImage) "image/jpeg" else "application/octet-stream"
+
+        val saveAsPicture = asImage && resolvedMime.startsWith("image/")
+        val resolver = context.contentResolver
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val collection = if (saveAsPicture) {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            }
+            val relativeDir = if (saveAsPicture) {
+                Environment.DIRECTORY_PICTURES + "/LinuxDo"
+            } else {
+                Environment.DIRECTORY_DOWNLOADS + "/LinuxDo"
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val itemUri = resolver.insert(collection, values)
+                ?: return "无法创建本地文件"
+            try {
+                resolver.openOutputStream(itemUri)?.use { out ->
+                    inputStream.use { input -> input.copyTo(out) }
+                } ?: return "无法写入本地文件"
+                val doneValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                resolver.update(itemUri, doneValues, null, null)
+            } catch (e: Throwable) {
+                resolver.delete(itemUri, null, null)
+                throw e
+            }
+            if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
+        } else {
+            val baseDir = context.getExternalFilesDir(
+                if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
+            ) ?: context.filesDir
+            if (!baseDir.exists()) baseDir.mkdirs()
+            val outFile = File(baseDir, fileName)
+            outFile.outputStream().use { out ->
+                inputStream.use { input -> input.copyTo(out) }
+            }
+            "已保存到：${outFile.absolutePath}"
+        }
+    }
     return withContext(Dispatchers.IO) {
         runCatching {
-            val request = Request.Builder().url(url).get().build()
-            var response = container.httpClient.newCall(request).execute()
-            if (response.code == 403 && response.header("cf-mitigated") != null) {
-                val challengedHost = response.request.url.host
-                response.close()
-                val cleared = container.browser.clearChallenge("download", requestHost = challengedHost)
-                if (cleared) {
-                    response = container.httpClient.newCall(request).execute()
+            val requestHost = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
+            if (!asImage) {
+                container.diagnostics.log("开始下载附件: ${org.linuxdo.android.net.gecko.GeckoManager.diagnosticUrl(url)}")
+            }
+            var request = buildDownloadRequest()
+            var fallbackReason: String? = null
+            var failedHost = requestHost.ifBlank { Config.HOST }
+            var failedFp = "-"
+            var response: okhttp3.Response? = null
+
+            try {
+                val firstResp = container.httpClient.newCall(request).execute()
+                val contentType = firstResp.header("Content-Type")
+                val isHtmlPayload = contentType?.contains("text/html", ignoreCase = true) == true
+                val isChallenged = firstResp.code in setOf(403, 429, 503) &&
+                    (firstResp.header("cf-mitigated") != null || (!asImage && isHtmlPayload))
+                val needAttachmentFallback = !asImage && (isChallenged || !firstResp.isSuccessful || isHtmlPayload)
+                if (isChallenged || needAttachmentFallback) {
+                    failedHost = firstResp.request.url.host
+                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
+                    fallbackReason = "HTTP ${firstResp.code}${if (isHtmlPayload) " (HTML)" else ""}"
+                    firstResp.close()
                 } else {
-                    return@withContext "下载被安全校验拦截，请重试"
+                    response = firstResp
+                }
+            } catch (e: Throwable) {
+                if (!asImage) {
+                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
+                    fallbackReason = "${e.javaClass.simpleName}: ${e.message ?: "连接异常"}"
+                } else {
+                    throw e
                 }
             }
-            response.use { resp ->
+
+            if (fallbackReason != null) {
+                if (!asImage) {
+                    container.diagnostics.log("附件 OkHttp 下载受阻($fallbackReason)，切换后台 Gecko 通道")
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "正在后台安全验证并下载，请稍候…", Toast.LENGTH_SHORT).show()
+                    }
+                    val prewarm = container.browser.prewarmAttachmentDownload(
+                        url = url,
+                        failedClearanceFp = failedFp,
+                        requestHost = failedHost,
+                    )
+                    if (!prewarm.cleared) {
+                        container.diagnostics.log("附件后台 Gecko 下载未能取得凭据或直链")
+                        return@withContext "下载被安全校验拦截，请重试"
+                    }
+                    val cachedTempFile = prewarm.tempFile
+                    if (cachedTempFile != null) {
+                        try {
+                            if (cachedTempFile.exists() && cachedTempFile.length() > 0L) {
+                                return@withContext cachedTempFile.inputStream().use { input ->
+                                    writeStreamToPublicStorage(
+                                        inputStream = input,
+                                        disposition = prewarm.contentDisposition,
+                                        finalUrl = prewarm.resolvedUrl ?: url,
+                                        contentType = prewarm.contentType,
+                                    )
+                                }.also { container.diagnostics.log("附件通过 Gecko 流式保存成功: $it") }
+                            }
+                        } finally {
+                            runCatching { cachedTempFile.delete() }
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().flush()
+                        container.sessionStore.syncFromWebView()
+                    }
+                    val retryTarget = prewarm.resolvedUrl ?: url
+                    request = buildDownloadRequest(retryTarget)
+                    response = container.httpClient.newCall(request).execute()
+                } else {
+                    val cleared = container.browser.clearChallenge(
+                        reason = "download-image",
+                        failedClearanceFp = failedFp,
+                        requestHost = failedHost,
+                    )
+                    if (cleared) {
+                        withContext(Dispatchers.Main) {
+                            CookieManager.getInstance().flush()
+                            container.sessionStore.syncFromWebView()
+                        }
+                        request = buildDownloadRequest()
+                        response = container.httpClient.newCall(request).execute()
+                    } else {
+                        return@withContext "下载被安全校验拦截，请重试"
+                    }
+                }
+            }
+            val finalResponse = response ?: return@withContext "下载失败：未收到响应"
+            finalResponse.use { resp ->
                 if (!resp.isSuccessful) {
+                    if (!asImage) container.diagnostics.log("附件最终下载失败: HTTP ${resp.code}")
                     return@withContext "下载失败 (HTTP ${resp.code})"
                 }
                 val body = resp.body ?: return@withContext "下载失败：响应内容为空"
-                val headerMime = resp.header("Content-Type")
-                    ?.substringBefore(';')
-                    ?.trim()
-                    ?.lowercase()
-                    ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
-                val fileName = resolveDownloadFileName(
+                writeStreamToPublicStorage(
+                    inputStream = body.byteStream(),
                     disposition = resp.header("Content-Disposition"),
                     finalUrl = resp.request.url.toString(),
-                    suggestedName = suggestedName,
-                    mimeType = headerMime,
-                    asImage = asImage,
-                )
-                val ext = fileName.substringAfterLast('.', "").lowercase()
-                val resolvedMime = headerMime
-                    ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-                    ?: if (asImage) "image/jpeg" else "application/octet-stream"
-
-                val saveAsPicture = asImage && resolvedMime.startsWith("image/")
-                val resolver = context.contentResolver
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val collection = if (saveAsPicture) {
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                    } else {
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                    }
-                    val relativeDir = if (saveAsPicture) {
-                        Environment.DIRECTORY_PICTURES + "/LinuxDo"
-                    } else {
-                        Environment.DIRECTORY_DOWNLOADS + "/LinuxDo"
-                    }
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    }
-                    val itemUri = resolver.insert(collection, values)
-                        ?: return@withContext "无法创建本地文件"
-                    try {
-                        resolver.openOutputStream(itemUri)?.use { out ->
-                            body.byteStream().use { input -> input.copyTo(out) }
-                        } ?: return@withContext "无法写入本地文件"
-                        val doneValues = ContentValues().apply {
-                            put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        }
-                        resolver.update(itemUri, doneValues, null, null)
-                    } catch (e: Throwable) {
-                        resolver.delete(itemUri, null, null)
-                        throw e
-                    }
-                    if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
-                } else {
-                    val baseDir = context.getExternalFilesDir(
-                        if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
-                    ) ?: context.filesDir
-                    if (!baseDir.exists()) baseDir.mkdirs()
-                    val outFile = File(baseDir, fileName)
-                    outFile.outputStream().use { out ->
-                        body.byteStream().use { input -> input.copyTo(out) }
-                    }
-                    "已保存到：${outFile.absolutePath}"
+                    contentType = resp.header("Content-Type"),
+                ).also {
+                    if (!asImage) container.diagnostics.log("附件 OkHttp 保存完成: $it")
                 }
             }
         }.getOrElse { err ->
+            if (!asImage) container.diagnostics.log("附件保存异常: ${err.javaClass.simpleName}: ${err.message}")
             "保存失败：${err.message ?: "网络异常"}"
         }
     }

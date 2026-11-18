@@ -534,10 +534,13 @@ fun ProfileScreen(
             if (section != ProfileSection.Summary && summaryFields.isEmpty()) {
                 onLoad(ProfileSection.Summary, false, false)
             }
-            if (!notificationOnly && userBadges == null && !isUserBadgesLoading) {
+            if (section != ProfileSection.Summary && !notificationOnly && userBadges == null && !isUserBadgesLoading) {
                 onRefreshUserBadges?.invoke()
             }
-            if (!notificationOnly) onLoadCdkScore()
+            if (!notificationOnly) {
+                kotlinx.coroutines.delay(600L)
+                onLoadCdkScore()
+            }
         }
         if (previousSection != section) {
             previousSection = section

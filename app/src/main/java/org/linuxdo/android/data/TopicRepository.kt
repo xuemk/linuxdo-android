@@ -383,7 +383,7 @@ class TopicRepository(
         )
     }
 
-    /** 主站速率型 429 挑战：递增冷却 + 轻提示，凭据保留；连续超档触发换线时同步淘汰旧节点凭据。 */
+    /** 主站速率型 429 挑战：递增冷却 + 轻提示，凭据保留；连续超档触发换线时保留健康凭据并解除静默补签冷却。 */
     private fun enterChallenge429Cooldown(
         path: String,
         retryAfterSeconds: Long?,
@@ -412,9 +412,11 @@ class TopicRepository(
         )
         if (remaining <= 0L) {
             diagnostics.log("429 速率挑战迟到旧响应: $path，已恢复或跨会话，不重开冷却")
-        } else if (rotated && sentClearanceFp != "-") {
-            noteRequestClearanceChallenged(sentClearanceFp, path)
-            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线并淘汰旧节点凭据(fp=$sentClearanceFp)，冷却 ${(remaining + 999L) / 1_000L}s")
+        } else if (rotated) {
+            // 仅轮换 Anycast 接入节点并不会改变客户端出口 IP，保留 cf_clearance 避免自毁进入 0 凭据裸奔死循环；
+            // 同时清除旧的静默补签冷却锁，允许新节点下必要时即时补签。
+            getRevalidateBlockedUntil = 0L
+            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线降温并保留 cf_clearance，过渡冷却 ${(remaining + 999L) / 1_000L}s")
         } else {
             diagnostics.log("429 速率挑战(第 $streak 次): $path，保留 cf_clearance，递增冷却 ${(remaining + 999L) / 1_000L}s 后自愈")
         }
@@ -868,6 +870,7 @@ class TopicRepository(
     fun armPostVerificationRunway(runwayMs: Long) {
         timingsCooldownUntil = SystemClock.elapsedRealtime() + runwayMs
         cachedCsrfToken = null
+        getRevalidateBlockedUntil = 0L
     }
 
     enum class VerificationProbeOutcome {
@@ -3805,6 +3808,9 @@ class TopicRepository(
     @Volatile
     private var categoryPermissionsSyncedGeneration = -1L
 
+    @Volatile
+    private var lastCategoriesRefreshAt = 0L
+
     fun hasSyncedCategoryPermissions(): Boolean {
         val currentGen = sessionStore?.sessionGeneration ?: 0L
         return categoryPermissionsSyncedGeneration == currentGen
@@ -3826,6 +3832,7 @@ class TopicRepository(
         }.getOrDefault(emptyMap())
         if (siteById.isEmpty()) return categories
         categoryPermissionsSyncedGeneration = currentGen
+        lastCategoriesRefreshAt = SystemClock.elapsedRealtime()
         fun mergeOne(category: Category): Category {
             val siteCat = siteById[category.id]
             val mergedSubs = category.subcategoryList.map { sub ->
@@ -3875,6 +3882,12 @@ class TopicRepository(
      * 若完全一致则返回 null，避免无意义的界面重组。
      */
     suspend fun refreshCategoriesFromServer(present: Boolean = true): Pair<List<Category>, String>? = categoryGate.withLock {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (categoryListCache != null && hasSyncedCategoryPermissions() &&
+            lastCategoriesRefreshAt > 0L && nowElapsed - lastCategoriesRefreshAt < 5 * 60_000L
+        ) {
+            return@withLock null
+        }
         val raw = request("/categories.json?include_subcategories=true", present = present)
         val decoded = json.decodeFromString<CategoryListResponse>(raw).categoryList.categories
         val freshList = mergeSiteCategoryMetadata(decoded, present = present)
@@ -5133,7 +5146,10 @@ class TopicRepository(
                 // 服务端已明确给出等待时间时，补签（同样会发请求）和重放都必须等到截止后，这里直接进入冷却。
                 val serverWaitRequired = challenge.isFrom429 && (challenge.retryAfterSeconds ?: 0L) > 0L
                 if (serverWaitRequired || !silentRevalidateForGet(path, challenge.failedClearanceFp)) {
-                    if (challenge.isFrom429) {
+                    // 仅当服务端要求等待或本次已携带有效凭据时，才把 429 质询收口为限流冷却；
+                    // 若当前 0 份 cf_clearance 裸奔(failedClearanceFp == "-")且静默补签无法自动通过，
+                    // 必须抛出 NeedsInteractiveVerification 拉起可见验证页补发凭据，否则会永不验证、无限循环提示“请求过于频繁”。
+                    if (challenge.isFrom429 && (serverWaitRequired || challenge.failedClearanceFp != "-")) {
                         val cooldownEx = enterChallenge429Cooldown(
                             path = path,
                             retryAfterSeconds = challenge.retryAfterSeconds,
@@ -5418,9 +5434,9 @@ class TopicRepository(
                                         retryAfterSeconds = result.retryAfterSeconds,
                                     )
                                 }
-                                // 速率型挑战：凭据仍有效，不判废、不弹验证页，走递增冷却自愈。
+                                // 速率型挑战：短冷却并在第 2 次命中时立即换线降温；前台请求在阈值内无感退避重放，避免连续弹错。
                                 probeSettled = true
-                                throw enterChallenge429Cooldown(
+                                val cooldownEx = enterChallenge429Cooldown(
                                     path = path,
                                     retryAfterSeconds = result.retryAfterSeconds,
                                     sentClearanceFp = result.sentClearanceFp,
@@ -5428,6 +5444,18 @@ class TopicRepository(
                                     requestGeneration = ticket.sessionGeneration,
                                     receivedAtElapsedMs = receivedAt,
                                 )
+                                val waitMs = cooldownEx.retryAfterMs
+                                if (retryAllowed && present && attempt < MAX_RETRIES &&
+                                    waitMs in 1L..(AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L)
+                                ) {
+                                    val jitterMs = (200L..600L).random()
+                                    val totalWaitMs = waitMs + jitterMs
+                                    diagnostics.log("前台请求 429 挑战自动退避 ${totalWaitMs}ms 后无感重试(${attempt + 1}/$MAX_RETRIES): $path")
+                                    delay(totalWaitMs)
+                                    attempt++
+                                    continue
+                                }
+                                throw cooldownEx
                             }
                             probeSettled = true
                             val cooldownEx = enterRateLimitCooldown(
@@ -5779,13 +5807,19 @@ class TopicRepository(
                     CooldownSlotDecision.NewRound -> {
                         if (nowElapsed - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS) challenge429Streak = 0
                         lastChallenge429At = nowElapsed
-                        val step = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
+                        val rawStep = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
                         challenge429Streak++
-                        activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
-                        activeCooldownStreak = challenge429Streak
-                        val shouldRotate = challenge429Streak > CHALLENGE_429_STEPS_MS.size &&
+                        val shouldRotate = challenge429Streak >= CHALLENGE_429_STEPS_MS.size &&
                             nowElapsed - lastChallenge429RotateAt > CHALLENGE_429_ROTATE_INTERVAL_MS
-                        if (shouldRotate) lastChallenge429RotateAt = nowElapsed
+                        val step = if (shouldRotate) {
+                            lastChallenge429RotateAt = nowElapsed
+                            challenge429Streak = 0
+                            2_500L
+                        } else {
+                            rawStep
+                        }
+                        activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
+                        activeCooldownStreak = if (shouldRotate) CHALLENGE_429_STEPS_MS.size else challenge429Streak
 
                         val wasActive = rateLimitedUntil > nowElapsed
                         rateLimitedByCfChallenge = if (wasActive) rateLimitedByCfChallenge else true
@@ -5798,7 +5832,7 @@ class TopicRepository(
                         val rem = (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
                         sessionStore?.setRateLimitedUntil(nowWall + rem)
                         shouldNotifyQuota = rem > 0L
-                        Triple(rem, challenge429Streak, shouldRotate)
+                        Triple(rem, activeCooldownStreak, shouldRotate)
                     }
                 }
             }
@@ -5933,8 +5967,8 @@ class TopicRepository(
         const val RATE_LIMIT_COOLDOWN_MS = 10_000L
         /** 进程重启后恢复已持久化的服务端 Retry-After 冷却上限（24 小时），避免截断长冷却。 */
         private const val MAX_PERSISTED_COOLDOWN_MS = 86_400_000L
-        /** 速率型 429 挑战的递增冷却档位。 */
-        private val CHALLENGE_429_STEPS_MS = longArrayOf(12_000L, 24_000L, 40_000L)
+        /** 速率型 429 挑战的递增冷却档位（第 2 次即切线降温，不在同一差节点死扛）。 */
+        private val CHALLENGE_429_STEPS_MS = longArrayOf(6_000L, 12_000L)
         /** 超过该时长无新的 429 挑战，档位从头计。 */
         private const val CHALLENGE_429_STREAK_RESET_MS = 3 * 60_000L
         /** 连续 429 档位成功恢复时，每级至少间隔该时长后再向下退档，避免并发 2xx 瞬间清零。 */
@@ -5947,8 +5981,8 @@ class TopicRepository(
         private const val PROBE_WAIT_POLL_MS = 150L
         /** 到期探针或静默补签在途时，后台请求的轻退避提示。 */
         private const val PROBE_WAIT_BACKOFF_MS = 2_000L
-        /** 换线降温的最小间隔，避免节点来回漂移本身又引发风控。 */
-        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 10 * 60_000L
+        /** 换线降温的最小间隔，避免短时间抖动；同时防止被差节点卡死。 */
+        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 30_000L
         /** timings 遇 429 挑战时仅自身熔断的时长（不写主站全局冷却）。 */
         private const val TIMINGS_CHALLENGE_429_FUSE_MS = 60_000L
         /** timings 遇普通 429 且无 Retry-After 时的自身熔断时长。 */

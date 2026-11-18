@@ -1110,6 +1110,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime()
 
     /**
+     * 距离当前登录会话进入首页的时长：新安装用户在登录页填写账号密码与人机验证往往耗时 1~2 分钟，
+     * 若只按进程启动时间计时，刚登录进首页 30 秒就会立刻触发子站连环 OAuth 预热，正撞在首屏请求峰值上。
+     */
+    private fun sinceSessionStartMs(): Long {
+        val base = maxOf(android.os.Process.getStartElapsedRealtime(), lastAuthenticatedSeedAt)
+        return (SystemClock.elapsedRealtime() - base).coerceAtLeast(0L)
+    }
+
+    /**
      * 本地无缓存时的首拉锁：进程启动后 [Config.CONNECT_FIRST_FETCH_LOCK_MS] 内不允许手动拉取，
      * 交给 [scheduleIdleConnectWarmup] 在启动 2 分钟后错峰取第一份。返回剩余锁定毫秒，0 表示放行。
      */
@@ -1130,10 +1139,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val username = _state.value.username ?: return
         val checkSession = connectSessionCheck(username)
         idleWarmupJob = viewModelScope.launch {
-            // 冷启动首轮不早于进程启动 2 分钟，避开首屏请求峰值；之后的触发至少再等 30 秒
+            // 冷启动/刚登录首轮不早于进首页 2 分钟，彻底避开首屏列表、分类、标签与头像请求峰值；之后的触发至少再等 30 秒
             delay(maxOf(
                 Config.CONNECT_IDLE_WARMUP_DELAY_MS,
-                Config.CONNECT_FIRST_WARMUP_AFTER_START_MS - sinceProcessStartMs(),
+                Config.CONNECT_FIRST_WARMUP_AFTER_START_MS - sinceSessionStartMs(),
             ))
             suspend fun awaitQuietWindow() {
                 checkSession()
@@ -4401,10 +4410,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             healMissingUsernameIfNeeded()
             return
         }
-        if (section == ProfileSection.Summary && !more) {
-            prewarmCurrentUserAvatar(username)
-            loadUserBadges(username, refresh = refresh)
-        }
         val filter = _notificationFilter.value
         val previous = _profile.value[section] ?: ProfileUiState()
         if (previous.loading) return
@@ -4417,6 +4422,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val fresh = fetchProfilePage(username, section, filter, previous, more)
                 _profile.update { it + (section to fresh) }
                 if (section == ProfileSection.Notifications) notificationCache[filter] = fresh
+                if (section == ProfileSection.Summary && !more) {
+                    prewarmCurrentUserAvatar(username)
+                    loadUserBadges(username, refresh = refresh)
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -7736,8 +7745,14 @@ fun openTopicSearch(topicId: Long, title: String) {
         )
     }
 
+    @Volatile private var lastAuthenticatedSeedAt = 0L
+    @Volatile private var lastFollowingWarmAt = 0L
+    @Volatile private var lastFollowingWarmUser: String? = null
+    @Volatile private var lastTagsSyncAt = 0L
+
     private fun applyAuthenticatedUserSeed(user: org.linuxdo.android.data.DiscourseUser) {
         if (user.id <= 0L || user.username.isBlank()) return
+        lastAuthenticatedSeedAt = SystemClock.elapsedRealtime()
         store.saveCurrentUserId(user.id)
         container.reading.switchUser(user.id)
         container.historyStore.switchUser(user.id)
@@ -7833,7 +7848,6 @@ fun openTopicSearch(topicId: Long, title: String) {
                         delay(2000L)
                         reconcileSessionAndCategories(cachedUser)
                     }
-                    scheduleIdleConnectWarmup()
                     // 添加账号/退出登录会经 clearAccountScopedState 停掉话题感知,登录回来要重新拉起。
                     restartAutoProbeLoop()
                     return@launch
@@ -7857,6 +7871,7 @@ fun openTopicSearch(topicId: Long, title: String) {
                 } else {
                     val username = currentUser.username
                     diagnostics.log("登录态有效: $username")
+                    lastAuthenticatedSeedAt = SystemClock.elapsedRealtime()
                     store.saveCurrentUserId(currentUser.id)
                     container.reading.switchUser(currentUser.id)
                     container.historyStore.switchUser(currentUser.id)
@@ -7897,13 +7912,22 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     /**
-     * 首屏列表上屏后，后台静默探测分类树更新并复核会话有效性（Stale-While-Revalidate）。
-     * 既保证冷启动首屏 0 阻塞秒开，又确保服务端分类变动或会话失效能够及时同步。
+     * 首屏列表上屏后，后台错峰静默探测分类树/标签更新并复核会话有效性（Stale-While-Revalidate）。
+     * 既保证冷启动首屏 0 阻塞秒开，又避免新安装登录后瞬间齐发多接口撞上 Cloudflare 速率规则。
      */
     private fun reconcileSessionAndCategories(cachedUser: String) {
         val expectedUserId = store.currentUserId()
-        syncCategoriesInBackground()
-        syncTagsInBackground()
+        syncCategoriesInBackground(delayMs = 3_500L)
+        syncTagsInBackground(delayMs = 8_000L)
+        val seedAgeMs = if (lastAuthenticatedSeedAt > 0L) {
+            SystemClock.elapsedRealtime() - lastAuthenticatedSeedAt
+        } else {
+            Long.MAX_VALUE
+        }
+        if (seedAgeMs in 0L..60_000L) {
+            // 刚通过登录流写入新鲜身份种子不足 60 秒，无需立刻重复查询 /session/current.json
+            return
+        }
         reconcileSessionJob?.cancel()
         reconcileSessionJob = viewModelScope.launch {
             try {
@@ -7981,11 +8005,13 @@ fun openTopicSearch(topicId: Long, title: String) {
         }
     }
 
-    private fun syncCategoriesInBackground() {
+    private fun syncCategoriesInBackground(delayMs: Long = 0L) {
+        if (pageJobs["sync:categories"]?.isActive == true) return
         val requestScopeGeneration = accountScopeGeneration
         pageJobs["sync:categories"] = viewModelScope.launch {
             try {
-                if (repository.isRateLimitCoolingDown()) return@launch
+                if (delayMs > 0L) delay(delayMs)
+                if (requestScopeGeneration != accountScopeGeneration || repository.isRateLimitCoolingDown()) return@launch
                 val updated = repository.refreshCategoriesFromServer(present = false)
                 if (requestScopeGeneration != accountScopeGeneration) return@launch
                 val known = repository.cachedCategoryMap()
@@ -8004,13 +8030,20 @@ fun openTopicSearch(topicId: Long, title: String) {
         }
     }
 
-    private fun syncTagsInBackground() {
+    private fun syncTagsInBackground(delayMs: Long = 0L) {
+        if (pageJobs["sync:tags"]?.isActive == true) return
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (lastTagsSyncAt > 0L && nowElapsed - lastTagsSyncAt < 10 * 60_000L && _tags.value.loaded) {
+            return
+        }
         val requestScopeGeneration = accountScopeGeneration
         pageJobs["sync:tags"] = viewModelScope.launch {
             try {
-                if (repository.isRateLimitCoolingDown()) return@launch
+                if (delayMs > 0L) delay(delayMs)
+                if (requestScopeGeneration != accountScopeGeneration || repository.isRateLimitCoolingDown()) return@launch
                 val updated = repository.refreshTagsFromServer(present = false)
                 if (requestScopeGeneration != accountScopeGeneration) return@launch
+                lastTagsSyncAt = SystemClock.elapsedRealtime()
                 if (updated != null) {
                     val (freshList, rawJson) = updated
                     container.preferences.edit { putString("cached_tags_json", rawJson) }
@@ -8758,11 +8791,22 @@ fun openTopicSearch(topicId: Long, title: String) {
         if (cached != null && isCurrentAccountUsername(cleanUser)) {
             followedUsernames.value = cached.map { it.username.lowercase() }.toSet()
         }
-        viewModelScope.launch {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (pageJobs["warm:following"]?.isActive == true) return
+        if (lastFollowingWarmUser.equals(cleanUser, ignoreCase = true) &&
+            lastFollowingWarmAt > 0L && nowElapsed - lastFollowingWarmAt < 5 * 60_000L
+        ) {
+            return
+        }
+        val requestScopeGeneration = accountScopeGeneration
+        pageJobs["warm:following"] = viewModelScope.launch {
             runCatching {
-                delay(1_500L)
-                if (repository.isRateLimitCoolingDown()) return@runCatching
+                delay(5_000L)
+                if (requestScopeGeneration != accountScopeGeneration || repository.isRateLimitCoolingDown()) return@runCatching
                 val fresh = repository.fetchFollowing(cleanUser, present = false)
+                if (requestScopeGeneration != accountScopeGeneration) return@runCatching
+                lastFollowingWarmAt = SystemClock.elapsedRealtime()
+                lastFollowingWarmUser = cleanUser
                 if (isCurrentAccountUsername(cleanUser)) {
                     followedUsernames.value = fresh.map { it.username.lowercase() }.toSet()
                 }

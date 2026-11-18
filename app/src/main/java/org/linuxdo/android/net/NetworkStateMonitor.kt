@@ -48,6 +48,7 @@ class NetworkStateMonitor(
 
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val handler = Handler(Looper.getMainLooper())
+    private var lastDetectedState = NetworkSecurityState()
     private val _state = MutableStateFlow(detect())
     val state = _state.asStateFlow()
 
@@ -108,18 +109,27 @@ class NetworkStateMonitor(
         handler.post(refreshTask)
     }
 
+    @Synchronized
     fun detect(): NetworkSecurityState {
-        val cm = connectivity ?: return NetworkSecurityState()
-        val isVpn = runCatching {
-            cm.allNetworks.any {
-                cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-            }
-        }.getOrDefault(false)
+        val cm = connectivity
+        // 其他 UID 使用的 VPN 不代表本 App 的出口；状态暂不可读时避免切换传输策略。
+        val isVpn = if (cm == null) null else runCatching {
+            val active = cm.activeNetwork
+            active?.let { cm.getNetworkCapabilities(it) }
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }.onFailure {
+            Log.w(TAG, "读取应用默认网络失败，保留上次 VPN 状态: ${it.javaClass.simpleName}")
+        }.getOrNull()
 
-        val isProxy = runCatching {
+        val isProxy = if (cm == null) null else runCatching {
             cm.defaultProxy != null
-        }.getOrDefault(false)
+        }.onFailure {
+            Log.w(TAG, "读取系统代理失败，保留上次代理状态: ${it.javaClass.simpleName}")
+        }.getOrNull()
 
-        return NetworkSecurityState(isVpn = isVpn, isProxy = isProxy)
+        return NetworkSecurityState(
+            isVpn = isVpn ?: lastDetectedState.isVpn,
+            isProxy = isProxy ?: lastDetectedState.isProxy,
+        ).also { lastDetectedState = it }
     }
 }
