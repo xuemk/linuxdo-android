@@ -1,7 +1,8 @@
 package org.linuxdo.android.ui.design
 
-import android.app.Activity
-import androidx.core.view.WindowCompat
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.runtime.SideEffect
@@ -59,16 +60,12 @@ fun IosTheme(
     }
     val view = LocalView.current
     SideEffect {
-        (view.context as? Activity)?.window?.let { window ->
-            @Suppress("DEPRECATION")
-            window.statusBarColor = colors.groupedBackground.toArgb()
-            @Suppress("DEPRECATION")
-            window.navigationBarColor = colors.card.toArgb()
-            WindowCompat.getInsetsController(window, view).apply {
-                isAppearanceLightStatusBars = !dark
-                isAppearanceLightNavigationBars = !dark
-            }
-        }
+        (view.context as? ComponentActivity)?.enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT,
+            ) { dark },
+            navigationBarStyle = SystemBarStyle.auto(colors.card.toArgb(), colors.card.toArgb()) { dark },
+        )
     }
     CompositionLocalProvider(
         LocalDensity provides appDensity,

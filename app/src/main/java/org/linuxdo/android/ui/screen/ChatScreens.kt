@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -77,8 +78,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import org.linuxdo.android.Config
@@ -92,6 +91,7 @@ import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosNavBar
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.linuxdo.android.ui.format.RelativeTime
 
 @Composable
@@ -872,14 +872,15 @@ private fun ChatMessageBubble(
 
     // 全屏图片预览 Dialog
     fullscreenImage?.let { upload ->
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { fullscreenImage = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false),
+            darkSystemBars = true,
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Color.Black)
+                    .safeDrawingPadding()
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,

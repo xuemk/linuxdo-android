@@ -8,6 +8,7 @@ import android.content.MutableContextWrapper
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
@@ -29,6 +30,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import android.widget.LinearLayout
+import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Button
 import android.util.TypedValue
@@ -66,6 +68,62 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import kotlin.math.roundToInt
+
+@Suppress("DEPRECATION")
+internal fun Dialog.showVerificationSheet(content: View, dark: Boolean) {
+    val container = FrameLayout(context)
+    container.addView(content, FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.BOTTOM,
+    ))
+    ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
+        val safeInsets = insets.getInsets(
+            WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime(),
+        )
+        view.setPadding(safeInsets.left, safeInsets.top, safeInsets.right, safeInsets.bottom)
+        insets
+    }
+    container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+        // 使用弹窗当前可用高度，分屏、旋转和键盘变化时都重新测量。
+        val availableHeight = (container.height - container.paddingTop - container.paddingBottom).coerceAtLeast(0)
+        val sheetHeight = (availableHeight * 0.92f).roundToInt()
+        if (content.layoutParams.height != sheetHeight) {
+            content.layoutParams = content.layoutParams.apply { height = sheetHeight }
+        }
+    }
+    setContentView(container)
+    window?.apply {
+        WindowCompat.setDecorFitsSystemWindows(this, false)
+        setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        statusBarColor = Color.TRANSPARENT
+        navigationBarColor = Color.TRANSPARENT
+        attributes = attributes.apply {
+            dimAmount = 0.5f
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+        }
+        addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+    }
+    show()
+    window?.apply {
+        setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        WindowCompat.getInsetsController(this, decorView).apply {
+            isAppearanceLightStatusBars = !dark
+            isAppearanceLightNavigationBars = !dark
+        }
+    }
+    ViewCompat.requestApplyInsets(container)
+}
 
 /**
  * 全应用唯一的 WebView 会话:
@@ -863,7 +921,6 @@ class BrowserSession(
 
         val dialog = Dialog(context).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setContentView(root)
             setCanceledOnTouchOutside(false)
             close.setOnClickListener { dismiss() }
             setOnDismissListener {
@@ -887,18 +944,7 @@ class BrowserSession(
         cfGeckoView = geckoView
         cfGeckoSession = geckoSession
         val stillCurrent = cookieSyncGuard(geckoView)
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setLayout(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                (context.resources.displayMetrics.heightPixels * 0.92f).toInt(),
-            )
-            setGravity(Gravity.BOTTOM)
-            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-            attributes = attributes.apply { dimAmount = 0.5f }
-        }
+        dialog.showVerificationSheet(root, isDark)
         geckoView.requestFocus()
         geckoView.postDelayed({
             if (isInCfMode && cfDialog?.isShowing == true && !isFreshCfClearance(currentCfClearance())) {

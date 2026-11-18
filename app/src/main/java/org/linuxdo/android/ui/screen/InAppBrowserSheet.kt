@@ -32,9 +32,7 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.asPaddingValues
-import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -44,12 +42,9 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -104,7 +99,6 @@ import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
@@ -122,8 +116,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.net.toUri
@@ -157,6 +149,7 @@ import org.linuxdo.android.net.gecko.LINKED_H5_CONTEXT_PREFIX
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.WebRequestError
@@ -453,15 +446,13 @@ private fun MiniAppLauncher(onDismiss: () -> Unit, onOpen: (MiniAppEntry) -> Uni
         }
     }
 
-    Dialog(onDismissRequest = ::back, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    FullscreenDialog(onDismissRequest = ::back, darkSystemBars = true) {
         BackHandler(onBack = ::back)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Brush.verticalGradient(listOf(Color(0xFF1E1E29), Color(0xFF252433), Color(0xFF2E2C3E))))
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .imePadding()
+                .safeDrawingPadding()
                 .onGloballyPositioned { coords ->
                     rootOriginInWindow = coords.positionInRoot()
                     rootSizePx = Size(coords.size.width.toFloat(), coords.size.height.toFloat())
@@ -1998,20 +1989,9 @@ fun InAppBrowserSheet(
 
     val showColdStartOverlay = holder.mainFrameError == null && !showPage
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = closeApp,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
     ) {
-        val dialogView = LocalView.current
-        DisposableEffect(dialogView) {
-            (dialogView.parent as? DialogWindowProvider)?.window?.setLayout(
-                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-            )
-            onDispose { }
-        }
         BackHandler {
             when {
                 actionSheetVisible -> actionSheetVisible = false
@@ -2028,7 +2008,7 @@ fun InAppBrowserSheet(
                 .fillMaxSize()
                 .background(navBarBg)
                 // 独立窗口按自己的安全区布局，避免复用主界面已消费的 Insets。
-                .padding(WindowInsets.safeDrawing.asPaddingValues()),
+                .safeDrawingPadding(),
         ) {
             Column(Modifier.fillMaxSize()) {
                 // 1. 原生导航栏 (44dp) —— default 模式下显示完整顶栏，custom 模式下隐藏顶栏让视图置顶
@@ -3250,12 +3230,11 @@ private fun NativeMailboxSheet(onDismiss: () -> Unit) {
             if (!isOwner()) { onDismiss(); break }
         }
     }
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = back,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         BackHandler(onBack = back)
-        Column(Modifier.fillMaxSize().background(colors.groupedBackground).statusBarsPadding().navigationBarsPadding().imePadding()) {
+        Column(Modifier.fillMaxSize().background(colors.groupedBackground).safeDrawingPadding()) {
             Row(Modifier.fillMaxWidth().background(colors.card).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = back, enabled = !sending) { Text("返回", color = colors.accent) }
                 Text(

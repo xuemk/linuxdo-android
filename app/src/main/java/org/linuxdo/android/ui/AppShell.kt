@@ -21,14 +21,12 @@ import androidx.compose.ui.graphics.drawscope.scale
 import org.linuxdo.android.data.InternalTopicLink
 import org.linuxdo.android.data.parseTopicLinkFromText
 import android.graphics.Color as AndroidColor
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
-import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView as AndroidTextView
 import androidx.compose.foundation.background
@@ -41,6 +39,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.Text
 import org.linuxdo.android.ui.screen.PostAction
@@ -85,6 +84,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import org.linuxdo.android.ui.screen.openExternal
 import org.linuxdo.android.net.BrowserSession
+import org.linuxdo.android.net.showVerificationSheet
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.NotificationPollInterval
@@ -190,6 +190,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 .fillMaxSize()
                 .background(IosTheme.colors.groupedBackground)
                 .systemBarsPadding()
+                .displayCutoutPadding()
                 .imePadding()
                 .clipToBounds(),
         ) {
@@ -475,23 +476,11 @@ private fun NativeWebLoginDialog(
         root.addView(webView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-        dialog.setContentView(root)
         dialog.setCanceledOnTouchOutside(false)
         dialog.setOnDismissListener {
             if (!dismissedByComposition) onClose()
         }
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(AndroidColor.TRANSPARENT))
-            setLayout(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                (context.resources.displayMetrics.heightPixels * 0.92f).toInt(),
-            )
-            setGravity(Gravity.BOTTOM)
-            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-            attributes = attributes.apply { dimAmount = 0.5f }
-        }
+        dialog.showVerificationSheet(root, dark)
         webView.requestFocus()
 
         onDispose {

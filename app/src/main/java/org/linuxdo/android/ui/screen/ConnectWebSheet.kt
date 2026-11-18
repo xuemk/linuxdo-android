@@ -26,8 +26,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -37,8 +36,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -77,6 +74,7 @@ import org.linuxdo.android.data.TrustRingMetric
 import org.linuxdo.android.data.TrustVetoMetric
 import org.linuxdo.android.ui.TrustReportUiState
 import org.linuxdo.android.ui.design.IosActivityIndicator
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.linuxdo.android.ui.design.sheetScrollable
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -104,12 +102,9 @@ fun ConnectWebSheet(
         }
     }
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+        darkSystemBars = true,
     ) {
         BackHandler {
             onDismiss()
@@ -118,8 +113,7 @@ fun ConnectWebSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF0F0F10))
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                .safeDrawingPadding(),
         ) {
             // 顶栏: 返回 + 品牌 + 刷新 + 关闭
             Row(

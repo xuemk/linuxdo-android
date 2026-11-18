@@ -33,7 +33,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
@@ -128,6 +128,7 @@ import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosRow
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.linuxdo.android.ui.design.IosLoadingBox
 import org.linuxdo.android.ui.design.IosSwitch
 import org.linuxdo.android.ui.design.UserAvatar
@@ -178,7 +179,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -2336,7 +2336,7 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f).padding(end = 8.dp)) {
                         Text("右侧楼层导航条", style = IosTheme.type.body.copy(fontSize = 14.5.sp))
                         Text(
-                            "半透明悬浮于右侧，按下后显示清晰，拖动并松手跳转楼层",
+                            "半透明悬浮于右侧，按住时显示清晰，拖动并松手跳转楼层；轻触不会跳转",
                             style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                             color = IosTheme.colors.secondaryLabel,
                             modifier = Modifier.padding(top = 3.dp),
@@ -11203,12 +11203,11 @@ internal fun TopicMetadataEditorSheet(
     val editable = state.original?.canEdit == true && !state.saving && !state.loading
     val category = state.rules?.categories?.firstOrNull { it.id == state.categoryId }
     val requestClose = { if (!state.saving) { if (state.dirty) discard = true else onClose() } }
-    Dialog(onDismissRequest = requestClose, properties = androidx.compose.ui.window.DialogProperties(
-        usePlatformDefaultWidth = false, decorFitsSystemWindows = false, dismissOnClickOutside = false)) {
+    FullscreenDialog(onDismissRequest = requestClose, dismissOnClickOutside = false) {
         androidx.activity.compose.BackHandler(enabled = true, onBack = requestClose)
         val focus = androidx.compose.ui.platform.LocalFocusManager.current
         val keyboard = LocalSoftwareKeyboardController.current
-        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).systemBarsPadding().imePadding()) {
+        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).safeDrawingPadding()) {
             ReaderPanelHeader(
                 "话题编辑", onClose = requestClose, closeEnabled = !state.saving,
                 actionText = if (state.saving) "保存中…" else "保存", actionEnabled = state.canSave,

@@ -174,7 +174,6 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
@@ -1781,9 +1780,8 @@ fun TopicDetailScreen(
         )
     }
     if (showToc) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { showToc = false },
-            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
         ) {
             Box(
                 modifier = Modifier
@@ -1793,6 +1791,7 @@ fun TopicDetailScreen(
                         indication = null,
                         onClick = { showToc = false },
                     )
+                    .safeDrawingPadding()
                     .padding(top = 96.dp, start = 20.dp, end = 20.dp),
                 contentAlignment = Alignment.TopCenter,
             ) {
@@ -1888,9 +1887,8 @@ fun TopicDetailScreen(
         }
     }
     if (authorMenuExpanded) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { authorMenuExpanded = false },
-            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
         ) {
             Box(
                 modifier = Modifier
@@ -1900,6 +1898,7 @@ fun TopicDetailScreen(
                         indication = null,
                         onClick = { authorMenuExpanded = false },
                     )
+                    .safeDrawingPadding()
                     .padding(top = 96.dp, start = 20.dp, end = 20.dp),
                 contentAlignment = Alignment.TopCenter,
             ) {
@@ -2803,13 +2802,11 @@ private fun TopicFloorScrollbar(
                     )
                 }
                 .pointerInput(total, descending, travelPx) {
+                    // 轻点仅显示按压反馈，跳转只在拖动结束后发起。
                     detectTapGestures(
                         onPress = {
                             pressed = true
                             try { tryAwaitRelease() } finally { pressed = false }
-                        },
-                        onTap = { position ->
-                            latestJump(TopicFloorNavigation.floorAtFraction(fractionAt(position.y), total, descending))
                         },
                     )
                 },
@@ -6431,8 +6428,8 @@ private fun InlineMediaCard(
         }
     }
     if (fullscreen && player != null) {
-        Dialog(onDismissRequest = { fullscreen = false }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+        FullscreenDialog(onDismissRequest = { fullscreen = false }, darkSystemBars = true) {
+            Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
                 NativePlayerView(player, Modifier.fillMaxSize(), playRequested)
                 TextButton(onClick = { fullscreen = false }, modifier = Modifier.align(Alignment.TopEnd)) {
                     Text("退出全屏", color = Color.White)
@@ -6928,11 +6925,11 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
     }
 
     if (fullscreen && canPreview) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { fullscreen = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+            darkSystemBars = true,
         ) {
-            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+            Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
                 SandboxedWebPreview(
                     url = onebox.url,
                     active = true,
@@ -7377,9 +7374,10 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) save() else Toast.makeText(context, "未获得相册保存权限，仍可直接分享", Toast.LENGTH_SHORT).show()
     }
-    Dialog(onDismissRequest = { if (!saving) onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    FullscreenDialog(onDismissRequest = { if (!saving) onDismiss() }) {
         Column(
             Modifier
+                .safeDrawingPadding()
                 .padding(16.dp)
                 .fillMaxWidth()
                 .fillMaxHeight(0.92f)
@@ -7802,9 +7800,10 @@ internal fun PostRevisionSheet(post: Post, onDismiss: () -> Unit) {
             }
         }
     }
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    FullscreenDialog(onDismissRequest = onDismiss) {
         Column(
             Modifier
+                .safeDrawingPadding()
                 .padding(16.dp)
                 .fillMaxWidth()
                 .fillMaxHeight(0.90f)
@@ -8838,12 +8837,9 @@ fun ImageViewer(
         isCurrentZoomed = false
     }
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+        darkSystemBars = true,
     ) {
         val view = LocalView.current
         SideEffect {
@@ -8876,13 +8872,11 @@ fun ImageViewer(
                     .fillMaxSize()
                     .background(Color.Black.copy(alpha = bgAlpha)),
             ) {
-                // 核心修复点：将图片实际显示范围限定在 statusBars 和 navigationBars 之间（避让虚拟按键/手势条）
-                // 彻底杜绝 1x 比例下长截图、竖图被底部的系统导航栏遮挡！
+                // 图片范围同时避让系统栏与横屏挖孔，背景仍铺满窗口。
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
+                        .safeDrawingPadding()
                         .graphicsLayer {
                             translationY = dismissOffsetY.value
                         }
@@ -8914,7 +8908,7 @@ fun ImageViewer(
                         Modifier
                             .align(Alignment.TopCenter)
                             .zIndex(10f)
-                            .statusBarsPadding()
+                            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
                             .padding(top = 16.dp)
                             .graphicsLayer { alpha = uiAlpha },
                     ) {
@@ -8936,7 +8930,7 @@ fun ImageViewer(
                     Modifier
                         .align(Alignment.TopEnd)
                         .zIndex(10f)
-                        .statusBarsPadding()
+                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                         .graphicsLayer { alpha = uiAlpha },
                     horizontalArrangement = Arrangement.spacedBy(12.dp),

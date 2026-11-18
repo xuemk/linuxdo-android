@@ -1,5 +1,7 @@
 package org.linuxdo.android.ui.design
 
+import android.os.Build
+import android.view.WindowManager
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -28,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -49,12 +52,62 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.doOnAttach
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.sin
+
+@Composable
+fun FullscreenDialog(
+    onDismissRequest: () -> Unit,
+    darkSystemBars: Boolean = IosTheme.colors.isDark,
+    dismissOnClickOutside: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismissRequest,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+            dismissOnClickOutside = dismissOnClickOutside,
+        ),
+    ) {
+        val view = LocalView.current
+        SideEffect {
+            (view.parent as? DialogWindowProvider)?.window?.let { window ->
+                window.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+                if (Build.VERSION.SDK_INT >= 28) {
+                    window.attributes = window.attributes.apply {
+                        layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                        } else {
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        }
+                    }
+                }
+                @Suppress("DEPRECATION")
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                view.doOnAttach {
+                    WindowCompat.getInsetsController(window, view).apply {
+                        isAppearanceLightStatusBars = !darkSystemBars
+                        isAppearanceLightNavigationBars = !darkSystemBars
+                    }
+                }
+            }
+        }
+        content()
+    }
+}
 
 /**
  * LINUX DO 社区特色定制头像形状：
