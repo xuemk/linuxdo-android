@@ -5,19 +5,43 @@ import android.content.Context
 import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import kotlin.math.roundToInt
+import org.linuxdo.android.ui.screen.AttachmentDownloadManager
+import org.linuxdo.android.ui.screen.AttachmentDownloadStage
+import org.linuxdo.android.ui.screen.AttachmentDownloadUiState
 import org.linuxdo.android.data.InternalTopicLink
 import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.parseTopicLinkFromText
@@ -185,6 +209,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
         }
     }
     val readSyncVerifyBanner by viewModel.readSyncVerifyBanner.collectAsStateWithLifecycle()
+    val attachmentDownload by AttachmentDownloadManager.state.collectAsStateWithLifecycle()
 
     val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
     val dark = when (themeMode) {
@@ -312,6 +337,40 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
             }
             else {
                 NativeWebLoginDialog(browser, viewModel::closeWebLoginModal, dark)
+            }
+
+            val downloadContext = LocalContext.current
+            var lastShownDownload by remember { mutableStateOf<AttachmentDownloadUiState?>(null) }
+            if (attachmentDownload != null) {
+                lastShownDownload = attachmentDownload
+            }
+            AnimatedVisibility(
+                visible = attachmentDownload != null,
+                enter = slideInVertically(
+                    animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
+                    initialOffsetY = { -it - 32 },
+                ) + fadeIn(animationSpec = tween(durationMillis = 220)),
+                exit = slideOutVertically(
+                    animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                    targetOffsetY = { -it - 32 },
+                ) + fadeOut(animationSpec = tween(durationMillis = 180)),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 10.dp, start = 14.dp, end = 14.dp)
+                    .widthIn(max = 420.dp)
+                    .zIndex(8f),
+            ) {
+                val cardState = attachmentDownload ?: lastShownDownload
+                if (cardState != null) {
+                    AttachmentDownloadOverlayCard(
+                        state = cardState,
+                        dark = dark,
+                        onCancel = { AttachmentDownloadManager.cancelCurrent(downloadContext) },
+                        onRetry = { AttachmentDownloadManager.retryLast(downloadContext) },
+                        onOpen = { uri, mime -> openDownloadedAttachment(downloadContext, uri, mime) },
+                        onDismiss = { AttachmentDownloadManager.dismiss() },
+                    )
+                }
             }
 
             val updateInfo = updateState.updateInfo
@@ -2006,6 +2065,433 @@ private fun ClipboardLinkDetectionCard(
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
                 )
+            }
+        }
+    }
+}
+
+private fun formatDownloadBytes(bytes: Long): String {
+    if (bytes <= 0L) return "0 B"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) {
+        return if (kb < 10.0) String.format(java.util.Locale.US, "%.1f KB", kb) else "${kb.roundToInt()} KB"
+    }
+    val mb = kb / 1024.0
+    return if (mb < 1024.0) {
+        String.format(java.util.Locale.US, "%.2f MB", mb)
+    } else {
+        String.format(java.util.Locale.US, "%.2f GB", mb / 1024.0)
+    }
+}
+
+private fun openDownloadedAttachment(context: Context, uri: Uri, mimeType: String?) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mimeType?.takeIf { it.isNotBlank() } ?: "*/*")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    val opened = runCatching {
+        context.startActivity(intent)
+        true
+    }.getOrDefault(false)
+    if (!opened) {
+        Toast.makeText(context, "未找到可直接打开此文件的应用，已保存至「下载/LinuxDo」", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * 全局悬浮附件下载进度卡片（iOS 灵动胶囊风格）：
+ * 挂载在 AppShell 顶层，切换出话题或切 Tab 后仍持续在后台下载并实时推进进度。
+ */
+@Composable
+private fun AttachmentDownloadOverlayCard(
+    state: AttachmentDownloadUiState,
+    dark: Boolean,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+    onOpen: (Uri, String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val accent = IosTheme.colors.accent
+    val successColor = if (dark) Color(0xFF30D158) else Color(0xFF28B446)
+    val errorColor = if (dark) Color(0xFFFF453A) else Color(0xFFE53935)
+    val tintColor = when (state.stage) {
+        AttachmentDownloadStage.COMPLETED -> successColor
+        AttachmentDownloadStage.FAILED -> errorColor
+        else -> accent
+    }
+    val borderColor = if (dark) {
+        Color.White.copy(alpha = 0.12f)
+    } else {
+        IosTheme.colors.separator.copy(alpha = 0.48f)
+    }
+    val rawProgress = state.progressFraction
+    val animatedProgress by animateFloatAsState(
+        targetValue = rawProgress ?: 0f,
+        animationSpec = tween(durationMillis = 160, easing = FastOutSlowInEasing),
+        label = "attachmentDownloadProgress",
+    )
+    val infiniteTransition = rememberInfiniteTransition(label = "attachmentDownloadShimmer")
+    val shimmerOffset by infiniteTransition.animateFloat(
+        initialValue = -0.35f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_150, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "attachmentShimmerOffset",
+    )
+    val spinnerAngle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "attachmentSpinnerAngle",
+    )
+
+    val subtitleText = when (state.stage) {
+        AttachmentDownloadStage.DOWNLOADING -> {
+            val sizePart = if (state.totalBytes > 0L) {
+                "${formatDownloadBytes(state.downloadedBytes)} / ${formatDownloadBytes(state.totalBytes)}"
+            } else if (state.downloadedBytes > 0L) {
+                "已接收 ${formatDownloadBytes(state.downloadedBytes)}"
+            } else {
+                "正在接收数据…"
+            }
+            val speedPart = if (state.speedBytesPerSec > 0L) " · ${formatDownloadBytes(state.speedBytesPerSec)}/s" else ""
+            sizePart + speedPart
+        }
+        AttachmentDownloadStage.COMPLETED -> {
+            val sizePart = if (state.downloadedBytes > 0L) " · ${formatDownloadBytes(state.downloadedBytes)}" else ""
+            "下载完成$sizePart · 下载/LinuxDo"
+        }
+        AttachmentDownloadStage.FAILED -> state.statusText
+        else -> state.statusText
+    }
+
+    val percentText = if (state.stage == AttachmentDownloadStage.DOWNLOADING && rawProgress != null) {
+        "${(animatedProgress * 100f).roundToInt().coerceIn(0, 100)}%"
+    } else {
+        null
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(
+                elevation = if (dark) 18.dp else 12.dp,
+                shape = RoundedCornerShape(18.dp),
+                ambientColor = Color.Black.copy(alpha = if (dark) 0.45f else 0.16f),
+                spotColor = Color.Black.copy(alpha = if (dark) 0.45f else 0.16f),
+            )
+            .clip(RoundedCornerShape(18.dp))
+            .background(IosTheme.colors.card)
+            .border(0.6.dp, borderColor, RoundedCornerShape(18.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // 左侧状态徽章（进行中带实时环形进度/旋转光弧，完成为勾选，失败为叹号）
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(tintColor.copy(alpha = if (dark) 0.18f else 0.11f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Canvas(Modifier.size(26.dp)) {
+                        val strokeW = 2.2.dp.toPx()
+                        val pad = strokeW / 2f
+                        val arcSize = Size(size.width - strokeW, size.height - strokeW)
+                        when (state.stage) {
+                            AttachmentDownloadStage.COMPLETED -> {
+                                drawCircle(
+                                    color = tintColor.copy(alpha = 0.2f),
+                                    radius = size.minDimension / 2f - pad,
+                                    style = Stroke(width = strokeW),
+                                )
+                                val check = Path().apply {
+                                    moveTo(size.width * 0.27f, size.height * 0.52f)
+                                    lineTo(size.width * 0.44f, size.height * 0.69f)
+                                    lineTo(size.width * 0.74f, size.height * 0.34f)
+                                }
+                                drawPath(
+                                    path = check,
+                                    color = tintColor,
+                                    style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
+                                )
+                            }
+                            AttachmentDownloadStage.FAILED -> {
+                                drawCircle(
+                                    color = tintColor.copy(alpha = 0.25f),
+                                    radius = size.minDimension / 2f - pad,
+                                    style = Stroke(width = strokeW),
+                                )
+                                drawLine(
+                                    color = tintColor,
+                                    start = Offset(size.width * 0.5f, size.height * 0.28f),
+                                    end = Offset(size.width * 0.5f, size.height * 0.57f),
+                                    strokeWidth = 2.3.dp.toPx(),
+                                    cap = StrokeCap.Round,
+                                )
+                                drawCircle(
+                                    color = tintColor,
+                                    radius = 1.4.dp.toPx(),
+                                    center = Offset(size.width * 0.5f, size.height * 0.71f),
+                                )
+                            }
+                            else -> {
+                                drawArc(
+                                    color = tintColor.copy(alpha = 0.18f),
+                                    startAngle = 0f,
+                                    sweepAngle = 360f,
+                                    useCenter = false,
+                                    topLeft = Offset(pad, pad),
+                                    size = arcSize,
+                                    style = Stroke(width = strokeW),
+                                )
+                                if (rawProgress != null && state.stage == AttachmentDownloadStage.DOWNLOADING) {
+                                    drawArc(
+                                        color = tintColor,
+                                        startAngle = -90f,
+                                        sweepAngle = (animatedProgress * 360f).coerceAtLeast(10f),
+                                        useCenter = false,
+                                        topLeft = Offset(pad, pad),
+                                        size = arcSize,
+                                        style = Stroke(width = strokeW, cap = StrokeCap.Round),
+                                    )
+                                } else {
+                                    drawArc(
+                                        color = tintColor,
+                                        startAngle = spinnerAngle - 90f,
+                                        sweepAngle = 105f,
+                                        useCenter = false,
+                                        topLeft = Offset(pad, pad),
+                                        size = arcSize,
+                                        style = Stroke(width = strokeW, cap = StrokeCap.Round),
+                                    )
+                                }
+                                // 居中精巧向下下载箭头
+                                val arrowStroke = 1.8.dp.toPx()
+                                drawLine(
+                                    color = tintColor,
+                                    start = Offset(size.width * 0.5f, size.height * 0.30f),
+                                    end = Offset(size.width * 0.5f, size.height * 0.66f),
+                                    strokeWidth = arrowStroke,
+                                    cap = StrokeCap.Round,
+                                )
+                                val arrowHead = Path().apply {
+                                    moveTo(size.width * 0.36f, size.height * 0.53f)
+                                    lineTo(size.width * 0.5f, size.height * 0.68f)
+                                    lineTo(size.width * 0.64f, size.height * 0.53f)
+                                }
+                                drawPath(
+                                    path = arrowHead,
+                                    color = tintColor,
+                                    style = Stroke(width = arrowStroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.width(12.dp))
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = state.fileName,
+                            style = IosTheme.type.footnote.copy(fontWeight = FontWeight.SemiBold, fontSize = 13.5.sp),
+                            color = IosTheme.colors.label,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (state.pendingCount > 0) {
+                            Text(
+                                text = "+${state.pendingCount} 排队",
+                                style = IosTheme.type.caption.copy(fontSize = 10.5.sp, fontWeight = FontWeight.Medium),
+                                color = accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(accent.copy(alpha = if (dark) 0.2f else 0.11f))
+                                    .padding(horizontal = 5.dp, vertical = 1.5.dp),
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = subtitleText,
+                            style = IosTheme.type.caption.copy(fontSize = 11.8.sp),
+                            color = when (state.stage) {
+                                AttachmentDownloadStage.COMPLETED -> successColor
+                                AttachmentDownloadStage.FAILED -> errorColor
+                                else -> IosTheme.colors.secondaryLabel
+                            },
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (percentText != null) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = percentText,
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Bold),
+                                color = accent,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.width(10.dp))
+
+                when (state.stage) {
+                    AttachmentDownloadStage.COMPLETED -> {
+                        val savedUri = state.savedUri
+                        if (savedUri != null) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(9.dp))
+                                    .background(successColor)
+                                    .clickable {
+                                        onOpen(savedUri, state.savedMimeType)
+                                        onDismiss()
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = "打开",
+                                    color = Color.White,
+                                    style = IosTheme.type.caption.copy(fontWeight = FontWeight.Bold, fontSize = 12.sp),
+                                )
+                            }
+                            Spacer(Modifier.width(4.dp))
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .clickable(onClick = onDismiss),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "✕",
+                                color = IosTheme.colors.secondaryLabel,
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    AttachmentDownloadStage.FAILED -> {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(accent)
+                                .clickable(onClick = onRetry)
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "重试",
+                                color = Color.White,
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Bold, fontSize = 12.sp),
+                            )
+                        }
+                        Spacer(Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .clickable(onClick = onDismiss),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "✕",
+                                color = IosTheme.colors.secondaryLabel,
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    else -> {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(IosTheme.colors.fieldBackground)
+                                .clickable(onClick = onCancel)
+                                .padding(horizontal = 11.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "取消",
+                                color = IosTheme.colors.secondaryLabel,
+                                style = IosTheme.type.caption.copy(fontWeight = FontWeight.Medium, fontSize = 12.sp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 底部圆角丝滑进度条（进行中显示，有总大小时平滑梯度推进，未知大小时流光扫描）
+            if (state.isActive) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(IosTheme.colors.fieldBackground),
+                ) {
+                    if (rawProgress != null && state.stage == AttachmentDownloadStage.DOWNLOADING) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(animatedProgress.coerceAtLeast(0.02f))
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(
+                                    Brush.horizontalGradient(
+                                        colors = listOf(accent.copy(alpha = 0.85f), accent),
+                                    ),
+                                ),
+                        )
+                    } else {
+                        Canvas(Modifier.fillMaxSize()) {
+                            val barWidth = size.width * 0.36f
+                            val startX = shimmerOffset * size.width
+                            drawRoundRect(
+                                brush = Brush.horizontalGradient(
+                                    colors = listOf(
+                                        accent.copy(alpha = 0.15f),
+                                        accent,
+                                        accent.copy(alpha = 0.15f),
+                                    ),
+                                    startX = startX,
+                                    endX = startX + barWidth,
+                                ),
+                                topLeft = Offset(startX, 0f),
+                                size = Size(barWidth, size.height),
+                                cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
+                            )
+                        }
+                    }
+                }
             }
         }
     }

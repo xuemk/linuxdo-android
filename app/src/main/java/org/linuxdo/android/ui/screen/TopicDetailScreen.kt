@@ -6813,16 +6813,11 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
             }
             .clickable {
                 if (isAttachmentOnebox) {
-                    Toast.makeText(context, "正在下载文件…", Toast.LENGTH_SHORT).show()
-                    scope.launch {
-                        val result = saveMediaToPublicStorage(
-                            context = context,
-                            url = onebox.url,
-                            suggestedName = onebox.title.trim(),
-                            asImage = false,
-                        )
-                        Toast.makeText(context, result, Toast.LENGTH_LONG).show()
-                    }
+                    AttachmentDownloadManager.enqueue(
+                        context = context,
+                        url = onebox.url,
+                        suggestedName = onebox.title.trim(),
+                    )
                 } else if (internalTopic != null && openTopic != null) {
                     openTopic(
                         internalTopic.topicId,
@@ -8146,16 +8141,11 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                         link, TextLinkStyles(style = SpanStyle(color = colors.accent)),
                         linkInteractionListener = {
                             if (run.isAttachment) {
-                                Toast.makeText(context, "正在下载文件…", Toast.LENGTH_SHORT).show()
-                                scope.launch {
-                                    val result = saveMediaToPublicStorage(
-                                        context = context,
-                                        url = link,
-                                        suggestedName = run.text.trim(),
-                                        asImage = false,
-                                    )
-                                    Toast.makeText(context, result, Toast.LENGTH_LONG).show()
-                                }
+                                AttachmentDownloadManager.enqueue(
+                                    context = context,
+                                    url = link,
+                                    suggestedName = run.text.trim(),
+                                )
                             } else {
                                 val internalTarget = parseInternalTopicUrl(link)
                                 val opener = updatedOpenTopic
@@ -9289,6 +9279,321 @@ private fun ImageViewerPage(
     }
 }
 
+internal enum class AttachmentDownloadStage {
+    CONNECTING,
+    SWITCHING_CHANNEL,
+    VERIFYING,
+    DOWNLOADING,
+    SAVING,
+    COMPLETED,
+    FAILED,
+}
+
+internal data class AttachmentDownloadUiState(
+    val id: Long,
+    val url: String,
+    val suggestedName: String?,
+    val fileName: String,
+    val stage: AttachmentDownloadStage,
+    val statusText: String,
+    val downloadedBytes: Long = 0L,
+    val totalBytes: Long = -1L,
+    val speedBytesPerSec: Long = 0L,
+    val pendingCount: Int = 0,
+    val savedUri: Uri? = null,
+    val savedMimeType: String? = null,
+    val resultMessage: String? = null,
+) {
+    val isActive: Boolean
+        get() = stage != AttachmentDownloadStage.COMPLETED && stage != AttachmentDownloadStage.FAILED
+
+    val progressFraction: Float?
+        get() = if (totalBytes > 0L) {
+            (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+        } else {
+            null
+        }
+}
+
+private data class SavedMediaOutcome(
+    val success: Boolean,
+    val message: String,
+    val fileName: String? = null,
+    val copiedBytes: Long = 0L,
+    val savedUri: Uri? = null,
+    val mimeType: String? = null,
+)
+
+/**
+ * 进程级附件下载管理器：独立于单个话题页生命周期运行，切出话题或切换 Tab 仍继续后台下载，
+ * 并通过全局 [state] 驱动 AppShell 顶层悬浮进度胶囊实时展示进度、网速、打开与重试操作。
+ */
+internal object AttachmentDownloadManager {
+    private data class QueuedTask(
+        val id: Long,
+        val url: String,
+        val suggestedName: String?,
+        val initialFileName: String,
+    )
+
+    private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val lock = Any()
+    private val queue = ArrayDeque<QueuedTask>()
+    private var nextTaskId = 1L
+    private var activeTask: QueuedTask? = null
+    private var activeJob: Job? = null
+    private var autoDismissJob: Job? = null
+
+    private val _state = kotlinx.coroutines.flow.MutableStateFlow<AttachmentDownloadUiState?>(null)
+    val state: kotlinx.coroutines.flow.StateFlow<AttachmentDownloadUiState?> = _state
+
+    private fun initialDisplayName(url: String, suggestedName: String?): String {
+        val cleanSuggested = suggestedName
+            ?.replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() && it.length <= 120 }
+        if (cleanSuggested != null) return cleanSuggested
+        val fromUrl = runCatching { Uri.parse(url).lastPathSegment?.trim() }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        return fromUrl ?: "附件文件"
+    }
+
+    fun enqueue(context: Context, url: String, suggestedName: String?) {
+        val appContext = context.applicationContext
+        val cleanUrl = url.trim()
+        if (cleanUrl.isBlank()) return
+        val startImmediately: QueuedTask? = synchronized(lock) {
+            // 同一 URL 正在下载或已在队列中时直接去重，避免重复点击产生多份副本
+            if (activeTask?.url == cleanUrl && activeJob?.isActive == true) {
+                return
+            }
+            if (queue.any { it.url == cleanUrl }) {
+                return
+            }
+            val task = QueuedTask(
+                id = nextTaskId++,
+                url = cleanUrl,
+                suggestedName = suggestedName?.trim()?.takeIf { it.isNotBlank() },
+                initialFileName = initialDisplayName(cleanUrl, suggestedName),
+            )
+            if (activeJob?.isActive == true) {
+                queue.addLast(task)
+                val pending = queue.size
+                _state.value = _state.value?.copy(pendingCount = pending)
+                null
+            } else {
+                autoDismissJob?.cancel()
+                autoDismissJob = null
+                activeTask = task
+                task
+            }
+        }
+        if (startImmediately != null) {
+            launchTask(appContext, startImmediately)
+        }
+    }
+
+    fun retryLast(context: Context) {
+        val current = _state.value ?: return
+        if (current.isActive) return
+        enqueue(context, current.url, current.suggestedName)
+    }
+
+    fun cancelCurrent(context: Context) {
+        val appContext = context.applicationContext
+        val nextTask: QueuedTask? = synchronized(lock) {
+            autoDismissJob?.cancel()
+            autoDismissJob = null
+            activeJob?.cancel()
+            activeJob = null
+            activeTask = null
+            val next = queue.removeFirstOrNull()
+            if (next != null) {
+                activeTask = next
+            } else {
+                _state.value = null
+            }
+            next
+        }
+        if (nextTask != null) {
+            launchTask(appContext, nextTask)
+        }
+    }
+
+    fun dismiss() {
+        synchronized(lock) {
+            val current = _state.value ?: return
+            if (current.isActive) return
+            autoDismissJob?.cancel()
+            autoDismissJob = null
+            _state.value = null
+        }
+    }
+
+    private fun launchTask(appContext: Context, task: QueuedTask) {
+        val pendingCount = synchronized(lock) { queue.size }
+        _state.value = AttachmentDownloadUiState(
+            id = task.id,
+            url = task.url,
+            suggestedName = task.suggestedName,
+            fileName = task.initialFileName,
+            stage = AttachmentDownloadStage.CONNECTING,
+            statusText = "正在连接服务器…",
+            pendingCount = pendingCount,
+        )
+        val job = downloadScope.launch {
+            var lastSpeedAt = android.os.SystemClock.elapsedRealtime()
+            var lastSpeedBytes = 0L
+            var smoothedSpeed = 0L
+            fun updateIfCurrent(transform: (AttachmentDownloadUiState) -> AttachmentDownloadUiState) {
+                val cur = _state.value
+                if (cur != null && cur.id == task.id) {
+                    _state.value = transform(cur)
+                }
+            }
+            try {
+                val outcome = saveMediaToPublicStorageInternal(
+                    context = appContext,
+                    url = task.url,
+                    suggestedName = task.suggestedName,
+                    asImage = false,
+                    onFileNameResolved = { resolvedName ->
+                        if (resolvedName.isNotBlank()) {
+                            updateIfCurrent { it.copy(fileName = resolvedName) }
+                        }
+                    },
+                    onStage = { stage, statusText ->
+                        if (stage == AttachmentDownloadStage.CONNECTING ||
+                            stage == AttachmentDownloadStage.SWITCHING_CHANNEL ||
+                            stage == AttachmentDownloadStage.VERIFYING
+                        ) {
+                            lastSpeedAt = android.os.SystemClock.elapsedRealtime()
+                            lastSpeedBytes = 0L
+                            smoothedSpeed = 0L
+                        }
+                        updateIfCurrent {
+                            it.copy(
+                                stage = stage,
+                                statusText = statusText,
+                                downloadedBytes = if (stage == AttachmentDownloadStage.SWITCHING_CHANNEL || stage == AttachmentDownloadStage.VERIFYING) 0L else it.downloadedBytes,
+                                totalBytes = if (stage == AttachmentDownloadStage.SWITCHING_CHANNEL || stage == AttachmentDownloadStage.VERIFYING) -1L else it.totalBytes,
+                                speedBytesPerSec = if (stage == AttachmentDownloadStage.DOWNLOADING) it.speedBytesPerSec else 0L,
+                            )
+                        }
+                    },
+                    onProgress = { copiedBytes, totalBytes ->
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val deltaMs = now - lastSpeedAt
+                        if (copiedBytes < lastSpeedBytes) {
+                            lastSpeedBytes = copiedBytes
+                            lastSpeedAt = now
+                            smoothedSpeed = 0L
+                        } else if (deltaMs >= 350L) {
+                            val instant = ((copiedBytes - lastSpeedBytes) * 1000L) / deltaMs
+                            smoothedSpeed = if (smoothedSpeed <= 0L) instant else (smoothedSpeed * 7L + instant * 3L) / 10L
+                            lastSpeedBytes = copiedBytes
+                            lastSpeedAt = now
+                        }
+                        updateIfCurrent {
+                            it.copy(
+                                stage = AttachmentDownloadStage.DOWNLOADING,
+                                statusText = "正在下载",
+                                downloadedBytes = copiedBytes,
+                                totalBytes = totalBytes,
+                                speedBytesPerSec = smoothedSpeed,
+                            )
+                        }
+                    },
+                )
+                val nextQueued: QueuedTask? = synchronized(lock) {
+                    if (activeTask?.id == task.id) {
+                        activeTask = null
+                        activeJob = null
+                    }
+                    queue.removeFirstOrNull()?.also { activeTask = it }
+                }
+                val remainingPending = synchronized(lock) { queue.size }
+                if (outcome.success) {
+                    val finalBytes = outcome.copiedBytes.coerceAtLeast(_state.value?.downloadedBytes ?: 0L)
+                    updateIfCurrent {
+                        it.copy(
+                            fileName = outcome.fileName?.takeIf(String::isNotBlank) ?: it.fileName,
+                            stage = AttachmentDownloadStage.COMPLETED,
+                            statusText = "已保存到系统「下载/LinuxDo」",
+                            downloadedBytes = finalBytes,
+                            totalBytes = if (finalBytes > 0L) finalBytes else it.totalBytes,
+                            speedBytesPerSec = 0L,
+                            pendingCount = remainingPending,
+                            savedUri = outcome.savedUri,
+                            savedMimeType = outcome.mimeType,
+                            resultMessage = outcome.message,
+                        )
+                    }
+                } else {
+                    updateIfCurrent {
+                        it.copy(
+                            stage = AttachmentDownloadStage.FAILED,
+                            statusText = outcome.message,
+                            speedBytesPerSec = 0L,
+                            pendingCount = remainingPending,
+                            resultMessage = outcome.message,
+                        )
+                    }
+                }
+                if (nextQueued != null) {
+                    delay(1_200L)
+                    launchTask(appContext, nextQueued)
+                } else if (outcome.success) {
+                    scheduleAutoDismiss(task.id, delayMs = 4_500L)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (err: Throwable) {
+                val nextQueued: QueuedTask? = synchronized(lock) {
+                    if (activeTask?.id == task.id) {
+                        activeTask = null
+                        activeJob = null
+                    }
+                    queue.removeFirstOrNull()?.also { activeTask = it }
+                }
+                val remainingPending = synchronized(lock) { queue.size }
+                updateIfCurrent {
+                    it.copy(
+                        stage = AttachmentDownloadStage.FAILED,
+                        statusText = "保存失败：${err.message ?: "网络异常"}",
+                        speedBytesPerSec = 0L,
+                        pendingCount = remainingPending,
+                    )
+                }
+                if (nextQueued != null) {
+                    delay(1_200L)
+                    launchTask(appContext, nextQueued)
+                }
+            }
+        }
+        synchronized(lock) {
+            if (activeTask?.id == task.id) {
+                activeJob = job
+            }
+        }
+    }
+
+    private fun scheduleAutoDismiss(taskId: Long, delayMs: Long) {
+        synchronized(lock) {
+            autoDismissJob?.cancel()
+            autoDismissJob = downloadScope.launch {
+                delay(delayMs)
+                synchronized(lock) {
+                    val cur = _state.value
+                    if (cur != null && cur.id == taskId && !cur.isActive) {
+                        _state.value = null
+                    }
+                }
+            }
+        }
+    }
+}
+
 private class MediaDownloadBodyReadException(
     val copiedBytes: Long,
     val expectedBytes: Long,
@@ -9307,9 +9612,12 @@ private suspend fun copyMediaStreamChecked(
     inputStream: java.io.InputStream,
     outputStream: java.io.OutputStream,
     expectedBytes: Long,
+    onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
 ): Long {
     val buffer = ByteArray(32 * 1024)
     var copied = 0L
+    var lastProgressAt = 0L
+    onProgress?.invoke(0L, expectedBytes)
     while (true) {
         kotlinx.coroutines.currentCoroutineContext().ensureActive()
         val read = try {
@@ -9323,12 +9631,18 @@ private suspend fun copyMediaStreamChecked(
         kotlinx.coroutines.currentCoroutineContext().ensureActive()
         outputStream.write(buffer, 0, read)
         copied += read
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (onProgress != null && now - lastProgressAt >= 80L) {
+            lastProgressAt = now
+            onProgress(copied, expectedBytes)
+        }
     }
     outputStream.flush()
     kotlinx.coroutines.currentCoroutineContext().ensureActive()
     if (expectedBytes > 0L && copied < expectedBytes) {
         throw MediaDownloadLengthMismatchException(copied, expectedBytes)
     }
+    onProgress?.invoke(copied, if (expectedBytes > 0L) expectedBytes else copied)
     return copied
 }
 
@@ -9337,7 +9651,22 @@ private suspend fun saveMediaToPublicStorage(
     url: String,
     suggestedName: String?,
     asImage: Boolean,
-): String {
+): String = saveMediaToPublicStorageInternal(
+    context = context,
+    url = url,
+    suggestedName = suggestedName,
+    asImage = asImage,
+).message
+
+private suspend fun saveMediaToPublicStorageInternal(
+    context: Context,
+    url: String,
+    suggestedName: String?,
+    asImage: Boolean,
+    onFileNameResolved: ((String) -> Unit)? = null,
+    onStage: ((AttachmentDownloadStage, String) -> Unit)? = null,
+    onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+): SavedMediaOutcome {
     val app = context.applicationContext as App
     val container = app.container
     withContext(Dispatchers.Main) { container.sessionStore.syncFromWebView() }
@@ -9359,7 +9688,8 @@ private suspend fun saveMediaToPublicStorage(
         finalUrl: String,
         contentType: String?,
         expectedBytes: Long = -1L,
-    ): Pair<String, Long> {
+        reportProgress: Boolean = true,
+    ): SavedMediaOutcome {
         val headerMime = contentType
             ?.substringBefore(';')
             ?.trim()
@@ -9372,6 +9702,7 @@ private suspend fun saveMediaToPublicStorage(
             mimeType = headerMime,
             asImage = asImage,
         )
+        onFileNameResolved?.invoke(fileName)
         val ext = fileName.substringAfterLast('.', "").lowercase()
         val resolvedMime = headerMime
             ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
@@ -9403,7 +9734,12 @@ private suspend fun saveMediaToPublicStorage(
                     ?: throw java.io.IOException("无法写入本地文件")
                 out.use { output ->
                     inputStream.use { input ->
-                        copyMediaStreamChecked(input, output, expectedBytes)
+                        copyMediaStreamChecked(
+                            inputStream = input,
+                            outputStream = output,
+                            expectedBytes = expectedBytes,
+                            onProgress = if (reportProgress) onProgress else null,
+                        )
                     }
                 }
             } catch (e: Throwable) {
@@ -9415,7 +9751,14 @@ private suspend fun saveMediaToPublicStorage(
             }
             resolver.update(itemUri, doneValues, null, null)
             val msg = if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
-            msg to copied
+            SavedMediaOutcome(
+                success = true,
+                message = msg,
+                fileName = fileName,
+                copiedBytes = copied,
+                savedUri = itemUri,
+                mimeType = resolvedMime,
+            )
         } else {
             val baseDir = context.getExternalFilesDir(
                 if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
@@ -9426,7 +9769,12 @@ private suspend fun saveMediaToPublicStorage(
             val copied = try {
                 partFile.outputStream().use { output ->
                     inputStream.use { input ->
-                        copyMediaStreamChecked(input, output, expectedBytes)
+                        copyMediaStreamChecked(
+                            inputStream = input,
+                            outputStream = output,
+                            expectedBytes = expectedBytes,
+                            onProgress = if (reportProgress) onProgress else null,
+                        )
                     }
                 }
             } catch (e: Throwable) {
@@ -9441,7 +9789,14 @@ private suspend fun saveMediaToPublicStorage(
                     runCatching { partFile.delete() }
                 }
             }
-            "已保存到：${outFile.absolutePath}" to copied
+            SavedMediaOutcome(
+                success = true,
+                message = "已保存到：${outFile.absolutePath}",
+                fileName = fileName,
+                copiedBytes = copied,
+                savedUri = null,
+                mimeType = resolvedMime,
+            )
         }
     }
     return withContext(Dispatchers.IO) {
@@ -9450,6 +9805,7 @@ private suspend fun saveMediaToPublicStorage(
             val requestHost = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
             if (!asImage) {
                 container.diagnostics.log("开始下载附件: ${org.linuxdo.android.net.gecko.GeckoManager.diagnosticUrl(url)}")
+                onStage?.invoke(AttachmentDownloadStage.CONNECTING, "正在连接服务器…")
             }
             val baseClient = container.httpClient
             val activeClient = org.linuxdo.android.net.buildActiveMediaDownloadClient(baseClient)
@@ -9507,9 +9863,9 @@ private suspend fun saveMediaToPublicStorage(
                             return@use
                         }
                         if (!resp.isSuccessful) {
-                            return@withContext "下载失败 (HTTP ${resp.code})"
+                            return@withContext SavedMediaOutcome(false, "下载失败 (HTTP ${resp.code})")
                         }
-                        val body = resp.body ?: return@withContext "下载失败：响应内容为空"
+                        val body = resp.body ?: return@withContext SavedMediaOutcome(false, "下载失败：响应内容为空")
                         val finalUrl = resp.request.url.toString()
                         resolvedUrlInAttempt = finalUrl
                         val expectedBytes = body.contentLength()
@@ -9518,9 +9874,10 @@ private suspend fun saveMediaToPublicStorage(
                                 "附件下载[attempt $attempt/$maxAttempts, mode=$modeLabel] HTTP ${resp.code} " +
                                     "host=${resp.request.url.host} expected=${if (expectedBytes > 0L) expectedBytes else -1}B",
                             )
+                            onStage?.invoke(AttachmentDownloadStage.DOWNLOADING, "正在下载")
                         }
                         stage = "copy"
-                        val (savedMsg, copiedBytes) = writeStreamToPublicStorage(
+                        val outcome = writeStreamToPublicStorage(
                             inputStream = body.byteStream(),
                             disposition = resp.header("Content-Disposition"),
                             finalUrl = finalUrl,
@@ -9528,9 +9885,9 @@ private suspend fun saveMediaToPublicStorage(
                             expectedBytes = expectedBytes,
                         )
                         if (!asImage) {
-                            container.diagnostics.log("附件保存成功[mode=$modeLabel, copied=${copiedBytes}B]: $savedMsg")
+                            container.diagnostics.log("附件保存成功[mode=$modeLabel, copied=${outcome.copiedBytes}B]: ${outcome.message}")
                         }
-                        return@withContext savedMsg
+                        return@withContext outcome
                     }
                     if (fallbackReason != null) break
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -9560,7 +9917,10 @@ private suspend fun saveMediaToPublicStorage(
                             container.diagnostics.log(
                                 "附件下载切换通道: active -> system (reason=$stage, direct=${preferredDirectUrl != null})",
                             )
+                            onStage?.invoke(AttachmentDownloadStage.SWITCHING_CHANNEL, "正在切换系统高速通道…")
                         }
+                    } else if (!asImage && attempt < maxAttempts) {
+                        onStage?.invoke(AttachmentDownloadStage.SWITCHING_CHANNEL, "连接中断，正在重试…")
                     }
                     if (attempt < maxAttempts) {
                         kotlinx.coroutines.delay(250L * attempt)
@@ -9573,38 +9933,46 @@ private suspend fun saveMediaToPublicStorage(
             if (fallbackReason != null) {
                 if (!asImage) {
                     container.diagnostics.log("附件 OkHttp 多通道未完成($fallbackReason)，切换后台 Gecko 通道")
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "正在后台安全验证并下载，请稍候…", Toast.LENGTH_SHORT).show()
+                    if (onStage != null) {
+                        onStage.invoke(AttachmentDownloadStage.VERIFYING, "正在后台安全验证并下载…")
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "正在后台安全验证并下载，请稍候…", Toast.LENGTH_SHORT).show()
+                        }
                     }
                     val prewarm = container.browser.prewarmAttachmentDownload(
                         url = url,
                         failedClearanceFp = failedFp,
                         requestHost = failedHost,
+                        onProgress = onProgress,
                     )
                     if (!prewarm.cleared) {
                         container.diagnostics.log("附件后台 Gecko 下载未能取得凭据或直链")
-                        return@withContext if (lastError != null) {
-                            "保存失败：已尝试直连、系统网络与内置浏览器通道仍中断，请稍后重试"
+                        val failMsg = if (lastError != null) {
+                            "保存失败：多通道下载均中断，请稍后重试"
                         } else {
                             "下载被安全校验拦截，请重试"
                         }
+                        return@withContext SavedMediaOutcome(false, failMsg)
                     }
                     val cachedTempFile = prewarm.tempFile
                     if (cachedTempFile != null) {
                         try {
                             if (cachedTempFile.exists() && cachedTempFile.length() > 0L) {
+                                onStage?.invoke(AttachmentDownloadStage.SAVING, "正在写入系统下载目录…")
                                 val tempLen = cachedTempFile.length()
-                                val (savedMsg, copiedBytes) = cachedTempFile.inputStream().use { input ->
+                                val outcome = cachedTempFile.inputStream().use { input ->
                                     writeStreamToPublicStorage(
                                         inputStream = input,
                                         disposition = prewarm.contentDisposition,
                                         finalUrl = prewarm.resolvedUrl ?: url,
                                         contentType = prewarm.contentType,
                                         expectedBytes = tempLen,
+                                        reportProgress = false,
                                     )
                                 }
-                                container.diagnostics.log("附件通过 Gecko 流式保存成功[copied=${copiedBytes}B]: $savedMsg")
-                                return@withContext savedMsg
+                                container.diagnostics.log("附件通过 Gecko 流式保存成功[copied=${outcome.copiedBytes}B]: ${outcome.message}")
+                                return@withContext outcome
                             }
                         } finally {
                             runCatching { cachedTempFile.delete() }
@@ -9620,6 +9988,7 @@ private suspend fun saveMediaToPublicStorage(
                     for ((modeLabel, client) in postGeckoClients) {
                         val req = buildDownloadRequest(retryTarget)
                         try {
+                            onStage?.invoke(AttachmentDownloadStage.DOWNLOADING, "正在下载")
                             val call = client.newCall(req)
                             activeCallRef.set(call)
                             val resp = try {
@@ -9635,15 +10004,15 @@ private suspend fun saveMediaToPublicStorage(
                                 }
                                 val body = r.body ?: throw java.io.IOException("响应内容为空")
                                 val expectedBytes = body.contentLength()
-                                val (savedMsg, copiedBytes) = writeStreamToPublicStorage(
+                                val outcome = writeStreamToPublicStorage(
                                     inputStream = body.byteStream(),
                                     disposition = r.header("Content-Disposition"),
                                     finalUrl = r.request.url.toString(),
                                     contentType = r.header("Content-Type"),
                                     expectedBytes = expectedBytes,
                                 )
-                                container.diagnostics.log("附件 Gecko 后重下成功[mode=$modeLabel, copied=${copiedBytes}B]: $savedMsg")
-                                return@withContext savedMsg
+                                container.diagnostics.log("附件 Gecko 后重下成功[mode=$modeLabel, copied=${outcome.copiedBytes}B]: ${outcome.message}")
+                                return@withContext outcome
                             }
                         } catch (cancelled: kotlinx.coroutines.CancellationException) {
                             activeCallRef.getAndSet(null)?.cancel()
@@ -9653,7 +10022,7 @@ private suspend fun saveMediaToPublicStorage(
                             container.diagnostics.log("附件 Gecko 后重下中断[mode=$modeLabel]: ${err.javaClass.simpleName}: ${err.message}")
                         }
                     }
-                    return@withContext "保存失败：${postError?.message ?: fallbackReason}"
+                    return@withContext SavedMediaOutcome(false, "保存失败：${postError?.message ?: fallbackReason}")
                 } else {
                     val cleared = container.browser.clearChallenge(
                         reason = "download-image",
@@ -9661,7 +10030,7 @@ private suspend fun saveMediaToPublicStorage(
                         requestHost = failedHost,
                     )
                     if (!cleared) {
-                        return@withContext "下载被安全校验拦截，请重试"
+                        return@withContext SavedMediaOutcome(false, "下载被安全校验拦截，请重试")
                     }
                     withContext(Dispatchers.Main) {
                         CookieManager.getInstance().flush()
@@ -9685,14 +10054,14 @@ private suspend fun saveMediaToPublicStorage(
                                     return@use
                                 }
                                 val body = r.body ?: throw java.io.IOException("响应内容为空")
-                                val (savedMsg, _) = writeStreamToPublicStorage(
+                                val outcome = writeStreamToPublicStorage(
                                     inputStream = body.byteStream(),
                                     disposition = r.header("Content-Disposition"),
                                     finalUrl = r.request.url.toString(),
                                     contentType = r.header("Content-Type"),
                                     expectedBytes = body.contentLength(),
                                 )
-                                return@withContext savedMsg
+                                return@withContext outcome
                             }
                         } catch (cancelled: kotlinx.coroutines.CancellationException) {
                             activeCallRef.getAndSet(null)?.cancel()
@@ -9701,16 +10070,16 @@ private suspend fun saveMediaToPublicStorage(
                             postError = err
                         }
                     }
-                    return@withContext "保存失败：${postError?.message ?: "网络异常"}"
+                    return@withContext SavedMediaOutcome(false, "保存失败：${postError?.message ?: "网络异常"}")
                 }
             }
-            "保存失败：${lastError?.message ?: "未收到响应"}"
+            SavedMediaOutcome(false, "保存失败：${lastError?.message ?: "未收到响应"}")
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             activeCallRef.getAndSet(null)?.cancel()
             throw cancelled
         } catch (err: Throwable) {
             if (!asImage) container.diagnostics.log("附件保存异常: ${err.javaClass.simpleName}: ${err.message}")
-            "保存失败：${err.message ?: "网络异常"}"
+            SavedMediaOutcome(false, "保存失败：${err.message ?: "网络异常"}")
         } finally {
             activeCallRef.getAndSet(null)?.cancel()
         }

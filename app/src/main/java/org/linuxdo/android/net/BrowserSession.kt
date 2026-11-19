@@ -44,7 +44,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -3900,6 +3902,7 @@ class BrowserSession(
         timeoutMs: Long,
         targetUrl: String? = null,
         captureExternalStream: Boolean = false,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
     ): AttachmentPrewarmResult {
         if (verifyPhase == VerifyPhase.RUNNING) {
             // 与验证页共用 Gecko Cookie 库，这里清 Cookie 会把用户正在过的挑战清掉
@@ -4005,19 +4008,43 @@ class BrowserSession(
                         externalContentType = headerType
                         externalContentDisposition = headerDisp
                         val stream = if (captureExternalStream && respStatus in 200..299) response.body else null
+                        val headerLen = response.headers.entries
+                            .firstOrNull { it.key.equals("content-length", ignoreCase = true) }
+                            ?.value?.trim()?.toLongOrNull() ?: -1L
                         if (stream != null && externalDownloadJob == null) {
                             runCatching { response.setReadTimeoutMillis(30_000L) }
                             externalDownloadJob = scope.launch(Dispatchers.IO) {
                                 var tmp: java.io.File? = null
                                 try {
                                     tmp = java.io.File.createTempFile("gecko_attachment_", ".tmp", context.cacheDir)
+                                    val buffer = ByteArray(32 * 1024)
+                                    var copied = 0L
+                                    var lastNotifyAt = 0L
+                                    onProgress?.invoke(0L, headerLen)
                                     stream.use { input ->
                                         tmp.outputStream().use { out ->
-                                            input.copyTo(out)
+                                            while (true) {
+                                                currentCoroutineContext().ensureActive()
+                                                val read = input.read(buffer)
+                                                if (read < 0) break
+                                                if (read == 0) continue
+                                                out.write(buffer, 0, read)
+                                                copied += read
+                                                val now = SystemClock.elapsedRealtime()
+                                                if (now - lastNotifyAt >= 80L) {
+                                                    lastNotifyAt = now
+                                                    onProgress?.invoke(copied, headerLen)
+                                                }
+                                            }
+                                            out.flush()
                                         }
                                     }
+                                    onProgress?.invoke(copied, if (headerLen > 0L) headerLen else copied)
                                     externalTempFile = tmp
                                     diagnostics.log("Headless GeckoSession 已流式接收附件: ${tmp.length()} bytes")
+                                } catch (cancelled: CancellationException) {
+                                    runCatching { tmp?.delete() }
+                                    throw cancelled
                                 } catch (error: Exception) {
                                     runCatching { tmp?.delete() }
                                     diagnostics.log("Headless GeckoSession 流式读取附件失败: ${error.message}")
@@ -4192,6 +4219,7 @@ class BrowserSession(
         url: String,
         failedClearanceFp: String = "-",
         requestHost: String = Config.HOST,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
     ): AttachmentPrewarmResult = solveMutex.withLock {
         val normalizedHost = requestHost.lowercase().trimEnd('.')
         val allowedHost = normalizedHost == Config.HOST || normalizedHost.endsWith(".${Config.HOST}") ||
@@ -4208,6 +4236,7 @@ class BrowserSession(
                 timeoutMs = 15_000L,
                 targetUrl = url,
                 captureExternalStream = true,
+                onProgress = onProgress,
             )
         } finally {
             store.endClearanceRecovery(recoveryId)
