@@ -164,13 +164,35 @@ class AccountManager(context: Context) {
         } else {
             current.activeUserId
         }
-        write(current.copy(activeUserId = nextActive, accounts = nextAccounts))
+        write(current.copy(activeUserId = nextActive, accounts = nextAccounts), listOf(userId))
     }
 
     @Synchronized
     fun clear() {
-        read()
-        write(StoredAccounts())
+        val current = read()
+        write(StoredAccounts(), current.accounts.map { it.userId })
+    }
+
+    @Synchronized
+    fun nativeMailCredentials(userId: Long): NativeMailCredentials? {
+        require(userId > 0L)
+        return preferences.getString("$KEY_NATIVE_MAIL$userId", null)?.let {
+            json.decodeFromString<NativeMailCredentials>(it)
+        }
+    }
+
+    @Synchronized
+    fun saveNativeMailCredentials(userId: Long, credentials: NativeMailCredentials) {
+        require(userId > 0L)
+        if (!preferences.edit().putString("$KEY_NATIVE_MAIL$userId", json.encodeToString(credentials)).commit()) {
+            throw EncryptedStorageUnavailableException()
+        }
+    }
+
+    @Synchronized
+    fun forgetNativeMailCredentials(userId: Long) {
+        require(userId > 0L)
+        if (!preferences.edit().remove("$KEY_NATIVE_MAIL$userId").commit()) throw EncryptedStorageUnavailableException()
     }
 
     @Synchronized
@@ -213,9 +235,11 @@ class AccountManager(context: Context) {
         }
     }
 
-    private fun write(value: StoredAccounts) {
+    private fun write(value: StoredAccounts, removedMailAccounts: List<Long> = emptyList()) {
         try {
-            if (!preferences.edit().putString(KEY_ACCOUNTS, json.encodeToString(value)).commit()) {
+            val editor = preferences.edit().putString(KEY_ACCOUNTS, json.encodeToString(value))
+            removedMailAccounts.forEach { editor.remove("$KEY_NATIVE_MAIL$it") }
+            if (!editor.commit()) {
                 throw EncryptedStorageUnavailableException()
             }
             memoryCache = value
@@ -231,6 +255,7 @@ class AccountManager(context: Context) {
         const val MAX_ACCOUNTS = 3
         private const val PREFS_NAME = "account_sessions_secure"
         private const val KEY_ACCOUNTS = "accounts"
+        private const val KEY_NATIVE_MAIL = "native_mail_"
         private const val FORUM_SESSION_COOKIE = "_forum_session"
 
         fun encryptedPreferences(context: Context): SharedPreferences =

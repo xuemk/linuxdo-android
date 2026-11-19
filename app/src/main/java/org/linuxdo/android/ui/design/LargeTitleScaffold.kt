@@ -30,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -43,6 +44,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
@@ -93,7 +95,11 @@ fun IosLargeTitleScaffold(
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
     val density = LocalDensity.current
-    val titleBoxHeight = if (compactTop) IosMetrics.largeTitleHeight else 34.dp
+    var navBarHeight by remember { mutableStateOf(IosMetrics.navBarHeight) }
+    val titleBoxHeight = maxOf(
+        if (compactTop) IosMetrics.largeTitleHeight else 34.dp,
+        with(density) { IosTheme.type.largeTitle.lineHeight.toDp() } + 6.dp,
+    )
     val largeTitlePx = remember(density, titleBoxHeight) { with(density) { titleBoxHeight.toPx() } }
     val collapse by remember(listState, largeTitlePx, showLargeTitle) {
         derivedStateOf {
@@ -104,9 +110,9 @@ fun IosLargeTitleScaffold(
     }
 
     val topPadding = if (showLargeTitle) {
-        if (compactTop) 0.dp else IosMetrics.navBarHeight
+        if (compactTop) 0.dp else navBarHeight
     } else {
-        IosMetrics.navBarHeight
+        navBarHeight
     }
 
     Box(modifier.fillMaxSize().clipToBounds().background(IosTheme.colors.groupedBackground)) {
@@ -198,6 +204,7 @@ fun IosLargeTitleScaffold(
         ) {
             IosNavBar(
                 title = title,
+                modifier = Modifier.onSizeChanged { navBarHeight = with(density) { it.height.toDp() } },
                 titleAlpha = if (!showLargeTitle) 1f else collapse,
                 showDivider = if (!showLargeTitle) true else collapse > 0.01f,
                 backLabel = backLabel,
@@ -233,6 +240,11 @@ fun IosNavBar(
     trailing: @Composable () -> Unit = {},
     customTitle: (@Composable () -> Unit)? = null,
 ) {
+    val density = LocalDensity.current
+    val backPadding = if (onBack == null) 56.dp else if (backLabel.isBlank()) 56.dp else maxOf(
+        72.dp,
+        with(density) { (IosTheme.type.subheadline.fontSize * backLabel.length).toDp() } + 40.dp,
+    )
     Column(modifier.fillMaxWidth().background(background)) {
         Box(
             Modifier
@@ -247,7 +259,7 @@ fun IosNavBar(
                         .fillMaxWidth()
                         .alpha(titleAlpha)
                         .padding(
-                            start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 48.dp,
+                            start = if (onBack != null) backPadding else 48.dp,
                             end = if (onBack != null) 56.dp else 48.dp,
                         ),
                     contentAlignment = Alignment.Center,
@@ -264,7 +276,7 @@ fun IosNavBar(
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .alpha(titleAlpha)
-                        .padding(start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 56.dp, end = 56.dp),
+                        .padding(start = backPadding, end = 56.dp),
                 )
             }
             if (onBack != null) {

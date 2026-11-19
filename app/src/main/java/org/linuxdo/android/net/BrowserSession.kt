@@ -8,6 +8,7 @@ import android.content.MutableContextWrapper
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
@@ -29,6 +30,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import android.widget.LinearLayout
+import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Button
 import android.util.TypedValue
@@ -42,7 +44,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -59,6 +63,7 @@ import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.net.gecko.GeckoAuthBridge
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.GeckoSession
 import kotlinx.coroutines.SupervisorJob
 import okhttp3.Cookie
 import okhttp3.FormBody
@@ -66,6 +71,71 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import kotlin.math.roundToInt
+
+/** 附件链接经后台 Headless Gecko 预热过盾与重定向解析后的结果。 */
+data class AttachmentPrewarmResult(
+    val cleared: Boolean,
+    val resolvedUrl: String? = null,
+    val tempFile: java.io.File? = null,
+    val contentType: String? = null,
+    val contentDisposition: String? = null,
+)
+
+@Suppress("DEPRECATION")
+internal fun Dialog.showVerificationSheet(content: View, dark: Boolean) {
+    val container = FrameLayout(context)
+    container.addView(content, FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.BOTTOM,
+    ))
+    ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
+        val safeInsets = insets.getInsets(
+            WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime(),
+        )
+        view.setPadding(safeInsets.left, safeInsets.top, safeInsets.right, safeInsets.bottom)
+        insets
+    }
+    container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+        // 使用弹窗当前可用高度，分屏、旋转和键盘变化时都重新测量。
+        val availableHeight = (container.height - container.paddingTop - container.paddingBottom).coerceAtLeast(0)
+        val sheetHeight = (availableHeight * 0.92f).roundToInt()
+        if (content.layoutParams.height != sheetHeight) {
+            content.layoutParams = content.layoutParams.apply { height = sheetHeight }
+        }
+    }
+    setContentView(container)
+    window?.apply {
+        WindowCompat.setDecorFitsSystemWindows(this, false)
+        setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        statusBarColor = Color.TRANSPARENT
+        navigationBarColor = Color.TRANSPARENT
+        attributes = attributes.apply {
+            dimAmount = 0.5f
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+        }
+        addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+    }
+    show()
+    window?.apply {
+        setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        WindowCompat.getInsetsController(this, decorView).apply {
+            isAppearanceLightStatusBars = !dark
+            isAppearanceLightNavigationBars = !dark
+        }
+    }
+    ViewCompat.requestApplyInsets(container)
+}
 
 /**
  * 全应用唯一的 WebView 会话:
@@ -114,9 +184,35 @@ class BrowserSession(
 
     /** 本轮验证页超时未加载完成的诊断是否已记录，避免界面每 150ms 轮询时重复写日志。 */
     @Volatile private var verifyStallLogged = false
+    @Volatile private var verifyStallReason: String? = null
+    @Volatile private var lastVerifyEgressTraceAt: Long = 0L
 
     /** 本轮验证页首次到达源站（Discourse 404）的时间，0 表示尚未到达。 */
     @Volatile private var verifyOriginReachedAt = 0L
+    @Volatile private var lastAuthenticatedUser: org.linuxdo.android.data.DiscourseUser? = null
+
+    fun consumeAuthenticatedUser(): org.linuxdo.android.data.DiscourseUser? =
+        lastAuthenticatedUser.also { lastAuthenticatedUser = null }
+
+    private fun parseAuthenticatedUser(userObj: JSONObject?): org.linuxdo.android.data.DiscourseUser? {
+        if (userObj == null) return null
+        val id = userObj.optLong("id", 0L)
+        val username = userObj.optString("username").trim()
+        if (id <= 0L || username.isBlank()) return null
+        val anim = userObj.optString("animated_avatar").takeIf { it.isNotBlank() }
+        val seeSignatures = if (userObj.has("see_signatures") && !userObj.isNull("see_signatures")) {
+            userObj.optBoolean("see_signatures")
+        } else null
+        return org.linuxdo.android.data.DiscourseUser(
+            id = id,
+            username = username,
+            name = userObj.optString("name").takeIf { it.isNotBlank() },
+            avatarTemplate = userObj.optString("avatar_template").takeIf { it.isNotBlank() },
+            animatedAvatar = anim,
+            trustLevel = if (userObj.has("trust_level") && !userObj.isNull("trust_level")) userObj.optInt("trust_level") else null,
+            seeSignatures = seeSignatures,
+        )
+    }
 
     /** 进入本轮验证前已存在的 cf_clearance，再次读到它们不算新签发。 */
     private var verifyStaleClearances: Set<String> = emptySet()
@@ -146,6 +242,7 @@ class BrowserSession(
     /** 最近一次成功完成 CF 验证/重验证的时间戳（elapsedRealtime），用于并发过盾锁内去重合并。 */
     @Volatile private var lastClearedAtElapsed: Long = 0L
     private var verificationClearance: String? = null
+    private var verificationClearanceUserAgent: String? = null
 
     private var onAuthCallback: ((success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit)? = null
     private var cachedLogin: String = ""
@@ -157,6 +254,7 @@ class BrowserSession(
     /** 非空表示认证 WebView 正在整页打开邮件登录链接（Fluxdo 同款兑换方式）。 */
     private var pendingEmailLink: String? = null
     private var emailLinkCompleting: Boolean = false
+    @Volatile private var emailLinkAttemptId: Long = 0L
     /** 首个 onPageFinished 往往早于 Cookie 落盘，剩余复查次数。 */
     private var emailLinkRechecksRemaining: Int = 0
     private var cachedSecondFactor: String? = null
@@ -199,6 +297,7 @@ class BrowserSession(
     private var authGeckoSession: org.mozilla.geckoview.GeckoSession? = null
     private var mainGeckoView: org.mozilla.geckoview.GeckoView? = null
     private var mainGeckoSession: org.mozilla.geckoview.GeckoSession? = null
+    private var mainGeckoUserAgent: String? = null
     private val geckoBridges = mutableMapOf<View, GeckoAuthBridge>()
     private var authGeckoInitJob: Job? = null
     private var cfGeckoInitJob: Job? = null
@@ -231,8 +330,11 @@ class BrowserSession(
     ): Map<String, String> {
         val bridge = geckoBridges[view]
         val generation = store.sessionGeneration
+        val emailAttemptId = emailLinkAttemptId
+        val activeEmailLogin = isCurrentEmailLinkAttempt(view, emailAttemptId)
         fun checkSyncCurrent() {
-            if (store.sessionChanging || generation != store.sessionGeneration || authorityStillValid?.invoke() == false) {
+            if (store.sessionChanging || generation != store.sessionGeneration || authorityStillValid?.invoke() == false ||
+                (activeEmailLogin && !isCurrentEmailLinkAttempt(view, emailAttemptId))) {
                 throw CancellationException("浏览器会话已变更")
             }
         }
@@ -252,6 +354,11 @@ class BrowserSession(
                 val domain = cookie.optString("domain").removePrefix(".")
                 if (domain != Config.HOST) return@mapNotNull null
                 val name = cookie.getString("name")
+                // 普通挑战快照可能已落后于 HTTP 会话，不能当作新的登录响应回写。
+                if (!authoritativeAuth && !activeEmailLogin &&
+                    (name.equals(Config.SESSION_COOKIE, ignoreCase = true) || name.equals("_forum_session", ignoreCase = true))) {
+                    return@mapNotNull null
+                }
                 val value = cookie.getString("value")
                 if (name.equals(CF_CLEARANCE_COOKIE, ignoreCase = true) && value.isNotBlank()) {
                     val isCandidateFresh = value !in staleForSync && !store.isClearanceChallenged(value)
@@ -284,7 +391,7 @@ class BrowserSession(
                 requestGeneration = generation,
                 sentCookies = previousCookies,
                 authoritativeAuth = authoritativeAuth,
-                authorityStillValid = authorityStillValid,
+                authorityStillValid = { checkSyncCurrent(); true },
                 authBrowserSnapshot = view === currentAuthView(),
             )
         }
@@ -319,8 +426,9 @@ class BrowserSession(
         }
     }
 
-    private fun refreshBrowserCookies(view: View, onComplete: () -> Unit) {
-        val stillCurrent = cookieSyncGuard(view)
+    private fun refreshBrowserCookies(view: View, authorityStillValid: (() -> Boolean)? = null, onComplete: () -> Unit) {
+        val cookieStillCurrent = cookieSyncGuard(view)
+        val stillCurrent = { cookieStillCurrent() && authorityStillValid?.invoke() != false }
         scope.launch(Dispatchers.Main) {
             try {
                 syncBrowserCookies(view, authorityStillValid = stillCurrent)
@@ -397,6 +505,7 @@ class BrowserSession(
 
     fun cancelCaptchaLogin() {
         authSubmissionGeneration += 1L
+        emailLinkAttemptId += 1L
         authGeckoInitJob?.cancel()
         val submissionId = currentSubmissionId
         val completion = authSubmitCompletion
@@ -585,6 +694,7 @@ class BrowserSession(
                             awaitingSecondFactorLogin = false
                             cb(false, error, false)
                         } else if (isSuccessfulSessionAuthResult(obj, has2faToken)) {
+                            lastAuthenticatedUser = parseAuthenticatedUser(resObj?.optJSONObject("user"))
                             awaitingSecondFactorLogin = false
                             cb(true, null, false)
                         } else {
@@ -863,7 +973,6 @@ class BrowserSession(
 
         val dialog = Dialog(context).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setContentView(root)
             setCanceledOnTouchOutside(false)
             close.setOnClickListener { dismiss() }
             setOnDismissListener {
@@ -877,8 +986,8 @@ class BrowserSession(
                     isInCfMode = false
                     cfGeckoInitJob?.cancel()
                     dismissedView?.let { geckoBridges.remove(it)?.close() }
-                    dismissedSession?.close()
                     dismissedView?.releaseSession()
+                    dismissedSession?.close()
                     onAuthCallback?.invoke(false, "Cloudflare 验证已取消，请重试", false)
                 }
             }
@@ -887,18 +996,7 @@ class BrowserSession(
         cfGeckoView = geckoView
         cfGeckoSession = geckoSession
         val stillCurrent = cookieSyncGuard(geckoView)
-        dialog.show()
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setLayout(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                (context.resources.displayMetrics.heightPixels * 0.92f).toInt(),
-            )
-            setGravity(Gravity.BOTTOM)
-            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-            attributes = attributes.apply { dimAmount = 0.5f }
-        }
+        dialog.showVerificationSheet(root, isDark)
         geckoView.requestFocus()
         geckoView.postDelayed({
             if (isInCfMode && cfDialog?.isShowing == true && !isFreshCfClearance(currentCfClearance())) {
@@ -908,6 +1006,7 @@ class BrowserSession(
         cfGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
                 if (!stillCurrent()) return@launch
+                synchronizeGeckoUserAgent(geckoSession, "登录安全验证", stillCurrent)
                 val bridge = GeckoAuthBridge.create(
                     context,
                     geckoSession,
@@ -967,8 +1066,25 @@ class BrowserSession(
 
     /** 把 Gecko 签发的 cf_clearance 写进系统 CookieManager 并同步到加密存储，OkHttp 从那里取。只搬 cf_clearance，不动会话 Cookie。 */
     private fun adoptGeckoClearance(clearance: String) {
-        CookieManager.getInstance().setCookie(Config.BASE_URL, "$CF_CLEARANCE_COOKIE=$clearance; Path=/; Domain=.linux.do; Secure; HttpOnly; SameSite=None")
-        CookieManager.getInstance().flush()
+        val manager = CookieManager.getInstance()
+        val existingRaw = manager.getCookie(Config.BASE_URL).orEmpty()
+        existingRaw.split(';')
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(CF_CLEARANCE_COOKIE, ignoreCase = true) }
+            .map { it.substringAfter('=').trim() }
+            .filter { it.isNotBlank() && it != clearance }
+            .forEach { old ->
+                store.noteClearanceChallenged(old, host = Config.HOST, source = "adoptGeckoClearance替换")
+            }
+        manager.setCookie(
+            Config.BASE_URL,
+            "$CF_CLEARANCE_COOKIE=$clearance; Path=/; Domain=${Config.HOST}; Max-Age=0; Secure; HttpOnly",
+        )
+        manager.setCookie(
+            Config.BASE_URL,
+            "$CF_CLEARANCE_COOKIE=$clearance; Path=/; Domain=.${Config.HOST}; Max-Age=86400; Secure; HttpOnly; SameSite=None",
+        )
+        manager.flush()
         store.syncFromWebView()
     }
 
@@ -976,12 +1092,39 @@ class BrowserSession(
      * 内置同域网页 / 帖内预览页面完成时，若 Gecko 持有未判废的新 cf_clearance，同步回 SessionStore。
      * 只搬未判废的 cf_clearance，不动 _t / _forum_session，防止挑战页或匿名页冲掉主站登录态。
      */
-    fun syncFreshClearanceFromInAppGecko(candidates: Collection<String>, source: String) {
+    fun syncFreshClearanceFromInAppGecko(
+        candidates: Collection<String>,
+        source: String,
+        session: GeckoSession? = null,
+    ) {
         val fresh = candidates.lastOrNull { it.isNotBlank() && !store.isClearanceChallenged(it) } ?: return
         val current = currentCfClearance()
-        if (fresh != current) {
+        if (fresh == current) return
+        val generation = store.sessionGeneration
+        val knownGeckoUa = mainGeckoUserAgent
+        if (!knownGeckoUa.isNullOrBlank()) {
+            if (store.userAgentOrNull() != knownGeckoUa) {
+                store.saveUserAgent(knownGeckoUa)
+                webViewInstance?.settings?.userAgentString = knownGeckoUa
+                authWebView?.settings?.userAgentString = knownGeckoUa
+                diagnostics.log("内置 Gecko 页面同步凭据前已对齐缓存 UA ($source)")
+            }
             adoptGeckoClearance(fresh)
             diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            return
+        }
+        if (session == null) {
+            adoptGeckoClearance(fresh)
+            diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            return
+        }
+        scope.launch(Dispatchers.Main) {
+            val stillCurrent = { !store.sessionChanging && store.sessionGeneration == generation }
+            runCatching { synchronizeGeckoUserAgent(session, source, stillCurrent) }
+            if (stillCurrent() && !store.isClearanceChallenged(fresh) && fresh != currentCfClearance()) {
+                adoptGeckoClearance(fresh)
+                diagnostics.log("内置 Gecko 页面同步新 cf_clearance ($source): ${clearanceFingerprint(fresh)}")
+            }
         }
     }
 
@@ -1237,8 +1380,18 @@ class BrowserSession(
             if (submissionGeneration != authSubmissionGeneration) return@launch
             TopicRepository.postGate.withLock {
                 if (submissionGeneration != authSubmissionGeneration) return@withLock
+                if (TopicRepository.isRateLimitCoolingDown()) {
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
+                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                    return@withLock
+                }
                 TopicRepository.throttlePost(burst = true)
                 if (submissionGeneration != authSubmissionGeneration) return@withLock
+                if (TopicRepository.isRateLimitCoolingDown()) {
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
+                    submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
+                    return@withLock
+                }
 
                 currentSubmissionId = submissionId
                 currentSubmissionCallback = submissionCallback
@@ -1329,14 +1482,17 @@ class BrowserSession(
         authSubmitJob = scope.launch(Dispatchers.IO) {
             previousJob?.join()
             TopicRepository.postGate.withLock {
-                if (TopicRepository.isRateLimitCoolingDown()) {
-                    val remainingSec = (TopicRepository.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                suspend fun abortIfCoolingDown(): Boolean {
+                    if (!TopicRepository.isRateLimitCoolingDown()) return false
+                    val remainingSec = ((TopicRepository.rateLimitRemainingMs() + 999L) / 1000L).coerceAtLeast(1L)
                     withContext(Dispatchers.Main) {
                         submissionCallback(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
                     }
-                    return@withLock
+                    return true
                 }
+                if (abortIfCoolingDown()) return@withLock
                 TopicRepository.throttlePost(burst = true)
+                if (abortIfCoolingDown()) return@withLock
                 try {
                     // 1. 获取 CSRF Token
                     diagnostics.log("Native 登录第 1 步: 请求 /session/csrf...")
@@ -1399,6 +1555,7 @@ class BrowserSession(
 
                     // 2. 兑换 hCaptcha token (若有)
                     if (!hcaptchaToken.isNullOrBlank()) {
+                        if (abortIfCoolingDown()) return@launch
                         diagnostics.log("Native 登录第 2 步: 兑换 hCaptcha token...")
                         val endpoints = listOf("/captcha/hcaptcha/create.json", "/hcaptcha/create.json")
                         var hOk = false
@@ -1406,6 +1563,7 @@ class BrowserSession(
                         var isCfEncountered = false
 
                         for (ep in endpoints) {
+                            if (abortIfCoolingDown()) return@launch
                             val hBody = FormBody.Builder()
                                 .add("token", hcaptchaToken)
                                 .build()
@@ -1460,6 +1618,7 @@ class BrowserSession(
                     }
 
                     // 3. 提交登录 /session.json 或 发送邮件 /u/email-login.json
+                    if (abortIfCoolingDown()) return@launch
                     if (isEmailMode) {
                         val email = cachedEmailSend.orEmpty()
                         diagnostics.log("Native 登录第 3 步: 提交发送登录邮件 $email (/u/email-login.json)...")
@@ -1643,6 +1802,7 @@ class BrowserSession(
                                     awaitingSecondFactorLogin = false
                                     submissionCallback(false, error, false)
                                 } else if (resp.isSuccessful || !user.isNullOrBlank()) {
+                                    lastAuthenticatedUser = parseAuthenticatedUser(resObj?.optJSONObject("user"))
                                     awaitingSecondFactorLogin = false
                                     CookieManager.getInstance().flush()
                                     diagnostics.log("Native 登录成功！用户: ${user ?: cachedLogin}")
@@ -1775,8 +1935,8 @@ class BrowserSession(
         dialog.setOnDismissListener(null)
         dialog.dismiss()
         view?.destroy()
-        gSession?.close()
         gView?.releaseSession()
+        gSession?.close()
     }
 
     /**
@@ -2349,6 +2509,7 @@ class BrowserSession(
             onResult(false, "操作过于频繁，请等待 ${remainingSec} 秒后再试", false)
             return
         }
+        emailLinkAttemptId += 1L
         onAuthCallback = onResult
         cachedEmailSend = null
         isDarkCached = isDark
@@ -2369,6 +2530,10 @@ class BrowserSession(
         }
     }
 
+    private fun isCurrentEmailLinkAttempt(view: View, attemptId: Long): Boolean =
+        emailLinkCompleting && pendingEmailLink != null && emailLinkAttemptId == attemptId &&
+            currentAuthView() === view && !isInCfMode
+
     /**
      * 整页链接登录的结果判定：只看是否真的落到了会话 Cookie _t。
      *
@@ -2377,16 +2542,18 @@ class BrowserSession(
      * 没拿到就短间隔复查若干轮，而不是一次判死。
      */
     private fun checkEmailLinkLogin(view: View, url: String?) {
-        if (!emailLinkCompleting || pendingEmailLink == null) return
+        val attemptId = emailLinkAttemptId
+        val stillCurrent = { isCurrentEmailLinkAttempt(view, attemptId) }
+        if (!stillCurrent()) return
         if (view is GeckoView) {
-            refreshBrowserCookies(view) { checkEmailLinkResult(view, url) }
+            refreshBrowserCookies(view, authorityStillValid = stillCurrent) { checkEmailLinkResult(view, url, attemptId) }
         } else {
-            checkEmailLinkResult(view, url)
+            checkEmailLinkResult(view, url, attemptId)
         }
     }
 
-    private fun checkEmailLinkResult(view: View, url: String?) {
-        if (!emailLinkCompleting || pendingEmailLink == null || currentAuthView() !== view) return
+    private fun checkEmailLinkResult(view: View, url: String?, attemptId: Long) {
+        if (!isCurrentEmailLinkAttempt(view, attemptId)) return
         CookieManager.getInstance().flush()
         val hasSession = runCatching { store.syncFromWebView().containsKey(Config.SESSION_COOKIE) }
             .getOrDefault(false)
@@ -2401,7 +2568,7 @@ class BrowserSession(
             emailLinkRechecksRemaining--
             view.postDelayed(
                 {
-                    if (emailLinkCompleting && currentAuthView() === view) {
+                    if (isCurrentEmailLinkAttempt(view, attemptId)) {
                         checkEmailLinkLogin(view, url)
                     }
                 },
@@ -2551,6 +2718,47 @@ class BrowserSession(
     private fun clearanceFingerprint(value: String?): String =
         if (value.isNullOrBlank()) "无" else "${value.take(8)}…(${value.length}字符)"
 
+    private suspend fun synchronizeGeckoUserAgent(
+        session: GeckoSession,
+        source: String,
+        stillCurrent: () -> Boolean,
+    ): String = withContext(Dispatchers.Main) {
+        if (!stillCurrent()) throw CancellationException("验证会话已切换")
+        val browserUserAgent = withTimeoutOrNull(10_000L) {
+            suspendCancellableCoroutine<String?> { continuation ->
+                session.userAgent.accept(
+                    { value -> if (continuation.isActive) continuation.resume(value) },
+                    { _ -> if (continuation.isActive) continuation.resume(null) },
+                )
+            }
+        }?.takeIf { it.isNotBlank() } ?: error("无法读取验证浏览器标识")
+        if (!stillCurrent()) throw CancellationException("验证会话已切换")
+        val previousUserAgent = store.userAgentOrNull()
+        if (previousUserAgent != browserUserAgent) {
+            store.saveUserAgent(browserUserAgent)
+            webViewInstance?.settings?.userAgentString = browserUserAgent
+            authWebView?.settings?.userAgentString = browserUserAgent
+        }
+        if (session === mainGeckoSession) mainGeckoUserAgent = browserUserAgent
+        diagnostics.log(
+            "验证浏览器身份同步[$source]: AppUA=${NetDiagnostics.fingerprint(store.userAgentOrNull())} " +
+                "GeckoUA=${NetDiagnostics.fingerprint(browserUserAgent)} 更新=${previousUserAgent != browserUserAgent}",
+        )
+        browserUserAgent
+    }
+
+    fun logVerifyClientIdentity(stage: String) {
+        val appUserAgent = store.userAgentOrNull()
+        val context = attachedActivityContext ?: appContext
+        diagnostics.log(
+            "验证身份对照[$stage]: AppUA=${NetDiagnostics.fingerprint(appUserAgent)} " +
+                "GeckoUA=${NetDiagnostics.fingerprint(mainGeckoUserAgent)} " +
+                "一致=${mainGeckoUserAgent?.let { it == appUserAgent } ?: "未读取"} " +
+                "clearance=${store.currentCfClearanceFp()} " +
+                GeckoManager.runtimeNetworkSummary(context),
+        )
+    }
+
 
     /**
      * 认证/登录视图：使用独立的可见 GeckoView (Firefox Necko+NSS，支持 DoH+ECH)，
@@ -2596,21 +2804,7 @@ class BrowserSession(
         authGeckoInitJob = scope.launch(Dispatchers.Main) {
             try {
                 if (!stillCurrent()) return@launch
-                val browserUserAgent = withTimeoutOrNull(10_000L) {
-                    suspendCancellableCoroutine<String?> { continuation ->
-                        geckoSession.userAgent.accept(
-                            { value -> if (continuation.isActive) continuation.resume(value) },
-                            { _ -> if (continuation.isActive) continuation.resume(null) },
-                        )
-                    }
-                }?.takeIf { it.isNotBlank() } ?: error("无法读取认证浏览器标识")
-                if (!stillCurrent()) return@launch
-                if (store.userAgentOrNull() != browserUserAgent) {
-                    store.saveUserAgent(browserUserAgent)
-                    webViewInstance?.settings?.userAgentString = browserUserAgent
-                    authWebView?.settings?.userAgentString = browserUserAgent
-                    diagnostics.log("接口与认证浏览器的 User-Agent 已同步")
-                }
+                synchronizeGeckoUserAgent(geckoSession, "密码登录", stillCurrent)
                 Log.d("GeckoAuthBridge", "认证会话 User-Agent 已对齐")
                 val bridge = GeckoAuthBridge.create(
                     activityContext,
@@ -2917,10 +3111,21 @@ class BrowserSession(
         verifyProbeJob = scope.launch(Dispatchers.Main) {
             val recoveryId = store.beginClearanceRecovery()
             try {
+                val generation = store.sessionGeneration
+                val session = view.session ?: return@launch
+                val stillCurrent = {
+                    !store.sessionChanging && generation == store.sessionGeneration &&
+                        mainGeckoView === view && mainGeckoSession === session &&
+                        verifyPhase != VerifyPhase.RUNNING && authGeckoView == null &&
+                        !isInCfMode && !awaitingSecondFactorLogin && currentCfClearance() == null
+                }
+                if (!stillCurrent()) return@launch
+                synchronizeGeckoUserAgent(session, "后台预热", stillCurrent)
                 val context = attachedActivityContext ?: appContext
                 val geckoStale = withContext(Dispatchers.IO) {
                     GeckoManager.cfClearancesFromDb(context)
                 }
+                if (!stillCurrent()) return@launch
                 val staleSet = (geckoStale + store.cfClearancesForVerification()).toMutableSet()
                 if (
                     mainGeckoView !== view ||
@@ -3005,6 +3210,10 @@ class BrowserSession(
                         return@launch
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                diagnostics.log("Gecko 后台预热准备失败: ${error.javaClass.simpleName}")
             } finally {
                 store.endClearanceRecovery(recoveryId)
             }
@@ -3021,6 +3230,7 @@ class BrowserSession(
         mainGeckoView?.releaseSession()
         mainGeckoSession?.close()
         mainGeckoSession = null
+        mainGeckoUserAgent = null
         mainGeckoView = null
     }
 
@@ -3032,24 +3242,44 @@ class BrowserSession(
         verifyProbeJob?.cancel()
         resetVerifyPageFlags()
         verifyProbeJob = scope.launch(Dispatchers.Main) {
-            val context = attachedActivityContext ?: appContext
-            GeckoManager.getOrCreateRuntime(context)
-            view.session?.stop()
-            val geckoStale = withContext(Dispatchers.IO) {
-                GeckoManager.cfClearancesFromDb(context)
+            val generation = store.sessionGeneration
+            val session = view.session ?: return@launch
+            val stillCurrent = {
+                !store.sessionChanging && generation == store.sessionGeneration &&
+                    mainGeckoView === view && mainGeckoSession === session && verifyPhase == VerifyPhase.RUNNING
             }
-            verifyStaleClearances = verifyStaleClearances + geckoStale + setOfNotNull(verificationClearance)
-            if (!org.linuxdo.android.net.gecko.GeckoManager.clearSiteCookies(context)) {
-                diagnostics.log("验证页清理 Gecko 旧凭据失败，继续以旧值为基线判定新签发")
+            try {
+                synchronizeGeckoUserAgent(session, "常规安全验证", stillCurrent)
+                val context = attachedActivityContext ?: appContext
+                GeckoManager.getOrCreateRuntime(context)
+                session.stop()
+                val geckoStale = withContext(Dispatchers.IO) {
+                    GeckoManager.cfClearancesFromDb(context)
+                }
+                if (!stillCurrent()) return@launch
+                verifyStaleClearances = verifyStaleClearances + geckoStale + setOfNotNull(verificationClearance)
+                if (!GeckoManager.clearSiteCookies(context)) {
+                    diagnostics.log("验证页清理 Gecko 旧凭据失败，继续以旧值为基线判定新签发")
+                }
+                if (!stillCurrent()) return@launch
+                diagnostics.log(
+                    "正在用 GeckoView 打开安全验证页 (排除旧凭据 ${verifyStaleClearances.size} 枚, " +
+                        "${GeckoManager.runtimeNetworkSummary(context)})",
+                )
+                session.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+                runVerifyProbe(view)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (stillCurrent()) {
+                    verifyLoadFailed = true
+                    verifyStallReason = "验证组件初始化异常 (${error.javaClass.simpleName})，请重试"
+                    activeChallengeDetectedAt = 0L
+                    verificationNeedsInteraction = false
+                    view.alpha = 0f
+                    diagnostics.log("安全验证准备失败: ${error.javaClass.simpleName}")
+                }
             }
-            if (mainGeckoView !== view || verifyPhase != VerifyPhase.RUNNING) return@launch
-            GeckoManager.getOrCreateRuntime(context)
-            diagnostics.log(
-                "正在用 GeckoView 打开安全验证页 (排除旧凭据 ${verifyStaleClearances.size} 枚, " +
-                    "${GeckoManager.runtimeNetworkSummary(context)})",
-            )
-            view.session?.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH")
-            runVerifyProbe(view)
         }
     }
 
@@ -3057,6 +3287,7 @@ class BrowserSession(
         verificationPageLoaded = false
         verifyLoadFailed = false
         verifyStallLogged = false
+        verifyStallReason = null
         verifyOriginReachedAt = 0L
         verificationNeedsInteraction = false
         verificationSawChallenge = false
@@ -3079,6 +3310,7 @@ class BrowserSession(
         if (runCatching { Uri.parse(url).host }.getOrNull() == Config.HOST) {
             verificationPageLoaded = true
             verifyLoadFailed = false
+            verifyStallReason = null
             diagnostics.log("验证页 Gecko 加载完成: ${GeckoManager.diagnosticUrl(url)}")
         }
     }
@@ -3086,6 +3318,20 @@ class BrowserSession(
     private fun onVerifyGeckoLoadError(view: GeckoView, url: String, error: org.mozilla.geckoview.WebRequestError) {
         if (mainGeckoView !== view || verifyPhase != VerifyPhase.RUNNING) return
         verifyLoadFailed = true
+        verifyStallReason = when (error.code) {
+            org.mozilla.geckoview.WebRequestError.ERROR_UNKNOWN_HOST ->
+                "无法解析验证服务地址 (DNS 失败)，请检查网络或 DoH 设置后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_NET_TIMEOUT ->
+                "连接验证服务超时，请检查网络或代理设置后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_OFFLINE ->
+                "当前网络已断开，请连接网络后重试"
+            org.mozilla.geckoview.WebRequestError.ERROR_SECURITY_SSL,
+            org.mozilla.geckoview.WebRequestError.ERROR_SECURITY_BAD_CERT,
+            org.mozilla.geckoview.WebRequestError.ERROR_BAD_HSTS_CERT ->
+                "安全连接握手失败 (SSL/TLS 异常)，请检查网络环境或设备时间后重试"
+            else ->
+                "验证页面加载失败 (错误码 ${error.category}/${error.code})，请检查网络后重试"
+        }
         activeChallengeDetectedAt = 0L
         verificationNeedsInteraction = false
         view.alpha = 0f
@@ -3224,6 +3470,7 @@ class BrowserSession(
             adoptGeckoClearance(clearance)
             lastClearedAtElapsed = SystemClock.elapsedRealtime()
             verificationClearance = null
+            verificationClearanceUserAgent = null
         }
         verifyPhase = VerifyPhase.DONE
         verificationNeedsInteraction = false
@@ -3285,7 +3532,13 @@ class BrowserSession(
 
     /** 记录 Gecko 网络栈的出口摘要，用于和 OkHttp 的同名记录对照凭据为何不通用。 */
     suspend fun logVerifyGeckoEgress() = withContext(Dispatchers.Main) {
-        val bridge = mainGeckoView?.let { geckoBridges[it] }
+        if (TopicRepository.isRateLimitCoolingDown()) return@withContext
+        val now = SystemClock.elapsedRealtime()
+        if (lastVerifyEgressTraceAt != 0L && now - lastVerifyEgressTraceAt < 60_000L) return@withContext
+        lastVerifyEgressTraceAt = now
+        val view = mainGeckoView
+        val generation = store.sessionGeneration
+        val bridge = view?.let { geckoBridges[it] }
         val summary = if (bridge == null) {
             "验证页脚本桥不可用"
         } else {
@@ -3297,7 +3550,9 @@ class BrowserSession(
                 "读取失败: ${error.message.orEmpty().take(60)}"
             }
         }
-        diagnostics.log("[诊断] 出口对照 Gecko验证页: $summary")
+        if (generation == store.sessionGeneration && mainGeckoView === view && !store.sessionChanging) {
+            diagnostics.log("[诊断] 出口对照 Gecko验证页: $summary")
+        }
     }
 
     suspend fun openUrl(url: String) = withContext(Dispatchers.Main) {
@@ -3466,7 +3721,10 @@ class BrowserSession(
         prewarmJob = null
         // 重试时现场已无 clearance，保留首次进入时记下的那枚，供放弃验证时回填
         verifyStaleClearances = store.cfClearancesForVerification()
-        store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let { verificationClearance = it }
+        store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let {
+            verificationClearance = it
+            verificationClearanceUserAgent = store.userAgentOrNull()
+        }
         verifyPhase = VerifyPhase.RUNNING
         verificationStartedAt = SystemClock.elapsedRealtime()
         resetVerifyPageFlags()
@@ -3499,6 +3757,9 @@ class BrowserSession(
         !verificationPageLoaded && SystemClock.elapsedRealtime() - verificationStartedAt > VERIFY_STALL_MS -> {
             if (!verifyStallLogged) {
                 verifyStallLogged = true
+                if (verifyStallReason == null) {
+                    verifyStallReason = "验证页面超过 ${VERIFY_STALL_MS / 1_000L} 秒仍未加载完成，请检查网络或切换代理后重试"
+                }
                 val view = mainGeckoView
                 val bridge = view?.let { geckoBridges[it] }
                 diagnostics.log(
@@ -3524,14 +3785,21 @@ class BrowserSession(
         if (verifyPhase != VerifyPhase.RUNNING || isVerifyChallengeActive() || TopicRepository.isRateLimitCoolingDown()) return false
         verifyProbeJob?.cancel()
         verificationClearance = null
+        verificationClearanceUserAgent = null
         return finishVerify(null, "App 请求通道已不被 Cloudflare 挑战")
     }
 
     /** 验证页加载异常：Gecko 主框架报错，或打开后 [VERIFY_STALL_MS] 内一页都没加载完。 */
     fun isVerificationPageStalled(): Boolean = verifyPageState() == VerifyPageState.STALLED
 
+    fun verifyStallReason(): String? = verifyStallReason
+
     /** 验证页已收口（取得新凭据，或已回源但等不到新凭据）。凭据是否真能用由上层用 OkHttp 复核。 */
     fun interactiveVerificationComplete(): Boolean = verifyPhase == VerifyPhase.DONE
+
+    fun canReconfirmVerification(): Boolean =
+        verifyPhase == VerifyPhase.DONE && mainGeckoUserAgent != null &&
+            mainGeckoUserAgent == store.userAgentOrNull() && currentCfClearance() != null
 
     /**
      * 用户放弃验证时：若没拿到新 clearance，就把进入验证前的那枚回填。
@@ -3540,9 +3808,15 @@ class BrowserSession(
      */
     suspend fun restoreClearanceIfVerificationAbandoned() = withContext(Dispatchers.Main) {
         val previous = verificationClearance?.takeIf { it.isNotBlank() } ?: return@withContext
+        val previousUserAgent = verificationClearanceUserAgent
         verificationClearance = null
+        verificationClearanceUserAgent = null
         val current = store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]
         if (!current.isNullOrBlank()) return@withContext
+        if (previousUserAgent != store.userAgentOrNull()) {
+            diagnostics.log("验证已取消，旧 cf_clearance 的浏览器标识已变化，不回填不匹配的安全凭据")
+            return@withContext
+        }
         CookieManager.getInstance().apply {
             setCookie(
                 Config.BASE_URL,
@@ -3605,21 +3879,36 @@ class BrowserSession(
         }
 
     /** 调用方必须已持有 [solveMutex]。 */
-    private suspend fun acquireCfClearanceLocked(reason: String, timeoutMs: Long = Config.CHALLENGE_TIMEOUT_MS): Boolean {
+    private suspend fun acquireCfClearanceLocked(
+        reason: String,
+        timeoutMs: Long = Config.CHALLENGE_TIMEOUT_MS,
+        targetUrl: String? = null,
+    ): Boolean {
         val recoveryId = store.beginClearanceRecovery()
         return try {
-            acquireCfClearanceInRecovery(reason, timeoutMs)
+            acquireCfClearanceInRecoveryInternal(
+                reason = reason,
+                timeoutMs = timeoutMs,
+                targetUrl = targetUrl,
+                captureExternalStream = false,
+            ).cleared
         } finally {
             store.endClearanceRecovery(recoveryId)
         }
     }
 
-    private suspend fun acquireCfClearanceInRecovery(reason: String, timeoutMs: Long): Boolean {
+    private suspend fun acquireCfClearanceInRecoveryInternal(
+        reason: String,
+        timeoutMs: Long,
+        targetUrl: String? = null,
+        captureExternalStream: Boolean = false,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+    ): AttachmentPrewarmResult {
         if (verifyPhase == VerifyPhase.RUNNING) {
             // 与验证页共用 Gecko Cookie 库，这里清 Cookie 会把用户正在过的挑战清掉
             diagnostics.log("静默补签让位: 验证页正在进行 ($reason)")
             lastSilentOutcome = SilentOutcome.CHALLENGE
-            return false
+            return AttachmentPrewarmResult(cleared = false)
         }
         withContext(Dispatchers.Main) {
             verifyProbeJob?.cancel()
@@ -3627,18 +3916,27 @@ class BrowserSession(
         }
         val startedAt = SystemClock.elapsedRealtime()
         val context = attachedActivityContext ?: appContext
+        val loadTargetUrl = targetUrl?.takeIf {
+            val parsed = runCatching { Uri.parse(it) }.getOrNull()
+            val host = parsed?.host?.lowercase()?.trimEnd('.').orEmpty()
+            parsed?.scheme == "https" && (
+                host == Config.HOST || host.endsWith(".${Config.HOST}") ||
+                    host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+                )
+        } ?: "${Config.BASE_URL}$CF_CHALLENGE_PATH"
+        val isTargetSpecific = loadTargetUrl != "${Config.BASE_URL}$CF_CHALLENGE_PATH"
         diagnostics.log(
-            "静默补签 cf_clearance 开始: $reason (${GeckoManager.runtimeNetworkSummary(context)})",
+            "静默补签 cf_clearance 开始: $reason target=${GeckoManager.diagnosticUrl(loadTargetUrl)} (${GeckoManager.runtimeNetworkSummary(context)})",
         )
         val generation = store.sessionGeneration
 
         val staleClearances = withContext(Dispatchers.Main) { store.cfClearancesForVerification() }.toMutableSet()
-        staleClearances.addAll(withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(context) })
+        staleClearances.addAll(GeckoManager.liveCfClearances(context))
         diagnostics.log("静默补签基线: 排除 ${staleClearances.size} 枚旧凭据，其中已判废 ${staleClearances.count(store::isClearanceChallenged)} 枚")
         if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
         if (verifyPhase == VerifyPhase.RUNNING) {
             lastSilentOutcome = SilentOutcome.CHALLENGE
-            return false
+            return AttachmentPrewarmResult(cleared = false)
         }
         val authInProgress = withContext(Dispatchers.Main) { authGeckoView != null }
         if (authInProgress) {
@@ -3647,40 +3945,152 @@ class BrowserSession(
             withContext(Dispatchers.Main) {
                 runCatching { authGeckoView?.let { geckoBridges[it] }?.clearCfClearance() }
             }
+        } else if (isTargetSpecific) {
+            // 访问附件等受保护目标 URL 时保留主站会话 Cookie，仅清旧 cf_clearance 触发该 URL 的质询。
+            val sessionCookies = withContext(Dispatchers.Main) { store.syncFromWebView() }
+            if (!GeckoAuthBridge.prepareTargetChallengeCookies(context, sessionCookies)) {
+                diagnostics.log("静默补签: 定点准备目标会话 Cookie 失败，回退清理站点 Cookie")
+                GeckoManager.clearSiteCookies(context)
+            }
         } else if (!GeckoManager.clearSiteCookies(context)) {
             diagnostics.log("静默补签: 清理 Gecko 旧凭据失败，仅按旧值基线判定")
         }
 
         var headlessLoadFailed = false
+        var headlessInChallengePage = false
         var headlessFinishedAt = 0L
+        var externalResponseReceived = false
+        var externalResolvedUrl: String? = null
+        var externalContentType: String? = null
+        var externalContentDisposition: String? = null
+        var externalTempFile: java.io.File? = null
+        var externalDownloadJob: Job? = null
         val headlessSession = withContext(Dispatchers.Main) {
             if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
             if (verifyPhase == VerifyPhase.RUNNING) return@withContext null
             org.linuxdo.android.net.gecko.GeckoManager.createChallengeSession(
                 context = context,
-                onLocationChanged = { url -> diagnostics.log("Headless GeckoSession 导航: ${GeckoManager.diagnosticUrl(url)}") },
+                onLocationChanged = { url ->
+                    headlessFinishedAt = 0L
+                    diagnostics.log("Headless GeckoSession 导航: ${GeckoManager.diagnosticUrl(url)}")
+                },
+                onPageStarted = { _ ->
+                    headlessFinishedAt = 0L
+                },
+                onTitleChanged = { title ->
+                    val trimmed = title.trim()
+                    if (HEADLESS_CHALLENGE_TITLE_REGEX.containsMatchIn(trimmed)) {
+                        headlessInChallengePage = true
+                        headlessFinishedAt = 0L
+                    } else if (trimmed.isNotBlank()) {
+                        headlessInChallengePage = false
+                    }
+                },
                 onPageFinished = { url ->
-                    if (headlessFinishedAt == 0L) headlessFinishedAt = SystemClock.elapsedRealtime()
+                    if (!headlessInChallengePage && headlessFinishedAt == 0L) {
+                        headlessFinishedAt = SystemClock.elapsedRealtime()
+                    }
                     diagnostics.log("Headless GeckoSession 完成: ${GeckoManager.diagnosticUrl(url)}")
                 },
+                onExternalResponse = { response ->
+                    val respStatus = response.statusCode
+                    val respUri = response.uri?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+                    val headerType = response.headers.entries
+                        .firstOrNull { it.key.equals("content-type", ignoreCase = true) }?.value
+                    val headerDisp = response.headers.entries
+                        .firstOrNull { it.key.equals("content-disposition", ignoreCase = true) }?.value
+                    if (respStatus in 200..399) {
+                        externalResponseReceived = true
+                        headlessLoadFailed = false
+                        headlessInChallengePage = false
+                        if (headlessFinishedAt == 0L) headlessFinishedAt = SystemClock.elapsedRealtime()
+                        if (!respUri.isNullOrBlank()) externalResolvedUrl = respUri
+                        externalContentType = headerType
+                        externalContentDisposition = headerDisp
+                        val stream = if (captureExternalStream && respStatus in 200..299) response.body else null
+                        val headerLen = response.headers.entries
+                            .firstOrNull { it.key.equals("content-length", ignoreCase = true) }
+                            ?.value?.trim()?.toLongOrNull() ?: -1L
+                        if (stream != null && externalDownloadJob == null) {
+                            runCatching { response.setReadTimeoutMillis(30_000L) }
+                            externalDownloadJob = scope.launch(Dispatchers.IO) {
+                                var tmp: java.io.File? = null
+                                try {
+                                    tmp = java.io.File.createTempFile("gecko_attachment_", ".tmp", context.cacheDir)
+                                    val buffer = ByteArray(32 * 1024)
+                                    var copied = 0L
+                                    var lastNotifyAt = 0L
+                                    onProgress?.invoke(0L, headerLen)
+                                    stream.use { input ->
+                                        tmp.outputStream().use { out ->
+                                            while (true) {
+                                                currentCoroutineContext().ensureActive()
+                                                val read = input.read(buffer)
+                                                if (read < 0) break
+                                                if (read == 0) continue
+                                                out.write(buffer, 0, read)
+                                                copied += read
+                                                val now = SystemClock.elapsedRealtime()
+                                                if (now - lastNotifyAt >= 80L) {
+                                                    lastNotifyAt = now
+                                                    onProgress?.invoke(copied, headerLen)
+                                                }
+                                            }
+                                            out.flush()
+                                        }
+                                    }
+                                    onProgress?.invoke(copied, if (headerLen > 0L) headerLen else copied)
+                                    externalTempFile = tmp
+                                    diagnostics.log("Headless GeckoSession 已流式接收附件: ${tmp.length()} bytes")
+                                } catch (cancelled: CancellationException) {
+                                    runCatching { tmp?.delete() }
+                                    throw cancelled
+                                } catch (error: Exception) {
+                                    runCatching { tmp?.delete() }
+                                    diagnostics.log("Headless GeckoSession 流式读取附件失败: ${error.message}")
+                                }
+                            }
+                        } else {
+                            runCatching { response.body?.close() }
+                        }
+                    } else {
+                        runCatching { response.body?.close() }
+                    }
+                },
                 onPageError = { url, error ->
-                    headlessLoadFailed = true
+                    if (!externalResponseReceived) {
+                        headlessLoadFailed = true
+                    }
                     diagnostics.log("Headless GeckoSession 加载失败 [${error.category}/${error.code}]: ${GeckoManager.diagnosticUrl(url)}")
                 },
                 onDiagnostic = { message ->
                     diagnostics.log("Headless GeckoSession $message")
                 },
-            ).also { it.loadUri("${Config.BASE_URL}$CF_CHALLENGE_PATH") }
+            )
         } ?: run {
             lastSilentOutcome = SilentOutcome.CHALLENGE
-            return false
+            return AttachmentPrewarmResult(cleared = false)
         }
 
-        // 静默等待使用有限预算，主框架失败立即返回；未取得 Cookie 不能证明挑战需要人工操作。
-        val effectiveTimeoutMs = timeoutMs.coerceAtMost(HEADLESS_REVALIDATE_MAX_MS)
+        // 静默等待使用有限预算，主框架失败立即返回；挑战页 JS 验证期间保持 active 并避免 5.5s 提前掐断。
+        val effectiveTimeoutMs = if (isTargetSpecific) {
+            maxOf(timeoutMs, 15_000L)
+        } else {
+            timeoutMs.coerceAtMost(HEADLESS_REVALIDATE_MAX_MS)
+        }
         val deadline = startedAt + effectiveTimeoutMs
+        var clearanceAdoptedAt = 0L
         var outcome = SilentOutcome.TIMEOUT
         try {
+            withContext(Dispatchers.Main) {
+                headlessSession.setActive(true)
+                synchronizeGeckoUserAgent(headlessSession, "静默补签") {
+                    generation == store.sessionGeneration && !store.sessionChanging && verifyPhase != VerifyPhase.RUNNING
+                }
+                if (SystemClock.elapsedRealtime() < deadline) {
+                    headlessSession.loadUri(loadTargetUrl)
+                }
+            }
             while (SystemClock.elapsedRealtime() < deadline) {
                 delay(POLL_INTERVAL_MS)
                 if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
@@ -3688,55 +4098,101 @@ class BrowserSession(
                     outcome = SilentOutcome.CHALLENGE
                     break
                 }
-                if (headlessLoadFailed) {
-                    outcome = SilentOutcome.UNREACHABLE
-                    break
-                }
-                val candidates = withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(context) }
-                val rejected = candidates.filter(store::isClearanceChallenged)
-                if (staleClearances.addAll(rejected)) {
-                    diagnostics.logThrottled("silent-rejected-clearance", "静默补签忽略已判废凭据，继续等待新值")
-                }
-                val clearance = selectFreshCfClearance(candidates, staleClearances)
-                if (clearance == null) {
-                    val finishedAt = headlessFinishedAt
-                    if (finishedAt > 0L && SystemClock.elapsedRealtime() - finishedAt >= HEADLESS_LOADED_WAIT_MS) {
-                        diagnostics.log("静默补签页面加载后的等待预算耗尽，尚未取得新凭据，未确认是否需要交互；交由可见验证页继续处理")
-                        outcome = SilentOutcome.TIMEOUT
-                        break
+                if (clearanceAdoptedAt == 0L) {
+                    val candidates = GeckoManager.liveCfClearances(context)
+                    val rejected = candidates.filter(store::isClearanceChallenged)
+                    if (staleClearances.addAll(rejected)) {
+                        diagnostics.logThrottled("silent-rejected-clearance", "静默补签忽略已判废凭据，继续等待新值")
                     }
-                    continue
-                }
-                val adopted = withContext(Dispatchers.Main) {
-                    if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
-                    if (verifyPhase == VerifyPhase.RUNNING || store.isClearanceChallenged(clearance)) {
-                        false
-                    } else {
-                        adoptGeckoClearance(clearance)
-                        val active = currentCfClearance()
-                        if (active == clearance) {
-                            true
-                        } else {
-                            staleClearances.add(clearance)
-                            diagnostics.logThrottled(
-                                "silent-adopt-shadowed",
-                                "静默补签候选凭据 ${clearanceFingerprint(clearance)} 未成为当前权威值(当前=${clearanceFingerprint(active)})",
-                            )
-                            false
+                    val clearance = selectFreshCfClearance(candidates, staleClearances)
+                    if (clearance != null) {
+                        val adopted = withContext(Dispatchers.Main) {
+                            if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
+                            if (verifyPhase == VerifyPhase.RUNNING || store.isClearanceChallenged(clearance)) {
+                                false
+                            } else {
+                                adoptGeckoClearance(clearance)
+                                val active = currentCfClearance()
+                                if (active == clearance) {
+                                    true
+                                } else {
+                                    staleClearances.add(clearance)
+                                    diagnostics.logThrottled(
+                                        "silent-adopt-shadowed",
+                                        "静默补签候选凭据 ${clearanceFingerprint(clearance)} 未成为当前权威值(当前=${clearanceFingerprint(active)})",
+                                    )
+                                    false
+                                }
+                            }
+                        }
+                        if (adopted) {
+                            diagnostics.log("Headless GeckoSession 静默补签成功取得 cf_clearance: ${clearanceFingerprint(clearance)}")
+                            if (!captureExternalStream || externalResponseReceived) {
+                                outcome = SilentOutcome.CLEARED
+                                break
+                            }
+                            clearanceAdoptedAt = SystemClock.elapsedRealtime()
                         }
                     }
                 }
-                if (adopted) {
-                    diagnostics.log("Headless GeckoSession 静默补签成功取得 cf_clearance: ${clearanceFingerprint(clearance)}")
+                if (captureExternalStream && externalResponseReceived) {
+                    diagnostics.log("Headless GeckoSession 已直连取得附件响应，结束等待并完成下载流")
                     outcome = SilentOutcome.CLEARED
                     break
+                }
+                if (clearanceAdoptedAt > 0L && SystemClock.elapsedRealtime() - clearanceAdoptedAt >= 4_000L) {
+                    diagnostics.log("Headless GeckoSession 已取得 cf_clearance 且附件重定向等待结束，交由上层继续下载")
+                    outcome = SilentOutcome.CLEARED
+                    break
+                }
+                if (headlessLoadFailed) {
+                    if (clearanceAdoptedAt > 0L) {
+                        outcome = SilentOutcome.CLEARED
+                    } else {
+                        outcome = SilentOutcome.UNREACHABLE
+                    }
+                    break
+                }
+                val finishedAt = headlessFinishedAt
+                if (clearanceAdoptedAt == 0L && !headlessInChallengePage && finishedAt > 0L &&
+                    SystemClock.elapsedRealtime() - finishedAt >= HEADLESS_LOADED_WAIT_MS
+                ) {
+                    diagnostics.log("静默补签页面加载后的等待预算耗尽，尚未取得新凭据，未确认是否需要交互；交由可见验证页继续处理")
+                    outcome = SilentOutcome.TIMEOUT
+                    break
+                }
+            }
+            if (outcome != SilentOutcome.CLEARED && clearanceAdoptedAt > 0L) {
+                outcome = SilentOutcome.CLEARED
+            }
+            if (outcome == SilentOutcome.CLEARED && captureExternalStream) {
+                // 若在刚收割到 cf_clearance 后还未来得及记录 Cookie 或流尚在写入，补做一次同步与等待
+                val extraCandidates = runCatching { GeckoManager.liveCfClearances(context) }.getOrDefault(emptySet())
+                selectFreshCfClearance(extraCandidates, staleClearances)?.let { fresh ->
+                    withContext(Dispatchers.Main) {
+                        if (generation == store.sessionGeneration && !store.sessionChanging && !store.isClearanceChallenged(fresh)) {
+                            adoptGeckoClearance(fresh)
+                        }
+                    }
+                }
+                withTimeoutOrNull(60_000L) {
+                    externalDownloadJob?.join()
                 }
             }
         } catch (cancelled: CancellationException) {
             diagnostics.log("[诊断] 静默补签 cf_clearance 被取消(+${SystemClock.elapsedRealtime() - startedAt}ms)")
             throw cancelled
+        } catch (error: Exception) {
+            diagnostics.log("静默安全验证准备失败: ${error.javaClass.simpleName}")
+            outcome = SilentOutcome.UNREACHABLE
         } finally {
+            if (outcome != SilentOutcome.CLEARED) {
+                externalDownloadJob?.cancel()
+                runCatching { externalTempFile?.delete() }
+                externalTempFile = null
+            }
             withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                runCatching { headlessSession.setActive(false) }
                 headlessSession.close()
             }
         }
@@ -3749,13 +4205,49 @@ class BrowserSession(
             "静默补签 cf_clearance ${if (cleared) "成功" else "未通过(${outcome.name})"}" +
                 " 耗时=${SystemClock.elapsedRealtime() - startedAt}ms",
         )
-        return cleared
+        return AttachmentPrewarmResult(
+            cleared = cleared,
+            resolvedUrl = externalResolvedUrl,
+            tempFile = externalTempFile,
+            contentType = externalContentType,
+            contentDisposition = externalContentDisposition,
+        )
+    }
+
+    /** 附件下载专用预热：利用 Headless Gecko 对目标 URL 过盾并直接捕获重定向直链或外部下载流。 */
+    suspend fun prewarmAttachmentDownload(
+        url: String,
+        failedClearanceFp: String = "-",
+        requestHost: String = Config.HOST,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+    ): AttachmentPrewarmResult = solveMutex.withLock {
+        val normalizedHost = requestHost.lowercase().trimEnd('.')
+        val allowedHost = normalizedHost == Config.HOST || normalizedHost.endsWith(".${Config.HOST}") ||
+            normalizedHost == "ldstatic.com" || normalizedHost.endsWith(".ldstatic.com")
+        if (!allowedHost) {
+            diagnostics.log("子站/外站挑战不触发主站凭据重签: $requestHost")
+            return@withLock AttachmentPrewarmResult(cleared = false)
+        }
+        // /uploads/* 属于路径级 WAF 拦截，不能据此判废主站健康 cf_clearance，避免下载完附件后主站 0 凭据裸奔。
+        val recoveryId = store.beginClearanceRecovery()
+        return@withLock try {
+            acquireCfClearanceInRecoveryInternal(
+                reason = "download-attachment",
+                timeoutMs = 15_000L,
+                targetUrl = url,
+                captureExternalStream = true,
+                onProgress = onProgress,
+            )
+        } finally {
+            store.endClearanceRecovery(recoveryId)
+        }
     }
 
     suspend fun clearChallenge(
         reason: String,
         failedClearanceFp: String = "-",
         requestHost: String = Config.HOST,
+        targetUrl: String? = null,
     ): Boolean = solveMutex.withLock {
         if (!requestHost.equals(Config.HOST, ignoreCase = true)) {
             diagnostics.log("子站挑战不触发主站凭据重签: $requestHost")
@@ -3766,32 +4258,39 @@ class BrowserSession(
             currentCfClearance()
         }
         val currentFp = NetDiagnostics.fingerprint(currentClearance)
+        val effectiveFailedFp = if (failedClearanceFp != "-") {
+            failedClearanceFp
+        } else if (!targetUrl.isNullOrBlank() && currentFp != "-") {
+            currentFp
+        } else {
+            "-"
+        }
         val now = SystemClock.elapsedRealtime()
         val sinceLastClear = if (lastClearedAtElapsed > 0L) now - lastClearedAtElapsed else Long.MAX_VALUE
         // P0-1 锁内 Double-Check：
-        // a. 请求携带的 failedClearanceFp 与当前 WebView 权威 currentFp 已不同（且当前值未被判死）；
-        // b. 起飞时无凭据(failedClearanceFp == "-")，但距上次 CLEARED < 8s 且当前已持有未判死的 cf_clearance。
+        // a. 请求携带的 effectiveFailedFp 与当前 WebView 权威 currentFp 已不同（且当前值未被判死）；
+        // b. 起飞时无凭据(effectiveFailedFp == "-")，但距上次 CLEARED < 8s 且当前已持有未判死的 cf_clearance。
         val currentHealthy = currentFp != "-" && !store.isClearanceChallenged(currentClearance)
-        val clearanceRotated = failedClearanceFp != "-" &&
+        val clearanceRotated = effectiveFailedFp != "-" &&
             currentHealthy &&
-            currentFp != failedClearanceFp
-        val recentlyCleared = failedClearanceFp == "-" &&
+            currentFp != effectiveFailedFp
+        val recentlyCleared = effectiveFailedFp == "-" &&
             currentHealthy &&
             sinceLastClear in 0L..COALESCE_CLEAR_WINDOW_MS
         if (clearanceRotated || recentlyCleared) {
             withContext(Dispatchers.Main) { store.syncFromWebView() }
             lastSilentOutcome = SilentOutcome.CLEARED
             diagnostics.log(
-                "静默重验证合并跳过(凭据已就绪): $reason | failedFp=$failedClearanceFp currentFp=$currentFp" +
+                "静默重验证合并跳过(凭据已就绪): $reason | failedFp=$effectiveFailedFp currentFp=$currentFp" +
                     " sinceLast=${if (sinceLastClear == Long.MAX_VALUE) -1L else sinceLastClear}ms",
             )
             return@withLock true
         }
-        if (failedClearanceFp != "-") {
-            store.noteClearanceChallenged(failedClearanceFp, host = Config.HOST)
+        if (effectiveFailedFp != "-") {
+            store.noteClearanceChallenged(effectiveFailedFp, host = Config.HOST)
         }
         // 在免梯环境下，系统 WebView 无法走 ECH，统一委派给 GeckoSession 静默补签
-        return@withLock acquireCfClearanceLocked(reason)
+        return@withLock acquireCfClearanceLocked(reason, targetUrl = targetUrl)
     }
 
     /** 403 诊断：主站与 credit 子站的 CF/会话 Cookie 作用域与指纹。 */
@@ -3811,11 +4310,12 @@ class BrowserSession(
         val brands = evalString(
             "(navigator.userAgentData && navigator.userAgentData.brands) ? navigator.userAgentData.brands.map(function(b){return b.brand+'/'+b.version}).join(',') : 'none'",
         )
+        val effectiveUa = store.userAgentOrNull() ?: userAgent
         val chromeVersion = { ua: String -> Regex("Chrome/([\\d.]+)").find(ua)?.groupValues?.get(1) ?: "-" }
         diagnostics.log(
-            "[诊断] 环境: 固定UA Chrome=${chromeVersion(userAgent)} 页面UA Chrome=${chromeVersion(pageUa)}" +
-                " 系统WebView Chrome=${chromeVersion(systemUa)} 页面UA与固定UA一致=${pageUa == userAgent}" +
-                " ClientHints=$brands uaFp=${NetDiagnostics.fingerprint(userAgent)}",
+            "[诊断] 环境: 固定UA Chrome=${chromeVersion(effectiveUa)} 页面UA Chrome=${chromeVersion(pageUa)}" +
+                " 系统WebView Chrome=${chromeVersion(systemUa)} 页面UA与固定UA一致=${pageUa == effectiveUa}" +
+                " ClientHints=$brands uaFp=${NetDiagnostics.fingerprint(effectiveUa)}",
         )
     }
 
@@ -3999,9 +4499,13 @@ class BrowserSession(
         const val HCAPTCHA_CALLBACK_SETTLE_DELAY_MS = 300L
         const val POLL_INTERVAL_MS = 700L
         /** 无头静默补签总等待预算，耗尽后交由可见验证页处理。 */
-        const val HEADLESS_REVALIDATE_MAX_MS = 10_000L
+        const val HEADLESS_REVALIDATE_MAX_MS = 14_000L
         /** 页面加载完成后的无凭据等待预算；耗尽仅表示验证结果未确认。 */
         const val HEADLESS_LOADED_WAIT_MS = 5_500L
+        val HEADLESS_CHALLENGE_TITLE_REGEX = Regex(
+            "^(just a moment|checking your browser|verifying you are human|请稍候|请稍等|正在验证)",
+            RegexOption.IGNORE_CASE,
+        )
         const val LAYOUT_TIMEOUT_MS = 1_500L
         /** 同批并发请求在锁内合并跳过重验证的时间窗口（8 秒，覆盖单轮重载耗时）。 */
         const val COALESCE_CLEAR_WINDOW_MS = 8_000L

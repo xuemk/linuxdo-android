@@ -26,13 +26,14 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.runtime.key
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
@@ -48,6 +49,8 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.pager.HorizontalPager
@@ -90,6 +93,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.text.DateFormat
 import java.util.Date
 import kotlin.math.min
+import kotlin.math.roundToInt
+import org.linuxdo.android.ui.design.AppFontScale
 import org.linuxdo.android.Config
 import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.data.SavedTopic
@@ -123,6 +128,7 @@ import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosRow
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.linuxdo.android.ui.design.IosLoadingBox
 import org.linuxdo.android.ui.design.IosSwitch
 import org.linuxdo.android.ui.design.UserAvatar
@@ -173,7 +179,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -496,6 +501,8 @@ fun ProfileScreen(
     onOpenFollowing: () -> Unit = {},
     onOpenChat: () -> Unit = {},
     onOpenBlacklist: () -> Unit = {},
+    onOpenLdcStore: () -> Unit = {},
+    onOpenLdcMail: () -> Unit = {},
     onOpenUser: (username: String, primaryAvatar: String?, staticAvatar: String?) -> Unit = { _, _, _ -> },
     onComposePrivateMessage: (String) -> Unit = {},
     onOpenUserReplies: ((String) -> Unit)? = null,
@@ -527,10 +534,13 @@ fun ProfileScreen(
             if (section != ProfileSection.Summary && summaryFields.isEmpty()) {
                 onLoad(ProfileSection.Summary, false, false)
             }
-            if (!notificationOnly && userBadges == null && !isUserBadgesLoading) {
+            if (section != ProfileSection.Summary && !notificationOnly && userBadges == null && !isUserBadgesLoading) {
                 onRefreshUserBadges?.invoke()
             }
-            if (!notificationOnly) onLoadCdkScore()
+            if (!notificationOnly) {
+                kotlinx.coroutines.delay(600L)
+                onLoadCdkScore()
+            }
         }
         if (previousSection != section) {
             previousSection = section
@@ -1011,81 +1021,20 @@ fun ProfileScreen(
                         )
                     }
 
-                    // 5. 常用快捷卡片组 (实时聊天 与 本地拉黑用户)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        // 卡片 1: 实时聊天
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(IosTheme.colors.card)
-                                .border(
-                                    1.dp,
-                                    if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
-                                    RoundedCornerShape(16.dp)
-                                )
-                                .clickable(onClick = onOpenChat)
-                                .padding(horizontal = 14.dp, vertical = 10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text("💬", fontSize = 16.sp)
-                                        Text("实时聊天频道", style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold))
-                                    }
-                                    Text("与佬友在线互动畅聊", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
-                                }
-                                Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel.copy(alpha = 0.6f))
-                            }
-                        }
-                        // 卡片 2: 本地黑名单 (严格对齐文案规范与单行排版)
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(IosTheme.colors.card)
-                                .border(
-                                    1.dp,
-                                    if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
-                                    RoundedCornerShape(16.dp)
-                                )
-                                .clickable(onClick = onOpenBlacklist)
-                                .padding(horizontal = 14.dp, vertical = 10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text("🚫", fontSize = 16.sp)
-                                        Text("本地黑名单", style = IosTheme.type.body.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold))
-                                    }
-                                    Text(
-                                        text = "本机屏蔽话题、评论",
-                                        style = IosTheme.type.caption.copy(fontSize = 11.sp),
-                                        color = IosTheme.colors.secondaryLabel,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel.copy(alpha = 0.6f))
-                            }
-                        }
+                        ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, Modifier.weight(1f).fillMaxHeight())
+                        ProfileQuickLink("专属邮箱", "✉️", onOpenLdcMail, Modifier.weight(1f).fillMaxHeight())
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        ProfileQuickLink("实时聊天", "💬", onOpenChat, Modifier.weight(1f).fillMaxHeight())
+                        ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
                     }
 
                     // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
@@ -1365,6 +1314,35 @@ fun ProfileScreen(
             badge = badge,
             onDismiss = { selectedBadge = null },
         )
+    }
+}
+
+@Composable
+private fun ProfileQuickLink(
+    title: String,
+    icon: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier.fillMaxWidth().heightIn(min = 44.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(IosTheme.colors.card)
+            .border(1.dp, IosTheme.colors.separator.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(icon, fontSize = 16.sp)
+        Text(
+            title,
+            style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold),
+            modifier = Modifier.weight(1f),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel)
     }
 }
 
@@ -2082,6 +2060,15 @@ fun SettingsScreen(
     onSkinPreset: (org.linuxdo.android.ui.design.SkinPreset) -> Unit = {},
     isSelfHealing: Boolean = false,
     onSelfHealNetwork: () -> Unit = {},
+    fontScale: Float = AppFontScale.DEFAULT,
+    onFontScale: (Float) -> Unit = {},
+    showTopicScrollbar: Boolean = true,
+    onShowTopicScrollbar: (Boolean) -> Unit = {},
+    seeSignatures: Boolean = false,
+    signatureSyncBusy: Boolean = false,
+    signatureSyncNotice: String? = null,
+    onSyncSeeSignatures: () -> Unit = {},
+    onOpenWebSignaturePreferences: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var showSyncConfirmDialog by remember { mutableStateOf(false) }
@@ -2089,6 +2076,7 @@ fun SettingsScreen(
     var showAutoRefreshIntervalDialog by remember { mutableStateOf(false) }
     var showNotificationScopeDialog by remember { mutableStateOf(false) }
     var showTestPushLabDialog by remember { mutableStateOf(false) }
+    var showSignatureSyncDialog by remember { mutableStateOf(false) }
 
     val prefs = remember { context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE) }
     var devOptionsUnlocked by remember {
@@ -2289,9 +2277,85 @@ fun SettingsScreen(
         }
 
         // ── 2. 阅读与浏览 ──
+        if (page == SettingsPage.Reading) item("font-size") {
+            SectionTitle("字体大小")
+            IosGroupCard {
+                Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "字体大小 · ${(fontScale * 100).roundToInt()}%",
+                            style = IosTheme.type.body.copy(fontSize = 14.5.sp),
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            onClick = { onFontScale(AppFontScale.DEFAULT) },
+                            enabled = fontScale != AppFontScale.DEFAULT,
+                        ) {
+                            Text("恢复默认", style = IosTheme.type.footnote, maxLines = 1)
+                        }
+                    }
+                    Text(
+                        "调整应用内的文字大小，默认 100%。",
+                        style = IosTheme.type.footnote,
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                    Slider(
+                        value = fontScale,
+                        onValueChange = onFontScale,
+                        valueRange = AppFontScale.MIN..AppFontScale.MAX,
+                        steps = AppFontScale.STEPS,
+                        colors = SliderDefaults.colors(
+                            thumbColor = IosTheme.colors.accent,
+                            activeTrackColor = IosTheme.colors.accent,
+                            inactiveTrackColor = IosTheme.colors.separator,
+                        ),
+                        modifier = Modifier.fillMaxWidth().semantics { contentDescription = "字体大小" },
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(
+                            "较小 · ${(AppFontScale.MIN * 100).roundToInt()}%",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                        )
+                        Text(
+                            "较大 · ${(AppFontScale.MAX * 100).roundToInt()}%",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(IosTheme.colors.groupedBackground).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("字号预览", style = IosTheme.type.headline)
+                        Text("在 LINUX DO 分享见闻，阅读话题与回复。", style = IosTheme.type.body)
+                        Text("设置立即生效，并在下次打开时保留。", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    }
+                }
+            }
+        }
         if (page == SettingsPage.Reading) item("group-reading") {
             SectionTitle("列表与阅读偏好")
             IosGroupCard {
+                IosRow(onClick = { onShowTopicScrollbar(!showTopicScrollbar) }) {
+                    SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
+                        SettingBookIcon(tint = IosTheme.colors.accent)
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text("右侧楼层导航条", style = IosTheme.type.body.copy(fontSize = 14.5.sp))
+                        Text(
+                            "半透明悬浮于右侧，按住时显示清晰，拖动并松手跳转楼层；轻触不会跳转",
+                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                    IosSwitch(checked = showTopicScrollbar, onCheckedChange = onShowTopicScrollbar)
+                }
+                IosDivider()
                 // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
                 // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
                 if (false) {
@@ -2530,6 +2594,42 @@ fun SettingsScreen(
                             Text("✓", color = IosTheme.colors.accent, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         }
                     }
+                }
+
+                IosDivider()
+
+                // 2.18 显示用户签名（小尾巴，与网页端开关保持一致）
+                IosRow(onClick = { showSignatureSyncDialog = true }) {
+                    SettingIconBadge(bgColor = Color(0xFFEAF7EE)) {
+                        SettingPictureIcon(tint = Color(0xFF2E7D32))
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text("显示用户签名（小尾巴）", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Normal)
+                        Text(
+                            "与网页端「启用签名」设置保持一致，支持动画 SVG / GIF",
+                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                        if (!signatureSyncNotice.isNullOrBlank()) {
+                            Text(
+                                signatureSyncNotice,
+                                style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                                color = IosTheme.colors.accent,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        text = when {
+                            signatureSyncBusy -> "同步中…"
+                            seeSignatures -> "已开启 ›"
+                            else -> "已关闭 ›"
+                        },
+                        style = IosTheme.type.subheadline.copy(fontSize = 13.sp),
+                        color = if (seeSignatures && !signatureSyncBusy) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                    )
                 }
 
                 IosDivider()
@@ -3146,34 +3246,38 @@ fun SettingsScreen(
             var editingServer by remember { mutableStateOf<DohServer?>(null) }
             var showResetConfirmDialog by remember { mutableStateOf(false) }
 
-            val isVpnActive = remember(context) {
-                runCatching {
-                    val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-                    cm?.allNetworks?.any { network ->
-                        cm.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
-                    } ?: false
-                }.getOrDefault(false)
+            val netSecurityState = remember(context) {
+                runCatching { org.linuxdo.android.net.NetworkStateMonitor(context).detect() }
+                    .getOrDefault(org.linuxdo.android.net.NetworkSecurityState())
             }
+            val keepingDohOverVpn = netSecurityState.isVpn && !netSecurityState.isProxy && dohForceOverProxy
 
             SectionTitle("DoH 安全直连")
             IosGroupCard {
-                // VPN 开启提示
-                if (isVpnActive) {
+                // VPN / 系统代理开启提示
+                if (netSecurityState.shouldPauseDoh) {
                     IosRow(onClick = {}) {
-                        SettingIconBadge(bgColor = if (dohForceOverProxy) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)) {
-                            SettingInfoIcon(tint = if (dohForceOverProxy) Color(0xFF4CAF50) else Color(0xFFFF9500))
+                        SettingIconBadge(bgColor = if (keepingDohOverVpn) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)) {
+                            SettingInfoIcon(tint = if (keepingDohOverVpn) Color(0xFF4CAF50) else Color(0xFFFF9500))
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(
-                                if (dohForceOverProxy) "已检测到 VPN (已强制保持 DoH)" else "已检测到 VPN / 系统代理",
+                                when {
+                                    netSecurityState.isProxy -> "已检测到系统 HTTP 代理 (已让渡代理)"
+                                    keepingDohOverVpn -> "已检测到 VPN (已强制保持 DoH)"
+                                    else -> "已检测到 VPN / 系统代理"
+                                },
                                 style = IosTheme.type.body.copy(fontSize = 14.5.sp),
                                 fontWeight = FontWeight.SemiBold,
-                                color = if (dohForceOverProxy) Color(0xFF4CAF50) else Color(0xFFFF9500),
+                                color = if (keepingDohOverVpn) Color(0xFF4CAF50) else Color(0xFFFF9500),
                             )
                             Text(
-                                if (dohForceOverProxy) "已保持原生 DoH + ECH 隧道，可防止代理分流规则设为直连时的明文 SNI 阻断"
-                                else "若代理分流规则将 L 站设为了直连，可能导致打不开；建议开启下方「代理环境保持 DoH」",
+                                when {
+                                    netSecurityState.isProxy -> "系统 HTTP 代理下 Gecko 验证与业务请求统一走系统代理，避免双出口引发风控"
+                                    keepingDohOverVpn -> "已保持原生 DoH + ECH 隧道，可防止代理分流规则设为直连时的明文 SNI 阻断"
+                                    else -> "若 VPN 分流规则将 L 站设为了直连，可能导致打不开；可开启下方「代理环境保持 DoH」（系统 HTTP 代理下不生效）"
+                                },
                                 style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                                 modifier = Modifier.padding(top = 2.dp),
@@ -3247,7 +3351,7 @@ fun SettingsScreen(
                                 style = IosTheme.type.body.copy(fontSize = 14.5.sp),
                             )
                             Text(
-                                "开启 VPN/代理且分流规则直连 L 站时强制保持 DoH，防止明文 SNI 阻断",
+                                "仅对 VPN 生效：分流规则直连 L 站时保持 DoH，防止明文 SNI 阻断；系统 HTTP 代理下始终走代理，保持验证与业务同一出口",
                                 style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                                 modifier = Modifier.padding(top = 2.dp),
@@ -3932,6 +4036,82 @@ fun SettingsScreen(
                 onLogout()
             },
         )
+    }
+
+    if (showSignatureSyncDialog) {
+        Dialog(onDismissRequest = { showSignatureSyncDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 280.dp, max = 340.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(IosTheme.colors.card)
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("用户签名（小尾巴）", style = IosTheme.type.headline, fontWeight = FontWeight.Bold)
+                Text(
+                    "当前网页端状态：${if (seeSignatures) "已开启" else "已关闭"}。\nAPP 严格遵循 linux.do 网页端「个人偏好 → 个人资料 → 启用签名」开关，并在登录、切换账号及关闭网页偏好页后低频同步，避免额外请求触发 429。",
+                    style = IosTheme.type.caption,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+                if (!signatureSyncNotice.isNullOrBlank()) {
+                    Text(
+                        signatureSyncNotice,
+                        style = IosTheme.type.caption,
+                        color = IosTheme.colors.accent,
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.accent.copy(alpha = 0.12f))
+                            .clickable {
+                                showSignatureSyncDialog = false
+                                onOpenWebSignaturePreferences()
+                            }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "前往网页端开启或关闭 ›",
+                            style = IosTheme.type.body,
+                            fontWeight = FontWeight.SemiBold,
+                            color = IosTheme.colors.accent,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.groupedBackground)
+                            .clickable(enabled = !signatureSyncBusy) { onSyncSeeSignatures() }
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (signatureSyncBusy) "正在从网页端同步…" else "立即从网页端同步状态",
+                            style = IosTheme.type.body,
+                            color = if (signatureSyncBusy) IosTheme.colors.secondaryLabel else IosTheme.colors.label,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Text(
+                        "关闭",
+                        style = IosTheme.type.body,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { showSignatureSyncDialog = false }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                }
+            }
+        }
     }
 
     if (showAutoRefreshIntervalDialog) {
@@ -5174,7 +5354,13 @@ fun UnreadBell(count: Int, onClick: () -> Unit) {
 
 /** 登录/验证页顶部的说明条;WebView 本体由 AppShell 抬到它下方显示。 */
 @Composable
-fun WebTopBar(screen: Screen, onCancel: () -> Unit = {}, onRetry: () -> Unit = {}) {
+fun WebTopBar(
+    screen: Screen,
+    onCancel: () -> Unit = {},
+    onRetry: () -> Unit = {},
+    retryEnabled: Boolean = true,
+    retryRemainingSeconds: Long = 0L,
+) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -5188,7 +5374,16 @@ fun WebTopBar(screen: Screen, onCancel: () -> Unit = {}, onRetry: () -> Unit = {
             color = IosTheme.colors.label,
         )
         androidx.compose.material3.TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterStart)) { Text("返回") }
-        androidx.compose.material3.TextButton(onClick = onRetry, modifier = Modifier.align(Alignment.CenterEnd)) { Text("重试") }
+        androidx.compose.material3.TextButton(
+            onClick = onRetry,
+            enabled = retryEnabled,
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            Text(
+                if (!retryEnabled && retryRemainingSeconds > 0L) "重试(${retryRemainingSeconds}s)"
+                else "重试",
+            )
+        }
     }
 }
 
@@ -8342,6 +8537,7 @@ fun TopicCreatorSheet(
         // 正文编辑区（所见即所得图文流：基于原生 EditText + ReplacementSpan，全光标连续穿越）
         val textColorInt = IosTheme.colors.label.toArgb()
         val hintColorInt = IosTheme.colors.tertiaryLabel.toArgb()
+        val editorTextSizePx = with(LocalDensity.current) { 16.sp.toPx() }
 
         Box(
             modifier = Modifier
@@ -8367,6 +8563,7 @@ fun TopicCreatorSheet(
                 },
                 update = { view ->
                     view.updateThemeColors(textColorInt, hintColorInt)
+                    view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                     view.setCompletionSource(completionSource, categoryId = state.categoryId)
                     view.setOnEditPollListener { span, spec ->
                         editingPollTarget = Pair(span, spec)
@@ -10438,6 +10635,8 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
         FloatingAction.Connect -> Color(0xFF1E88E5).copy(alpha = 0.15f) to Color(0xFF1E88E5)
         FloatingAction.Chat -> Color(0xFFE91E63).copy(alpha = 0.15f) to Color(0xFFE91E63)
         FloatingAction.Apps -> Color(0xFF07C160).copy(alpha = 0.15f) to Color(0xFF07C160)
+        FloatingAction.LdcStore -> Color(0xFFF59E0B).copy(alpha = 0.15f) to Color(0xFFF59E0B)
+        FloatingAction.LdcMail -> Color(0xFF007AFF).copy(alpha = 0.15f) to Color(0xFF007AFF)
     }
 
     Box(
@@ -10554,6 +10753,20 @@ private fun FloatingActionSettingBadge(action: FloatingAction, modifier: Modifie
                     FloatingAction.Apps -> {
                         drawArc(color = actionTint, startAngle = 120f, sweepAngle = 250f, useCenter = false, topLeft = Offset(3.5f, 3.5f), size = Size(11f, 11f), style = stroke)
                         drawArc(color = actionTint, startAngle = -60f, sweepAngle = 250f, useCenter = false, topLeft = Offset(9.5f, 9.5f), size = Size(11f, 11f), style = stroke)
+                    }
+                    FloatingAction.LdcStore -> {
+                        val bag = Path().apply {
+                            moveTo(5f, 8f); lineTo(19f, 8f); lineTo(20.5f, 20f); lineTo(3.5f, 20f); close()
+                        }
+                        drawPath(bag, actionTint, style = stroke)
+                        drawArc(actionTint, 180f, 180f, false, Offset(8f, 3f), Size(8f, 10f), style = stroke)
+                    }
+                    FloatingAction.LdcMail -> {
+                        drawRoundRect(actionTint, Offset(3.5f, 5.5f), Size(17f, 13f), CornerRadius(2f, 2f), style = stroke)
+                        val flap = Path().apply {
+                            moveTo(4.5f, 7f); lineTo(12f, 13f); lineTo(19.5f, 7f)
+                        }
+                        drawPath(flap, actionTint, style = stroke)
                     }
                 }
             }
@@ -11016,12 +11229,11 @@ internal fun TopicMetadataEditorSheet(
     val editable = state.original?.canEdit == true && !state.saving && !state.loading
     val category = state.rules?.categories?.firstOrNull { it.id == state.categoryId }
     val requestClose = { if (!state.saving) { if (state.dirty) discard = true else onClose() } }
-    Dialog(onDismissRequest = requestClose, properties = androidx.compose.ui.window.DialogProperties(
-        usePlatformDefaultWidth = false, decorFitsSystemWindows = false, dismissOnClickOutside = false)) {
+    FullscreenDialog(onDismissRequest = requestClose, dismissOnClickOutside = false) {
         androidx.activity.compose.BackHandler(enabled = true, onBack = requestClose)
         val focus = androidx.compose.ui.platform.LocalFocusManager.current
         val keyboard = LocalSoftwareKeyboardController.current
-        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).systemBarsPadding().imePadding()) {
+        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground).safeDrawingPadding()) {
             ReaderPanelHeader(
                 "话题编辑", onClose = requestClose, closeEnabled = !state.saving,
                 actionText = if (state.saving) "保存中…" else "保存", actionEnabled = state.canSave,

@@ -302,8 +302,9 @@ class UserApiKeyAuthService(
         label: String,
         generation: Long,
     ): TransportResult {
-        val execute: suspend () -> TransportResult = {
+        val execute: suspend (Long) -> TransportResult = { requestRound ->
             checkSession(generation)
+            throwIfRateLimitCoolingDown()
             suspendCancellableCoroutine { continuation ->
                 val call = client.newCall(request)
                 continuation.invokeOnCancellation { call.cancel() }
@@ -313,6 +314,7 @@ class UserApiKeyAuthService(
                     }
 
                     override fun onResponse(call: Call, response: Response) {
+                        val receivedAt = android.os.SystemClock.elapsedRealtime()
                         try {
                             val result = response.use {
                                 checkSession(generation)
@@ -330,15 +332,23 @@ class UserApiKeyAuthService(
                                 diagnostics.log("网页授权 $label: HTTP ${response.code}, cf-mitigated=${mitigated ?: "-"}")
                                 if (response.code == 429) {
                                     val remaining = TopicRepository.enterRateLimitCooldown(
-                                        label, retryAfter, store,
+                                        path = label,
+                                        retryAfterSeconds = retryAfter,
+                                        sessionStore = store,
                                         cfChallenge = mitigated?.contains("challenge", ignoreCase = true) == true ||
                                             TopicRepository.isCfChallengeBody(body),
+                                        requestRound = requestRound,
+                                        requestGeneration = generation,
+                                        receivedAtElapsedMs = receivedAt,
                                     )
-                                    throw RateLimitException(remaining)
+                                    throw RateLimitException(remaining, round = requestRound, sessionGeneration = generation, receivedAtElapsedMs = receivedAt, alreadyRecorded = true)
                                 }
                                 TransportResult(
-                                    response.code, body,
-                                    ChallengeDetector.isChallenge(response.code, mitigated, body), retryAfter,
+                                    status = response.code,
+                                    body = body,
+                                    challenged = ChallengeDetector.isChallenge(response.code, mitigated, body),
+                                    retryAfterSeconds = retryAfter,
+                                    receivedAtElapsedMs = receivedAt,
                                 )
                             }
                             if (continuation.isActive) continuation.resume(result)
@@ -353,16 +363,36 @@ class UserApiKeyAuthService(
             if (request.method == "POST") {
                 TopicRepository.postGate.withLock {
                     TopicRepository.throttlePost(burst = true)
+                    var status = -1
                     try {
-                        execute()
+                        TopicRepository.withMainSiteWriteGate(sessionStore = store, statusOf = { status }) { round ->
+                            try {
+                                execute(round).also { status = it.status }
+                            } catch (rateLimited: RateLimitException) {
+                                if (rateLimited.alreadyRecorded) status = 429
+                                throw rateLimited
+                            }
+                        }
                     } finally {
                         TopicRepository.markPostCompleted()
                     }
                 }
             } else {
                 TopicRepository.getSemaphore.withPermit {
-                    TopicRepository.acquireGetSlot { false }
-                    execute()
+                    var status = -1
+                    TopicRepository.withMainSiteReadGate(
+                        isMainSite = true,
+                        present = true,
+                        sessionStore = store,
+                        statusOf = { status },
+                    ) { round ->
+                        try {
+                            execute(round).also { status = if (it.challenged) 403 else it.status }
+                        } catch (rateLimited: RateLimitException) {
+                            if (rateLimited.alreadyRecorded) status = 429
+                            throw rateLimited
+                        }
+                    }
                 }
             }
         } catch (error: IOException) {

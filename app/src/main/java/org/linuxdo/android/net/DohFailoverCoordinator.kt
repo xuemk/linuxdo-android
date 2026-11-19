@@ -133,13 +133,16 @@ class DohFailoverCoordinator(
     val currentClient: OkHttpClient
         get() = currentEpoch.get().client
 
+    private fun shouldPauseDohForProxy(state: NetworkSecurityState = networkMonitor.detect()): Boolean =
+        state.shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+
     /**
      * 判断异常是否符合故障转移触发资格。
      */
     fun isFailoverEligible(error: Throwable): Boolean {
         // 如果未开启自动故障切换，或 DoH 本身已关闭，或当前处于 VPN/系统代理暂停中，则不触发切换
         if (!store.isDohEnabled() || !store.isDohAutoFailoverEnabled()) return false
-        if (networkMonitor.detect().shouldPauseDoh) return false
+        if (shouldPauseDohForProxy()) return false
 
         return isDefinitiveDohEchError(error) || isJitterError(error)
     }
@@ -292,6 +295,27 @@ class DohFailoverCoordinator(
         }
     }
 
+    /** 主动清理空闲/半开连接，并在直连 Anycast 模式下轮换优选节点（供幂等单次重试恢复）。 */
+    fun onIdempotentSingleFailureRetry(epochGen: Long) {
+        val epoch = currentEpoch.get()
+        if (epoch.generation != epochGen) return
+        runCatching { epoch.client.connectionPool.evictAll() }
+        if (epoch.transport != null && (!store.isDohEnabled() || epoch.routeMode == NetworkRouteMode.DIRECT)) {
+            anycastPool?.rotateWinner()
+        }
+    }
+
+    /** 进程启动或冷态预热 Anycast 节点池，避免首个业务请求盲选未探测节点超时。 */
+    fun warmUpAnycastIfNeeded() {
+        val pool = anycastPool ?: return
+        if (pool.hasHealthyProbedNode() || shouldPauseDohForProxy()) return
+        scope.launch {
+            if (!pool.hasHealthyProbedNode() && !shouldPauseDohForProxy()) {
+                runCatching { pool.refresh() }
+            }
+        }
+    }
+
     /** 清除所有惩罚（供用户重置使用） */
     fun clearAllPenalties() {
         penalties.clear()
@@ -343,8 +367,8 @@ class DohFailoverCoordinator(
     }
 
     private fun buildEpoch(gen: Long, server: DohServer): TransportEpoch {
-        // VPN / 系统代理享有最高优先级：整体让渡系统网络，不做任何直连或 DoH 特殊处理。
-        val shouldYieldToSystem = networkMonitor.detect().shouldPauseDoh
+        // VPN / 系统代理默认让渡系统网络；仅当用户显式开启「代理环境保持 DoH」时才继续维持 DoH + ECH 直连。
+        val shouldYieldToSystem = shouldPauseDohForProxy()
         // 「直连优先」：无 VPN 时**始终**建立原生传输层。它用内置 ECH 公钥握手，不依赖 DoH
         // 可达性（见 native 的 ech.rs），因此设置里的 DoH 开关只决定 A 记录解析源，
         // 不再决定直连能力的存亡 —— 旧实现把 transport 绑在 isDohEnabled 上，用户一关开关
@@ -443,8 +467,8 @@ class DohFailoverCoordinator(
         }
 
         val netState = networkMonitor.detect()
-        if (netState.shouldPauseDoh) {
-            val summary = if (netState.isVpn) "VPN 已开启，直连已让渡系统网络" else "系统代理已开启，直连已让渡系统网络"
+        if (shouldPauseDohForProxy(netState)) {
+            val summary = if (netState.isProxy) "系统代理已开启，直连已让渡系统网络" else "VPN 已开启，直连已让渡系统网络"
             latestSmartSummary.set(summary)
             onSmartRouteUpdated?.invoke(activeRouteMode.get(), -1L, -1L, summary)
             return

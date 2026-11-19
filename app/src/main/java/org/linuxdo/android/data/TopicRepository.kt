@@ -233,9 +233,11 @@ class TopicRepository(
             val savedWallUntil = store.getRateLimitedUntil()
             val nowWall = System.currentTimeMillis()
             if (savedWallUntil > nowWall) {
-                val remaining = (savedWallUntil - nowWall).coerceAtMost(RATE_LIMIT_COOLDOWN_MS)
+                val remaining = (savedWallUntil - nowWall).coerceAtMost(MAX_PERSISTED_COOLDOWN_MS)
                 synchronized(rateLimitLock) {
                     rateLimitedUntil = maxOf(rateLimitedUntil, SystemClock.elapsedRealtime() + remaining)
+                    // 进程重启后恢复的冷却同样需要到期单探针，不能到期即放开并发。
+                    rateLimitProbeRequired = true
                 }
             }
         }
@@ -337,46 +339,134 @@ class TopicRepository(
         path: String,
         retryAfterSeconds: Long? = null,
         cfChallenge: Boolean = false,
+        requestRound: Long = -1L,
+        requestGeneration: Long = -1L,
+        receivedAtElapsedMs: Long = 0L,
     ): RateLimitException {
         val host = requestHost(path)
         if (host != Config.HOST) {
             val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(retryAfterSeconds, RATE_LIMIT_COOLDOWN_MS)
+            val now = SystemClock.elapsedRealtime()
+            val origin = if (receivedAtElapsedMs in 1L..now) receivedAtElapsedMs else now
             val remaining = synchronized(siteRateLimitedUntil) {
-                val now = SystemClock.elapsedRealtime()
-                val until = maxOf(siteRateLimitedUntil[host] ?: 0L, now + cooldownMs)
+                val until = maxOf(siteRateLimitedUntil[host] ?: 0L, origin + cooldownMs)
                 siteRateLimitedUntil[host] = until
-                until - now
+                (until - now).coerceAtLeast(0L)
             }
             diagnostics.log("子站限流(${if (cfChallenge) "CF质询" else "429"}): $host，暂停该站请求 ${(remaining + 999L) / 1_000L}s")
-            return RateLimitException(remaining)
+            return RateLimitException(remaining, round = requestRound, sessionGeneration = requestGeneration, receivedAtElapsedMs = origin, alreadyRecorded = true)
         }
-        val remaining = Companion.enterRateLimitCooldown(path, retryAfterSeconds, sessionStore, cfChallenge)
-        val kind = if (cfChallenge) "CF质询" else "429"
-        diagnostics.log(
-            "服务端限流($kind): $path，暂停自动网络请求 ${remaining / 1_000L}s，" +
-                "后台池惩罚 ${ApiQuotaPool.UNREAD_POLL.penaltyRemainingMs() / 1_000L}s",
+        val remaining = Companion.enterRateLimitCooldown(
+            path = path,
+            retryAfterSeconds = retryAfterSeconds,
+            sessionStore = sessionStore,
+            cfChallenge = cfChallenge,
+            requestRound = requestRound,
+            requestGeneration = requestGeneration,
+            receivedAtElapsedMs = receivedAtElapsedMs,
         )
-        return RateLimitException(remaining)
+        val kind = if (cfChallenge) "CF质询" else "429"
+        if (remaining > 0L) {
+            diagnostics.log(
+                "服务端限流($kind): $path，暂停自动网络请求 ${remaining / 1_000L}s，" +
+                    "后台池惩罚 ${ApiQuotaPool.UNREAD_POLL.penaltyRemainingMs() / 1_000L}s",
+            )
+        } else {
+            diagnostics.log("服务端限流($kind)迟到旧响应: $path，归属旧轮次且已恢复，不重开冷却")
+        }
+        return RateLimitException(
+            retryAfterMs = remaining,
+            round = requestRound,
+            sessionGeneration = requestGeneration,
+            receivedAtElapsedMs = receivedAtElapsedMs,
+            alreadyRecorded = true,
+        )
     }
 
-    /** 主站速率型 429 挑战：递增冷却 + 轻提示，凭据保留；连续超档触发换线时同步淘汰旧节点凭据。 */
+    /** 主站速率型 429 挑战：递增冷却 + 轻提示，凭据保留；连续超档触发换线时保留健康凭据并解除静默补签冷却。 */
     private fun enterChallenge429Cooldown(
         path: String,
         retryAfterSeconds: Long?,
         sentClearanceFp: String = "-",
+        requestRound: Long = -1L,
+        requestGeneration: Long = -1L,
+        receivedAtElapsedMs: Long = 0L,
     ): RateLimitException {
-        if (requestHost(path) != Config.HOST) return enterRateLimitCooldown(path, retryAfterSeconds, cfChallenge = true)
-        val (remaining, streak, rotated) = Companion.enterChallenge429Cooldown(path, retryAfterSeconds, sessionStore)
-        if (rotated && sentClearanceFp != "-") {
-            noteRequestClearanceChallenged(sentClearanceFp, path)
-            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线并淘汰旧节点凭据(fp=$sentClearanceFp)，冷却 ${(remaining + 999L) / 1_000L}s")
+        if (requestHost(path) != Config.HOST) {
+            return enterRateLimitCooldown(
+                path = path,
+                retryAfterSeconds = retryAfterSeconds,
+                cfChallenge = true,
+                requestRound = requestRound,
+                requestGeneration = requestGeneration,
+                receivedAtElapsedMs = receivedAtElapsedMs,
+            )
+        }
+        val (remaining, streak, rotated) = Companion.enterChallenge429Cooldown(
+            path = path,
+            retryAfterSeconds = retryAfterSeconds,
+            sessionStore = sessionStore,
+            requestRound = requestRound,
+            requestGeneration = requestGeneration,
+            receivedAtElapsedMs = receivedAtElapsedMs,
+        )
+        if (remaining <= 0L) {
+            diagnostics.log("429 速率挑战迟到旧响应: $path，已恢复或跨会话，不重开冷却")
+        } else if (rotated) {
+            // 仅轮换 Anycast 接入节点并不会改变客户端出口 IP，保留 cf_clearance 避免自毁进入 0 凭据裸奔死循环；
+            // 同时清除旧的静默补签冷却锁，允许新节点下必要时即时补签。
+            getRevalidateBlockedUntil = 0L
+            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线降温并保留 cf_clearance，过渡冷却 ${(remaining + 999L) / 1_000L}s")
         } else {
             diagnostics.log("429 速率挑战(第 $streak 次): $path，保留 cf_clearance，递增冷却 ${(remaining + 999L) / 1_000L}s 后自愈")
         }
-        return RateLimitException(remaining)
+        return RateLimitException(
+            retryAfterMs = remaining,
+            round = requestRound,
+            sessionGeneration = requestGeneration,
+            receivedAtElapsedMs = receivedAtElapsedMs,
+            alreadyRecorded = true,
+        )
     }
 
     fun resetChallenge429Streak() = Companion.resetChallenge429Streak()
+
+    fun recordBackgroundPollHttpResult(
+        path: String,
+        status: Int,
+        cfMitigated: String?,
+        retryAfterSeconds: Long?,
+        sentClearanceFp: String,
+    ): Long {
+        if (status in 200..299) {
+            ApiQuotaPool.UNREAD_POLL.onSuccess()
+            onBackgroundMainSiteGetSucceeded(sessionStore)
+            return 0L
+        }
+        val challenged = ChallengeDetector.isChallenge429(status, cfMitigated, "") ||
+            cfMitigated?.contains("challenge", ignoreCase = true) == true
+        if (status == 429) {
+            val ex = if (challenged) {
+                enterChallenge429Cooldown(
+                    path = path,
+                    retryAfterSeconds = retryAfterSeconds,
+                    sentClearanceFp = sentClearanceFp,
+                )
+            } else {
+                enterRateLimitCooldown(
+                    path = path,
+                    retryAfterSeconds = retryAfterSeconds,
+                    cfChallenge = false,
+                )
+            }
+            return ex.retryAfterMs
+        }
+        if (challenged && status in listOf(403, 503)) {
+            ApiQuotaPool.onServerRateLimited(60_000L, cfChallenge = true)
+            return 60_000L
+        }
+        return 0L
+    }
 
     /**
      * 阅读进度上报复用的 CSRF Token。
@@ -751,9 +841,12 @@ class TopicRepository(
     /** timings 重新同步成功，横幅可以收起。 */
     var onTimingsRecovered: (() -> Unit)? = null
 
+    /** 会话接口同步到网页端「启用签名」(see_signatures) 偏好时回调。 */
+    var onUserSeeSignaturesSynced: ((userId: Long, enabled: Boolean) -> Unit)? = null
+
     private fun markTimingsSynced() {
         timingsCooldownUntil = 0L
-        resetChallenge429Streak()
+        Companion.stepDownChallenge429Streak()
         onTimingsRecovered?.invoke()
     }
 
@@ -777,6 +870,7 @@ class TopicRepository(
     fun armPostVerificationRunway(runwayMs: Long) {
         timingsCooldownUntil = SystemClock.elapsedRealtime() + runwayMs
         cachedCsrfToken = null
+        getRevalidateBlockedUntil = 0L
     }
 
     enum class VerificationProbeOutcome {
@@ -790,6 +884,25 @@ class TopicRepository(
         INCONCLUSIVE,
         /** 复核被 429 限流（含速率型挑战）：凭据未必失效，调用方应递增退避后换轻量接口重探。 */
         RATE_LIMITED,
+    }
+
+    data class VerificationProbeResult(
+        val outcome: VerificationProbeOutcome,
+        val status: Int? = null,
+        val retryAfterSeconds: Long? = null,
+        val detail: String? = null,
+    ) {
+        val retryAfterMillis: Long
+            get() {
+                val seconds = (retryAfterSeconds ?: 0L).coerceAtLeast(0L)
+                return if (seconds > Long.MAX_VALUE / 1_000L) Long.MAX_VALUE else seconds * 1_000L
+            }
+
+        fun retryAtElapsedMillis(now: Long, minimumWaitMs: Long): Long {
+            val elapsed = now.coerceAtLeast(0L)
+            val waitMs = maxOf(minimumWaitMs.coerceAtLeast(0L), retryAfterMillis)
+            return elapsed + waitMs.coerceAtMost(Long.MAX_VALUE - elapsed)
+        }
     }
 
     fun resolveVerificationProbePath(probePath: String?): String {
@@ -806,7 +919,7 @@ class TopicRepository(
      * 验证页走 Gecko 自己的 DoH/ECH 与 TLS 栈，签发的 cf_clearance 不一定被 CF 认作同一访客；
      * 区分“放行 / 挑战 / 暂时无法判断(0、429、5xx)”，并对 429 落实 Retry-After 与全局限流冷却。
      */
-    suspend fun probeClearanceAfterVerification(probePath: String? = null): VerificationProbeOutcome =
+    suspend fun probeClearanceAfterVerification(probePath: String? = null): VerificationProbeResult =
         probeVerificationTarget(probePath = probePath, afterCompletion = true)
 
     /**
@@ -815,24 +928,29 @@ class TopicRepository(
      * 不能再依赖页面 DOM 标记或 Gecko 新签发凭据来判定完成。
      * 严格遵守 429 冷却，且只有拿到明确非挑战的 2xx..4xx（非 429）响应才判为 CLEARED。
      */
-    suspend fun probeAppPathDuringVerification(probePath: String? = null): VerificationProbeOutcome =
+    suspend fun probeAppPathDuringVerification(probePath: String? = null): VerificationProbeResult =
         probeVerificationTarget(probePath = probePath, afterCompletion = false)
 
     private suspend fun probeVerificationTarget(
         probePath: String?,
         afterCompletion: Boolean,
-    ): VerificationProbeOutcome {
+    ): VerificationProbeResult {
         val userId = sessionStore?.currentUserId()
         val generation = sessionStore?.sessionGeneration
         checkSiteSession(userId, generation)
         val targetPath = resolveVerificationProbePath(probePath)
         val stageLabel = if (afterCompletion) "验证后凭据复核" else "验证页旁路探测"
-        if (isRateLimitCoolingDown()) {
+        if (isRateLimitCoolingDown() || (!afterCompletion && isMainSiteGateBusy())) {
+            val remSec = (rateLimitRemainingMs() + 999L) / 1_000L
             diagnostics.logThrottled(
                 "verify-probe-cooldown",
-                "$stageLabel: 429 冷却还剩 ${(rateLimitRemainingMs() + 999L) / 1_000L}s，跳过探测 $targetPath",
+                if (remSec > 0L) "$stageLabel: 429 冷却还剩 ${remSec}s，跳过探测 $targetPath"
+                else "$stageLabel: 主站正处单探针或低速恢复期，让行跳过旁路探测 $targetPath",
             )
-            return VerificationProbeOutcome.DEFERRED
+            return VerificationProbeResult(
+                VerificationProbeOutcome.DEFERRED,
+                detail = if (remSec > 0L) "处于 429 冷却期 (${remSec}s)" else "主站正处恢复让行期",
+            )
         }
         val transport = transportProvider()
         val result = try {
@@ -847,12 +965,18 @@ class TopicRepository(
                 "verify-probe-error",
                 "$stageLabel(${transport.name}): $targetPath 异常(${error.javaClass.simpleName})，暂无法判断",
             )
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                detail = "网络请求异常 (${error.javaClass.simpleName})",
+            )
         }
         checkSiteSession(userId, generation)
         if (result == null) {
             diagnostics.logThrottled("verify-probe-timeout", "$stageLabel(${transport.name}): $targetPath 探测超时，继续等待")
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                detail = "复核请求超时 (${VERIFY_PROBE_TIMEOUT_MS / 1_000L}s)",
+            )
         }
         diagnostics.recordStatus(transport.name, result.status, targetPath)
         val challenge429 = result.status == 429 && (
@@ -864,10 +988,20 @@ class TopicRepository(
             // 速率型挑战只由验证页自身递增退避，不写主站全局冷却；真实业务限流仍需全局退让。
             if (!challenge429) enterRateLimitCooldown(targetPath, result.retryAfterSeconds)
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> 429(${if (challenge429) "速率挑战" else "限流"})，退避后重探")
-            return VerificationProbeOutcome.RATE_LIMITED
+            return VerificationProbeResult(
+                VerificationProbeOutcome.RATE_LIMITED,
+                result.status,
+                result.retryAfterSeconds,
+                detail = if (challenge429) "Cloudflare 速率限制 (HTTP 429)" else "站点请求限流 (HTTP 429)",
+            )
         } else if (isRateLimitCoolingDown()) {
             // 探测在途时其他请求也可能收到 429，不能用本次 200 提前解除它的冷却。
-            return VerificationProbeOutcome.INCONCLUSIVE
+            return VerificationProbeResult(
+                VerificationProbeOutcome.INCONCLUSIVE,
+                result.status,
+                result.retryAfterSeconds,
+                detail = "当前处于 429 限流冷却等待期",
+            )
         }
         if (result.challenged) {
             if (afterCompletion) {
@@ -878,17 +1012,33 @@ class TopicRepository(
                     "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=true，继续等待验证页",
                 )
             }
-            return VerificationProbeOutcome.CHALLENGED
+            return VerificationProbeResult(
+                VerificationProbeOutcome.CHALLENGED,
+                result.status,
+                result.retryAfterSeconds,
+                detail = "HTTP ${result.status} 安全验证拦截",
+            )
         }
         if (result.status in 200..499) {
             diagnostics.log("$stageLabel(${transport.name}): $targetPath -> ${result.status}，已放行")
-            return VerificationProbeOutcome.CLEARED
+            return VerificationProbeResult(VerificationProbeOutcome.CLEARED, result.status)
         }
         diagnostics.logThrottled(
             "verify-probe-inconclusive",
             "$stageLabel(${transport.name}): $targetPath -> ${result.status} challenged=false，暂无法判断",
         )
-        return VerificationProbeOutcome.INCONCLUSIVE
+        val failureDetail = if (result.status == 0) {
+            val summary = result.body.lineSequence().firstOrNull()?.trim()?.take(48).orEmpty()
+            if (summary.isNotBlank()) "网络连接失败 ($summary)" else "网络连接中断或超时"
+        } else {
+            "源站服务异常 (HTTP ${result.status})"
+        }
+        return VerificationProbeResult(
+            VerificationProbeOutcome.INCONCLUSIVE,
+            result.status,
+            result.retryAfterSeconds,
+            detail = failureDetail,
+        )
     }
 
     /** 阅读同步触发的手工过盾完成后调用：下一次心跳优先走 WebView 网络栈（起飞缓冲由 [armPostVerificationRunway] 统一设置）。 */
@@ -957,9 +1107,9 @@ class TopicRepository(
             suspend fun sendViaFallback(transport: Transport, csrfFallback: String?): TransportResult? = try {
                 postGate.withLock {
                     ensureReadingActive()
-                    if (isRateLimitCoolingDown()) return@withLock null
+                    if (isMainSiteGateBusy()) return@withLock null
                     throttlePost(burst = true)
-                    if (isRateLimitCoolingDown()) return@withLock null
+                    if (isMainSiteGateBusy()) return@withLock null
                     val fallbackCsrf = transport.obtainCsrfToken() ?: csrfFallback ?: return@withLock null
                     ensureReadingActive()
                     try {
@@ -1024,10 +1174,10 @@ class TopicRepository(
             var requestStartedAt = 0L
             suspend fun sendViaPrimary(csrf: String, burst: Boolean = false): TransportResult? = postGate.withLock {
                 ensureReadingActive()
-                if (isRateLimitCoolingDown()) return@withLock null
+                if (isMainSiteGateBusy()) return@withLock null
                 throttlePost(burst = burst)
                 ensureReadingActive()
-                if (isRateLimitCoolingDown()) return@withLock null
+                if (isMainSiteGateBusy()) return@withLock null
                 requestStartedAt = SystemClock.elapsedRealtime()
                 try {
                     primaryTransport.write("/topics/timings", "POST", form, csrf, Transport.FORM_CONTENT_TYPE, present = false)
@@ -1281,13 +1431,22 @@ class TopicRepository(
             val generation = sessionStore?.sessionGeneration ?: return@withLock emptyList()
             val path = "/message-bus/$clientId/poll"
             val config = getPollingConfiguration(generation)
+            var pollRound = currentRateLimitRound()
             backgroundGetGate.withLock {
                 val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
                 if (wait > 0L) delay(wait)
                 ensureRequestAllowed()
                 throwIfRateLimitCoolingDown()
                 if (isSilentPrefetchBackingOff()) throw NeedsInteractiveVerification("话题订阅正在退避")
-                acquireGetSlot { isRateLimitCoolingDown() }
+                val pollIsMainSite = config.pollUrl(clientId).host == Config.HOST
+                val slotTicket = acquireGetSlot(
+                    isMainSite = pollIsMainSite,
+                    present = false,
+                    allowClaimProbe = false,
+                ) { generation }
+                // 长轮询会挂起 70 秒，不能占住恢复期的单并发名额；它只服从放行间隔。
+                releaseInFlight(slotTicket)
+                pollRound = slotTicket.round
                 currentCoroutineContext().ensureActive()
                 lastBackgroundGetAt = SystemClock.elapsedRealtime()
             }
@@ -1334,6 +1493,7 @@ class TopicRepository(
                                     challenged = ChallengeDetector.isChallenge(incoming.code, incoming.header("cf-mitigated"), body),
                                     retryAfterSeconds = HttpHeaderUtils.extractRetryAfterSeconds(
                                         incoming.header("Retry-After"), incoming.header("x-ratelimit-reset"), body),
+                                    receivedAtElapsedMs = SystemClock.elapsedRealtime(),
                                 )
                                 if (continuation.isActive) continuation.resumeWith(Result.success(result))
                             }
@@ -1353,8 +1513,14 @@ class TopicRepository(
             when {
                 result.status == 429 -> {
                     if (result.challenged) enterSilentPrefetchBackoff(NeedsInteractiveVerification("话题订阅被挑战拦截"))
-                    throw enterRateLimitCooldown(path, maxOf(if (result.challenged) 120L else 15L, result.retryAfterSeconds ?: 0L),
-                        cfChallenge = result.challenged)
+                    throw enterRateLimitCooldown(
+                        path = path,
+                        retryAfterSeconds = maxOf(if (result.challenged) 120L else 15L, result.retryAfterSeconds ?: 0L),
+                        cfChallenge = result.challenged,
+                        requestRound = pollRound,
+                        requestGeneration = generation,
+                        receivedAtElapsedMs = result.receivedAtElapsedMs,
+                    )
                 }
                 result.challenged || result.status == 403 -> {
                     val error = NeedsInteractiveVerification("话题订阅被拦截，停止自动请求")
@@ -1448,17 +1614,18 @@ class TopicRepository(
      * 4. /u/{username}.json（用户公开资料根对象）。
      * 成功探测后自动录入 AvatarCache 全局单例。
      */
-    suspend fun resolveAnimatedAvatar(username: String): String? {
+    suspend fun resolveAnimatedAvatar(username: String, present: Boolean = false): String? {
         val cleanUser = username.trim().removePrefix("@")
         if (cleanUser.isBlank()) return null
         val cached = AvatarCache.get(cleanUser)
         if (!cached.isNullOrBlank() && isAnimatedAvatarPath(cached)) {
             return cached
         }
+        if (AvatarCache.isNonAnimated(cleanUser)) return null
 
         // 1. /u/search/users.json?term= (精准匹配 BasicUser)
         val fromSearch = runCatching {
-            val searchJson = objectRequest("/u/search/users.json?term=${encode(cleanUser)}")
+            val searchJson = objectRequest("/u/search/users.json?term=${encode(cleanUser)}", present = present)
             val users = searchJson.objects("users")
             val matched = users.firstOrNull { it.text("username").equals(cleanUser, ignoreCase = true) }
             matched?.text("animated_avatar")?.takeIf(::isAnimatedAvatarPath)
@@ -1470,7 +1637,7 @@ class TopicRepository(
 
         // 2. /user_actions.json
         val fromActions = runCatching {
-            val acts = objectRequest("/user_actions.json?username=${encode(cleanUser)}&offset=0&limit=1").objects("user_actions")
+            val acts = objectRequest("/user_actions.json?username=${encode(cleanUser)}&offset=0&limit=1", present = present).objects("user_actions")
             val firstAct = acts.firstOrNull()
             val candidate = firstAct?.text("acting_user_animated_avatar")?.ifBlank { null }
                 ?: firstAct?.text("animated_avatar")?.ifBlank { null }
@@ -1483,7 +1650,7 @@ class TopicRepository(
 
         // 3. /u/{username}.json
         val fromUser = runCatching {
-            val uJson = objectRequest("/u/${encode(cleanUser)}.json")
+            val uJson = objectRequest("/u/${encode(cleanUser)}.json", present = present)
             val uUser = uJson["user"] as? JsonObject ?: uJson
             (uUser["gamification_score"] as? JsonPrimitive)?.intOrNull?.let { score ->
                 saveCachedGamificationScore(cleanUser, score)
@@ -1700,14 +1867,14 @@ class TopicRepository(
         }
     }
 
-    suspend fun fetchFollowing(username: String): List<FollowUser> {
-        val list = fetchFollowList(username, "following")
+    suspend fun fetchFollowing(username: String, present: Boolean = true): List<FollowUser> {
+        val list = fetchFollowList(username, "following", present = present)
         saveCachedFollowing(username, list)
         return list
     }
 
-    private suspend fun fetchFollowList(username: String, listName: String): List<FollowUser> {
-        val result = json.parseToJsonElement(request("/u/${encode(username)}/follow/$listName")) as? JsonArray
+    private suspend fun fetchFollowList(username: String, listName: String, present: Boolean = true): List<FollowUser> {
+        val result = json.parseToJsonElement(request("/u/${encode(username)}/follow/$listName", present = present)) as? JsonArray
             ?: return emptyList()
         return result.mapNotNull { element ->
             runCatching { json.decodeFromJsonElement<FollowUser>(element) }.getOrNull()
@@ -2449,35 +2616,56 @@ class TopicRepository(
         while (true) {
             checkWriteSession(expectedUserId, expectedGeneration)
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
+            var roundSnapshot = currentRateLimitRound()
             val result = postGate.withLock {
                 throttlePost(burst = true)
                 checkWriteSession(expectedUserId, expectedGeneration)
-                val transport = transportProvider()
+                // 上传同样每次发送前（含重试）重新经过冷却/探针/恢复期闸门。
+                val ticket = acquireWriteTicket { sessionStore?.sessionGeneration ?: -1L }
+                var status = -1
                 try {
+                    checkWriteSession(expectedUserId, expectedGeneration)
+                    roundSnapshot = ticket.round
+                    val transport = transportProvider()
                     transport.upload(
                         "/uploads.json", csrf, fileName, mimeType, bytes,
                         mapOf("type" to "composer", "synchronous" to "true"),
-                    )
-                } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
-            }
-            checkWriteSession(expectedUserId, expectedGeneration)
-            diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
-            if (result.status == 429) {
-                val cfChallenge = isCfChallengeBody(result.body)
-                val cooldownEx = enterRateLimitCooldown("/uploads.json", result.retryAfterSeconds, cfChallenge = cfChallenge)
-                val waitSec = result.retryAfterSeconds ?: 3L
-                if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                    rateLimitRetried = true
-                    delay(waitSec * 1_000L)
-                    continue
+                    ).also { status = it.status }
+                } finally {
+                    lastPostRequestAt = SystemClock.elapsedRealtime()
+                    if (status == 429) releaseInFlight(ticket) else settleWriteTicket(ticket, status, sessionStore)
                 }
-                throw cooldownEx
+            }
+            val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
+            try {
+                checkWriteSession(expectedUserId, expectedGeneration)
+                diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
+                if (result.status == 429) {
+                    val cfChallenge = isCfChallengeBody(result.body)
+                    val cooldownEx = enterRateLimitCooldown(
+                        path = "/uploads.json",
+                        retryAfterSeconds = result.retryAfterSeconds,
+                        cfChallenge = cfChallenge,
+                        requestRound = roundSnapshot,
+                        requestGeneration = expectedGeneration ?: -1L,
+                        receivedAtElapsedMs = receivedAt,
+                    )
+                    val waitSec = result.retryAfterSeconds ?: 3L
+                    if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        rateLimitRetried = true
+                        delay(waitSec * 1_000L)
+                        continue
+                    }
+                    throw cooldownEx
+                }
+            } finally {
+                if (result.status == 429) releaseGetProbeForRound(roundSnapshot)
             }
             if (result.challenged) {
                 cachedCsrfToken = null
                 noteRequestClearanceChallenged(result.sentClearanceFp, "/uploads.json")
                 // 对齐 v1.3.1：撞盾先静默过盾，连 CSRF 一起重取后重传一次。
-                if (!revalidated && sessionStore?.sessionChanging != true &&
+                if (!revalidated && sessionStore?.sessionChanging != true && !isRateLimitCoolingDown() &&
                     transportProvider().revalidate("/uploads.json", result.sentClearanceFp, requestHost = Config.HOST)
                 ) {
                     revalidated = true
@@ -2602,10 +2790,16 @@ class TopicRepository(
         val byFilter = NotificationFilter.entries.associateWith { filter ->
             unreadByType.entries.filter { filter.includes(it.key) }.sumOf { it.value }
         }
+        val recentEntries = runCatching {
+            json.parseToJsonElement(payload).jsonObject.objects("notifications")
+                .map(::toNotificationEntry)
+        }.getOrDefault(emptyList())
         return UnreadSummary(
             count = count,
             unreadFilters = byFilter.filterValues { it > 0 }.keys,
             unreadByFilter = byFilter,
+            recentEntries = recentEntries,
+            hasMore = page.hasMore(0, NOTIFICATION_SCAN_LIMIT),
         )
     }
 
@@ -2654,46 +2848,81 @@ class TopicRepository(
             checkWriteSession(expectedUserId, expectedGeneration)
             beforeAttempt()
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
+            var roundSnapshot = currentRateLimitRound()
+            val mainSite = requestHost(path) == Config.HOST
             val result = postGate.withLock {
                 throttlePost(burst = true)
                 checkWriteSession(expectedUserId, expectedGeneration)
                 beforeAttempt()
-                val transport = transportProvider()
-                try { transport.write(path, method, body, csrf, contentType) } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
-            }
-            checkWriteSession(expectedUserId, expectedGeneration)
-            diagnostics.recordStatus(transportProvider().name, result.status, path)
-            if (result.status == 429) {
-                val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
-                    isCfChallengeBody(result.body)
-                if (cfChallenge) {
-                    // 速率型挑战：凭据仍有效。仅在携带过期值时换新值重放，或当前无凭据(sent=-)时静默补签一次，否则递增冷却。
-                    if (requestHost(path) == Config.HOST && !revalidated && sessionStore?.sessionChanging != true) {
-                        if (isCarriedClearanceStale(result.sentClearanceFp)) {
-                            cachedCsrfToken = null
-                            revalidated = true
-                            csrfRefreshed = true
-                            continue
-                        }
-                        if (result.sentClearanceFp == "-" &&
-                            transportProvider().revalidate(path, "-", requestHost = Config.HOST)
-                        ) {
-                            cachedCsrfToken = null
-                            revalidated = true
-                            csrfRefreshed = true
-                            continue
-                        }
+                // 每次实际发送（含重试）都重新经过冷却/探针/恢复期闸门，缓存的 CSRF 不能绕过。
+                val ticket = if (mainSite) acquireWriteTicket { sessionStore?.sessionGeneration ?: -1L } else null
+                var status = -1
+                try {
+                    checkWriteSession(expectedUserId, expectedGeneration)
+                    roundSnapshot = ticket?.round ?: currentRateLimitRound()
+                    val transport = transportProvider()
+                    transport.write(path, method, body, csrf, contentType).also { status = it.status }
+                } finally {
+                    lastPostRequestAt = SystemClock.elapsedRealtime()
+                    // 429 由下方冷却逻辑按轮次结算探针，其余结果在这里结算。
+                    if (ticket != null) {
+                        if (status == 429) releaseInFlight(ticket) else settleWriteTicket(ticket, status, sessionStore)
                     }
-                    throw enterChallenge429Cooldown(path, result.retryAfterSeconds, result.sentClearanceFp)
                 }
-                val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds)
-                val waitSec = result.retryAfterSeconds ?: 3L
-                if (!rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                    rateLimitRetried = true
-                    delay(waitSec * 1_000L)
-                    continue
+            }
+            val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
+            try {
+                checkWriteSession(expectedUserId, expectedGeneration)
+                diagnostics.recordStatus(transportProvider().name, result.status, path)
+                if (result.status == 429) {
+                    val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                        isCfChallengeBody(result.body)
+                    if (cfChallenge) {
+                        // 速率型挑战：凭据仍有效。仅在携带过期值时换新值重放，或当前无凭据(sent=-)时静默补签一次，否则递增冷却。
+                        // 服务端已给出等待时间时不换值重放、不补签，直接按截止时间冷却。
+                        val serverWait = (result.retryAfterSeconds ?: 0L) > 0L
+                        if (requestHost(path) == Config.HOST && !revalidated && !serverWait && sessionStore?.sessionChanging != true) {
+                            if (isCarriedClearanceStale(result.sentClearanceFp)) {
+                                cachedCsrfToken = null
+                                revalidated = true
+                                csrfRefreshed = true
+                                continue
+                            }
+                            if (result.sentClearanceFp == "-" && !isRateLimitCoolingDown() &&
+                                transportProvider().revalidate(path, "-", requestHost = Config.HOST)
+                            ) {
+                                cachedCsrfToken = null
+                                revalidated = true
+                                csrfRefreshed = true
+                                continue
+                            }
+                        }
+                        throw enterChallenge429Cooldown(
+                            path = path,
+                            retryAfterSeconds = result.retryAfterSeconds,
+                            sentClearanceFp = result.sentClearanceFp,
+                            requestRound = roundSnapshot,
+                            requestGeneration = expectedGeneration ?: -1L,
+                            receivedAtElapsedMs = receivedAt,
+                        )
+                    }
+                    val cooldownEx = enterRateLimitCooldown(
+                        path = path,
+                        retryAfterSeconds = result.retryAfterSeconds,
+                        requestRound = roundSnapshot,
+                        requestGeneration = expectedGeneration ?: -1L,
+                        receivedAtElapsedMs = receivedAt,
+                    )
+                    val waitSec = result.retryAfterSeconds ?: 3L
+                    if (!rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                        rateLimitRetried = true
+                        delay(waitSec * 1_000L)
+                        continue
+                    }
+                    throw cooldownEx
                 }
-                throw cooldownEx
+            } finally {
+                if (result.status == 429 && mainSite) releaseGetProbeForRound(roundSnapshot)
             }
             if (result.challenged || (result.status == 403 && ChallengeDetector.isChallenge(result.status, "", result.body))) {
                 if (requestHost(path) != Config.HOST) {
@@ -2711,7 +2940,7 @@ class TopicRepository(
                 // 对齐 v1.3.1：先静默过盾再连 CSRF 一起重发一次。CF 挑战在边缘拦截，源站没收到，重放安全。
                 // 不能在这里删 cf_clearance：删了之后所有请求都必然撞盾，静默过盾也失去了可续的凭据。
                 // clearChallenge 最长要等 30 秒，绝不能占着 postGate 等。
-                if (!revalidated && sessionStore?.sessionChanging != true &&
+                if (!revalidated && sessionStore?.sessionChanging != true && !isRateLimitCoolingDown() &&
                     transportProvider().revalidate(path, result.sentClearanceFp, requestHost = requestHost(path))
                 ) {
                     revalidated = true
@@ -2773,7 +3002,38 @@ class TopicRepository(
         checkWriteSession(userId, generation)
         if (!healed) return false
         cachedCsrfToken = null
-        val response = transportProvider().get("/session/current.json", present = false)
+        if (isRateLimitCoolingDown()) return false
+        val response = try {
+            getSemaphore.withPermit {
+                var status = -1
+                withMainSiteReadGate(
+                    isMainSite = true,
+                    present = false,
+                    sessionStore = store,
+                    statusOf = { status },
+                ) { round ->
+                    val res = transportProvider().getWithoutRevalidate("/session/current.json", present = false)
+                    val recvAt = res.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
+                    diagnostics.recordStatus(transportProvider().name, res.status, "/session/current")
+                    if (res.status == 429) {
+                        status = 429
+                        val cf429 = ChallengeDetector.isChallenge429(res.status, res.cfMitigated, res.body) || isCfChallengeBody(res.body)
+                        if (cf429) {
+                            enterChallenge429Cooldown("/session/current.json", res.retryAfterSeconds, res.sentClearanceFp, round, generation, recvAt)
+                        } else {
+                            enterRateLimitCooldown("/session/current.json", res.retryAfterSeconds, requestRound = round, requestGeneration = generation, receivedAtElapsedMs = recvAt)
+                        }
+                    } else {
+                        status = res.status
+                    }
+                    res
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: RateLimitException) {
+            return false
+        }
         checkWriteSession(userId, generation)
         if (response.status != 200 || response.challenged) return false
         val actualUserId = runCatching {
@@ -3131,11 +3391,11 @@ class TopicRepository(
     private suspend fun getAllBadgesRaw(): JsonObject? {
         val now = SystemClock.elapsedRealtime()
         cachedAllBadgesRaw?.let { (time, data) ->
-            if (now - time < 120_000L && data != null) return data
+            if (now - time < 1_800_000L && data != null) return data
         }
         return allBadgesGate.withLock {
             val second = cachedAllBadgesRaw
-            if (second != null && now - second.first < 120_000L && second.second != null) {
+            if (second != null && SystemClock.elapsedRealtime() - second.first < 1_800_000L && second.second != null) {
                 return@withLock second.second
             }
             val fetched = runCatching { objectRequest("/badges.json", present = false, retryAllowed = false) }.getOrNull()
@@ -3151,9 +3411,9 @@ class TopicRepository(
 
     /**
      * 获取用户徽章数据：
-     * 1. 内存 30s 缓存防刷 + In-flight Single-Flight 去重，避免同屏重复拉取；
+     * 1. 内存 10m 缓存防刷 + In-flight Single-Flight 去重，避免切 Tab 重复拉取触发 429；
      * 2. 请求官方接口 /user-badges/{username}.json?grouped=true 获取用户已获得的徽章；
-     * 3. 请求全站徽章池 /badges.json (带 120s 内存缓存) 补全未获得的徽章；
+     * 3. 请求全站徽章池 /badges.json (带 30m 内存缓存) 补全未获得的徽章；
      * 4. 严格使用官方名称、描述 (HTML 清洗) 与图标/图片；
      * 5. 优先排序已获取的徽章，后排未获取的徽章。
      */
@@ -3162,7 +3422,7 @@ class TopicRepository(
         val now = SystemClock.elapsedRealtime()
         if (!forceRefresh) {
             userBadgesMemoryCache[key]?.let { (time, list) ->
-                if (now - time < 30_000L && list.isNotEmpty()) {
+                if (now - time < 600_000L && list.isNotEmpty()) {
                     return@withContext list
                 }
             }
@@ -3425,6 +3685,8 @@ class TopicRepository(
                 throw error
             } catch (error: NeedsInteractiveVerification) {
                 throw error
+            } catch (error: RateLimitException) {
+                throw error
             } catch (error: Exception) {
                 diagnostics.log("优先通知列表加载回退: ${error.message}")
                 null
@@ -3546,6 +3808,9 @@ class TopicRepository(
     @Volatile
     private var categoryPermissionsSyncedGeneration = -1L
 
+    @Volatile
+    private var lastCategoriesRefreshAt = 0L
+
     fun hasSyncedCategoryPermissions(): Boolean {
         val currentGen = sessionStore?.sessionGeneration ?: 0L
         return categoryPermissionsSyncedGeneration == currentGen
@@ -3557,16 +3822,17 @@ class TopicRepository(
      * （可发帖分类下发 `permission <= 1`，只读/高信任等级/公告分类为 `null` 或 `> 1`），并包含完整的标签约束字段。
      * 将 `/site.json` 的分类权限与标签规则合并到分类树中，确保创建/编辑话题时的可选分类与服务端权限严格一致。
      */
-    private suspend fun mergeSiteCategoryMetadata(categories: List<Category>): List<Category> {
+    private suspend fun mergeSiteCategoryMetadata(categories: List<Category>, present: Boolean = true): List<Category> {
         val currentGen = sessionStore?.sessionGeneration ?: 0L
         val siteById = runCatching {
-            val site = objectRequest("/site.json")
+            val site = objectRequest("/site.json", present = present)
             site.objects("categories")
                 .map { json.decodeFromJsonElement(Category.serializer(), it) }
                 .associateBy { it.id }
         }.getOrDefault(emptyMap())
         if (siteById.isEmpty()) return categories
         categoryPermissionsSyncedGeneration = currentGen
+        lastCategoriesRefreshAt = SystemClock.elapsedRealtime()
         fun mergeOne(category: Category): Category {
             val siteCat = siteById[category.id]
             val mergedSubs = category.subcategoryList.map { sub ->
@@ -3615,10 +3881,16 @@ class TopicRepository(
      * 若与本地缓存不一致（新增/改名/改色/子分类调整/发帖权限更新），更新内存缓存并返回最新数据与原始 JSON 供持久化落盘；
      * 若完全一致则返回 null，避免无意义的界面重组。
      */
-    suspend fun refreshCategoriesFromServer(): Pair<List<Category>, String>? = categoryGate.withLock {
-        val raw = request("/categories.json?include_subcategories=true")
+    suspend fun refreshCategoriesFromServer(present: Boolean = true): Pair<List<Category>, String>? = categoryGate.withLock {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (categoryListCache != null && hasSyncedCategoryPermissions() &&
+            lastCategoriesRefreshAt > 0L && nowElapsed - lastCategoriesRefreshAt < 5 * 60_000L
+        ) {
+            return@withLock null
+        }
+        val raw = request("/categories.json?include_subcategories=true", present = present)
         val decoded = json.decodeFromString<CategoryListResponse>(raw).categoryList.categories
-        val freshList = mergeSiteCategoryMetadata(decoded)
+        val freshList = mergeSiteCategoryMetadata(decoded, present = present)
         val freshMap = flattenCategories(freshList).associateBy { it.id }
         val changed = categoryListCache != freshList || categoryCache != freshMap
         categoryListCache = freshList
@@ -3679,8 +3951,8 @@ class TopicRepository(
         ).allTagsSorted().also { tagListCache = it }
     }
 
-    suspend fun refreshTagsFromServer(): Pair<List<DiscourseTag>, String>? = tagGate.withLock {
-        val raw = request("/tags.json")
+    suspend fun refreshTagsFromServer(present: Boolean = true): Pair<List<DiscourseTag>, String>? = tagGate.withLock {
+        val raw = request("/tags.json", present = present)
         val freshList = json.decodeFromString<DiscourseTagsResponse>(raw).allTagsSorted()
         val changed = tagListCache != freshList
         tagListCache = freshList
@@ -3739,10 +4011,10 @@ class TopicRepository(
         return user?.username
     }
 
-    suspend fun fetchCurrentUserDetails(): DiscourseUser? {
+    suspend fun fetchCurrentUserDetails(present: Boolean = true): DiscourseUser? {
         val generation = sessionStore?.sessionGeneration
         val body = try {
-            request("/session/current.json")
+            request("/session/current.json", present = present)
         } catch (error: HttpStatusException) {
             if (error.status == 404) return null
             throw error
@@ -3756,12 +4028,19 @@ class TopicRepository(
         }
         if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
         if (generation != null) withContext(Dispatchers.Main) { sessionStore?.normalizeVerifiedAuthCookies(generation) }
+        val customFields = user["custom_fields"] as? JsonObject
+        val seeSignatures = parseBooleanField(user["see_signatures"])
+            ?: parseBooleanField(customFields?.get("see_signatures"))
+        if (seeSignatures != null) {
+            sessionStore?.setSeeSignaturesEnabled(id, seeSignatures)
+            onUserSeeSignaturesSynced?.invoke(id, seeSignatures)
+        }
         val animatedFromSession = user["animated_avatar"]?.jsonPrimitive?.contentOrNull?.takeIf(::isAnimatedAvatarPath)
-        val animated = animatedFromSession
-            ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
-            ?: resolveAnimatedAvatar(username)
+        val animated = animatedFromSession ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
         if (!animated.isNullOrBlank()) {
             AvatarCache.record(username, animated)
+        } else {
+            AvatarCache.recordNonAnimated(username)
         }
         return DiscourseUser(
             id = id,
@@ -3770,7 +4049,18 @@ class TopicRepository(
             avatarTemplate = user["avatar_template"]?.jsonPrimitive?.contentOrNull,
             animatedAvatar = animated,
             trustLevel = user["trust_level"]?.jsonPrimitive?.intOrNull,
+            seeSignatures = seeSignatures,
         )
+    }
+
+    private fun parseBooleanField(element: JsonElement?): Boolean? {
+        val primitive = element as? JsonPrimitive ?: return null
+        primitive.booleanOrNull?.let { return it }
+        return when (primitive.contentOrNull?.trim()?.lowercase()) {
+            "true", "t", "1", "yes" -> true
+            "false", "f", "0", "no" -> false
+            else -> null
+        }
     }
 
     suspend fun fetchTrustReport(present: Boolean = false): TrustReport? {
@@ -3810,15 +4100,32 @@ class TopicRepository(
     suspend fun fetchGamificationScore(username: String, present: Boolean = false): Int? {
         val cleanUser = username.trim().removePrefix("@")
         if (cleanUser.isBlank()) return null
-        val score = runCatching {
-            val root = objectRequest("/u/${encode(cleanUser)}/card.json", burst = true, present = present, retryAllowed = false)
+        if (isRateLimitCoolingDown()) return getCachedGamificationScore(cleanUser)
+        val fetchFromCard = try {
+            val root = objectRequest("/u/${encode(cleanUser)}/card.json", burst = false, present = present, retryAllowed = false)
             val user = root["user"] as? JsonObject ?: root
             (user["gamification_score"] as? JsonPrimitive)?.intOrNull
-        }.getOrNull() ?: runCatching {
-            val root = objectRequest("/u/${encode(cleanUser)}.json", burst = true, present = present, retryAllowed = false)
-            val user = root["user"] as? JsonObject ?: root
-            (user["gamification_score"] as? JsonPrimitive)?.intOrNull
-        }.getOrNull()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: RateLimitException) {
+            return getCachedGamificationScore(cleanUser)
+        } catch (error: NeedsInteractiveVerification) {
+            return getCachedGamificationScore(cleanUser)
+        } catch (_: Exception) {
+            null
+        }
+        val score = fetchFromCard ?: run {
+            if (isRateLimitCoolingDown()) return getCachedGamificationScore(cleanUser)
+            try {
+                val root = objectRequest("/u/${encode(cleanUser)}.json", burst = false, present = present, retryAllowed = false)
+                val user = root["user"] as? JsonObject ?: root
+                (user["gamification_score"] as? JsonPrimitive)?.intOrNull
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+        }
         if (score != null) {
             saveCachedGamificationScore(cleanUser, score)
         }
@@ -3866,7 +4173,7 @@ class TopicRepository(
      * 获取 LINUX DO Credit 用户积分信息。
      * GET https://credit.linux.do/api/v1/oauth/user-info
      */
-    suspend fun fetchLdcUserInfo(): LdcUserInfo {
+    suspend fun fetchLdcUserInfo(includeRemoteGamification: Boolean = false): LdcUserInfo {
         val raw = request("https://credit.linux.do/api/v1/oauth/user-info", present = false)
         val root = json.parseToJsonElement(raw).jsonObject
         val dataElem = root["data"] as? JsonObject ?: throw IllegalStateException("LDC 响应缺少 data 字段")
@@ -3876,7 +4183,11 @@ class TopicRepository(
         fun readBool(key: String): Boolean = (dataElem[key] as? JsonPrimitive)?.booleanOrNull ?: (readStr(key).toBooleanStrictOrNull() ?: false)
         val ldcUsername = readStr("username")
         val todayIncome = fetchLdcTodayIncome(ldcUsername)
-        val gamificationScore = fetchGamificationScore(ldcUsername, present = false)
+        val gamificationScore = if (includeRemoteGamification) {
+            fetchGamificationScore(ldcUsername, present = false)
+        } else {
+            getCachedGamificationScore(ldcUsername)
+        }
         return LdcUserInfo(
             id = readLong("id"),
             username = ldcUsername,
@@ -3947,16 +4258,18 @@ class TopicRepository(
         require(!isPost || (request.url.host == targetHost && request.url.encodedPath == "/api/v1/oauth/callback") ||
             (request.url.host == "connect.linux.do" && (request.url.encodedPath == "/oauth2/authorize" ||
                 request.url.encodedPath.startsWith("/oauth2/approve/")))) { "OAuth 表单目标不受信任" }
-        val executeCall = suspend {
+        val isMainSite = request.url.host == Config.HOST
+        val executeCall: suspend (Long) -> LdcOAuthResponse = { requestRound ->
             currentCoroutineContext().ensureActive()
             checkSiteSession(userId, generation)
             if (sessionStore?.isClearanceRecoveryInProgress() == true) throw RateLimitException(5_000L)
             throwIfSiteCoolingDown(request.url.host)
-            if (request.url.host == Config.HOST) throwIfRateLimitCoolingDown()
+            if (isMainSite) throwIfRateLimitCoolingDown()
             val taggedRequest = request.newBuilder()
                 .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation))
                 .build()
             client.newCall(taggedRequest).execute().use { response ->
+                val receivedAt = SystemClock.elapsedRealtime()
                 currentCoroutineContext().ensureActive()
                 checkSiteSession(userId, generation)
                 val body = response.body?.string().orEmpty()
@@ -3969,7 +4282,14 @@ class TopicRepository(
                         body = body,
                     )
                     val responsePath = response.request.url.newBuilder().query(null).fragment(null).build().toString()
-                    throw enterRateLimitCooldown(responsePath, retryAfter, cfChallenge = challenged)
+                    throw enterRateLimitCooldown(
+                        path = responsePath,
+                        retryAfterSeconds = retryAfter,
+                        cfChallenge = challenged,
+                        requestRound = requestRound,
+                        requestGeneration = generation,
+                        receivedAtElapsedMs = receivedAt,
+                    )
                 }
                 if (challenged) {
                     throw HttpStatusException(response.code, "$label 遇到安全验证，请稍后重试")
@@ -3984,16 +4304,40 @@ class TopicRepository(
         return if (isPost) {
             postGate.withLock {
                 throttlePost(burst = true)
+                var status = -1
                 try {
-                    executeCall()
+                    if (isMainSite) {
+                        withMainSiteWriteGate(sessionStore = sessionStore, statusOf = { status }) { round ->
+                            try {
+                                executeCall(round).also { status = it.status }
+                            } catch (rateLimited: RateLimitException) {
+                                if (rateLimited.alreadyRecorded) status = 429
+                                throw rateLimited
+                            }
+                        }
+                    } else {
+                        executeCall(currentRateLimitRound())
+                    }
                 } finally {
                     markPostCompleted()
                 }
             }
         } else {
             getSemaphore.withPermit {
-                acquireGetSlot { false }
-                executeCall()
+                var status = -1
+                withMainSiteReadGate(
+                    isMainSite = isMainSite,
+                    present = true,
+                    sessionStore = sessionStore,
+                    statusOf = { status },
+                ) { round ->
+                    try {
+                        executeCall(round).also { status = it.status }
+                    } catch (rateLimited: RateLimitException) {
+                        if (rateLimited.alreadyRecorded) status = 429
+                        throw rateLimited
+                    }
+                }
             }
         }
     }
@@ -4238,7 +4582,9 @@ class TopicRepository(
      */
     suspend fun fetchCustomSidebarSection(): CustomSection? {
         val raw = try {
-            request("/sidebar_sections.json")
+            request("/sidebar_sections.json", present = false, retryAllowed = false)
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Exception) {
             diagnostics.log("拉取自定义侧边栏分区失败: ${error.message}")
             return null
@@ -4393,15 +4739,29 @@ class TopicRepository(
                 fields["second_factor_method"] = JsonPrimitive(secondFactorMethod)
             }
             val body = JsonObject(fields).toString()
+            var postRound = currentRateLimitRound()
             val loginResult = try {
-                loginCall("/session.json", loginDeadlineNs) { transport.write("/session.json", "POST", body, csrf) }
+                var status = -1
+                withMainSiteWriteGate(sessionStore = sessionStore, statusOf = { status }) { round ->
+                    postRound = round
+                    loginCall("/session.json", loginDeadlineNs) { transport.write("/session.json", "POST", body, csrf) }
+                        .also { status = it.status }
+                }
             } finally {
                 markPostCompleted()
             }
+            val receivedAt = loginResult.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
             diagnostics.recordStatus(transport.name, loginResult.status, "/session")
             if (loginResult.status == 429) {
-                enterRateLimitCooldown("/session.json", loginResult.retryAfterSeconds)
-                throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试")
+                enterRateLimitCooldown(
+                    path = "/session.json",
+                    retryAfterSeconds = loginResult.retryAfterSeconds,
+                    cfChallenge = isCfChallengeBody(loginResult.body),
+                    requestRound = postRound,
+                    requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                    receivedAtElapsedMs = receivedAt,
+                )
+                throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试", loginResult.retryAfterSeconds)
             }
             if (loginResult.challenged) {
                 throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
@@ -4473,18 +4833,32 @@ class TopicRepository(
             val sendDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
             val safeEmail = email.replace("\"", "\\\"")
             val body = "{\"login\":\"$safeEmail\"}"
+            var postRound = currentRateLimitRound()
             val result = try {
-                loginCall("/u/email-login.json", sendDeadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
+                var status = -1
+                withMainSiteWriteGate(sessionStore = sessionStore, statusOf = { status }) { round ->
+                    postRound = round
+                    loginCall("/u/email-login.json", sendDeadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
+                        .also { status = it.status }
+                }
             } finally {
                 markPostCompleted()
             }
+            val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
             diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
             if (result.challenged) {
                 throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
             }
             if (result.status == 429) {
-                enterRateLimitCooldown("/u/email-login.json", result.retryAfterSeconds)
-                throw HttpStatusException(429, "发送登录邮件过于频繁，请稍后再试")
+                enterRateLimitCooldown(
+                    path = "/u/email-login.json",
+                    retryAfterSeconds = result.retryAfterSeconds,
+                    cfChallenge = isCfChallengeBody(result.body),
+                    requestRound = postRound,
+                    requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                    receivedAtElapsedMs = receivedAt,
+                )
+                throw HttpStatusException(429, "发送登录邮件过于频繁，请稍后再试", result.retryAfterSeconds)
             }
             if (result.status == 403) throw RiskControlException(403, "发送登录邮件触发风控 (403)")
             if (result.status == 0) throw NetworkTimeoutException()
@@ -4493,17 +4867,35 @@ class TopicRepository(
     }
 
     private suspend fun loginCsrf(transport: Transport, deadlineNs: Long = 0L): String {
+        var csrfRound = currentRateLimitRound()
         val result = getSemaphore.withPermit {
-            acquireGetSlot { false }
-            loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
+            var status = -1
+            withMainSiteReadGate(
+                isMainSite = true,
+                present = true,
+                sessionStore = sessionStore,
+                statusOf = { status },
+            ) { round ->
+                csrfRound = round
+                loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
+                    .also { status = if (it.challenged) 403 else it.status }
+            }
         }
+        val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
         diagnostics.recordStatus(transport.name, result.status, "/session/csrf")
         if (result.challenged) {
             throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截", readProbePath = "/session/csrf.json")
         }
         if (result.status == 429) {
-            enterRateLimitCooldown("/session/csrf.json", result.retryAfterSeconds)
-            throw HttpStatusException(429, "获取凭据过于频繁，请稍后再试")
+            enterRateLimitCooldown(
+                path = "/session/csrf.json",
+                retryAfterSeconds = result.retryAfterSeconds,
+                cfChallenge = isCfChallengeBody(result.body),
+                requestRound = csrfRound,
+                requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                receivedAtElapsedMs = receivedAt,
+            )
+            throw HttpStatusException(429, "获取凭据过于频繁，请稍后再试", result.retryAfterSeconds)
         }
         if (result.status == 403) throw RiskControlException(403, "获取登录凭证触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
@@ -4540,15 +4932,29 @@ class TopicRepository(
             } else {
                 "{}"
             }
+            var postRound = currentRateLimitRound()
             val result = try {
-                loginCall(path, loginDeadlineNs) { transport.write(path, "POST", reqBody, csrf) }
+                var status = -1
+                withMainSiteWriteGate(sessionStore = sessionStore, statusOf = { status }) { round ->
+                    postRound = round
+                    loginCall(path, loginDeadlineNs) { transport.write(path, "POST", reqBody, csrf) }
+                        .also { status = it.status }
+                }
             } finally {
                 markPostCompleted()
             }
+            val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
             diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
             if (result.status == 429) {
-                enterRateLimitCooldown(path, result.retryAfterSeconds)
-                throw HttpStatusException(429, "验证邮件令牌过于频繁，请稍后再试")
+                enterRateLimitCooldown(
+                    path = path,
+                    retryAfterSeconds = result.retryAfterSeconds,
+                    cfChallenge = isCfChallengeBody(result.body),
+                    requestRound = postRound,
+                    requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                    receivedAtElapsedMs = receivedAt,
+                )
+                throw HttpStatusException(429, "验证邮件令牌过于频繁，请稍后再试", result.retryAfterSeconds)
             }
             if (result.challenged) {
                 throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
@@ -4717,43 +5123,117 @@ class TopicRepository(
         try {
             return pacedGet(path, burst, present, allow429Challenge = retryAllowed, retryAllowed = retryAllowed, beforeDispatch = beforeDispatch)
         } catch (challenge: NeedsInteractiveVerification) {
-            if (!retryAllowed || !present || requestHost(path) != Config.HOST) throw challenge
+            if (!retryAllowed || !present || requestHost(path) != Config.HOST) {
+                if (challenge.isFrom429 && requestHost(path) == Config.HOST) {
+                    // 不补签也要记录这次 429 的服务端等待要求，否则冷却会丢失。
+                    throw enterChallenge429Cooldown(
+                        path = path,
+                        retryAfterSeconds = challenge.retryAfterSeconds,
+                        sentClearanceFp = challenge.failedClearanceFp,
+                        requestRound = challenge.requestRound,
+                        requestGeneration = challenge.requestGeneration,
+                        receivedAtElapsedMs = challenge.receivedAtElapsedMs,
+                    )
+                }
+                releaseGetProbeForRound(challenge.requestRound)
+                throw challenge
+            }
             // 对齐 v1.3.1 & P0-1/P0-3：撞盾先在隐藏 WebView 里按当前出口静默重签 cf_clearance（带锁内去重合并），成功再重试一次。
             // 换代理/切直连后凭据与出口不一致时，这一步让第一个被挑战的请求就把凭据换掉，用户无感。
             // 必须在串行闸门外做：静默过盾最长 30 秒，占着闸门会把所有 GET 堵死。
-            if (!silentRevalidateForGet(path, challenge.failedClearanceFp)) {
-                if (challenge.isFrom429) {
-                    throw enterChallenge429Cooldown(path, null, challenge.failedClearanceFp)
+            var probeHandedOff = false
+            try {
+                // 服务端已明确给出等待时间时，补签（同样会发请求）和重放都必须等到截止后，这里直接进入冷却。
+                val serverWaitRequired = challenge.isFrom429 && (challenge.retryAfterSeconds ?: 0L) > 0L
+                if (serverWaitRequired || !silentRevalidateForGet(path, challenge.failedClearanceFp)) {
+                    // 仅当服务端要求等待或本次已携带有效凭据时，才把 429 质询收口为限流冷却；
+                    // 若当前 0 份 cf_clearance 裸奔(failedClearanceFp == "-")且静默补签无法自动通过，
+                    // 必须抛出 NeedsInteractiveVerification 拉起可见验证页补发凭据，否则会永不验证、无限循环提示“请求过于频繁”。
+                    if (challenge.isFrom429 && (serverWaitRequired || challenge.failedClearanceFp != "-")) {
+                        val cooldownEx = enterChallenge429Cooldown(
+                            path = path,
+                            retryAfterSeconds = challenge.retryAfterSeconds,
+                            sentClearanceFp = challenge.failedClearanceFp,
+                            requestRound = challenge.requestRound,
+                            requestGeneration = challenge.requestGeneration,
+                            receivedAtElapsedMs = challenge.receivedAtElapsedMs,
+                        )
+                        probeHandedOff = true
+                        throw cooldownEx
+                    }
+                    throw challenge
                 }
-                throw challenge
-            }
-            return try {
-                pacedGet(path, burst, present, allow429Challenge = false, beforeDispatch = beforeDispatch)
-            } catch (retryChallenge: NeedsInteractiveVerification) {
-                // P0-4: CLEARED 后重放立撞 403/503 交互挑战 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
-                // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
-                // 速率型 429 挑战在 dispatchGet 已转为递增冷却（RateLimitException），不会走到这里。
-                getRevalidateBlockedUntil = maxOf(
-                    getRevalidateBlockedUntil,
-                    SystemClock.elapsedRealtime() + CLEARANCE_MISMATCH_COOLDOWN_MS,
-                )
-                diagnostics.log(
-                    "静默过盾后重放仍被挑战(sent=${retryChallenge.failedClearanceFp})，判定凭据与 OkHttp 出口不匹配，" +
-                        "熔断静默过盾 ${CLEARANCE_MISMATCH_COOLDOWN_MS / 1_000L}s: $path",
-                )
-                if (present) {
-                    val primary = transportProvider()
-                    val fallback = fallbackTransportProvider?.invoke()?.takeIf { it.name != primary.name }
-                    if (fallback != null && fallback.isReady()) {
-                        diagnostics.log("前台 GET 尝试单次切换 ${fallback.name} 兜底重放: $path")
-                        val fbResult = fallback.getWithoutRevalidate(path, present = true)
-                        diagnostics.recordStatus(fallback.name, fbResult.status, path)
-                        if (fbResult.status in 200..299) {
-                            return fbResult.body
+                releaseGetProbeForRound(challenge.requestRound)
+                probeHandedOff = true
+                return try {
+                    pacedGet(path, burst, present, allow429Challenge = false, beforeDispatch = beforeDispatch)
+                } catch (retryChallenge: NeedsInteractiveVerification) {
+                    releaseGetProbeForRound(retryChallenge.requestRound)
+                    // P0-4: CLEARED 后重放立撞 403/503 交互挑战 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
+                    // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
+                    // 速率型 429 挑战在 dispatchGet 已转为递增冷却（RateLimitException），不会走到这里。
+                    getRevalidateBlockedUntil = maxOf(
+                        getRevalidateBlockedUntil,
+                        SystemClock.elapsedRealtime() + CLEARANCE_MISMATCH_COOLDOWN_MS,
+                    )
+                    diagnostics.log(
+                        "静默过盾后重放仍被挑战(sent=${retryChallenge.failedClearanceFp})，判定凭据与 OkHttp 出口不匹配，" +
+                            "熔断静默过盾 ${CLEARANCE_MISMATCH_COOLDOWN_MS / 1_000L}s: $path",
+                    )
+                    if (present && !isRateLimitCoolingDown()) {
+                        val primary = transportProvider()
+                        val fallback = fallbackTransportProvider?.invoke()?.takeIf { it.name != primary.name }
+                        if (fallback != null && fallback.isReady()) {
+                            diagnostics.log("前台 GET 尝试单次切换 ${fallback.name} 兜底重放: $path")
+                            val fbResult = getSemaphore.withPermit {
+                                var fbStatus = -1
+                                withMainSiteReadGate(
+                                    isMainSite = true,
+                                    present = true,
+                                    sessionStore = sessionStore,
+                                    statusOf = { fbStatus },
+                                ) { fbRound ->
+                                    val res = fallback.getWithoutRevalidate(path, present = true)
+                                    val recvAt = res.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
+                                    diagnostics.recordStatus(fallback.name, res.status, path)
+                                    if (res.status == 429) {
+                                        fbStatus = 429
+                                        val cf429 = ChallengeDetector.isChallenge429(res.status, res.cfMitigated, res.body) ||
+                                            isCfChallengeBody(res.body)
+                                        throw if (cf429) {
+                                            enterChallenge429Cooldown(
+                                                path = path,
+                                                retryAfterSeconds = res.retryAfterSeconds,
+                                                sentClearanceFp = res.sentClearanceFp,
+                                                requestRound = fbRound,
+                                                requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                                                receivedAtElapsedMs = recvAt,
+                                            )
+                                        } else {
+                                            enterRateLimitCooldown(
+                                                path = path,
+                                                retryAfterSeconds = res.retryAfterSeconds,
+                                                requestRound = fbRound,
+                                                requestGeneration = sessionStore?.sessionGeneration ?: -1L,
+                                                receivedAtElapsedMs = recvAt,
+                                            )
+                                        }
+                                    }
+                                    fbStatus = if (res.challenged) 403 else res.status
+                                    res
+                                }
+                            }
+                            if (fbResult.status in 200..299 && !fbResult.challenged) {
+                                return fbResult.body
+                            }
                         }
                     }
+                    throw retryChallenge
                 }
-                throw retryChallenge
+            } finally {
+                if (!probeHandedOff) {
+                    releaseGetProbeForRound(challenge.requestRound)
+                }
             }
         }
     }
@@ -4790,25 +5270,70 @@ class TopicRepository(
      */
     private suspend fun silentRevalidateForGet(path: String, failedClearanceFp: String = "-"): Boolean {
         if (requestHost(path) != Config.HOST) return false
-        if (sessionStore?.sessionChanging == true || isNonChallengeRateLimitCoolingDown()) return false
-        val now = SystemClock.elapsedRealtime()
-        if (now < getRevalidateBlockedUntil) {
+        if (sessionStore?.sessionChanging == true || isRateLimitCoolingDown()) return false
+        if (SystemClock.elapsedRealtime() < getRevalidateBlockedUntil) {
             diagnostics.logThrottled("get-revalidate", "GET 撞盾: 静默过盾冷却中，直接交由上层处理")
             return false
         }
         val generation = sessionStore?.sessionGeneration
-        val cleared = transportProvider().revalidate(path, failedClearanceFp, requestHost = requestHost(path))
-        if (generation != null && generation != sessionStore?.sessionGeneration) {
-            throw CancellationException("会话已切换")
+        var existingFlight: CompletableDeferred<Boolean>? = null
+        var ownedFlight: CompletableDeferred<Boolean>? = null
+        synchronized(silentRevalidateFlightLock) {
+            val active = inFlightSilentRevalidate
+            if (active != null && !active.isCompleted) {
+                existingFlight = active
+            } else {
+                ownedFlight = CompletableDeferred<Boolean>().also { inFlightSilentRevalidate = it }
+            }
         }
-        if (cleared) {
-            // 重验证会重新加载首页，Discourse 可能借机换掉 _forum_session
-            cachedCsrfToken = null
-        } else {
-            getRevalidateBlockedUntil = SystemClock.elapsedRealtime() + GET_REVALIDATE_FAILURE_COOLDOWN_MS
-            diagnostics.log("GET 撞盾静默过盾未通过，${GET_REVALIDATE_FAILURE_COOLDOWN_MS / 60_000L} 分钟内不再静默重试: $path")
+        if (existingFlight != null) {
+            val sharedCleared = existingFlight!!.await()
+            if (generation != null && generation != sessionStore?.sessionGeneration) {
+                throw CancellationException("会话已切换")
+            }
+            if (!sharedCleared) {
+                diagnostics.logThrottled("get-revalidate", "GET 撞盾: 复用并发静默补签失败结果")
+            }
+            return sharedCleared
         }
-        return cleared
+        val deferred = ownedFlight!!
+        return try {
+            val cleared = silentRevalidateMutex.withLock {
+                val nowLocked = SystemClock.elapsedRealtime()
+                when {
+                    sessionStore?.sessionChanging == true || isRateLimitCoolingDown() -> false
+                    nowLocked < getRevalidateBlockedUntil -> {
+                        diagnostics.logThrottled("get-revalidate", "GET 撞盾: 静默过盾冷却中，直接交由上层处理")
+                        false
+                    }
+                    else -> {
+                        val revalidated = transportProvider().revalidate(path, failedClearanceFp, requestHost = requestHost(path))
+                        if (generation != null && generation != sessionStore?.sessionGeneration) {
+                            throw CancellationException("会话已切换")
+                        }
+                        if (revalidated) {
+                            // 重验证会重新加载首页，Discourse 可能借机换掉 _forum_session
+                            cachedCsrfToken = null
+                        } else {
+                            getRevalidateBlockedUntil = SystemClock.elapsedRealtime() + GET_REVALIDATE_FAILURE_COOLDOWN_MS
+                            diagnostics.log("GET 撞盾静默过盾未通过，${GET_REVALIDATE_FAILURE_COOLDOWN_MS / 60_000L} 分钟内不再静默重试: $path")
+                        }
+                        revalidated
+                    }
+                }
+            }
+            deferred.complete(cleared)
+            cleared
+        } catch (t: Throwable) {
+            deferred.complete(false)
+            throw t
+        } finally {
+            synchronized(silentRevalidateFlightLock) {
+                if (inFlightSilentRevalidate === deferred) {
+                    inFlightSilentRevalidate = null
+                }
+            }
+        }
     }
 
     private suspend fun dispatchGet(
@@ -4823,102 +5348,156 @@ class TopicRepository(
         val isMainSite = host == Config.HOST
         ensureRequestAllowed()
         throwIfSiteCoolingDown(host)
-        if (!present) throwIfRateLimitCoolingDown()
+        awaitGetCooldownOrProbeGate(isMainSite = isMainSite, present = present)
         return getSemaphore.withPermit {
             ensureRequestAllowed()
             throwIfSiteCoolingDown(host)
-            if (!present) throwIfRateLimitCoolingDown()
+            awaitGetCooldownOrProbeGate(isMainSite = isMainSite, present = present)
             var attempt = 0
             var staleReplayed = false
-            var revalidated = false
             while (true) {
-                acquireGetSlot { !present && isRateLimitCoolingDown() }
-                currentCoroutineContext().ensureActive()
-                throwIfSiteCoolingDown(host)
-                if (!present) throwIfRateLimitCoolingDown()
-                // 前台请求发出后，后台计量池在静默窗口内让行，避免与用户操作贴脸叠加
-                if (present) ApiQuotaPool.markForeground()
-                val transport = transportProvider()
-                beforeDispatch?.invoke()
-                val result = try {
-                    if (retryAllowed && isMainSite) transport.get(path, present = present)
-                    else transport.getWithoutRevalidate(path, present = present)
-                } finally {
-                    // 时间戳已在 acquireGetSlot 记录
+                val ticket = acquireGetSlot(isMainSite = isMainSite, present = present) {
+                    sessionStore?.sessionGeneration ?: -1L
                 }
-                diagnostics.recordStatus(transport.name, result.status, path)
-                if (!isMainSite && result.status == 429) {
-                    val challenged = result.challenged || ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
-                    if (challenged) noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                    throw enterRateLimitCooldown(path, result.retryAfterSeconds, cfChallenge = challenged)
-                }
-                if (!isMainSite && result.challenged) {
-                    noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                    throw HttpStatusException(result.status, "子站安全验证未通过，请稍后重试", result.retryAfterSeconds)
-                }
-                when {
-                    result.challenged -> {
-                        if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
-                            staleReplayed = true
-                            diagnostics.log("检测到携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，跳过 WebView 直接换新值重放: $path")
-                            continue
-                        }
-                        noteRequestClearanceChallenged(result.sentClearanceFp, path)
-                        notify403OrChallenged("request $path challenged")
-                        throw NeedsInteractiveVerification(
-                            "请求 $path 被 Cloudflare 挑战拦截",
-                            failedClearanceFp = result.sentClearanceFp,
-                            readProbePath = path,
+                var probeSettled = false
+                try {
+                    currentCoroutineContext().ensureActive()
+                    throwIfSiteCoolingDown(host)
+                    // 前台请求发出后，后台计量池在静默窗口内让行，避免与用户操作贴脸叠加
+                    if (present) ApiQuotaPool.markForeground()
+                    val transport = transportProvider()
+                    beforeDispatch?.invoke()
+                    val result = try {
+                        if (retryAllowed && isMainSite) transport.get(path, present = present)
+                        else transport.getWithoutRevalidate(path, present = present)
+                    } finally {
+                        // 时间戳已在 acquireGetSlot 记录
+                    }
+                    val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
+                    diagnostics.recordStatus(transport.name, result.status, path)
+                    if (!isMainSite && result.status == 429) {
+                        val challenged = result.challenged || ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
+                        if (challenged) noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                        probeSettled = true
+                        throw enterRateLimitCooldown(
+                            path = path,
+                            retryAfterSeconds = result.retryAfterSeconds,
+                            cfChallenge = challenged,
+                            requestRound = ticket.round,
+                            requestGeneration = ticket.sessionGeneration,
+                            receivedAtElapsedMs = receivedAt,
                         )
                     }
-                    result.status == 429 -> {
-                        val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
-                            isCfChallengeBody(result.body)
-                        if (cfChallenge) {
+                    if (!isMainSite && result.challenged) {
+                        noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                        throw HttpStatusException(result.status, "子站安全验证未通过，请稍后重试", result.retryAfterSeconds)
+                    }
+                    when {
+                        result.challenged -> {
                             if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
                                 staleReplayed = true
-                                diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
+                                diagnostics.log("检测到携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，跳过 WebView 直接换新值重放: $path")
                                 continue
                             }
-                            if (allow429Challenge && retryAllowed && present && result.sentClearanceFp == "-") {
-                                diagnostics.log("429 CF 挑战当前无有效 cf_clearance(sent=-)，先尝试一次静默补签: $path")
-                                throw NeedsInteractiveVerification(
-                                    "请求 $path 遇到 Cloudflare 速率验证",
-                                    failedClearanceFp = "-",
-                                    isFrom429 = true,
-                                    readProbePath = path,
+                            noteRequestClearanceChallenged(result.sentClearanceFp, path)
+                            notify403OrChallenged("request $path challenged")
+                            if (ticket.isProbe) probeSettled = true
+                            throw NeedsInteractiveVerification(
+                                "请求 $path 被 Cloudflare 挑战拦截",
+                                failedClearanceFp = result.sentClearanceFp,
+                                readProbePath = path,
+                                requestRound = ticket.round,
+                                requestGeneration = ticket.sessionGeneration,
+                                receivedAtElapsedMs = receivedAt,
+                            )
+                        }
+                        result.status == 429 -> {
+                            val cfChallenge = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body) ||
+                                isCfChallengeBody(result.body)
+                            if (cfChallenge) {
+                                if (retryAllowed && !staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
+                                    staleReplayed = true
+                                    diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
+                                    continue
+                                }
+                                if (allow429Challenge && retryAllowed && present && result.sentClearanceFp == "-") {
+                                    diagnostics.log("429 CF 挑战当前无有效 cf_clearance(sent=-)，先尝试一次静默补签: $path")
+                                    if (ticket.isProbe) probeSettled = true
+                                    throw NeedsInteractiveVerification(
+                                        "请求 $path 遇到 Cloudflare 速率验证",
+                                        failedClearanceFp = "-",
+                                        isFrom429 = true,
+                                        readProbePath = path,
+                                        requestRound = ticket.round,
+                                        requestGeneration = ticket.sessionGeneration,
+                                        receivedAtElapsedMs = receivedAt,
+                                        retryAfterSeconds = result.retryAfterSeconds,
+                                    )
+                                }
+                                // 速率型挑战：短冷却并在第 2 次命中时立即换线降温；前台请求在阈值内无感退避重放，避免连续弹错。
+                                probeSettled = true
+                                val cooldownEx = enterChallenge429Cooldown(
+                                    path = path,
+                                    retryAfterSeconds = result.retryAfterSeconds,
+                                    sentClearanceFp = result.sentClearanceFp,
+                                    requestRound = ticket.round,
+                                    requestGeneration = ticket.sessionGeneration,
+                                    receivedAtElapsedMs = receivedAt,
                                 )
+                                val waitMs = cooldownEx.retryAfterMs
+                                if (retryAllowed && present && attempt < MAX_RETRIES &&
+                                    waitMs in 1L..(AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L)
+                                ) {
+                                    val jitterMs = (200L..600L).random()
+                                    val totalWaitMs = waitMs + jitterMs
+                                    diagnostics.log("前台请求 429 挑战自动退避 ${totalWaitMs}ms 后无感重试(${attempt + 1}/$MAX_RETRIES): $path")
+                                    delay(totalWaitMs)
+                                    attempt++
+                                    continue
+                                }
+                                throw cooldownEx
                             }
-                            // 速率型挑战：凭据仍有效，不判废、不弹验证页，走递增冷却自愈。
-                            throw enterChallenge429Cooldown(path, result.retryAfterSeconds, result.sentClearanceFp)
+                            probeSettled = true
+                            val cooldownEx = enterRateLimitCooldown(
+                                path = path,
+                                retryAfterSeconds = result.retryAfterSeconds,
+                                requestRound = ticket.round,
+                                requestGeneration = ticket.sessionGeneration,
+                                receivedAtElapsedMs = receivedAt,
+                            )
+                            val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
+                            if (retryAllowed && present && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                                val jitterMs = (200L..800L).random()
+                                val totalWaitMs = (waitSec * 1_000L) + jitterMs
+                                diagnostics.log("前台请求 429 自动等待 ${totalWaitMs}ms (含抖动 ${jitterMs}ms) 后重试(${attempt + 1}/$MAX_RETRIES): $path")
+                                delay(totalWaitMs)
+                                attempt++
+                            } else {
+                                throw cooldownEx
+                            }
                         }
-                        val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds)
-                        val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
-                        if (retryAllowed && present && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
-                            val jitterMs = (200L..800L).random()
-                            val totalWaitMs = (waitSec * 1_000L) + jitterMs
-                            diagnostics.log("前台请求 429 自动等待 ${totalWaitMs}ms (含抖动 ${jitterMs}ms) 后重试(${attempt + 1}/$MAX_RETRIES): $path")
-                            delay(totalWaitMs)
+                        result.status == 403 -> {
+                            if (isMainSite) notify403OrChallenged("request $path 403")
+                            throw HttpStatusException(result.status, result.body.take(120))
+                        }
+                        result.status in 200..299 -> {
+                            if (isMainSite) onMainSiteGetSucceeded(ticket, sessionStore)
+                            probeSettled = true
+                            return result.body
+                        }
+                        // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
+                        result.status == 0 -> throw NetworkTimeoutException()
+                        retryAllowed && result.status >= 500 && attempt < MAX_RETRIES -> {
+                            delay(BACKOFF_BASE_MS shl attempt)
                             attempt++
-                        } else {
-                            throw cooldownEx
                         }
+                        else -> throw HttpStatusException(result.status, result.body.take(120), result.retryAfterSeconds)
                     }
-                    result.status == 403 -> {
-                        if (isMainSite) notify403OrChallenged("request $path 403")
-                        throw HttpStatusException(result.status, result.body.take(120))
+                } finally {
+                    if (!probeSettled) {
+                        releaseGetProbeIfAborted(ticket)
                     }
-                    result.status in 200..299 -> {
-                        if (isMainSite) resetChallenge429Streak()
-                        return result.body
-                    }
-                    // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
-                    result.status == 0 -> throw NetworkTimeoutException()
-                    retryAllowed && result.status >= 500 && attempt < MAX_RETRIES -> {
-                        delay(BACKOFF_BASE_MS shl attempt)
-                        attempt++
-                    }
-                    else -> throw HttpStatusException(result.status, result.body.take(120), result.retryAfterSeconds)
+                    releaseInFlight(ticket)
                 }
             }
             @Suppress("UNREACHABLE_CODE")
@@ -4991,6 +5570,11 @@ class TopicRepository(
         /** P0-4: 静默过盾成功但新 cf_clearance 对 OkHttp 仍立撞 403（出口/栈不一致）时的熔断时长。 */
         const val CLEARANCE_MISMATCH_COOLDOWN_MS = 60_000L
 
+        /** GET 撞盾静默补签并发合并：同一时刻仅允许一条隐藏 WebView 补签，排队请求共享其结果。 */
+        private val silentRevalidateMutex = Mutex()
+        private val silentRevalidateFlightLock = Any()
+        private var inFlightSilentRevalidate: CompletableDeferred<Boolean>? = null
+
         /** 后台静默预取撞盾后的全进程退避截止时间（elapsedRealtime）。 */
         @Volatile var silentPrefetchBackoffUntil = 0L
         const val SILENT_PREFETCH_BACKOFF_MS = 2 * 60_000L
@@ -5000,9 +5584,112 @@ class TopicRepository(
         var rateLimitedUntil = 0L
         /** 当前活跃的 429 冷却是否纯由 Cloudflare 质询型 429（cf-mitigated=challenge）触发。 */
         var rateLimitedByCfChallenge = false
+        /** 冷却轮次（开启后阻塞同轮叠加，到期放行一条探针并递增轮次以隔离迟到旧响应）。 */
+        private var rateLimitRound = 1L
+        /** 已经记录过冷却的轮次编号（-1 表示当前轮次尚未进入冷却）。 */
+        private var activeCooldownRound = -1L
+        /** 当前冷却轮次对应的连续 429 档位快照。 */
+        private var activeCooldownStreak = -1
+        /** 冷却到期后是否必须先放行并验证一条主站业务 GET，确认通过后再放开并发。 */
+        private var rateLimitProbeRequired = false
+        /**
+         * 当前到期探针的所有者标识（取探针领取时的轮次号，0 表示无探针在途）。只有持有者本身才能释放或结算探针；
+         * 迟到响应延长冷却时只改截止时间，不得清掉在途探针，否则会并发放出第二条探针。
+         */
+        private var rateLimitProbeOwner = 0L
+        /** 探针成功后的低速恢复期截止时间：期间主站请求单并发、放大间隔，避免积压请求集中发出。 */
+        private var rateLimitRecoveryUntil = 0L
+        /** 计入恢复期并发统计的主站业务请求在途数。 */
+        private var mainSiteInFlight = 0
+        private var lastRecoveryClaimAt = 0L
+        /** 每次写入新的冷却截止时间都递增；探针只有在领取后版本未变时，成功才能解除探针要求。 */
+        private var rateLimitDeadlineVersion = 0L
         private val siteRateLimitedUntil = mutableMapOf<String, Long>()
         private val oauthFlights = mutableMapOf<String, CompletableDeferred<Boolean>>()
         private val oauthSucceededAt = mutableMapOf<String, Long>()
+
+        private data class GetSlotTicket(
+            val round: Long,
+            val sessionGeneration: Long,
+            val isProbe: Boolean,
+            /** 探针领取时的冷却截止版本。 */
+            val deadlineVersion: Long = -1L,
+            /** 是否占用了恢复期在途计数，结束时必须归还。 */
+            val countsInFlight: Boolean = false,
+        )
+
+        private sealed interface CooldownSlotDecision {
+            /** 旧轮次或旧会话的迟到响应：不再递增客户端档位，但服务端明确给出的等待时间仍须遵守。 */
+            data object StaleRound : CooldownSlotDecision
+            data object SameRoundActiveOrLate : CooldownSlotDecision
+            data object NewRound : CooldownSlotDecision
+        }
+
+        /** 仅当 [round] 正是当前探针持有者时释放；其他请求（包括迟到的旧轮次响应）无权清除探针。 */
+        private fun releaseProbeOwnerLocked(round: Long) {
+            if (round > 0L && rateLimitProbeOwner == round) {
+                rateLimitProbeOwner = 0L
+            }
+        }
+
+        /**
+         * 服务端截止时间与客户端轮次分开处理：只要 Retry-After 指向未来且晚于现有截止时间，就延长冷却。
+         * 只更新截止时间并要求到期探针，不触碰在途探针的所有权。
+         */
+        private fun extendServerDeadlineLocked(
+            serverUntil: Long,
+            nowElapsed: Long,
+            nowWall: Long,
+            cfChallenge: Boolean,
+            sessionStore: SessionStore?,
+        ): Boolean {
+            if (serverUntil <= nowElapsed || serverUntil <= rateLimitedUntil) return false
+            val wasActive = rateLimitedUntil > nowElapsed
+            rateLimitedByCfChallenge = if (wasActive) rateLimitedByCfChallenge && cfChallenge else cfChallenge
+            rateLimitedUntil = serverUntil
+            rateLimitProbeRequired = true
+            rateLimitRecoveryUntil = 0L
+            rateLimitDeadlineVersion++
+            if (activeCooldownRound < 0L) activeCooldownRound = rateLimitRound
+            sessionStore?.setRateLimitedUntil(nowWall + (rateLimitedUntil - nowElapsed))
+            return true
+        }
+
+        private fun classifyCooldownDecisionLocked(
+            nowElapsed: Long,
+            requestRound: Long,
+            requestGeneration: Long,
+            sessionStore: SessionStore?,
+        ): CooldownSlotDecision {
+            val currentGen = sessionStore?.sessionGeneration ?: -1L
+            // 跨会话或旧轮次的迟到响应不再推高客户端档位，但其 Retry-After 仍代表服务端真实要求，交由 StaleRound 只更新截止时间。
+            if (sessionStore != null && requestGeneration >= 0L && requestGeneration != currentGen) {
+                return CooldownSlotDecision.StaleRound
+            }
+            if (requestRound >= 0L) {
+                if (requestRound == activeCooldownRound) {
+                    return CooldownSlotDecision.SameRoundActiveOrLate
+                }
+                if (requestRound < rateLimitRound) {
+                    return CooldownSlotDecision.StaleRound
+                }
+                if (nowElapsed < rateLimitedUntil && activeCooldownRound >= 0L) {
+                    return CooldownSlotDecision.SameRoundActiveOrLate
+                }
+                return CooldownSlotDecision.NewRound
+            }
+            return if (nowElapsed < rateLimitedUntil) {
+                CooldownSlotDecision.SameRoundActiveOrLate
+            } else {
+                CooldownSlotDecision.NewRound
+            }
+        }
+
+        fun currentRateLimitRound(): Long = synchronized(rateLimitLock) { rateLimitRound }
+
+        fun isSilentRevalidating(): Boolean = synchronized(silentRevalidateFlightLock) {
+            inFlightSilentRevalidate?.isCompleted == false
+        }
 
         fun isRateLimitCoolingDown(): Boolean = rateLimitRemainingMs() > 0L
 
@@ -5025,28 +5712,65 @@ class TopicRepository(
             retryAfterSeconds: Long? = null,
             sessionStore: SessionStore? = null,
             cfChallenge: Boolean = false,
+            requestRound: Long = -1L,
+            requestGeneration: Long = -1L,
+            receivedAtElapsedMs: Long = 0L,
         ): Long {
             val nowElapsed = SystemClock.elapsedRealtime()
+            val originElapsed = if (receivedAtElapsedMs in 1L..nowElapsed) receivedAtElapsedMs else nowElapsed
             val nowWall = System.currentTimeMillis()
-            val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(retryAfterSeconds, RATE_LIMIT_COOLDOWN_MS)
+            val retryAfterMs = retryAfterSeconds?.takeIf { it > 0L }?.coerceIn(1L, 86_400L)?.times(1_000L) ?: 0L
+            var shouldNotifyQuota = false
             val remaining = synchronized(rateLimitLock) {
-                val wasActive = rateLimitedUntil > nowElapsed
-                rateLimitedByCfChallenge = if (wasActive) {
-                    rateLimitedByCfChallenge && cfChallenge
-                } else {
-                    cfChallenge
+                val serverUntil = if (retryAfterMs > 0L) originElapsed + retryAfterMs else 0L
+                when (classifyCooldownDecisionLocked(nowElapsed, requestRound, requestGeneration, sessionStore)) {
+                    CooldownSlotDecision.StaleRound,
+                    CooldownSlotDecision.SameRoundActiveOrLate -> {
+                        if (nowElapsed < rateLimitedUntil) {
+                            rateLimitedByCfChallenge = rateLimitedByCfChallenge && cfChallenge
+                        }
+                        if (extendServerDeadlineLocked(serverUntil, nowElapsed, nowWall, cfChallenge, sessionStore)) {
+                            shouldNotifyQuota = true
+                        }
+                        releaseProbeOwnerLocked(requestRound)
+                        (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
+                    }
+                    CooldownSlotDecision.NewRound -> {
+                        val wasActive = rateLimitedUntil > nowElapsed
+                        rateLimitedByCfChallenge = if (wasActive) {
+                            rateLimitedByCfChallenge && cfChallenge
+                        } else {
+                            cfChallenge
+                        }
+                        val targetUntil = if (retryAfterMs > 0L) {
+                            maxOf(nowElapsed, originElapsed + retryAfterMs)
+                        } else {
+                            nowElapsed + RATE_LIMIT_COOLDOWN_MS
+                        }
+                        rateLimitedUntil = maxOf(rateLimitedUntil, targetUntil)
+                        activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
+                        rateLimitProbeRequired = true
+                        rateLimitRecoveryUntil = 0L
+                        rateLimitDeadlineVersion++
+                        // 只有探针自己的 429 才能交还探针；无轮次的外部 429 保留在途探针，由版本号阻止它解除新冷却。
+                        releaseProbeOwnerLocked(requestRound)
+                        val rem = (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
+                        sessionStore?.setRateLimitedUntil(nowWall + rem)
+                        shouldNotifyQuota = rem > 0L
+                        rem
+                    }
                 }
-                rateLimitedUntil = maxOf(rateLimitedUntil, nowElapsed + cooldownMs)
-                sessionStore?.setRateLimitedUntil(nowWall + cooldownMs)
-                (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
             }
-            ApiQuotaPool.onServerRateLimited(remaining, cfChallenge)
+            if (shouldNotifyQuota && remaining > 0L) {
+                ApiQuotaPool.onServerRateLimited(remaining, cfChallenge)
+            }
             return remaining
         }
 
-        /** 主站 429 + cf-mitigated=challenge 的连续命中档位；2xx 或长时间无命中后清零。 */
+        /** 主站 429 + cf-mitigated=challenge 的连续命中档位；2xx 逐步恢复或长时间无命中后清零。 */
         private var challenge429Streak = 0
         private var lastChallenge429At = 0L
+        private var lastChallenge429StepDownAt = 0L
         private var lastChallenge429RotateAt = 0L
 
         /** 递增冷却连续撞满最高档后的有限度换线（由 AppContainer 注入，轮换 Anycast 优选节点并回收连接）。 */
@@ -5054,36 +5778,147 @@ class TopicRepository(
 
         /**
          * 速率型 429 挑战进入递增冷却（12s → 24s → 40s），不判废凭据、不弹验证页。
-         * 返回本次冷却毫秒与是否需要触发换线。
+         * 同轮次并发/重复处理合并计为一次且不重算倒计时；返回冷却毫秒、当前档位与是否需要触发换线。
          */
         fun enterChallenge429Cooldown(
             path: String,
             retryAfterSeconds: Long?,
             sessionStore: SessionStore?,
+            requestRound: Long = -1L,
+            requestGeneration: Long = -1L,
+            receivedAtElapsedMs: Long = 0L,
         ): Triple<Long, Int, Boolean> {
-            val now = SystemClock.elapsedRealtime()
-            val (stepMs, streak, rotate) = synchronized(rateLimitLock) {
-                if (now - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS) challenge429Streak = 0
-                lastChallenge429At = now
-                val step = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
-                challenge429Streak++
-                val shouldRotate = challenge429Streak > CHALLENGE_429_STEPS_MS.size &&
-                    now - lastChallenge429RotateAt > CHALLENGE_429_ROTATE_INTERVAL_MS
-                if (shouldRotate) lastChallenge429RotateAt = now
-                Triple(step, challenge429Streak, shouldRotate)
-            }
+            val nowElapsed = SystemClock.elapsedRealtime()
+            val originElapsed = if (receivedAtElapsedMs in 1L..nowElapsed) receivedAtElapsedMs else nowElapsed
+            val nowWall = System.currentTimeMillis()
             val retryAfterMs = retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L
-            val cooldownSeconds = (maxOf(stepMs, retryAfterMs) + 999L) / 1_000L
-            val remaining = enterRateLimitCooldown(path, cooldownSeconds, sessionStore, cfChallenge = true)
+            var shouldNotifyQuota = false
+            val (remaining, streak, rotate) = synchronized(rateLimitLock) {
+                val serverUntil = if (retryAfterMs > 0L) originElapsed + retryAfterMs else 0L
+                when (classifyCooldownDecisionLocked(nowElapsed, requestRound, requestGeneration, sessionStore)) {
+                    CooldownSlotDecision.StaleRound,
+                    CooldownSlotDecision.SameRoundActiveOrLate -> {
+                        if (extendServerDeadlineLocked(serverUntil, nowElapsed, nowWall, cfChallenge = true, sessionStore)) {
+                            shouldNotifyQuota = true
+                        }
+                        releaseProbeOwnerLocked(requestRound)
+                        Triple((rateLimitedUntil - nowElapsed).coerceAtLeast(0L), activeCooldownStreak.coerceAtLeast(1), false)
+                    }
+                    CooldownSlotDecision.NewRound -> {
+                        if (nowElapsed - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS) challenge429Streak = 0
+                        lastChallenge429At = nowElapsed
+                        val rawStep = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
+                        challenge429Streak++
+                        val shouldRotate = challenge429Streak >= CHALLENGE_429_STEPS_MS.size &&
+                            nowElapsed - lastChallenge429RotateAt > CHALLENGE_429_ROTATE_INTERVAL_MS
+                        val step = if (shouldRotate) {
+                            lastChallenge429RotateAt = nowElapsed
+                            challenge429Streak = 0
+                            2_500L
+                        } else {
+                            rawStep
+                        }
+                        activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
+                        activeCooldownStreak = if (shouldRotate) CHALLENGE_429_STEPS_MS.size else challenge429Streak
+
+                        val wasActive = rateLimitedUntil > nowElapsed
+                        rateLimitedByCfChallenge = if (wasActive) rateLimitedByCfChallenge else true
+                        val targetUntil = maxOf(nowElapsed + step, serverUntil)
+                        rateLimitedUntil = maxOf(rateLimitedUntil, targetUntil)
+                        rateLimitProbeRequired = true
+                        rateLimitRecoveryUntil = 0L
+                        rateLimitDeadlineVersion++
+                        releaseProbeOwnerLocked(requestRound)
+                        val rem = (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
+                        sessionStore?.setRateLimitedUntil(nowWall + rem)
+                        shouldNotifyQuota = rem > 0L
+                        Triple(rem, activeCooldownStreak, shouldRotate)
+                    }
+                }
+            }
+            if (shouldNotifyQuota && remaining > 0L) {
+                ApiQuotaPool.onServerRateLimited(remaining, cfChallenge = true)
+            }
             if (rotate) {
                 runCatching { onChallenge429Persistent?.invoke("连续 $streak 次 429 速率挑战: $path") }
             }
             return Triple(remaining, streak, rotate)
         }
 
+        private fun onMainSiteGetSucceeded(ticket: GetSlotTicket, sessionStore: SessionStore?) {
+            val now = SystemClock.elapsedRealtime()
+            synchronized(rateLimitLock) {
+                val currentGen = sessionStore?.sessionGeneration ?: -1L
+                val isStaleGeneration = sessionStore != null &&
+                    ticket.sessionGeneration >= 0L &&
+                    ticket.sessionGeneration != currentGen
+                if (ticket.isProbe && rateLimitProbeOwner == ticket.round) {
+                    releaseProbeOwnerLocked(ticket.round)
+                    // 跨账号/旧会话探针完成时必须先归还探针锁，再保留当前会话的探针验证要求。
+                    if (isStaleGeneration) return
+                    // 探针在途期间若有迟到 429 延长了截止时间，本次成功只交还探针，不解除新一段冷却后的探针要求。
+                    if (ticket.deadlineVersion != rateLimitDeadlineVersion || now < rateLimitedUntil) return
+                    rateLimitProbeRequired = false
+                    activeCooldownRound = -1L
+                    activeCooldownStreak = -1
+                    rateLimitRound++
+                    rateLimitRecoveryUntil = now + RATE_LIMIT_RECOVERY_MS
+                    // 探针刚通过时不立即降档 challenge429Streak，防止 20s 低速恢复期内再撞 429 时卡死在第一档(12s)；
+                    // 待恢复期平稳结束后，再按 CHALLENGE_429_STEP_DOWN_INTERVAL_MS 逐级退档。
+                    lastChallenge429StepDownAt = now
+                } else if (
+                    !isStaleGeneration &&
+                    !ticket.isProbe &&
+                    activeCooldownRound < 0L &&
+                    now >= rateLimitedUntil &&
+                    now >= rateLimitRecoveryUntil &&
+                    ticket.round == rateLimitRound &&
+                    challenge429Streak > 0 &&
+                    now - lastChallenge429StepDownAt >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS &&
+                    now - lastChallenge429At >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS
+                ) {
+                    challenge429Streak = (challenge429Streak - 1).coerceAtLeast(0)
+                    lastChallenge429StepDownAt = now
+                }
+            }
+        }
+
+        private fun releaseGetProbeIfAborted(ticket: GetSlotTicket) {
+            if (!ticket.isProbe) return
+            synchronized(rateLimitLock) { releaseProbeOwnerLocked(ticket.round) }
+        }
+
+        fun releaseGetProbeForRound(round: Long) {
+            synchronized(rateLimitLock) { releaseProbeOwnerLocked(round) }
+        }
+
+        /** 归还恢复期在途计数；每张票据只在请求真正结束时调用一次。 */
+        private fun releaseInFlight(ticket: GetSlotTicket) {
+            if (!ticket.countsInFlight) return
+            synchronized(rateLimitLock) { mainSiteInFlight = (mainSiteInFlight - 1).coerceAtLeast(0) }
+        }
+
+        fun stepDownChallenge429Streak() {
+            val now = SystemClock.elapsedRealtime()
+            synchronized(rateLimitLock) {
+                if (
+                    activeCooldownRound < 0L &&
+                    now >= rateLimitedUntil &&
+                    now >= rateLimitRecoveryUntil &&
+                    challenge429Streak > 0 &&
+                    now - lastChallenge429StepDownAt >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS &&
+                    now - lastChallenge429At >= CHALLENGE_429_STEP_DOWN_INTERVAL_MS
+                ) {
+                    challenge429Streak = (challenge429Streak - 1).coerceAtLeast(0)
+                    lastChallenge429StepDownAt = now
+                }
+            }
+        }
+
         fun resetChallenge429Streak() {
             synchronized(rateLimitLock) {
                 challenge429Streak = 0
+                activeCooldownStreak = -1
             }
         }
 
@@ -5091,6 +5926,13 @@ class TopicRepository(
             synchronized(rateLimitLock) {
                 rateLimitedUntil = 0L
                 rateLimitedByCfChallenge = false
+                activeCooldownRound = -1L
+                activeCooldownStreak = -1
+                rateLimitProbeRequired = false
+                rateLimitProbeOwner = 0L
+                rateLimitRecoveryUntil = 0L
+                rateLimitDeadlineVersion++
+                rateLimitRound++
                 sessionStore?.setRateLimitedUntil(0L)
             }
         }
@@ -5123,12 +5965,24 @@ class TopicRepository(
         const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
         /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
         const val RATE_LIMIT_COOLDOWN_MS = 10_000L
-        /** 速率型 429 挑战的递增冷却档位。 */
-        private val CHALLENGE_429_STEPS_MS = longArrayOf(12_000L, 24_000L, 40_000L)
+        /** 进程重启后恢复已持久化的服务端 Retry-After 冷却上限（24 小时），避免截断长冷却。 */
+        private const val MAX_PERSISTED_COOLDOWN_MS = 86_400_000L
+        /** 速率型 429 挑战的递增冷却档位（第 2 次即切线降温，不在同一差节点死扛）。 */
+        private val CHALLENGE_429_STEPS_MS = longArrayOf(6_000L, 12_000L)
         /** 超过该时长无新的 429 挑战，档位从头计。 */
         private const val CHALLENGE_429_STREAK_RESET_MS = 3 * 60_000L
-        /** 换线降温的最小间隔，避免节点来回漂移本身又引发风控。 */
-        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 10 * 60_000L
+        /** 连续 429 档位成功恢复时，每级至少间隔该时长后再向下退档，避免并发 2xx 瞬间清零。 */
+        private const val CHALLENGE_429_STEP_DOWN_INTERVAL_MS = 10_000L
+        /** 探针通过后的低速恢复期时长、并发上限与相邻放行间隔。 */
+        private const val RATE_LIMIT_RECOVERY_MS = 20_000L
+        private const val RATE_LIMIT_RECOVERY_MAX_IN_FLIGHT = 1
+        private const val RATE_LIMIT_RECOVERY_SPACING_MS = 1_000L
+        /** 到期探针或静默补签在途时，前台请求让行轮询间隔。 */
+        private const val PROBE_WAIT_POLL_MS = 150L
+        /** 到期探针或静默补签在途时，后台请求的轻退避提示。 */
+        private const val PROBE_WAIT_BACKOFF_MS = 2_000L
+        /** 换线降温的最小间隔，避免短时间抖动；同时防止被差节点卡死。 */
+        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 30_000L
         /** timings 遇 429 挑战时仅自身熔断的时长（不写主站全局冷却）。 */
         private const val TIMINGS_CHALLENGE_429_FUSE_MS = 60_000L
         /** timings 遇普通 429 且无 Retry-After 时的自身熔断时长。 */
@@ -5149,16 +6003,245 @@ class TopicRepository(
         const val MAX_POST_TIME_MS = 60_000L
         const val MAX_TOPIC_TIME_MS = 30 * 60 * 1_000L
 
-        /** 申请读轨道 (GET) 令牌，强制执行滑动窗口限频与防尖峰错峰 */
-        suspend fun acquireGetSlot(isCoolingDown: () -> Boolean) {
-            while (true) {
-                if (isCoolingDown()) {
-                    val remaining = synchronized(rateLimitLock) {
-                        (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
-                    }
+        private fun nextCooldownOrProbeWaitMsLocked(
+            isMainSite: Boolean,
+            present: Boolean,
+            allowClaimProbe: Boolean = true,
+        ): Long {
+            val now = SystemClock.elapsedRealtime()
+            val remaining = synchronized(rateLimitLock) {
+                val rem = (rateLimitedUntil - now).coerceAtLeast(0L)
+                if (rem > 0L) {
+                    rem
+                } else if (isMainSite && rateLimitProbeRequired && (rateLimitProbeOwner != 0L || !allowClaimProbe)) {
+                    -1L // 已有单条到期探针在途
+                } else if (isMainSite && recoveryWaitMsLocked(now) > 0L) {
+                    -1L // 低速恢复期：单并发 + 放大间隔
+                } else {
+                    0L
+                }
+            }
+            if (remaining > 0L) {
+                if (!present) {
                     throw RateLimitException(remaining)
                 }
+                if (!isMainSite) return 0L
+                if (remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) {
+                    throw RateLimitException(remaining)
+                }
+                return minOf(remaining, 500L)
+            }
+            if (remaining < 0L) {
+                if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
+                return PROBE_WAIT_POLL_MS
+            }
+            if (isMainSite && isSilentRevalidating()) {
+                if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
+                return PROBE_WAIT_POLL_MS
+            }
+            return 0L
+        }
+
+        private suspend fun awaitGetCooldownOrProbeGate(
+            isMainSite: Boolean,
+            present: Boolean,
+            allowClaimProbe: Boolean = true,
+        ) {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val waitMs = nextCooldownOrProbeWaitMsLocked(isMainSite, present, allowClaimProbe)
+                if (waitMs <= 0L) return
+                delay(waitMs)
+            }
+        }
+
+        private fun tryClaimGetSlotLocked(
+            isMainSite: Boolean,
+            present: Boolean,
+            now: Long,
+            allowClaimProbe: Boolean = true,
+            sessionGenerationProvider: () -> Long,
+        ): GetSlotTicket? {
+            if (isMainSite && isSilentRevalidating()) {
+                if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
+                return null
+            }
+            return synchronized(rateLimitLock) {
+                val remaining = (rateLimitedUntil - now).coerceAtLeast(0L)
+                if (remaining > 0L) {
+                    if (!present) throw RateLimitException(remaining)
+                    if (isMainSite && remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) {
+                        throw RateLimitException(remaining)
+                    }
+                    if (isMainSite) return@synchronized null
+                }
+                claimMainSiteTicketLocked(isMainSite, present, now, allowClaimProbe, sessionGenerationProvider)
+            }
+        }
+
+        /** 恢复期内距离下一次可放行的等待毫秒；0 表示可立即放行。 */
+        private fun recoveryWaitMsLocked(now: Long): Long {
+            if (now >= rateLimitRecoveryUntil) return 0L
+            if (mainSiteInFlight >= RATE_LIMIT_RECOVERY_MAX_IN_FLIGHT) return PROBE_WAIT_POLL_MS
+            return (RATE_LIMIT_RECOVERY_SPACING_MS - (now - lastRecoveryClaimAt)).coerceAtLeast(0L)
+        }
+
+        /**
+         * 冷却已到期后为主站请求发放票据：必要时领取唯一探针，恢复期内执行单并发与间隔，
+         * 返回 null 表示需要稍后重试。调用方必须持有 [rateLimitLock]。
+         */
+        private fun claimMainSiteTicketLocked(
+            isMainSite: Boolean,
+            present: Boolean,
+            now: Long,
+            allowClaimProbe: Boolean,
+            sessionGenerationProvider: () -> Long,
+        ): GetSlotTicket? {
+            if (isMainSite && rateLimitProbeRequired) {
+                if (rateLimitProbeOwner != 0L || !allowClaimProbe) {
+                    if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
+                    return null
+                }
+                val generation = sessionGenerationProvider()
+                rateLimitRound++
+                rateLimitProbeOwner = rateLimitRound
+                mainSiteInFlight++
+                lastRecoveryClaimAt = now
+                return GetSlotTicket(
+                    round = rateLimitRound,
+                    sessionGeneration = generation,
+                    isProbe = true,
+                    deadlineVersion = rateLimitDeadlineVersion,
+                    countsInFlight = true,
+                )
+            }
+            if (isMainSite && now < rateLimitRecoveryUntil) {
+                if (recoveryWaitMsLocked(now) > 0L) {
+                    if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
+                    return null
+                }
+                val generation = sessionGenerationProvider()
+                mainSiteInFlight++
+                lastRecoveryClaimAt = now
+                return GetSlotTicket(
+                    round = rateLimitRound,
+                    sessionGeneration = generation,
+                    isProbe = false,
+                    countsInFlight = true,
+                )
+            }
+            return GetSlotTicket(
+                round = rateLimitRound,
+                sessionGeneration = sessionGenerationProvider(),
+                isProbe = false,
+            )
+        }
+
+        /** 冷却、待探针或低速恢复期内，非关键写请求（如阅读进度）应直接让行。 */
+        fun isMainSiteGateBusy(): Boolean = synchronized(rateLimitLock) {
+            val now = SystemClock.elapsedRealtime()
+            now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil
+        }
+
+        /** 图片等被动请求只等待业务探针和恢复期结束，不领取探针票据。 */
+        fun mainSiteGateWaitMs(): Long = synchronized(rateLimitLock) {
+            val now = SystemClock.elapsedRealtime()
+            maxOf(
+                (rateLimitedUntil - now).coerceAtLeast(0L),
+                (rateLimitRecoveryUntil - now).coerceAtLeast(0L),
+                if (rateLimitProbeRequired) PROBE_WAIT_BACKOFF_MS else 0L,
+            )
+        }
+
+        /**
+         * 主站写请求/上传的冷却与探针闸门。每次实际发送前（含重试）都必须调用：
+         * 冷却中短等或抛出 [RateLimitException]，到期后写请求本身可作为唯一探针放行，恢复期内服从单并发与间隔。
+         */
+        private suspend fun acquireWriteTicket(sessionGenerationProvider: () -> Long): GetSlotTicket {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val waitMs = nextCooldownOrProbeWaitMsLocked(isMainSite = true, present = true)
+                if (waitMs > 0L) {
+                    delay(waitMs)
+                    continue
+                }
+                val ticket = synchronized(rateLimitLock) {
+                    val now = SystemClock.elapsedRealtime()
+                    val remaining = (rateLimitedUntil - now).coerceAtLeast(0L)
+                    if (remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) throw RateLimitException(remaining)
+                    if (remaining > 0L) null
+                    else claimMainSiteTicketLocked(true, present = true, now, allowClaimProbe = true, sessionGenerationProvider)
+                }
+                if (ticket != null) return ticket
+                delay(PROBE_WAIT_POLL_MS)
+            }
+        }
+
+        /** 写请求结束后统一结算票据：2xx 视为探针通过，其余未进入冷却的结果交还探针。 */
+        private fun settleWriteTicket(ticket: GetSlotTicket, status: Int, sessionStore: SessionStore?) {
+            if (status in 200..299) onMainSiteGetSucceeded(ticket, sessionStore)
+            else releaseGetProbeIfAborted(ticket)
+            releaseInFlight(ticket)
+        }
+
+        /** 统一的主站写闸门（含冷却等待/拒发、唯一探针领取与恢复期单并发间隔），供外部登录/授权写请求复用。 */
+        internal suspend fun <T> withMainSiteWriteGate(
+            sessionStore: SessionStore?,
+            statusOf: () -> Int,
+            block: suspend (round: Long) -> T,
+        ): T {
+            val ticket = acquireWriteTicket { sessionStore?.sessionGeneration ?: -1L }
+            var responseReturned = false
+            return try {
+                block(ticket.round).also { responseReturned = true }
+            } finally {
+                val st = statusOf()
+                // 只有正常返回的 429 才将所有权交给调用方继续记录冷却；异常/取消必须在此兜底归还。
+                if (st == 429 && responseReturned) releaseInFlight(ticket)
+                else settleWriteTicket(ticket, if (responseReturned) st else -1, sessionStore)
+            }
+        }
+
+        /** 统一的读轨道闸门（含冷却/单探针/恢复期与滑动窗口），供登录/授权/兜底读取复用。 */
+        internal suspend fun <T> withMainSiteReadGate(
+            isMainSite: Boolean,
+            present: Boolean,
+            sessionStore: SessionStore?,
+            statusOf: () -> Int,
+            block: suspend (round: Long) -> T,
+        ): T {
+            val ticket = acquireGetSlot(
+                isMainSite = isMainSite,
+                present = present,
+                allowClaimProbe = true,
+            ) { sessionStore?.sessionGeneration ?: -1L }
+            var responseReturned = false
+            return try {
+                block(ticket.round).also { responseReturned = true }
+            } finally {
+                val st = statusOf()
+                if (isMainSite) {
+                    if (st == 429 && responseReturned) {
+                        // 正常返回的 429 由调用方按轮次记录冷却；异常退出则走下面的兜底释放。
+                    } else if (st in 200..299 && responseReturned) {
+                        onMainSiteGetSucceeded(ticket, sessionStore)
+                    } else {
+                        releaseGetProbeIfAborted(ticket)
+                    }
+                }
+                releaseInFlight(ticket)
+            }
+        }
+
+        private suspend fun <T> acquireGetPacedSlot(
+            awaitPreGate: suspend () -> Unit,
+            tryClaimOnWindowReady: (now: Long) -> T?,
+        ): T {
+            while (true) {
+                awaitPreGate()
                 var waitMs = 0L
+                var claimed: T? = null
+                var retryAfterGate = false
                 getRateLimiterLock.withLock {
                     val now = SystemClock.elapsedRealtime()
                     while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
@@ -5173,15 +6256,99 @@ class TopicRepository(
                         if (elapsedSinceLast < MIN_GET_SPACING_MS) {
                             waitMs = MIN_GET_SPACING_MS - elapsedSinceLast
                         } else {
-                            getRequestTimestamps.addLast(now)
-                            return
+                            val token = tryClaimOnWindowReady(now)
+                            if (token != null) {
+                                getRequestTimestamps.addLast(now)
+                                claimed = token
+                            } else {
+                                retryAfterGate = true
+                            }
                         }
                     }
                 }
+                if (claimed != null) return claimed!!
                 if (waitMs > 0L) {
                     delay(waitMs)
+                } else if (retryAfterGate) {
+                    delay(PROBE_WAIT_POLL_MS)
                 }
             }
+        }
+
+        /** 申请读轨道 (GET) 令牌（供显式登录/授权等仅需滑动窗口限频或自定义冷却判定的调用方使用）。 */
+        suspend fun acquireGetSlot(isCoolingDown: () -> Boolean) {
+            acquireGetPacedSlot(
+                awaitPreGate = {
+                    if (isCoolingDown()) {
+                        val remaining = synchronized(rateLimitLock) {
+                            (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                        }
+                        throw RateLimitException(remaining)
+                    }
+                },
+                tryClaimOnWindowReady = { Unit },
+            )
+        }
+
+        /** 申请读轨道 (GET) 令牌，强制执行冷却/单探针闸门、滑动窗口限频与防尖峰错峰 */
+        private suspend fun acquireGetSlot(
+            isMainSite: Boolean,
+            present: Boolean,
+            allowClaimProbe: Boolean = true,
+            sessionGenerationProvider: () -> Long,
+        ): GetSlotTicket = acquireGetPacedSlot(
+            awaitPreGate = {
+                awaitGetCooldownOrProbeGate(
+                    isMainSite = isMainSite,
+                    present = present,
+                    allowClaimProbe = allowClaimProbe,
+                )
+            },
+            tryClaimOnWindowReady = { now ->
+                tryClaimGetSlotLocked(
+                    isMainSite = isMainSite,
+                    present = present,
+                    now = now,
+                    allowClaimProbe = allowClaimProbe,
+                    sessionGenerationProvider = sessionGenerationProvider,
+                )
+            },
+        )
+
+        suspend fun tryAcquireBackgroundGetSlot(sessionStore: SessionStore?): Boolean {
+            if (mainSiteGateWaitMs() > 0L || isSilentRevalidating()) return false
+            return getRateLimiterLock.withLock {
+                val now = SystemClock.elapsedRealtime()
+                while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
+                    getRequestTimestamps.removeFirst()
+                }
+                if (getRequestTimestamps.size >= GET_WINDOW_MAX_REQUESTS) return@withLock false
+                val lastReq = getRequestTimestamps.lastOrNull() ?: 0L
+                if (now - lastReq < MIN_GET_SPACING_MS) return@withLock false
+                val ticket = runCatching {
+                    tryClaimGetSlotLocked(
+                        isMainSite = true,
+                        present = false,
+                        now = now,
+                        allowClaimProbe = false,
+                    ) { sessionStore?.sessionGeneration ?: -1L }
+                }.getOrNull() ?: return@withLock false
+                getRequestTimestamps.addLast(now)
+                releaseInFlight(ticket)
+                true
+            }
+        }
+
+        fun onBackgroundMainSiteGetSucceeded(sessionStore: SessionStore?) {
+            val currentRound = synchronized(rateLimitLock) { rateLimitRound }
+            onMainSiteGetSucceeded(
+                GetSlotTicket(
+                    round = currentRound,
+                    sessionGeneration = sessionStore?.sessionGeneration ?: -1L,
+                    isProbe = false,
+                ),
+                sessionStore,
+            )
         }
 
         /** 写轨道 (POST) 串行安全节流 */
@@ -5194,5 +6361,424 @@ class TopicRepository(
         fun markPostCompleted() {
             lastPostRequestAt = SystemClock.elapsedRealtime()
         }
+    }
+}
+
+/** 邮件使用独立 TLS Socket，不携带论坛 Cookie，也不进入 Cloudflare HTTP 通道。 */
+class NativeMailRepository(
+    context: android.content.Context,
+    private val accountId: Long,
+    private val accountGeneration: Long,
+) : java.io.Closeable {
+    private val appContext = context.applicationContext
+    private val container = (appContext as org.linuxdo.android.App).container
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val sockets = ConcurrentHashMap.newKeySet<java.net.Socket>()
+    private val services = ConcurrentHashMap.newKeySet<jakarta.mail.Service>()
+    private val operationLock = Mutex()
+
+    companion object {
+        const val HOST = "mail.linux.do"
+        const val IMAP_PORT = 993
+        const val SMTP_PORT = 465
+        private const val PAGE_SIZE = 40
+        internal const val IO_TIMEOUT_MS = 15_000
+    }
+
+    private fun ensureOwner() {
+        val store = container.sessionStore
+        if (closed.get() || store.currentUserId() != accountId || store.sessionGeneration != accountGeneration) {
+            throw CancellationException("邮箱所属账号已切换或页面已关闭")
+        }
+    }
+
+    private fun socketFactory(port: Int): javax.net.SocketFactory {
+        ensureOwner()
+        val store = container.sessionStore
+        val network = container.networkMonitor.detect()
+        val useDoh = store.isDohEnabled() && !network.shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+        val dns = if (useDoh) {
+            org.linuxdo.android.net.AdaptiveDohDns(
+                servers = org.linuxdo.android.net.loadDohServers(store),
+                bootstrapClient = OkHttpClient.Builder()
+                    .proxy(java.net.Proxy.NO_PROXY)
+                    .cookieJar(CookieJar.NO_COOKIES)
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(6, TimeUnit.SECONDS)
+                    .callTimeout(8, TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(false)
+                    .build(),
+                autoFailover = store.isDohAutoFailoverEnabled(),
+            ).apply { primaryServerId = store.getDohServerUrl() ?: org.linuxdo.android.net.DohPresets.DEFAULT.id }
+        } else okhttp3.Dns.SYSTEM
+        val route = if (network.isProxy) "系统代理" else if (useDoh) "DoH解析+邮件TLS" else "系统网络+邮件TLS"
+        val proxy = if (network.isProxy) java.net.ProxySelector.getDefault()
+            ?.select(URI("https://$HOST:$port"))?.firstOrNull() ?: throw IOException("系统代理无法提供邮件连接") else null
+        NetDiagnostics.log("邮箱连接准备 route=$route server=$HOST port=$port")
+        return object : javax.net.SocketFactory() {
+            override fun createSocket(): java.net.Socket {
+                ensureOwner()
+                val socket = NativeMailSocket(dns, proxy, port) { sockets.remove(it) }
+                sockets.add(socket)
+                if (closed.get()) {
+                    socket.close()
+                    ensureOwner()
+                }
+                return socket
+            }
+            override fun createSocket(host: String, port: Int): java.net.Socket = createSocket().apply {
+                require(host == HOST)
+                connect(java.net.InetSocketAddress.createUnresolved(host, port), IO_TIMEOUT_MS)
+            }
+            override fun createSocket(host: java.net.InetAddress, port: Int): java.net.Socket = createSocket(HOST, port)
+            override fun createSocket(host: String, port: Int, local: java.net.InetAddress, localPort: Int): java.net.Socket =
+                throw java.net.SocketException("邮件连接不支持指定本地地址")
+            override fun createSocket(host: java.net.InetAddress, port: Int, local: java.net.InetAddress, localPort: Int): java.net.Socket =
+                throw java.net.SocketException("邮件连接不支持指定本地地址")
+        }
+    }
+
+    private fun session(): jakarta.mail.Session {
+        val properties = java.util.Properties()
+        for (protocol in listOf("imaps", "smtps")) {
+            properties["mail.$protocol.socketFactory"] = socketFactory(if (protocol == "imaps") IMAP_PORT else SMTP_PORT)
+            properties.setProperty("mail.$protocol.socketFactory.fallback", "false")
+            properties.setProperty("mail.$protocol.ssl.enable", "true")
+            properties.setProperty("mail.$protocol.ssl.checkserveridentity", "true")
+            properties.setProperty("mail.$protocol.connectiontimeout", IO_TIMEOUT_MS.toString())
+            properties.setProperty("mail.$protocol.timeout", IO_TIMEOUT_MS.toString())
+            properties.setProperty("mail.$protocol.writetimeout", IO_TIMEOUT_MS.toString())
+            val tlsProtocols = javax.net.ssl.SSLContext.getDefault().supportedSSLParameters.protocols
+                .filter { it == "TLSv1.3" || it == "TLSv1.2" }.joinToString(" ")
+            properties.setProperty("mail.$protocol.ssl.protocols", tlsProtocols)
+        }
+        properties.setProperty("mail.imaps.peek", "true")
+        properties.setProperty("mail.imaps.fetchsize", "16384")
+        properties.setProperty("mail.smtps.auth", "true")
+        properties.setProperty("mail.smtps.quitwait", "false")
+        properties.setProperty("mail.smtps.sendpartial", "false")
+        return jakarta.mail.Session.getInstance(properties).apply { debug = false }
+    }
+
+    private fun <T> withStore(credentials: NativeMailCredentials, block: (jakarta.mail.Store) -> T): T {
+        ensureOwner()
+        val mailStore = session().getStore("imaps")
+        services.add(mailStore)
+        try {
+            ensureOwner()
+            mailStore.connect(HOST, IMAP_PORT, credentials.username, credentials.password)
+            ensureOwner()
+            return block(mailStore)
+        } finally {
+            runCatching { mailStore.close() }
+            services.remove(mailStore)
+        }
+    }
+
+    suspend fun inbox(
+        credentials: NativeMailCredentials,
+        beforeSequence: Int = 0,
+        expectedUidValidity: Long = 0L,
+    ): NativeMailPage = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
+            withStore(credentials) { mailStore ->
+                val folder = mailStore.getFolder("INBOX")
+                folder.open(jakarta.mail.Folder.READ_ONLY)
+                try {
+                    val uidFolder = folder as jakarta.mail.UIDFolder
+                    val validity = uidFolder.uidValidity
+                    if (expectedUidValidity != 0L && validity != expectedUidValidity) {
+                        throw IOException("邮箱目录已更新，请重新刷新收件箱")
+                    }
+                    val total = folder.messageCount
+                    val last = if (beforeSequence > 0) beforeSequence.coerceAtMost(total) else total
+                    val first = (last - PAGE_SIZE + 1).coerceAtLeast(1)
+                    val messages = if (last < 1) emptyList() else {
+                        val batch = folder.getMessages(first, last)
+                        folder.fetch(batch, jakarta.mail.FetchProfile().apply {
+                            add(jakarta.mail.FetchProfile.Item.ENVELOPE)
+                            add(jakarta.mail.FetchProfile.Item.FLAGS)
+                            add(jakarta.mail.UIDFolder.FetchProfileItem.UID)
+                        })
+                        batch.reversed().filterNot { it.isExpunged }.map {
+                            NativeMailMime.summary(it, uidFolder.getUID(it), validity)
+                        }
+                    }
+                    ensureOwner()
+                    NativeMailPage(messages, total, if (last > 0) first - 1 else 0, validity)
+                } finally {
+                    runCatching { folder.close(false) }
+                }
+            }
+        }
+    }
+
+    suspend fun read(credentials: NativeMailCredentials, summary: NativeMailSummary): NativeMailBody = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
+            withStore(credentials) { mailStore ->
+                val folder = mailStore.getFolder("INBOX")
+                folder.open(jakarta.mail.Folder.READ_WRITE)
+                try {
+                    val uidFolder = folder as jakarta.mail.UIDFolder
+                    if (uidFolder.uidValidity != summary.uidValidity) throw IOException("邮箱目录已更新，请刷新后再打开邮件")
+                    val message = uidFolder.getMessageByUID(summary.uid) ?: throw IOException("这封邮件已移走，请刷新收件箱")
+                    val body = NativeMailMime.body(message, summary)
+                    ensureOwner()
+                    message.setFlag(jakarta.mail.Flags.Flag.SEEN, true)
+                    body.copy(summary = summary.copy(seen = true))
+                } finally {
+                    runCatching { folder.close(false) }
+                }
+            }
+        }
+    }
+
+    /** 返回已发送副本的提示；SMTP 成功后副本失败绝不重发邮件。 */
+    suspend fun send(credentials: NativeMailCredentials, draft: NativeMailDraft): String? = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            ensureOwner()
+            currentCoroutineContext().ensureActive()
+            val mailSession = session()
+            val message = NativeMailMime.outgoing(mailSession, credentials, draft)
+            val transport = mailSession.getTransport("smtps")
+            services.add(transport)
+            try {
+                transport.connect(HOST, SMTP_PORT, credentials.username, credentials.password)
+                ensureOwner()
+                transport.sendMessage(message, message.allRecipients)
+                NetDiagnostics.log("邮箱 SMTP 已接受发送")
+            } finally {
+                runCatching { transport.close() }
+                services.remove(transport)
+            }
+            try {
+                withStore(credentials) { mailStore ->
+                    val folders = mailStore.defaultFolder.list("*")
+                    val sent = folders.firstOrNull {
+                        it is org.eclipse.angus.mail.imap.IMAPFolder && it.attributes.contains("\\Sent")
+                    } ?: folders.firstOrNull { it.name.lowercase() in setOf("sent", "sent messages", "sent items", "已发送") }
+                    if (sent == null) "邮件已发送，未找到已发送文件夹；可到网页邮箱查看" else {
+                        message.setFlag(jakarta.mail.Flags.Flag.SEEN, true)
+                        sent.appendMessages(arrayOf(message))
+                        null
+                    }
+                }
+            } catch (error: Exception) {
+                NetDiagnostics.log("邮箱已发送副本保存失败 type=${error.javaClass.simpleName}")
+                "邮件已发送，已发送副本未保存；请勿重复发送"
+            }
+        }
+    }
+
+    suspend fun probe(): String = operationLock.withLock {
+        withContext(Dispatchers.IO) {
+            listOf("收信" to IMAP_PORT, "发信" to SMTP_PORT).joinToString("\n") { (label, port) ->
+                ensureOwner()
+                try {
+                    socketFactory(port).createSocket(HOST, port).use { raw ->
+                        val tlsFactory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+                        (tlsFactory.createSocket(raw, HOST, port, true) as javax.net.ssl.SSLSocket).use { tls ->
+                            tls.soTimeout = IO_TIMEOUT_MS
+                            tls.sslParameters = tls.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
+                            tls.startHandshake()
+                            "$label $port：${tls.session.protocol} 连接正常"
+                        }
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    "$label $port：${describeNativeMailError(error)}"
+                }
+            }.also { ensureOwner(); NetDiagnostics.log("邮箱无凭据连接检测：$it") }
+        }
+    }
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        sockets.toList().forEach { runCatching { it.close() } }
+        services.toList().forEach { runCatching { it.close() } }
+        sockets.clear()
+        services.clear()
+    }
+}
+
+private class NativeMailSocket(
+    private val dns: okhttp3.Dns,
+    private val proxy: java.net.Proxy?,
+    private val expectedPort: Int,
+    private val onClose: (java.net.Socket) -> Unit,
+) : java.net.Socket(proxy?.takeIf { it.type() == java.net.Proxy.Type.SOCKS } ?: java.net.Proxy.NO_PROXY) {
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    init {
+        soTimeout = NativeMailRepository.IO_TIMEOUT_MS
+    }
+
+    override fun connect(endpoint: java.net.SocketAddress, timeout: Int) {
+        try {
+            connectMail(endpoint, timeout)
+        } catch (failure: Exception) {
+            runCatching { close() }
+            throw failure
+        }
+    }
+
+    private fun connectMail(endpoint: java.net.SocketAddress, timeout: Int) {
+        val target = endpoint as? java.net.InetSocketAddress ?: throw java.net.SocketException("邮件连接地址无效")
+        require(target.port == expectedPort)
+        if (closed.get()) throw java.net.SocketException("邮件连接已关闭")
+        if (proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS) {
+            super.connect(java.net.InetSocketAddress.createUnresolved(NativeMailRepository.HOST, target.port), timeout)
+            return
+        }
+        val proxyAddress = proxy?.takeIf { it.type() == java.net.Proxy.Type.HTTP }?.address() as? java.net.InetSocketAddress
+        val addresses = if (proxyAddress != null) okhttp3.Dns.SYSTEM.lookup(proxyAddress.hostString)
+            else dns.lookup(NativeMailRepository.HOST)
+        val address = addresses.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }.firstOrNull()
+            ?: throw java.net.UnknownHostException(NativeMailRepository.HOST)
+        // 保留真实 SocketImpl，Android TLS 包装需要从该 Socket 获取底层文件描述符。
+        super.connect(java.net.InetSocketAddress(address, proxyAddress?.port ?: target.port), timeout)
+        if (proxyAddress != null) {
+            val authority = "${NativeMailRepository.HOST}:${target.port}"
+            getOutputStream().write("CONNECT $authority HTTP/1.1\r\nHost: $authority\r\n\r\n".toByteArray(Charsets.UTF_8))
+            getOutputStream().flush()
+            val header = java.io.ByteArrayOutputStream()
+            var suffix = 0
+            while (header.size() < 8192 && suffix != 0x0d0a0d0a) {
+                val value = getInputStream().read()
+                if (value < 0) throw IOException("邮件代理连接提前结束")
+                header.write(value)
+                suffix = (suffix shl 8) or value
+            }
+            val status = header.toString(Charsets.UTF_8.name()).lineSequence().firstOrNull().orEmpty()
+            if (suffix != 0x0d0a0d0a || !Regex("^HTTP/\\d(?:\\.\\d)? 200(?: |$)").containsMatchIn(status)) {
+                throw IOException("系统代理未允许邮件端口 CONNECT")
+            }
+        }
+    }
+
+    override fun connect(endpoint: java.net.SocketAddress) = connect(endpoint, NativeMailRepository.IO_TIMEOUT_MS)
+    override fun close() {
+        if (closed.compareAndSet(false, true)) {
+            try { super.close() } finally { onClose(this) }
+        }
+    }
+}
+
+internal object NativeMailMime {
+    private const val MAX_BODY_BYTES = 1024 * 1024
+    private const val MAX_PARTS = 80
+
+    fun summary(message: jakarta.mail.Message, uid: Long, validity: Long): NativeMailSummary = NativeMailSummary(
+        uid, validity, message.subject?.take(500)?.ifBlank { "（无主题）" } ?: "（无主题）",
+        readableAddresses { message.from }.joinToString { addressLabel(it) }.take(500).ifBlank { "未知发件人" },
+        (message.sentDate ?: message.receivedDate)?.time ?: 0L,
+        message.isSet(jakarta.mail.Flags.Flag.SEEN),
+    )
+
+    private fun addressLabel(address: jakarta.mail.Address): String = if (address is jakarta.mail.internet.InternetAddress)
+        address.toUnicodeString() else address.toString()
+
+    private fun readableAddresses(read: () -> Array<out jakarta.mail.Address>?): List<jakarta.mail.Address> =
+        try { read()?.toList().orEmpty() } catch (_: jakarta.mail.internet.AddressException) { emptyList() }
+
+    fun body(message: jakarta.mail.Message, summary: NativeMailSummary): NativeMailBody {
+        var plain: String? = null
+        var html: String? = null
+        var truncated = false
+        var visited = 0
+        var remaining = MAX_BODY_BYTES
+        val attachments = mutableListOf<String>()
+        fun visit(part: jakarta.mail.Part, depth: Int) {
+            if (++visited > MAX_PARTS || depth > 12 || remaining <= 0) { truncated = true; return }
+            if (part.disposition.equals(jakarta.mail.Part.ATTACHMENT, true) || !part.fileName.isNullOrBlank()) {
+                attachments += runCatching { jakarta.mail.internet.MimeUtility.decodeText(part.fileName ?: "附件") }
+                    .getOrDefault("附件").take(200)
+                return
+            }
+            if (part.isMimeType("multipart/*")) {
+                val multipart = part.content as? jakarta.mail.Multipart ?: return
+                if (multipart.count > MAX_PARTS) truncated = true
+                for (index in 0 until minOf(multipart.count, MAX_PARTS)) visit(multipart.getBodyPart(index), depth + 1)
+            } else if (part.isMimeType("text/plain") || part.isMimeType("text/html")) {
+                val bytes = part.inputStream.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (output.size() < remaining) {
+                        val count = input.read(buffer, 0, minOf(buffer.size, remaining - output.size()))
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                    if (output.size() == remaining) truncated = true
+                    output.toByteArray()
+                }
+                remaining -= bytes.size
+                val charsetName = runCatching { jakarta.mail.internet.ContentType(part.contentType).getParameter("charset") }
+                    .getOrNull() ?: "UTF-8"
+                val charset = runCatching { java.nio.charset.Charset.forName(jakarta.mail.internet.MimeUtility.javaCharset(charsetName)) }
+                    .getOrDefault(Charsets.UTF_8)
+                val text = String(bytes, charset)
+                if (part.isMimeType("text/plain") && plain == null) plain = text
+                if (part.isMimeType("text/html") && html == null) html = sanitizeHtml(text)
+            }
+        }
+        visit(message, 0)
+        val text = plain ?: html?.let {
+            Jsoup.parse(it).apply { select("br").append("\\n"); select("p,div,li,tr").prepend("\\n") }
+                .text().replace("\\n", "\n")
+        } ?: "这封邮件没有可显示的正文"
+        return NativeMailBody(
+            summary, readableAddresses { message.getRecipients(jakarta.mail.Message.RecipientType.TO) }.joinToString { addressLabel(it) },
+            readableAddresses { message.replyTo }.filterIsInstance<jakarta.mail.internet.InternetAddress>().joinToString { it.address },
+            message.getHeader("Message-ID")?.firstOrNull()?.take(998),
+            message.getHeader("References")?.firstOrNull()?.takeLast(2000), text, html, attachments, truncated,
+        )
+    }
+
+    fun sanitizeHtml(raw: String): String {
+        val document = Jsoup.parse(raw)
+        document.select("script,style,iframe,object,embed,form,input,button,svg,math,link,meta,base,img,audio,video,source").remove()
+        val allowed = org.jsoup.safety.Safelist.basic().removeTags("img")
+        return Jsoup.clean(document.body().html(), allowed)
+    }
+
+    fun outgoing(
+        session: jakarta.mail.Session,
+        credentials: NativeMailCredentials,
+        draft: NativeMailDraft,
+    ): jakarta.mail.internet.MimeMessage {
+        require(draft.recipients.isNotBlank() && draft.recipients.none { it == '\r' || it == '\n' }) { "请输入有效的收件人地址" }
+        require(draft.subject.none { it == '\r' || it == '\n' }) { "主题不能包含换行" }
+        require(draft.text.isNotBlank() && draft.text.toByteArray(Charsets.UTF_8).size <= MAX_BODY_BYTES) { "正文不能为空且不能超过 1 MB" }
+        val recipients = jakarta.mail.internet.InternetAddress.parse(draft.recipients, true)
+        require(recipients.isNotEmpty() && recipients.size <= 30) { "收件人最多 30 个" }
+        recipients.forEach { it.validate() }
+        val sender = jakarta.mail.internet.InternetAddress(credentials.address, true).apply { validate() }
+        return jakarta.mail.internet.MimeMessage(session).apply {
+            setFrom(sender)
+            setRecipients(jakarta.mail.Message.RecipientType.TO, recipients)
+            setSubject(draft.subject.ifBlank { "（无主题）" }, "UTF-8")
+            setText(draft.text, "UTF-8")
+            sentDate = java.util.Date()
+            draft.inReplyTo?.takeIf { it.none { char -> char == '\r' || char == '\n' } }?.let { setHeader("In-Reply-To", it) }
+            draft.references?.takeIf { it.none { char -> char == '\r' || char == '\n' } }?.let { setHeader("References", it) }
+            saveChanges()
+        }
+    }
+}
+
+fun describeNativeMailError(error: Throwable): String {
+    val causes = generateSequence(error) { it.cause?.takeIf { cause -> cause !== it } }.take(8).toList()
+    return when {
+        causes.any { it is jakarta.mail.AuthenticationFailedException } -> "邮箱认证失败，请检查独立邮箱密码和登录名"
+        causes.any { it is java.net.UnknownHostException } -> "域名解析失败，请检查应用 DoH 设置"
+        causes.any { it is java.net.SocketTimeoutException } -> "连接超时，请重试或切换网络"
+        causes.any { it is javax.net.ssl.SSLException } -> "TLS 连接或证书校验失败，请切换网络后重试"
+        causes.any { it.message?.startsWith("系统代理") == true } -> "系统代理无法建立邮件 CONNECT 通道（993/465）"
+        error is IllegalArgumentException -> error.message ?: "邮箱配置或邮件内容无效"
+        error is jakarta.mail.internet.AddressException -> "邮箱地址格式不正确"
+        causes.any { it is IOException } -> "邮件服务器连接失败，请刷新或切换网络"
+        else -> "邮箱操作失败（${error.javaClass.simpleName}），请重试"
     }
 }

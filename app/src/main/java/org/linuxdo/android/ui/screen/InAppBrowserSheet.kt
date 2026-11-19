@@ -1,9 +1,11 @@
 package org.linuxdo.android.ui.screen
 
 import android.content.Context
+import android.os.Build
 import android.content.Intent
 import android.content.SharedPreferences
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -30,6 +32,7 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -39,19 +42,19 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
@@ -72,6 +75,7 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -104,12 +108,16 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.net.toUri
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
@@ -127,13 +135,21 @@ import org.json.JSONObject
 import org.linuxdo.android.App
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.MiniAppDirectoryPage
+import org.linuxdo.android.data.NativeMailCredentials
+import org.linuxdo.android.data.NativeMailSummary
+import org.linuxdo.android.data.NativeMailBody
+import org.linuxdo.android.data.NativeMailDraft
+import org.linuxdo.android.data.NativeMailRepository
+import org.linuxdo.android.data.describeNativeMailError
 import org.linuxdo.android.data.MiniAppEntry
 import org.linuxdo.android.data.MiniAppLibraryState
 import org.linuxdo.android.data.MiniAppSort
 import org.linuxdo.android.net.gecko.GeckoAuthBridge
+import org.linuxdo.android.net.gecko.LINKED_H5_CONTEXT_PREFIX
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.gecko.GeckoManager
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.WebRequestError
@@ -142,6 +158,58 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 internal const val IN_APP_BOOTSTRAP_PATH = "/robots.txt"
 private const val IN_APP_BOOTSTRAP_URL = "${Config.BASE_URL}$IN_APP_BOOTSTRAP_PATH"
 const val LINUXDO_APPS_PLAZA_URL = "${Config.BASE_URL}/apps"
+
+internal enum class ProfileWebApp(val url: String, val title: String) {
+    Store("https://ldcstore.com/", "LDCstore"),
+    Mail("https://webmail.linux.do/", "专属邮箱");
+
+    fun contextId(accountId: Long): String = "$LINKED_H5_CONTEXT_PREFIX${name.lowercase()}-${accountId.coerceAtLeast(0L)}"
+
+    companion object {
+        fun fromUrl(value: String?): ProfileWebApp? {
+            val parsed = value?.toHttpUrlOrNull() ?: return null
+            if (!parsed.isHttps || parsed.port != 443 || parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
+            return entries.firstOrNull { it.url.toHttpUrlOrNull()?.host == parsed.host }
+        }
+
+        fun isServiceHost(host: String?): Boolean = entries.any {
+            it.url.toHttpUrlOrNull()?.host == host?.lowercase()?.trimEnd('.')
+        }
+    }
+}
+
+internal object InAppViewport {
+    fun isBootstrapUrl(value: String?): Boolean {
+        val url = value?.toHttpUrlOrNull() ?: return false
+        return url.scheme == "https" && url.host == Config.HOST && url.encodedPath == IN_APP_BOOTSTRAP_PATH
+    }
+
+    fun isChallengeTitle(title: String): Boolean = Regex(
+        "^(just a moment|checking your browser|verifying you are human|请稍候|请稍等|正在验证)",
+        RegexOption.IGNORE_CASE,
+    ).containsMatchIn(title.trim())
+
+    fun canRevealTarget(url: String?): Boolean {
+        val parsed = url?.toHttpUrlOrNull() ?: return false
+        val path = parsed.encodedPath.lowercase()
+        val appPage = isTrustedForumHost(parsed.host) && (path == "/apps" || path.startsWith("/apps/"))
+        return !isBootstrapUrl(url) && !appPage
+    }
+
+    fun shouldShowPage(
+        bootstrapping: Boolean,
+        ready: Boolean,
+        challenge: Boolean,
+        url: String?,
+        revealTarget: Boolean = false,
+    ): Boolean = challenge || (!isBootstrapUrl(url) &&
+        ((!bootstrapping && ready) || (revealTarget && canRevealTarget(url))))
+
+    fun bottomClipping(viewTop: Int, viewHeight: Int, visibleBottom: Int): Int {
+        val height = viewHeight.coerceAtLeast(0).toLong()
+        return (viewTop.toLong() + height - visibleBottom).coerceIn(0L, height).toInt()
+    }
+}
 
 private fun isAppsPlazaUrl(value: String): Boolean = isTrustedForumUrl(value) &&
     value.toUri().path?.trimEnd('/') == "/apps"
@@ -378,15 +446,13 @@ private fun MiniAppLauncher(onDismiss: () -> Unit, onOpen: (MiniAppEntry) -> Uni
         }
     }
 
-    Dialog(onDismissRequest = ::back, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    FullscreenDialog(onDismissRequest = ::back, darkSystemBars = true) {
         BackHandler(onBack = ::back)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Brush.verticalGradient(listOf(Color(0xFF1E1E29), Color(0xFF252433), Color(0xFF2E2C3E))))
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .imePadding()
+                .safeDrawingPadding()
                 .onGloballyPositioned { coords ->
                     rootOriginInWindow = coords.positionInRoot()
                     rootSizePx = Size(coords.size.width.toFloat(), coords.size.height.toFloat())
@@ -1140,6 +1206,26 @@ private fun MiniAppSearchField(
         })
 }
 
+fun normalizeInAppTargetUrl(rawUrl: String?): String? {
+    val parsed = rawUrl?.trim()?.takeIf { it.isNotEmpty() }?.toHttpUrlOrNull() ?: return null
+    if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
+    val standardPort = (parsed.isHttps && parsed.port == 443) || (parsed.scheme == "http" && parsed.port == 80)
+    if (!standardPort) return null
+    val candidate = (if (parsed.isHttps) parsed else parsed.newBuilder().scheme("https").port(443).build()).toString()
+    return if (ProfileWebApp.fromUrl(candidate) != null || isTrustedForumUrl(candidate)) candidate else null
+}
+
+fun miniAppBadgeLabelForUrl(rawUrl: String?): String? {
+    val normalized = normalizeInAppTargetUrl(rawUrl) ?: return null
+    ProfileWebApp.fromUrl(normalized)?.let { return "${it.title} · 小程序" }
+    if (isLinuxDoMiniAppUrl(normalized)) return "linux.do · 小程序"
+    return null
+}
+
+fun isInAppMiniAppUrl(rawUrl: String?): Boolean = miniAppBadgeLabelForUrl(rawUrl) != null
+
+fun shouldOpenInAppBrowser(rawUrl: String?): Boolean = normalizeInAppTargetUrl(rawUrl) != null
+
 fun isLinuxDoMiniAppUrl(rawUrl: String?): Boolean {
     if (!isTrustedForumUrl(rawUrl)) return false
     val path = rawUrl?.toUri()?.path?.lowercase().orEmpty()
@@ -1148,6 +1234,7 @@ fun isLinuxDoMiniAppUrl(rawUrl: String?): Boolean {
 
 private fun defaultMiniAppTitle(url: String, initialTitle: String?): String {
     if (!initialTitle.isNullOrBlank()) return initialTitle
+    ProfileWebApp.fromUrl(url)?.let { return it.title }
     val uri = runCatching { url.toUri() }.getOrNull()
     val path = uri?.path?.lowercase().orEmpty()
     return when {
@@ -1201,8 +1288,10 @@ object MiniAppSessionPool {
         var contentReady = false
         var targetPainted = false
         var showChallenge by mutableStateOf(false)
+        var revealTarget by mutableStateOf(false)
+        var documentTitle = ""
         var loadEpoch by mutableStateOf(0)
-        var documentUrl = ""
+        var documentUrl by mutableStateOf("")
         var documentId: String? = null
         var bootstrapPreparing = false
         var appInfo by mutableStateOf<MiniAppEntry?>(null)
@@ -1211,6 +1300,10 @@ object MiniAppSessionPool {
         var desktopMode by mutableStateOf(false)
             private set
         var injectCss: String? = null
+        var webmailAutoLoginAttempted = false
+        var webmailManualLogout = false
+        var lastWebmailFillDocId: String? = null
+        var webmailFillingDocId: String? = null
 
         fun toggleDesktopMode() {
             val useDesktop = !desktopMode
@@ -1365,13 +1458,16 @@ object MiniAppSessionPool {
         val container = (appContext as? App)?.container
         val sessionStore = container?.sessionStore
         val browserSession = container?.browser
+        val accountId = sessionStore?.currentUserId() ?: 0L
+        val accountGeneration = sessionStore?.sessionGeneration ?: 0L
+        val webApp = ProfileWebApp.fromUrl(url)
+        val isolatedContextId = isolatedH5ContextId(url, accountId)
+        val oneWayAuth = isolatedContextId != null
 
         lateinit var holder: HeldSession
 
         fun isBootstrapLocation(raw: String?): Boolean {
-            val parsed = raw?.toUri() ?: return false
-            return parsed.host?.equals(Config.HOST, ignoreCase = true) == true &&
-                parsed.path == IN_APP_BOOTSTRAP_PATH
+            return InAppViewport.isBootstrapUrl(raw)
         }
 
         fun isCurrentHolder(): Boolean = activeHolder === holder &&
@@ -1379,13 +1475,14 @@ object MiniAppSessionPool {
             (sessionStore?.sessionGeneration ?: 0L) == holder.accountGeneration
 
         fun syncClearanceBack(pageUrl: String) {
-            if (!isCurrentHolder() || !isTrustedForumUrl(pageUrl)) return
+            // 子站及隔离容器的授权链只单向接收主站登录态，bootstrap 和子站回跳均不回传 Cookie。
+            if (oneWayAuth || !isCurrentHolder() || !isMainForumSyncUrl(pageUrl)) return
             poolScope.launch {
                 val clearances = runCatching { holder.bridge?.readCfClearances() }.getOrNull()
                     ?.takeIf { it.isNotEmpty() }
                     ?: withContext(Dispatchers.IO) { GeckoManager.cfClearancesFromDb(appContext).toList() }
                 if (isCurrentHolder()) {
-                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "小程序容器")
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "小程序容器", holder.session)
                     val pageHost = runCatching { android.net.Uri.parse(pageUrl).host }.getOrNull().orEmpty()
                     org.linuxdo.android.net.NetDiagnostics.log(
                         "小程序容器页面完成(Gecko) host=$pageHost title=${holder.title.take(30)} Cookie清单: " +
@@ -1415,9 +1512,7 @@ object MiniAppSessionPool {
                     holder.bootstrapPreparing = false
                 }
                 if (isCurrentHolder() && holder.loadEpoch == epoch) {
-                    syncClearanceBack(IN_APP_BOOTSTRAP_URL)
                     holder.bootstrapDone = true
-                    holder.bootstrapping = false
                     holder.session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 }
             }
@@ -1426,12 +1521,25 @@ object MiniAppSessionPool {
         fun applyDocumentState(state: JSONObject, bindDocument: Boolean = false) {
             if (!isCurrentHolder()) return
             val documentUrl = state.optString("url")
-            if (documentUrl != holder.documentUrl) return
             val documentId = state.optString("documentId").takeIf { it.isNotBlank() } ?: return
-            if (bindDocument) holder.documentId = documentId
+            if (bindDocument) {
+                if (documentUrl.isNotBlank() && holder.documentUrl != documentUrl) {
+                    holder.documentUrl = documentUrl
+                    if (!isBootstrapLocation(documentUrl)) holder.currentUrl = documentUrl
+                }
+                holder.documentId = documentId
+            }
             if (holder.documentId != documentId) return
+            if (documentUrl.isNotBlank() && documentUrl != holder.documentUrl) {
+                if (documentUrl.toHttpUrlOrNull()?.host == holder.documentUrl.toHttpUrlOrNull()?.host) {
+                    holder.documentUrl = documentUrl
+                    if (!isBootstrapLocation(documentUrl)) holder.currentUrl = documentUrl
+                } else {
+                    return
+                }
+            }
             val phase = state.optString("phase")
-            holder.showChallenge = phase == "challenge"
+            holder.showChallenge = phase == "challenge" || InAppViewport.isChallengeTitle(holder.documentTitle)
             if (isBootstrapLocation(documentUrl)) {
                 holder.contentReady = false
                 holder.hasRenderedFirstPage = false
@@ -1439,14 +1547,64 @@ object MiniAppSessionPool {
                 return
             }
             holder.contentReady = phase == "ready" || phase == "permission"
+            if (holder.contentReady) holder.bootstrapping = false
             holder.hasRenderedFirstPage = holder.contentReady && holder.targetPainted
             if (phase == "error" || phase == "unavailable") {
                 holder.mainFrameError = state.optString("detail").ifBlank { "小程序暂时无法启动，请稍后重试" }
+            }
+            if (webApp == ProfileWebApp.Mail && holder.contentReady &&
+                documentUrl.toHttpUrlOrNull()?.host == "webmail.linux.do") {
+                if (state.optBoolean("webmailLogout")) {
+                    holder.webmailManualLogout = true
+                    holder.webmailAutoLoginAttempted = true
+                } else if (state.optBoolean("webmailAuthenticated")) {
+                    if (!holder.webmailManualLogout) {
+                        holder.webmailAutoLoginAttempted = false
+                    }
+                } else if (state.optBoolean("webmailLogin") &&
+                    holder.lastWebmailFillDocId != documentId &&
+                    holder.webmailFillingDocId != documentId &&
+                    holder.accountId > 0L) {
+                    if (holder.webmailManualLogout) {
+                        holder.lastWebmailFillDocId = documentId
+                    } else {
+                        holder.webmailFillingDocId = documentId
+                        val hasLoginError = state.optBoolean("webmailLoginError")
+                        poolScope.launch {
+                            try {
+                                val creds = withContext(Dispatchers.IO) {
+                                    runCatching { container?.accountManager?.nativeMailCredentials(holder.accountId) }.getOrNull()
+                                }
+                                if (creds != null && creds.address.isNotBlank() && creds.password.isNotBlank() &&
+                                    isCurrentHolder() && holder.documentId == documentId && !holder.webmailManualLogout) {
+                                    val autoSubmit = !holder.webmailAutoLoginAttempted && !hasLoginError
+                                    val res = runCatching {
+                                        holder.bridge?.fillWebmailLogin(creds.address, creds.password, autoSubmit)
+                                    }.getOrNull()
+                                    if (res?.filled == true) {
+                                        holder.lastWebmailFillDocId = documentId
+                                    }
+                                    if (res?.submitted == true) {
+                                        holder.webmailAutoLoginAttempted = true
+                                    }
+                                    org.linuxdo.android.net.NetDiagnostics.log(
+                                        "专属邮箱登录页自动处理 (filled=${res?.filled == true}, autoSubmit=$autoSubmit, submitted=${res?.submitted == true})",
+                                    )
+                                }
+                            } finally {
+                                if (holder.webmailFillingDocId == documentId) {
+                                    holder.webmailFillingDocId = null
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
         val session = GeckoManager.createChallengeSession(
             context = appContext,
+            contextId = isolatedContextId,
             onLocationChanged = { navUrl ->
                 holder.documentUrl = navUrl
                 if (!isBootstrapLocation(navUrl)) {
@@ -1454,6 +1612,7 @@ object MiniAppSessionPool {
                 }
             },
             onPageStarted = { startUrl ->
+                if (!isCurrentHolder()) return@createChallengeSession
                 holder.loadEpoch++
                 holder.documentId = null
                 holder.documentUrl = startUrl
@@ -1461,6 +1620,9 @@ object MiniAppSessionPool {
                 holder.contentReady = false
                 holder.targetPainted = false
                 holder.showChallenge = false
+                holder.revealTarget = false
+                holder.documentTitle = ""
+                holder.bootstrapping = isBootstrapLocation(startUrl)
                 if (!isBootstrapLocation(startUrl)) {
                     holder.currentUrl = startUrl
                 }
@@ -1473,7 +1635,11 @@ object MiniAppSessionPool {
                 }
             },
             onTitleChanged = { newTitle ->
-                if (!isBootstrapLocation(holder.documentUrl) && MiniAppEntry.idFromUrl(holder.entryUrl) == null && newTitle.isNotBlank()) {
+                if (!isCurrentHolder()) return@createChallengeSession
+                holder.documentTitle = newTitle
+                holder.showChallenge = InAppViewport.isChallengeTitle(newTitle)
+                if (!holder.bootstrapping && !isBootstrapLocation(holder.documentUrl) &&
+                    MiniAppEntry.idFromUrl(holder.entryUrl) == null && newTitle.isNotBlank()) {
                     val cleaned = newTitle
                         .removeSuffix(" - LINUX DO")
                         .removeSuffix(" - Linux Do")
@@ -1506,11 +1672,11 @@ object MiniAppSessionPool {
                 }
             },
             onPageError = { failedUrl, error ->
-                holder.bootstrapping = false
                 if (isBootstrapLocation(failedUrl)) {
                     holder.bootstrapDone = true
                     if (isCurrentHolder()) holder.session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 } else {
+                    holder.bootstrapping = false
                     holder.currentUrl = failedUrl.ifBlank { holder.currentUrl }
                     holder.mainFrameError = describeGeckoLoadError(error)
                 }
@@ -1519,7 +1685,10 @@ object MiniAppSessionPool {
                 val target = targetUri.toUri()
                 val scheme = target.scheme?.lowercase().orEmpty()
                 val targetAppId = MiniAppEntry.idFromUrl(targetUri)
-                if (isAppsPlazaUrl(targetUri) || (targetAppId != null && targetAppId != MiniAppEntry.idFromUrl(holder.entryUrl))) {
+                if (!oneWayAuth && isolatedH5ContextId(targetUri, accountId) != null) {
+                    requestOpen(targetUri)
+                    true
+                } else if (isAppsPlazaUrl(targetUri) || (targetAppId != null && targetAppId != MiniAppEntry.idFromUrl(holder.entryUrl))) {
                     requestOpen(miniAppPublicUrl(targetUri))
                     true
                 } else if (targetAppId != null && target.getQueryParameter("embed_mode") != "true") {
@@ -1540,14 +1709,20 @@ object MiniAppSessionPool {
                     holder.hasRenderedFirstPage = holder.contentReady
                 }
             },
+            onDiagnostic = { message ->
+                if (isCurrentHolder()) org.linuxdo.android.net.NetDiagnostics.log(
+                    "H5 容器 epoch=${holder.loadEpoch} challenge=${holder.showChallenge} " +
+                        "ready=${holder.hasRenderedFirstPage} $message " + GeckoManager.runtimeNetworkSummary(appContext),
+                )
+            },
         )
 
         holder = HeldSession(
             key = key,
             entryUrl = url,
             session = session,
-            accountId = sessionStore?.currentUserId() ?: 0L,
-            accountGeneration = sessionStore?.sessionGeneration ?: 0L,
+            accountId = accountId,
+            accountGeneration = accountGeneration,
         ).apply {
             this.title = defaultMiniAppTitle(url, initialTitle)
             this.injectCss = injectCss
@@ -1570,7 +1745,30 @@ object MiniAppSessionPool {
                         }
                     },
                     onCallback = { name, payload ->
-                        if (name == "onInAppPageState") runCatching { JSONObject(payload) }.getOrNull()?.let { applyDocumentState(it) }
+                        if (name == "onInAppPageState") {
+                            runCatching { JSONObject(payload) }.getOrNull()?.let { applyDocumentState(it) }
+                        } else if (name == "onWebmailLogout" && webApp == ProfileWebApp.Mail && isCurrentHolder()) {
+                            holder.webmailManualLogout = true
+                            holder.webmailAutoLoginAttempted = true
+                        } else if (name == "onWebmailCredentials" && webApp == ProfileWebApp.Mail && isCurrentHolder() && holder.accountId > 0L) {
+                            val creds = runCatching { JSONObject(payload) }.getOrNull()
+                            val address = creds?.optString("address")?.trim().orEmpty()
+                            val password = creds?.optString("password").orEmpty()
+                            if (address.isNotBlank() && password.isNotBlank()) {
+                                val targetAccountId = holder.accountId
+                                holder.webmailManualLogout = false
+                                holder.webmailAutoLoginAttempted = true
+                                poolScope.launch(Dispatchers.IO) {
+                                    runCatching {
+                                        container?.accountManager?.saveNativeMailCredentials(
+                                            targetAccountId,
+                                            NativeMailCredentials(address, address, password),
+                                        )
+                                        org.linuxdo.android.net.NetDiagnostics.log("专属邮箱已保存登录凭据到本地安全存储")
+                                    }
+                                }
+                            }
+                        }
                     },
                 )
             }.getOrNull()
@@ -1585,12 +1783,10 @@ object MiniAppSessionPool {
                 if (isCurrentHolder() && !holder.bootstrapDone && !holder.bootstrapPreparing &&
                     !holder.showChallenge && holder.mainFrameError == null) {
                     holder.bootstrapDone = true
-                    holder.bootstrapping = false
                     session.load(GeckoSession.Loader().uri(miniAppLaunchUrl(url)).flags(GeckoSession.LOAD_FLAGS_REPLACE_HISTORY))
                 }
             } else {
                 holder.bootstrapDone = true
-                holder.bootstrapping = false
                 session.loadUri(miniAppLaunchUrl(url))
             }
         }
@@ -1614,11 +1810,19 @@ fun InAppBrowserSheet(
     onDismiss: () -> Unit,
     initialTitle: String? = null,
     injectCss: String? = null,
+    preferNativeMail: Boolean = false,
 ) {
+    val initialNormalizedUrl = remember(url) { normalizeInAppTargetUrl(url) ?: url }
+    val entry = initialNormalizedUrl.toHttpUrlOrNull()
+    if (preferNativeMail && ProfileWebApp.fromUrl(initialNormalizedUrl) == ProfileWebApp.Mail &&
+        entry?.encodedPath == "/" && entry.encodedQuery == null && entry.encodedFragment == null) {
+        NativeMailboxSheet(onDismiss)
+        return
+    }
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    var activeTargetUrl by remember(url) { mutableStateOf(url) }
-    var targetTitle by remember(url) { mutableStateOf(initialTitle) }
+    var activeTargetUrl by remember(initialNormalizedUrl) { mutableStateOf(initialNormalizedUrl) }
+    var targetTitle by remember(initialNormalizedUrl) { mutableStateOf(initialTitle) }
     var returnToLauncher by remember(url) { mutableStateOf(isAppsPlazaUrl(url)) }
     var actionSheetVisible by remember(activeTargetUrl) { mutableStateOf(false) }
     var keepFloatingOnExit by remember(activeTargetUrl) { mutableStateOf(false) }
@@ -1645,12 +1849,14 @@ fun InAppBrowserSheet(
     }
 
     val uri = remember(activeTargetUrl) { runCatching { activeTargetUrl.toUri() }.getOrNull() }
-    val validTrustedUrl = remember(activeTargetUrl) {
-        uri != null && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() && isTrustedForumUrl(activeTargetUrl)
+    val validInAppUrl = remember(activeTargetUrl) {
+        uri != null && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() &&
+            if (ProfileWebApp.isServiceHost(uri.host)) ProfileWebApp.fromUrl(activeTargetUrl) != null
+            else isTrustedForumUrl(activeTargetUrl)
     }
 
-    LaunchedEffect(activeTargetUrl, validTrustedUrl) {
-        if (!validTrustedUrl) {
+    LaunchedEffect(activeTargetUrl, validInAppUrl) {
+        if (!validInAppUrl) {
             if (uri == null || uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank()) {
                 Toast.makeText(context, "无法打开此链接", Toast.LENGTH_SHORT).show()
             } else {
@@ -1660,7 +1866,7 @@ fun InAppBrowserSheet(
         }
     }
 
-    if (!validTrustedUrl) return
+    if (!validInAppUrl) return
 
     val (holder, _) = remember(activeTargetUrl) {
         MiniAppSessionPool.acquireOrCreate(
@@ -1698,6 +1904,24 @@ fun InAppBrowserSheet(
         }
     }
 
+    val showPage = InAppViewport.shouldShowPage(
+        holder.bootstrapping, holder.hasRenderedFirstPage, holder.showChallenge, holder.documentUrl,
+        holder.revealTarget,
+    )
+    LaunchedEffect(holder, holder.loadEpoch, holder.documentUrl) {
+        val epoch = holder.loadEpoch
+        val documentUrl = holder.documentUrl
+        if (InAppViewport.canRevealTarget(documentUrl)) {
+            delay(2_000)
+            val store = (context.applicationContext as? App)?.container?.sessionStore
+            if (MiniAppSessionPool.activeHolder === holder && holder.loadEpoch == epoch &&
+                holder.documentUrl == documentUrl && holder.mainFrameError == null &&
+                store?.currentUserId() == holder.accountId && store.sessionGeneration == holder.accountGeneration) {
+                // 普通网页的挑战可能没有主站脚本回报；显示页面供用户验证，内部准备页仍隐藏。
+                holder.revealTarget = true
+            }
+        }
+    }
     var isTimeout by remember(holder) { mutableStateOf(false) }
     LaunchedEffect(holder, holder.loadEpoch, holder.hasRenderedFirstPage, holder.showChallenge, holder.mainFrameError) {
         isTimeout = false
@@ -1710,11 +1934,51 @@ fun InAppBrowserSheet(
     DisposableEffect(holder, geckoView) {
         MiniAppSessionPool.markContainerEntered()
         (geckoView.parent as? ViewGroup)?.removeView(geckoView)
-        geckoView.alpha = if (holder.hasRenderedFirstPage || holder.showChallenge) 1f else 0f
+        geckoView.alpha = if (showPage) 1f else 0f
         geckoView.setSession(holder.session)
         holder.session.setActive(true)
 
+        val visibleBounds = android.graphics.Rect()
+        val visibleFrame = android.graphics.Rect()
+        val screenLocation = IntArray(2)
+        val rootLocation = IntArray(2)
+        var lastClipping = -1
+        var disposed = false
+        fun updateVisibleViewport() {
+            if (disposed || geckoView.height <= 0 || !geckoView.getGlobalVisibleRect(visibleBounds)) return
+            geckoView.getLocationOnScreen(screenLocation)
+            geckoView.rootView.getLocationOnScreen(rootLocation)
+            visibleBounds.offset(rootLocation[0], rootLocation[1])
+            geckoView.getWindowVisibleDisplayFrame(visibleFrame)
+            val rootInsets = ViewCompat.getRootWindowInsets(geckoView)
+            val safeBottom = if (Build.VERSION.SDK_INT >= 30 && rootInsets != null) {
+                val manager = geckoView.context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val bottomInset = rootInsets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime(),
+                ).bottom
+                manager.currentWindowMetrics.bounds.bottom - bottomInset
+            } else visibleFrame.bottom
+            val clipping = InAppViewport.bottomClipping(
+                screenLocation[1], geckoView.height, minOf(visibleBounds.bottom, safeBottom),
+            )
+            if (clipping != lastClipping) {
+                geckoView.setVerticalClipping(clipping)
+                lastClipping = clipping
+            }
+        }
+        val layoutListener = android.view.ViewTreeObserver.OnGlobalLayoutListener { updateVisibleViewport() }
+        geckoView.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+        geckoView.addWindowInsetsListener("linuxdo-in-app-viewport") { _, insets ->
+            geckoView.post { updateVisibleViewport() }
+            insets
+        }
+        ViewCompat.requestApplyInsets(geckoView)
+
         onDispose {
+            disposed = true
+            if (geckoView.viewTreeObserver.isAlive) geckoView.viewTreeObserver.removeOnGlobalLayoutListener(layoutListener)
+            geckoView.removeWindowInsetsListener("linuxdo-in-app-viewport")
+            geckoView.setVerticalClipping(0)
             runCatching { geckoView.releaseSession() }
             MiniAppSessionPool.markContainerExited(
                 expectedHolder = holder,
@@ -1723,14 +1987,10 @@ fun InAppBrowserSheet(
         }
     }
 
-    val showColdStartOverlay = holder.mainFrameError == null && !holder.showChallenge && !holder.hasRenderedFirstPage
+    val showColdStartOverlay = holder.mainFrameError == null && !showPage
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = closeApp,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
     ) {
         BackHandler {
             when {
@@ -1747,8 +2007,8 @@ fun InAppBrowserSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .background(navBarBg)
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                // 独立窗口按自己的安全区布局，避免复用主界面已消费的 Insets。
+                .safeDrawingPadding(),
         ) {
             Column(Modifier.fillMaxSize()) {
                 // 1. 原生导航栏 (44dp) —— default 模式下显示完整顶栏，custom 模式下隐藏顶栏让视图置顶
@@ -1865,9 +2125,9 @@ fun InAppBrowserSheet(
                     } else {
                         AndroidView(
                             factory = { geckoView },
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxSize().clipToBounds(),
                             update = { view ->
-                                view.alpha = if (holder.hasRenderedFirstPage || holder.showChallenge) 1f else 0f
+                                view.alpha = if (showPage) 1f else 0f
                             },
                         )
                     }
@@ -2882,6 +3142,321 @@ internal fun describeGeckoLoadError(error: WebRequestError): String = when (erro
     else -> "网络连接异常 (${error.category}/${error.code})"
 }
 
+@Composable
+private fun NativeMailboxSheet(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val container = (context.applicationContext as App).container
+    val store = container.sessionStore
+    val accountId = store.currentUserId() ?: 0L
+    val generation = store.sessionGeneration
+    val colors = IosTheme.colors
+    var showWeb by remember(accountId) { mutableStateOf(false) }
+    if (accountId <= 0L) {
+        Dialog(onDismissRequest = onDismiss) {
+            Column(Modifier.background(colors.card, RoundedCornerShape(16.dp)).padding(22.dp)) {
+                Text("请先登录 L 站，再配置专属邮箱", color = colors.label)
+                TextButton(onClick = onDismiss) { Text("返回") }
+            }
+        }
+        return
+    }
+    val repository = remember(accountId, generation) { NativeMailRepository(context, accountId, generation) }
+    val initial = remember(accountId, generation) { runCatching { container.accountManager.nativeMailCredentials(accountId) } }
+    var credentials by remember(repository) { mutableStateOf(initial.getOrNull()) }
+    var storageReadable by remember(repository) { mutableStateOf(initial.isSuccess) }
+    var settingsOpen by remember(repository) { mutableStateOf(initial.getOrNull() == null) }
+    var address by remember(repository) { mutableStateOf(initial.getOrNull()?.address.orEmpty()) }
+    var username by remember(repository) { mutableStateOf(initial.getOrNull()?.username.orEmpty()) }
+    var password by remember(repository) { mutableStateOf("") }
+    var messages by remember(repository) { mutableStateOf(emptyList<NativeMailSummary>()) }
+    var total by remember(repository) { mutableStateOf(0) }
+    var nextSequence by remember(repository) { mutableStateOf(0) }
+    var uidValidity by remember(repository) { mutableStateOf(0L) }
+    var selected by remember(repository) { mutableStateOf<NativeMailBody?>(null) }
+    var draft by remember(repository) { mutableStateOf<NativeMailDraft?>(null) }
+    var busy by remember(repository) { mutableStateOf("") }
+    var notice by remember(repository) { mutableStateOf<String?>(null) }
+    var error by remember(repository) { mutableStateOf(if (initial.isFailure) "邮箱配置暂时无法读取，请重试" else null) }
+    val scope = rememberCoroutineScope()
+    val sending = busy == "发送中"
+    fun isOwner(): Boolean = store.currentUserId() == accountId && store.sessionGeneration == generation
+    fun perform(label: String, action: suspend () -> Unit) {
+        if (busy.isNotEmpty() || !isOwner()) return
+        busy = label
+        error = null
+        notice = null
+        scope.launch {
+            try {
+                action()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                if (isOwner()) {
+                    error = describeNativeMailError(failure) +
+                        if (label == "发送中") "；若发送时连接中断，请先查看已发送邮件，再决定是否重试" else ""
+                    org.linuxdo.android.net.NetDiagnostics.log("邮箱 $label 失败 type=${failure.javaClass.simpleName}")
+                }
+            } finally {
+                if (isOwner()) busy = ""
+            }
+        }
+    }
+    fun applyPage(page: org.linuxdo.android.data.NativeMailPage, append: Boolean) {
+        if (!isOwner()) return
+        messages = (if (append) messages + page.messages else page.messages).distinctBy { it.uid }
+        total = page.total
+        nextSequence = page.nextSequence
+        uidValidity = page.uidValidity
+    }
+    fun refresh(append: Boolean = false) {
+        val configured = credentials ?: return
+        perform("收信中") { applyPage(repository.inbox(configured, if (append) nextSequence else 0, if (append) uidValidity else 0L), append) }
+    }
+    val back: () -> Unit = {
+        if (!sending) {
+            when {
+                draft != null -> draft = null
+                selected != null -> selected = null
+                settingsOpen && credentials != null -> { settingsOpen = false; password = "" }
+                else -> onDismiss()
+            }
+        }
+    }
+    DisposableEffect(repository) { onDispose { repository.close() } }
+    LaunchedEffect(repository) {
+        if (credentials != null) refresh()
+        while (true) {
+            delay(400)
+            if (!isOwner()) { onDismiss(); break }
+        }
+    }
+    FullscreenDialog(
+        onDismissRequest = back,
+    ) {
+        BackHandler(onBack = back)
+        Column(Modifier.fillMaxSize().background(colors.groupedBackground).safeDrawingPadding()) {
+            Row(Modifier.fillMaxWidth().background(colors.card).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = back, enabled = !sending) { Text("返回", color = colors.accent) }
+                Text(
+                    when { draft != null -> "写邮件"; selected != null -> "邮件"; settingsOpen -> "邮箱配置"; else -> "专属邮箱" },
+                    color = colors.label, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { showWeb = true }, enabled = !sending) { Text("网页管理", color = colors.accent) }
+                if (credentials != null && draft == null && selected == null) {
+                    TextButton(onClick = { settingsOpen = !settingsOpen; password = "" }, enabled = busy.isEmpty()) {
+                        Text(if (settingsOpen) "收件箱" else "配置", color = colors.accent)
+                    }
+                }
+            }
+            if (busy.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = colors.accent)
+                    Text(busy, Modifier.padding(start = 9.dp), color = colors.secondaryLabel, fontSize = 13.sp)
+                }
+            }
+            error?.let { Text(it, color = colors.destructive, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(14.dp)) }
+            notice?.let { Text(it, color = colors.secondaryLabel, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(14.dp)) }
+            when {
+                draft != null -> {
+                    val currentDraft = draft!!
+                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) {
+                        Text("发件人：${credentials?.address.orEmpty()}", color = colors.secondaryLabel, fontSize = 13.sp)
+                        NativeMailField("收件人（多个地址用逗号分隔）", currentDraft.recipients, { draft = currentDraft.copy(recipients = it) }, enabled = !sending)
+                        NativeMailField("主题", currentDraft.subject, { draft = currentDraft.copy(subject = it) }, enabled = !sending)
+                        NativeMailField("正文", currentDraft.text, { draft = currentDraft.copy(text = it) }, minLines = 10, enabled = !sending)
+                        TextButton(onClick = {
+                            val configured = credentials ?: return@TextButton
+                            perform("发送中") {
+                                val warning = repository.send(configured, currentDraft)
+                                if (isOwner()) {
+                                    draft = null
+                                    notice = warning ?: "邮件已发送"
+                                }
+                            }
+                        }, enabled = busy.isEmpty() && currentDraft.recipients.isNotBlank() && currentDraft.text.isNotBlank()) { Text("发送邮件", color = colors.accent) }
+                    }
+                }
+                selected != null -> {
+                    val body = selected!!
+                    Column(Modifier.fillMaxWidth().background(colors.card).padding(16.dp)) {
+                        Text(body.summary.subject, color = colors.label, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                        Text(body.summary.sender, color = colors.secondaryLabel, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
+                        Text("收件人：${body.recipients}", color = colors.secondaryLabel, fontSize = 12.sp)
+                        Row {
+                            TextButton(onClick = {
+                                draft = NativeMailDraft(
+                                    body.replyTo,
+                                    if (body.summary.subject.startsWith("Re:", true)) body.summary.subject else "Re: ${body.summary.subject}",
+                                    "\n\n----- 原邮件 -----\n${body.summary.sender}\n${body.text.take(30_000)}",
+                                    body.messageId,
+                                    listOfNotNull(body.references, body.messageId).joinToString(" ").takeLast(2000).ifBlank { null },
+                                )
+                            }, enabled = busy.isEmpty() && body.replyTo.isNotBlank()) { Text("回复", color = colors.accent) }
+                        }
+                        if (body.attachments.isNotEmpty()) Text("附件：${body.attachments.joinToString()}（可在网页管理中打开）", color = colors.secondaryLabel, fontSize = 12.sp)
+                        if (body.truncated) Text("正文较大，已截取显示；完整内容可在网页邮箱查看", color = colors.secondaryLabel, fontSize = 12.sp)
+                    }
+                    NativeMailReader(body, Modifier.weight(1f).fillMaxWidth())
+                }
+                settingsOpen -> {
+                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) {
+                        Text("输入邮箱管理中设置的独立邮箱密码，配置会按当前 L 站账号加密保存。", color = colors.secondaryLabel, fontSize = 14.sp)
+                        Text("mail.linux.do · IMAP 993 / SMTP 465 · TLS", color = colors.secondaryLabel, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
+                        NativeMailField("邮箱地址", address, { address = it }, enabled = busy.isEmpty())
+                        NativeMailField("登录名（与邮箱地址相同可留空）", username, { username = it }, enabled = busy.isEmpty())
+                        NativeMailField(if (credentials == null) "独立邮箱密码" else "密码（不修改可留空）", password, { password = it }, password = true, enabled = busy.isEmpty())
+                        Row {
+                            TextButton(onClick = {
+                                perform("登录中") {
+                                    val login = username.trim().ifBlank { address.trim() }
+                                    val old = credentials?.takeIf { it.address == address.trim() && it.username == login }
+                                    val candidate = NativeMailCredentials(address.trim(), login, password.ifEmpty { old?.password.orEmpty() })
+                                    require(candidate.password.isNotBlank() && login.isNotBlank()) { "请填写邮箱密码和登录名" }
+                                    jakarta.mail.internet.InternetAddress(candidate.address, true).validate()
+                                    val page = repository.inbox(candidate)
+                                    if (isOwner()) {
+                                        withContext(Dispatchers.IO) { container.accountManager.saveNativeMailCredentials(accountId, candidate) }
+                                        if (isOwner()) {
+                                            credentials = candidate
+                                            settingsOpen = false
+                                            password = ""
+                                            applyPage(page, false)
+                                        }
+                                    }
+                                }
+                            }, enabled = busy.isEmpty() && storageReadable) { Text("登录并保存", color = colors.accent) }
+                            TextButton(onClick = { perform("检测中") { val result = repository.probe(); if (isOwner()) notice = result } }, enabled = busy.isEmpty()) {
+                                Text("检测连接", color = colors.accent)
+                            }
+                        }
+                        if (!storageReadable) TextButton(onClick = {
+                            perform("读取配置") {
+                                val loaded = withContext(Dispatchers.IO) { container.accountManager.nativeMailCredentials(accountId) }
+                                if (isOwner()) {
+                                    credentials = loaded
+                                    address = loaded?.address.orEmpty()
+                                    username = loaded?.username.orEmpty()
+                                    storageReadable = true
+                                }
+                            }
+                        }, enabled = busy.isEmpty()) { Text("重新读取配置", color = colors.accent) }
+                        if (credentials != null) TextButton(onClick = {
+                            perform("移除配置") {
+                                withContext(Dispatchers.IO) { container.accountManager.forgetNativeMailCredentials(accountId) }
+                                if (isOwner()) {
+                                    credentials = null; password = ""; address = ""; username = ""
+                                    messages = emptyList(); total = 0; nextSequence = 0; selected = null; draft = null
+                                }
+                            }
+                        }, enabled = busy.isEmpty()) { Text("移除本机邮箱配置", color = colors.destructive) }
+                    }
+                }
+                else -> {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("收件箱 · $total 封", color = colors.secondaryLabel, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { refresh() }, enabled = busy.isEmpty()) { Text("刷新", color = colors.accent) }
+                        TextButton(onClick = { draft = NativeMailDraft("", "", "") }, enabled = busy.isEmpty()) { Text("写信", color = colors.accent) }
+                    }
+                    LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
+                        if (messages.isEmpty() && busy.isEmpty() && error == null) item {
+                            Text("收件箱暂无邮件", color = colors.secondaryLabel, modifier = Modifier.fillMaxWidth().padding(30.dp), textAlign = TextAlign.Center)
+                        }
+                        items(messages, key = { it.uid }) { message ->
+                            Column(Modifier.fillMaxWidth().background(colors.card).clickable(enabled = busy.isEmpty()) {
+                                val configured = credentials ?: return@clickable
+                                perform("读取中") {
+                                    val body = repository.read(configured, message)
+                                    if (isOwner()) { selected = body; messages = messages.map { if (it.uid == message.uid) it.copy(seen = true) else it } }
+                                }
+                            }.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (!message.seen) Box(Modifier.size(7.dp).background(colors.accent, CircleShape))
+                                    Text(message.sender, color = colors.label, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                        fontWeight = if (message.seen) FontWeight.Normal else FontWeight.SemiBold,
+                                        modifier = Modifier.weight(1f).padding(start = if (message.seen) 0.dp else 8.dp))
+                                    if (message.dateMillis > 0) Text(
+                                        java.text.DateFormat.getDateInstance(java.text.DateFormat.SHORT, java.util.Locale.CHINA).format(java.util.Date(message.dateMillis)),
+                                        color = colors.tertiaryLabel, fontSize = 11.sp, modifier = Modifier.padding(start = 8.dp),
+                                    )
+                                }
+                                Text(message.subject, color = colors.secondaryLabel, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 5.dp))
+                            }
+                            Box(Modifier.fillMaxWidth().height(0.5.dp).background(colors.separator))
+                        }
+                        if (nextSequence > 0) item {
+                            TextButton(onClick = { refresh(true) }, enabled = busy.isEmpty(), modifier = Modifier.fillMaxWidth()) { Text("加载更多", color = colors.accent) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (showWeb) InAppBrowserSheet(ProfileWebApp.Mail.url, onDismiss = { showWeb = false }, preferNativeMail = false)
+}
+
+@Composable
+private fun NativeMailField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    password: Boolean = false,
+    minLines: Int = 1,
+    enabled: Boolean = true,
+) {
+    val colors = IosTheme.colors
+    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+        Text(label, color = colors.secondaryLabel, fontSize = 13.sp, modifier = Modifier.padding(bottom = 7.dp))
+        BasicTextField(
+            value, onValueChange, enabled = enabled, minLines = minLines,
+            singleLine = minLines == 1,
+            visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
+            keyboardOptions = KeyboardOptions(keyboardType = if (password) KeyboardType.Password else KeyboardType.Text),
+            textStyle = TextStyle(color = colors.label, fontSize = 16.sp),
+            modifier = Modifier.fillMaxWidth().background(colors.fieldBackground, RoundedCornerShape(10.dp)).padding(12.dp),
+        )
+    }
+}
+
+@Composable
+private fun NativeMailReader(body: NativeMailBody, modifier: Modifier) {
+    var htmlMode by remember(body.summary.uid) { mutableStateOf(body.html != null) }
+    Column(modifier) {
+        if (body.html != null) TextButton(onClick = { htmlMode = !htmlMode }) {
+            Text(if (htmlMode) "纯文本阅读" else "显示格式正文", color = IosTheme.colors.accent)
+        }
+        if (!htmlMode || body.html == null) SelectionContainer(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+            Text(body.text, color = IosTheme.colors.label, fontSize = 16.sp, modifier = Modifier.padding(16.dp))
+        } else {
+            val context = LocalContext.current
+            val colors = IosTheme.colors
+            val fontScale = LocalDensity.current.fontScale
+            val view = remember(body.summary.uid, colors.isDark) {
+                android.webkit.WebView(context).apply {
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    settings.javaScriptEnabled = false
+                    settings.blockNetworkLoads = true
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    settings.domStorageEnabled = false
+                    settings.textZoom = (fontScale * 100).roundToInt()
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: android.webkit.WebView, request: android.webkit.WebResourceRequest): Boolean {
+                            if (request.hasGesture() && request.url.scheme in setOf("https", "http", "mailto")) openExternal(context, request.url.toString())
+                            return true
+                        }
+                    }
+                    val textColor = if (colors.isDark) "#eeeeee" else "#222222"
+                    loadDataWithBaseURL("https://mail.invalid/", "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>" +
+                        "<style>body{padding:12px;font:16px sans-serif;line-height:1.6;color:$textColor;overflow-wrap:anywhere}table{max-width:100%}a{color:#448aff}</style>" +
+                        "</head><body>${body.html}</body></html>", "text/html", "UTF-8", null)
+                }
+            }
+            DisposableEffect(view) { onDispose { view.stopLoading(); view.destroy() } }
+            AndroidView(factory = { view }, modifier = Modifier.weight(1f).fillMaxWidth())
+        }
+    }
+}
+
 fun openExternal(context: android.content.Context, url: String) {
     runCatching {
         val intent = Intent(Intent.ACTION_VIEW, url.toUri()).apply {
@@ -2901,4 +3476,24 @@ fun isTrustedForumHost(rawHost: String?): Boolean {
 fun isTrustedForumUrl(rawUrl: String?): Boolean {
     val host = rawUrl?.toUri()?.host ?: return false
     return isTrustedForumHost(host)
+}
+
+internal fun isolatedH5ContextId(rawUrl: String?, accountId: Long): String? {
+    ProfileWebApp.fromUrl(rawUrl)?.let { return it.contextId(accountId) }
+    val parsed = rawUrl?.toHttpUrlOrNull() ?: return null
+    if (!parsed.isHttps || parsed.port != 443 || parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
+    val host = parsed.host.lowercase().trimEnd('.')
+    if (host !in TRUSTED_FORUM_HOSTS && isTrustedForumHost(host)) {
+        val sub = host.removeSuffix(".${Config.HOST}").replace('.', '-')
+        if (sub.isNotEmpty() && sub.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }) {
+            return "$LINKED_H5_CONTEXT_PREFIX$sub-${accountId.coerceAtLeast(0L)}"
+        }
+    }
+    return null
+}
+
+internal fun isMainForumSyncUrl(rawUrl: String?): Boolean {
+    if (InAppViewport.isBootstrapUrl(rawUrl)) return false
+    val parsed = rawUrl?.toHttpUrlOrNull() ?: return false
+    return parsed.isHttps && parsed.host.lowercase().trimEnd('.') in TRUSTED_FORUM_HOSTS
 }

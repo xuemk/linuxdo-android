@@ -96,6 +96,43 @@ fun buildSharedHttpClient(
 }
 
 /**
+ * 显式附件/媒体下载专用活跃客户端：继承当前主通道，延长单次读取与总超时并开启连接重试。
+ * 仅用于 GET/HEAD 下载，不影响全局 API 客户端及任何写操作。
+ */
+internal fun buildActiveMediaDownloadClient(base: OkHttpClient): OkHttpClient =
+    base.newBuilder()
+        .retryOnConnectionFailure(true)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+/**
+ * 显式附件/媒体下载专用系统通道客户端：当原生 Rust DoH/Anycast 通道在读取 CDN 大响应体中途断流时，
+ * 用全新 [OkHttpClient.Builder] 切换到平台默认 Socket/TLS、系统 DNS、系统代理与独立连接池重试，
+ * 保留同源会话/Cookie 拦截器语义并剔除原生 DoH 与 failover 拦截器。
+ */
+internal fun buildSystemMediaDownloadClient(base: OkHttpClient): OkHttpClient =
+    OkHttpClient.Builder()
+        .dns(Dns.SYSTEM)
+        .connectionPool(ConnectionPool(4, 1, TimeUnit.MINUTES))
+        .cookieJar(base.cookieJar)
+        .authenticator(base.authenticator)
+        .proxyAuthenticator(base.proxyAuthenticator)
+        .followRedirects(base.followRedirects)
+        .followSslRedirects(base.followSslRedirects)
+        .connectTimeout(Config.CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .apply {
+            base.interceptors
+                .filterNot { it is DohNoReplayInterceptor || it is DohFailoverInterceptor }
+                .forEach { addInterceptor(it) }
+            base.networkInterceptors.forEach { addNetworkInterceptor(it) }
+        }
+        .build()
+
+/**
  * 结合设置开关以及是否开启 VPN/代理综合判断，解析出当前应走哪个 HTTP 客户端。
  *
  * 判定矩阵：
@@ -118,11 +155,11 @@ fun resolveActiveHttpClient(
 
     val userAgent = org.linuxdo.android.AppContainer.resolveUserAgent(context, sessionStore)
     val isDohSwitchOn = sessionStore.isDohEnabled()
-    val isVpnOrProxyActive = NetworkStateMonitor(context).detect().shouldPauseDoh
     val forceOverProxy = sessionStore.isDohForceOverProxyEnabled()
+    val yieldToSystem = NetworkStateMonitor(context).detect().shouldYieldToSystem(forceOverProxy)
 
-    // 综合判断：只有设置开启且（无 VPN/代理直连，或用户开启了代理下保持 DoH）时，才走 DoH + ECH
-    val shouldUseDoh = isDohSwitchOn && (!isVpnOrProxyActive || forceOverProxy)
+    // 综合判断：设置开启且未让渡系统网络时才走 DoH + ECH；系统 HTTP 代理下总是让渡，保持三条链路同一出口
+    val shouldUseDoh = isDohSwitchOn && !yieldToSystem
 
     val transport = if (shouldUseDoh) {
         buildActiveDohTransport(sessionStore)
@@ -191,7 +228,8 @@ private class SessionHeaderInterceptor(
         }
         checkSession()
 
-        val builder = original.newBuilder().header("User-Agent", store.userAgentOrNull() ?: userAgent)
+        var requestUserAgent = store.userAgentOrNull() ?: userAgent
+        val builder = original.newBuilder()
         val siteReferer = when (host) {
             "credit.linux.do" -> "https://credit.linux.do/home"
             "cdk.linux.do" -> "https://cdk.linux.do/dashboard"
@@ -210,7 +248,7 @@ private class SessionHeaderInterceptor(
         val encodedPath = original.url.encodedPath
         val isPublicStaticIcon = isPublicStaticIconUrl(original.url)
         var rawWebCookieHeader = ""
-        val cookieHeader = if (!sendCookies) {
+        var cookieHeader = if (!sendCookies) {
             ""
         } else if (isPublicStaticIcon) {
             // 对齐 fluxdo：公开静态头像/表情仅只读携带 cf_clearance 等过盾与匿名 Cookie，
@@ -245,11 +283,21 @@ private class SessionHeaderInterceptor(
         } else {
             runBlocking(Dispatchers.Main) {
                 checkSession()
+                requestUserAgent = store.userAgentOrNull() ?: userAgent
                 rawWebCookieHeader = CookieManager.getInstance().getCookie(original.url.toString()).orEmpty()
                 if (host == Config.HOST) SessionStore.toCookieHeader(store.syncFromWebView())
                 else rawWebCookieHeader
             }
         }
+        val currentUserAgent = store.userAgentOrNull() ?: userAgent
+        if (currentUserAgent != requestUserAgent) {
+            // 标识切换不能把上一身份的安全凭据和新 UA 组合发送；登录 Cookie 仍保留。
+            requestUserAgent = currentUserAgent
+            cookieHeader = SessionStore.toCookieHeader(
+                SessionStore.parseCookieHeader(cookieHeader).filterKeys { !isCloudflareCookie(it) },
+            )
+        }
+        builder.header("User-Agent", requestUserAgent)
         val sentClearance = SessionStore.parseCookieHeader(cookieHeader)[Config.CF_CLEARANCE_COOKIE]
         original.tag(ActiveSessionRequest::class.java)?.sentClearanceFp = NetDiagnostics.fingerprint(sentClearance)
         original.tag(ActiveSessionRequest::class.java)?.sentSessionTokenHash =
@@ -262,13 +310,22 @@ private class SessionHeaderInterceptor(
             builder.header("Cookie", cookieHeader)
         }
         val outgoing = builder.build()
-        SiteImageGateInterceptor.checkRecovery(outgoing.url, store)
+        SiteImageGateInterceptor.checkRecovery(
+            outgoing.url,
+            store,
+            isSignature = outgoing.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null,
+            isExplicitDownload = outgoing.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null,
+        )
         if ((original.tag(org.linuxdo.android.push.PushSessionProvider::class.java)
                 ?.backgroundRequestDelayMs() ?: 0L) > 0L) {
             throw IOException("后台通知请求暂缓，等待验证或限流结束")
         }
         val response = chain.proceed(outgoing)
+        val responseMatchesUserAgent = runCatching {
+            requestUserAgent == (store.userAgentOrNull() ?: userAgent)
+        }.getOrDefault(false)
         if (
+            responseMatchesUserAgent &&
             !sentClearance.isNullOrBlank() &&
             shouldInvalidateClearance(outgoing, response.code, response.header("cf-mitigated"))
         ) {
@@ -304,8 +361,13 @@ private class SessionHeaderInterceptor(
             // 每次重定向都在进入下一跳前落 Cookie；普通 API 和 OAuth 共用此入口。
             runBlocking(Dispatchers.Main) {
                 checkSession()
+                val responseCookies = Cookie.parseAll(original.url, response.headers)
+                val sameUserAgent = requestUserAgent == (store.userAgentOrNull() ?: userAgent)
+                if (!sameUserAgent && responseCookies.any { isCloudflareCookie(it.name) }) {
+                    NetDiagnostics.log("忽略浏览器标识切换前的响应安全 Cookie，保留登录凭据更新")
+                }
                 store.applyResponseCookies(
-                    Cookie.parseAll(original.url, response.headers),
+                    if (sameUserAgent) responseCookies else responseCookies.filterNot { isCloudflareCookie(it.name) },
                     requestUrl = original.url.toString(),
                     requestGeneration = generation,
                     sentCookies = SessionStore.parseCookieHeader(cookieHeader),
@@ -317,6 +379,10 @@ private class SessionHeaderInterceptor(
             throw error
         }
     }
+
+    private fun isCloudflareCookie(name: String): Boolean =
+        name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) ||
+            name.startsWith("__cf", ignoreCase = true) || name.startsWith("_cf", ignoreCase = true)
 
     private fun shouldTraceCfFlow(path: String, status: Int): Boolean =
         status in setOf(401, 403, 429) ||
@@ -351,18 +417,27 @@ internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
         )
 
 /**
- * 公开图片和验证探针的单次挑战不等同于主站 API 凭据失效。
+ * 公开图片、验证探针以及带独立路径级 WAF 规则的接口（附件 `/uploads/` 前缀、显式下载、子站 OAuth `/session/sso_provider`）
+ * 的单次 403/503 挑战不等同于主站 API 凭据失效，绝不能据此拉黑健康的 `cf_clearance`。
  * 429 + cf-mitigated=challenge 是 WAF 速率规则，凭据本身仍有效，拉黑它只会让后续请求 0 份凭据裸奔撞盾，
- * 因此只有 403 / 503 交互挑战才判废。
+ * 因此只有主站普通 API 的 403 / 503 交互挑战才判废。
  */
 internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cfMitigated: String?): Boolean =
     request.url.isHttps && request.url.host == Config.HOST &&
         !isPublicStaticIconUrl(request.url) &&
+        request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) == null &&
+        request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) == null &&
+        !request.url.encodedPath.startsWith("/uploads/") &&
+        request.url.encodedPath != "/session/sso_provider" &&
         request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe != true &&
         status in setOf(403, 503) && cfMitigated?.contains("challenge", ignoreCase = true) == true
 
 private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
     request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
+    request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null -> "显式下载"
+    request.url.encodedPath.startsWith("/uploads/") -> "附件资源"
+    request.url.encodedPath == "/session/sso_provider" -> "SSO授权"
+    request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null -> "签名图片"
     isPublicStaticIconUrl(request.url) -> "公开图片"
     else -> "普通API"
 }
@@ -386,7 +461,12 @@ suspend fun awaitImageRetrySlot(attempt: Int) {
     val backoffMs = 2_000L shl attempt.coerceIn(0, 3)
     val jitterMs = kotlin.random.Random.nextLong(400L, 1_800L)
     kotlinx.coroutines.delay(maxOf(SiteImageGateInterceptor.cooldownRemainingMs(), backoffMs) + jitterMs)
-    SiteImageGateInterceptor.awaitClearanceRecovery()
+    while (true) {
+        SiteImageGateInterceptor.awaitClearanceRecovery()
+        val remaining = SiteImageGateInterceptor.cooldownRemainingMs()
+        if (remaining <= 0L) return
+        kotlinx.coroutines.delay(minOf(remaining, 1_000L))
+    }
 }
 
 /** 每张图自动重试的上限，超过后停在占位，等用户手动重载或重新进入页面。 */
@@ -406,6 +486,12 @@ internal object SiteImageGateInterceptor {
     /** 门禁主动拒绝（排队超时 / 冷却中）。界面据此判定为瞬时失败，冷却后再重试，而不是降级或放弃。 */
     class ThrottledException(message: String) : IOException(message)
 
+    /** 签名地址不一定有图片后缀或固定路径，显式标记后仍须经过图片门禁。 */
+    data object SignatureRequest
+
+    /** 用户主动点击触发的显式文件/附件下载，不进列表图片门禁排队与冷却。 */
+    data object ExplicitDownloadRequest
+
     private const val EMOJI_CONCURRENT = 12
     private const val AVATAR_CONCURRENT = 3
     private const val MEDIA_CONCURRENT = 4
@@ -416,6 +502,8 @@ internal object SiteImageGateInterceptor {
     private const val SVG_PREFIX = "/svg-sprite/"
     private val avatarPrefixes = listOf("/user_avatar/", "/letter_avatar")
     private const val UPLOADS_PREFIX = "/uploads/"
+    private const val IMAGES_PREFIX = "/images/"
+    private val mediaExtensions = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".ico")
 
     private val emojiPermits = java.util.concurrent.Semaphore(EMOJI_CONCURRENT, true)
     private val avatarPermits = java.util.concurrent.Semaphore(AVATAR_CONCURRENT, true)
@@ -427,20 +515,31 @@ internal object SiteImageGateInterceptor {
         NONE, EMOJI, AVATAR, MEDIA
     }
 
-    private fun categorize(url: okhttp3.HttpUrl): ImageCategory {
-        val host = url.host
-        if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return ImageCategory.NONE
+    private fun categorize(url: okhttp3.HttpUrl, isSignature: Boolean = false): ImageCategory {
+        val host = url.host.lowercase().trimEnd('.')
+        val isLinuxDo = host == Config.HOST || host.endsWith(".${Config.HOST}")
+        val isLdStatic = host == "ldstatic.com" || host.endsWith(".ldstatic.com")
+        if (!isLinuxDo && !isLdStatic) return ImageCategory.NONE
         val path = url.encodedPath
+        val lowerPath = path.lowercase()
         return when {
             path.startsWith(EMOJI_PREFIX) || path.startsWith(SVG_PREFIX) -> ImageCategory.EMOJI
             avatarPrefixes.any { path.startsWith(it) } -> ImageCategory.AVATAR
-            path.startsWith(UPLOADS_PREFIX) -> ImageCategory.MEDIA
+            isSignature -> ImageCategory.MEDIA
+            path.startsWith(UPLOADS_PREFIX) || path.startsWith(IMAGES_PREFIX) -> ImageCategory.MEDIA
+            mediaExtensions.any { lowerPath.endsWith(it) } -> ImageCategory.MEDIA
+            isLdStatic -> ImageCategory.MEDIA
             else -> ImageCategory.NONE
         }
     }
 
-    fun checkRecovery(url: okhttp3.HttpUrl, store: SessionStore) {
-        if (categorize(url) == ImageCategory.NONE) return
+    fun checkRecovery(
+        url: okhttp3.HttpUrl,
+        store: SessionStore,
+        isSignature: Boolean = false,
+        isExplicitDownload: Boolean = false,
+    ) {
+        if (isExplicitDownload || categorize(url, isSignature) == ImageCategory.NONE) return
         recoveryStore = store
         if (store.isClearanceRecoveryInProgress()) {
             throw ThrottledException("站内图片暂缓，等待安全验证完成")
@@ -455,9 +554,11 @@ internal object SiteImageGateInterceptor {
 
     fun intercept(chain: Interceptor.Chain, store: SessionStore): Response {
         val request = chain.request()
-        val category = categorize(request.url)
+        if (request.tag(ExplicitDownloadRequest::class.java) != null) return chain.proceed(request)
+        val isSignature = request.tag(SignatureRequest::class.java) != null
+        val category = categorize(request.url, isSignature)
         if (category == ImageCategory.NONE) return chain.proceed(request)
-        checkRecovery(request.url, store)
+        checkRecovery(request.url, store, isSignature)
         checkCooldown()
         val semaphore = when (category) {
             ImageCategory.EMOJI -> emojiPermits
@@ -470,7 +571,7 @@ internal object SiteImageGateInterceptor {
         }
         val response = try {
             if (chain.call().isCanceled()) throw IOException("Canceled")
-            checkRecovery(request.url, store)
+            checkRecovery(request.url, store, isSignature)
             checkCooldown()
             chain.proceed(request)
         } finally {
@@ -487,7 +588,7 @@ internal object SiteImageGateInterceptor {
     /** 图片自身冷却与主站全局 429 冷却取较长者；[retryImageAfterDelay] 的自动重试也据此等待。 */
     fun cooldownRemainingMs(): Long = maxOf(
         (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
-        org.linuxdo.android.data.TopicRepository.rateLimitRemainingMs(),
+        org.linuxdo.android.data.TopicRepository.mainSiteGateWaitMs(),
     )
 
     private fun checkCooldown() {
@@ -517,6 +618,21 @@ internal object SiteImageGateInterceptor {
         NetDiagnostics.log(
             "站内图片限流(${if (cfChallenge) "CF质询" else "429"}): ${response.request.url.encodedPath}，" +
                 "图片暂停 ${cooldownMs / 1_000L}s (与主API隔离)",
+        )
+    }
+
+    /** 供站内签名/媒体加载器在遇到 429 或 CF 质询时同步站内图片冷却，不污染主站 API 冷却池。 */
+    fun recordImageCooldownMs(durationMs: Long, path: String = "/signature", cfChallenge: Boolean = false) {
+        val safeMs = durationMs.coerceAtLeast(1_000L)
+        val now = android.os.SystemClock.elapsedRealtime()
+        val first = synchronized(this) {
+            val wasCooling = now < cooldownUntil
+            cooldownUntil = maxOf(cooldownUntil, now + safeMs)
+            !wasCooling
+        }
+        if (!first) return
+        NetDiagnostics.log(
+            "站内图片限流(${if (cfChallenge) "CF质询" else "429"}): $path，图片暂停 ${safeMs / 1_000L}s (与主API隔离)",
         )
     }
 }

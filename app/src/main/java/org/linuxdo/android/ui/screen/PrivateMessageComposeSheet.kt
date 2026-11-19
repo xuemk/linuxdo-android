@@ -16,11 +16,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -58,14 +56,13 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import kotlinx.coroutines.launch
 import org.linuxdo.android.data.AttachedMedia
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.FullscreenDialog
 
 @Composable
 fun PrivateMessageComposeSheet(
@@ -122,9 +119,8 @@ fun PrivateMessageComposeSheet(
         }
     }
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = { if (!sending && !isUploading) onDismiss() },
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         BackHandler(enabled = true) {
             if (!sending && !isUploading) onDismiss()
@@ -134,9 +130,7 @@ fun PrivateMessageComposeSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .background(IosTheme.colors.card)
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .imePadding(),
+                .safeDrawingPadding(),
         ) {
             // 顶部导航栏
             Row(
@@ -286,6 +280,7 @@ fun PrivateMessageComposeSheet(
                 )
             }
 
+            val editorTextSizePx = with(androidx.compose.ui.platform.LocalDensity.current) { 16.sp.toPx() }
             // 正文内容输入区 (填满剩余空间)
             Box(
                 modifier = Modifier
@@ -307,6 +302,7 @@ fun PrivateMessageComposeSheet(
                     },
                     update = {
                         it.updateThemeColors(textColor, hintColor)
+                        it.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                         it.setCompletionSource(completionSource)
                         it.isEnabled = !sending
                     },

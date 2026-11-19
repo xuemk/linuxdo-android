@@ -19,7 +19,6 @@ import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
-import org.mozilla.geckoview.StorageController
 import org.mozilla.geckoview.WebRequestError
 import java.io.File
 import java.io.Closeable
@@ -27,20 +26,39 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
-import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 object GeckoManager {
     private const val TAG = "GeckoManager"
+    private const val MAIN_COOKIE_CONTEXT_FILTER =
+        "COALESCE(originAttributes, '') NOT LIKE '%geckoViewSessionContextId=%' AND " +
+        "COALESCE(originAttributes, '') NOT LIKE '%userContextId=%' AND " +
+        "COALESCE(originAttributes, '') NOT LIKE '%privateBrowsingId=%'"
     private var runtime: GeckoRuntime? = null
+
+    fun refreshNetworkSettings(context: Context) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Handler(Looper.getMainLooper()).post { refreshNetworkSettings(context.applicationContext) }
+            return
+        }
+        val rt = runtime ?: return
+        val container = (context.applicationContext as? App)?.container ?: return
+        val store = container.sessionStore
+        val dohUri = store.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
+        val useDoh = store.isDohEnabled() &&
+            !container.networkMonitor.detect().shouldYieldToSystem(store.isDohForceOverProxyEnabled())
+        rt.settings.setTrustedRecursiveResolverUri(dohUri)
+        rt.settings.setTrustedRecursiveResolverMode(
+            if (useDoh) GeckoRuntimeSettings.TRR_MODE_ONLY else GeckoRuntimeSettings.TRR_MODE_DISABLED,
+        )
+        org.linuxdo.android.net.NetDiagnostics.log("Gecko 网络设置已同步 " + runtimeNetworkSummary(context))
+    }
 
     /**
      * 获取或初始化全局单例 GeckoRuntime，使用 Gecko 自身的 DoH 与 ECH。
@@ -52,7 +70,7 @@ object GeckoManager {
         val store = container?.sessionStore
         val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
         val useDoh = store?.isDohEnabled() != false &&
-            (container?.networkMonitor?.detect()?.shouldPauseDoh != true || store?.isDohForceOverProxyEnabled() == true)
+            container?.networkMonitor?.detect()?.shouldYieldToSystem(store?.isDohForceOverProxyEnabled() == true) != true
         val trrMode = if (useDoh) GeckoRuntimeSettings.TRR_MODE_ONLY else GeckoRuntimeSettings.TRR_MODE_DISABLED
         runtime?.let {
             it.settings.setTrustedRecursiveResolverUri(dohUri)
@@ -95,6 +113,7 @@ object GeckoManager {
 
         val rt = GeckoRuntime.create(context.applicationContext, settings)
         runtime = rt
+        GeckoAuthBridge.warmUpExtension(rt)
         Log.d(TAG, "GeckoRuntime 已启用 ECH，TRR mode=$trrMode，DoH host=${Uri.parse(dohUri).host}")
         return rt
     }
@@ -106,7 +125,8 @@ object GeckoManager {
         val dohUri = store?.getDohServerUrl()?.takeIf { it.isNotBlank() } ?: DohPresets.DEFAULT.url
         val pauseDoh = container?.networkMonitor?.detect()?.shouldPauseDoh == true
         val forceOverProxy = store?.isDohForceOverProxyEnabled() == true
-        val useDoh = store?.isDohEnabled() != false && (!pauseDoh || forceOverProxy)
+        val useDoh = store?.isDohEnabled() != false &&
+            container?.networkMonitor?.detect()?.shouldYieldToSystem(forceOverProxy) != true
         val trrLabel = if (useDoh) "ONLY(DoH+ECH)" else "DISABLED(系统/代理)"
         val dohHost = runCatching { Uri.parse(dohUri).host }.getOrNull() ?: "-"
         return "TRR=$trrLabel doh=$dohHost pauseDoh=$pauseDoh forceOverProxy=$forceOverProxy"
@@ -223,12 +243,15 @@ object GeckoManager {
         onPageError: (String, WebRequestError) -> Unit = { _, _ -> },
         onExternalRequest: ((uri: String) -> Boolean)? = null,
         returnErrorPageHtml: Boolean = true,
+        contextId: String? = null,
         onDiagnostic: (String) -> Unit = {},
         onContentPainted: (url: String) -> Unit = {},
+        onExternalResponse: ((org.mozilla.geckoview.WebResponse) -> Unit)? = null,
     ): GeckoSession {
         val rt = getOrCreateRuntime(context)
         val sessionSettings = GeckoSessionSettings.Builder()
-            .usePrivateMode(false) // 非无痕模式，确保 Cookie 落地到 cookies.sqlite
+            .usePrivateMode(false)
+            .contextId(contextId) // H5 按账号与站点持久隔离；关闭 Session 不删除登录数据。
             .build()
 
         val session = GeckoSession(sessionSettings)
@@ -332,6 +355,17 @@ object GeckoManager {
                     onDiagnostic("页面标题 ${title.take(40)}")
                 }
             }
+
+            override fun onExternalResponse(session: GeckoSession, response: org.mozilla.geckoview.WebResponse) {
+                val respUri = response.uri.orEmpty()
+                Log.d(TAG, "Gecko onExternalResponse: status=${response.statusCode} uri=${diagnosticUrl(respUri)}")
+                onDiagnostic("收到附件/外部响应 status=${response.statusCode} ${diagnosticUrl(respUri)}")
+                if (onExternalResponse != null) {
+                    onExternalResponse.invoke(response)
+                } else {
+                    runCatching { response.body?.close() }
+                }
+            }
         }
 
         session.open(rt)
@@ -391,25 +425,11 @@ object GeckoManager {
     }
 
     /**
-     * 经 Gecko 自身的 StorageController 清掉主站（含 .linux.do 域 Cookie）的全部 Cookie，迫使 CF 重新挑战并签发新凭据。
+     * 只清理主站默认容器（含 .linux.do 域 Cookie），保留商店/邮箱等隔离容器的登录数据。
      * 不能直接改 cookies.sqlite：Gecko 以内存中的 Cookie 为准，删库后旧值仍会被发出并写回。
      * 会一并清掉 Gecko 侧的 _t/_forum_session，登录流程每次都会重建，验证页不依赖它们。
      */
-    suspend fun clearSiteCookies(context: Context): Boolean = withContext(Dispatchers.Main) {
-        val result = getOrCreateRuntime(context).storageController
-            .clearDataFromHost(Config.HOST, StorageController.ClearFlags.COOKIES)
-        withTimeoutOrNull(5_000L) {
-            suspendCancellableCoroutine<Boolean> { continuation ->
-                result.accept(
-                    { if (continuation.isActive) continuation.resume(true) },
-                    { error ->
-                        Log.w(TAG, "清理 Gecko 站点 Cookie 失败: ${error?.message}")
-                        if (continuation.isActive) continuation.resume(false)
-                    },
-                )
-            }
-        } ?: false
-    }
+    suspend fun clearSiteCookies(context: Context): Boolean = GeckoAuthBridge.clearMainSiteCookies(context)
 
     /**
      * 从 GeckoView 的 moz_cookies SQLite 数据库中提取 linux.do 的凭据 (如 cf_clearance, _t, _forum_session)
@@ -432,6 +452,13 @@ object GeckoManager {
         .map { (_, value) -> value }
         .toSet()
 
+    /** 合并读取 Gecko 内存/响应头实时 cf_clearance 与 SQLite 持久库，消除落盘延迟。 */
+    suspend fun liveCfClearances(context: Context): Set<String> {
+        val fromMemory = runCatching { GeckoAuthBridge.readMainSiteCfClearances(context) }.getOrDefault(emptyList())
+        val fromDb = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { cfClearancesFromDb(context) }
+        return (fromMemory + fromDb).filter { it.isNotBlank() }.toSet()
+    }
+
     private fun readCookiesFromDb(context: Context): List<Pair<String, String>> {
         val result = mutableListOf<Pair<String, String>>()
         val dbFile = findCookiesDbFile(context) ?: return result
@@ -442,13 +469,14 @@ object GeckoManager {
             db.use {
                 val cursor = try {
                     it.rawQuery(
-                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%' ORDER BY lastAccessed ASC, expiry ASC",
-                        null
+                        "SELECT name, value FROM moz_cookies WHERE (host = ? OR host = ?) AND " +
+                            MAIN_COOKIE_CONTEXT_FILTER + " ORDER BY lastAccessed ASC, expiry ASC",
+                        arrayOf(Config.HOST, ".${Config.HOST}")
                     )
                 } catch (_: Throwable) {
                     it.rawQuery(
-                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%linux.do%'",
-                        null
+                        "SELECT name, value FROM moz_cookies WHERE (host = ? OR host = ?) AND " + MAIN_COOKIE_CONTEXT_FILTER,
+                        arrayOf(Config.HOST, ".${Config.HOST}")
                     )
                 }
                 cursor.use { c ->

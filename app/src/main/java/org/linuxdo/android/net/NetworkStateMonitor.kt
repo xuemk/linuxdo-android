@@ -18,6 +18,12 @@ data class NetworkSecurityState(
     /** 当开启 VPN 或系统代理时，DoH 安全直连应当自动暂停，直透系统代理 */
     val shouldPauseDoh: Boolean get() = isVpn || isProxy
 
+    /**
+     * 是否让渡系统网络。系统 HTTP 代理下 Gecko/WebView 一定走代理，原生客户端若强制 NO_PROXY 直连，
+     * API 与验证会出现两个出口 IP，导致 cf_clearance 失配和重复挑战；因此「代理环境保持 DoH」只对 VPN 生效。
+     */
+    fun shouldYieldToSystem(forceOverProxy: Boolean): Boolean = isProxy || (isVpn && !forceOverProxy)
+
     val summary: String get() = when {
         isVpn -> "VPN 已开启，DoH 暂停"
         isProxy -> "系统代理已开启，DoH 暂停"
@@ -42,6 +48,7 @@ class NetworkStateMonitor(
 
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val handler = Handler(Looper.getMainLooper())
+    private var lastDetectedState = NetworkSecurityState()
     private val _state = MutableStateFlow(detect())
     val state = _state.asStateFlow()
 
@@ -102,18 +109,27 @@ class NetworkStateMonitor(
         handler.post(refreshTask)
     }
 
+    @Synchronized
     fun detect(): NetworkSecurityState {
-        val cm = connectivity ?: return NetworkSecurityState()
-        val isVpn = runCatching {
-            cm.allNetworks.any {
-                cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-            }
-        }.getOrDefault(false)
+        val cm = connectivity
+        // 其他 UID 使用的 VPN 不代表本 App 的出口；状态暂不可读时避免切换传输策略。
+        val isVpn = if (cm == null) null else runCatching {
+            val active = cm.activeNetwork
+            active?.let { cm.getNetworkCapabilities(it) }
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }.onFailure {
+            Log.w(TAG, "读取应用默认网络失败，保留上次 VPN 状态: ${it.javaClass.simpleName}")
+        }.getOrNull()
 
-        val isProxy = runCatching {
+        val isProxy = if (cm == null) null else runCatching {
             cm.defaultProxy != null
-        }.getOrDefault(false)
+        }.onFailure {
+            Log.w(TAG, "读取系统代理失败，保留上次代理状态: ${it.javaClass.simpleName}")
+        }.getOrNull()
 
-        return NetworkSecurityState(isVpn = isVpn, isProxy = isProxy)
+        return NetworkSecurityState(
+            isVpn = isVpn ?: lastDetectedState.isVpn,
+            isProxy = isProxy ?: lastDetectedState.isProxy,
+        ).also { lastDetectedState = it }
     }
 }

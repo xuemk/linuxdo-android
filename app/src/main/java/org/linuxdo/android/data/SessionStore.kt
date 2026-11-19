@@ -1366,6 +1366,15 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             !plainPrefs.edit().remove(KEY_CURRENT_USER_ID).commit()) throw EncryptedStorageUnavailableException()
     }
 
+    /** 按账号隔离缓存网页端「启用签名」(see_signatures) 开关，未登录或未开启过时默认关闭。 */
+    fun isSeeSignaturesEnabled(userId: Long = currentUserId()): Boolean =
+        userId > 0L && plainPrefs.getBoolean("${KEY_SEE_SIGNATURES_PREFIX}_$userId", false)
+
+    fun setSeeSignaturesEnabled(userId: Long, enabled: Boolean) {
+        if (userId <= 0L) return
+        plainPrefs.edit().putBoolean("${KEY_SEE_SIGNATURES_PREFIX}_$userId", enabled).apply()
+    }
+
     fun hasAutoPromptedBatteryWhitelist(): Boolean =
         plainPrefs.getBoolean(KEY_AUTO_PROMPTED_BATTERY_WHITELIST, false)
 
@@ -1499,7 +1508,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     /** 是否在开启系统代理/VPN 时强制保持 DoH + ECH 直连（防止直连分流规则导致阻断，默认关闭由系统让渡） */
-    fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
+    override fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
 
     fun setDohForceOverProxyEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_DOH_FORCE_OVER_PROXY, enabled).apply()
@@ -1621,6 +1630,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_NOTIFICATION_SCOPE = "notification_scope"
         private const val KEY_KEEP_ALIVE_SERVICE = "keep_alive_service_enabled"
         private const val KEY_CUSTOM_REALTIME_SECONDS = "custom_realtime_seconds"
+        private const val KEY_SEE_SIGNATURES_PREFIX = "see_signatures_user"
         private const val KEY_AUTO_PROMPTED_BATTERY_WHITELIST = "auto_prompted_battery_whitelist_v130"
         // 带版本后缀：旧版实验室「设为 99」会把 99 写进这里并被当成真实未读累加，
         // 换 key 让历史残留在升级后直接作废，无需用户手动归零。

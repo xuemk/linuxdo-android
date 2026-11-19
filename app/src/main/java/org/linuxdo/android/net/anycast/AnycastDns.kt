@@ -3,7 +3,10 @@ package org.linuxdo.android.net.anycast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
 import org.linuxdo.android.net.TunnelConfig
 import java.net.InetAddress
@@ -30,16 +33,25 @@ class AnycastDns(
     override fun lookup(hostname: String): List<InetAddress> {
         if (!isTargetHost(hostname)) return fallback.lookup(hostname)
 
-        // lookup 在 OkHttp 的 IO 线程上同步调用，绝不能在此阻塞等探测结果：
-        // 首轮未完成时 ordered() 会按种子优先级给出可用节点，探测结果供后续请求受益。
+        // 冷启动若池内尚无已测速健康节点，发起后台探测并短暂等待首个健康节点就绪（最多 1.5s），
+        // 避免首个业务请求盲选未探测的 DEFAULT_SEEDS[0] 卡死 12s 超时。
         scheduleRefreshIfIdle()
+        if (!pool.hasHealthyProbedNode()) {
+            runBlocking {
+                withTimeoutOrNull(1_500L) {
+                    while (!pool.hasHealthyProbedNode() && refreshing.get()) {
+                        delay(50L)
+                    }
+                }
+            }
+        }
 
         val candidates = pool.ordered().mapNotNull { ip -> toInetAddress(hostname, ip) }
         // 全池耗尽时退回 fallback，而不是抛异常 —— 让上层编排器有机会降级（见 design §2.5）
         return candidates.ifEmpty { fallback.lookup(hostname) }
     }
 
-    private fun scheduleRefreshIfIdle() {
+    fun scheduleRefreshIfIdle() {
         if (!refreshing.compareAndSet(false, true)) return
         scope.launch {
             try {

@@ -127,6 +127,11 @@ class AnycastPool(
         newWinner
     }
 
+    /** 是否已有至少一个经过真实探测且健康的节点（防止冷启动盲选未测速死节点）。 */
+    fun hasHealthyProbedNode(): Boolean = synchronized(lock) {
+        nodes.values.any { it.isHealthy }
+    }
+
     /** 当前最优节点；全池均已尝试且无一健康时返回 null，交由上层降级。 */
     fun best(): String? {
         val sorted = snapshot()
@@ -158,23 +163,23 @@ class AnycastPool(
     suspend fun refresh(): List<AnycastNode> {
         val targets = nodes.keys.toList()
         val gate = Semaphore(PROBE_CONCURRENCY)
-        val results = coroutineScope {
+        coroutineScope {
             targets.map { ip ->
-                async(Dispatchers.IO) { gate.withPermit { AnycastProbe.probe(ip) } }
-            }.awaitAll()
-        }
-        synchronized(lock) {
-            val updated = nodes.toMutableMap()
-            results.forEach { result ->
-                val current = updated[result.ip] ?: return@forEach
-                updated[result.ip] = if (result.ok) {
-                    current.copy(latencyMs = result.elapsedMs, consecutiveFailures = 0)
-                } else {
-                    // 保留历史延迟：失败可能只是抖动，等连续失败达阈值再判死（见 isHealthy）
-                    current.copy(consecutiveFailures = current.consecutiveFailures + 1)
+                async(Dispatchers.IO) {
+                    val result = gate.withPermit { AnycastProbe.probe(ip) }
+                    synchronized(lock) {
+                        val current = nodes[result.ip] ?: return@synchronized
+                        val updatedNode = if (result.ok) {
+                            current.copy(latencyMs = result.elapsedMs, consecutiveFailures = 0)
+                        } else {
+                            // 保留历史延迟：失败可能只是抖动，等连续失败达阈值再判死（见 isHealthy）
+                            current.copy(consecutiveFailures = current.consecutiveFailures + 1)
+                        }
+                        nodes = nodes + (result.ip to updatedNode)
+                    }
+                    result
                 }
-            }
-            nodes = updated
+            }.awaitAll()
         }
         return snapshot()
     }

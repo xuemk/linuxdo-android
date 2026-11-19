@@ -1003,8 +1003,8 @@ private fun UserSummaryView(
                             .clickable {
                                 if (link.topicId != null) {
                                     onOpenTopic(link.topicId, link.topicTitle ?: link.title ?: "", link.postNumber)
-                                } else if (isTrustedForumUrl(link.url)) {
-                                    MiniAppSessionPool.requestOpen(link.url)
+                                } else if (shouldOpenInAppBrowser(link.url)) {
+                                    MiniAppSessionPool.requestOpen(normalizeInAppTargetUrl(link.url) ?: link.url)
                                 } else {
                                     openExternal(context, link.url)
                                 }

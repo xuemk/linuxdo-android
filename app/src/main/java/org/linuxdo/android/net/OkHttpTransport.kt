@@ -189,6 +189,7 @@ class OkHttpTransport(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
+                    val receivedAtElapsed = android.os.SystemClock.elapsedRealtime()
                     try {
                         response.use { resp ->
                             val text = resp.body?.string().orEmpty()
@@ -210,6 +211,7 @@ class OkHttpTransport(
                                 sentClearanceFp = activeTag.sentClearanceFp,
                                 cfMitigated = mitigated,
                                 sentSessionTokenHash = activeTag.sentSessionTokenHash,
+                                receivedAtElapsedMs = receivedAtElapsed,
                             )
                             if (continuation.isActive) {
                                 continuation.resume(transportResult)

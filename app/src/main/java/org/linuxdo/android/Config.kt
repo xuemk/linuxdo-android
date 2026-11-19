@@ -46,7 +46,7 @@ object Config {
     /** 本地还没有升级进度 / 积分缓存时，进程启动后多久内不允许手动拉取（交给后台首轮预热） */
     const val CONNECT_FIRST_FETCH_LOCK_MS = 10 * 60 * 1_000L
 
-    const val UNREAD_POLL_INTERVAL_MS = 10_000L
+    const val UNREAD_POLL_INTERVAL_MS = 20_000L
 
     /** TCP/TLS 建连超时。连不上服务器时要尽快报错,而不是让用户干等。 */
     const val CONNECT_TIMEOUT_MS = 10_000L

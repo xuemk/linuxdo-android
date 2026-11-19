@@ -31,6 +31,7 @@ sealed interface CookedBlock {
         val width: Int = 0,
         val height: Int = 0,
         val svgMarkup: String? = null,
+        val linkUrl: String? = null,
     ) : CookedBlock
     data class Video(
         val url: String,
@@ -321,9 +322,20 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             ?.let { anchor ->
                 contentUrl(anchor.attr("href")) ?: contentUrl(anchor.attr("data-download-href"))
             }
-        val originalUrl = lightboxHref ?: srcsetBest ?: rawSrc ?: return null
+        val linkedImage = img.parents().firstOrNull { it.normalName() == "a" }
+            ?.attr("href")?.let(::contentUrl)?.takeIf(::isImageLinkUrl)
+        val originalUrl = lightboxHref ?: linkedImage ?: srcsetBest ?: rawSrc ?: return null
         val displayUrl = rawSrc ?: srcsetBest ?: lightboxHref ?: originalUrl
         return displayUrl to originalUrl
+    }
+
+    private fun pictureLinkOf(element: Element, displayUrl: String, originalUrl: String): String? {
+        val anchor = element.parents().firstOrNull { it.normalName() == "a" } ?: return null
+        if (anchor.hasClass("lightbox") || anchor.hasAttr("data-download-href") ||
+            anchor.hasClass("attachment") || anchor.hasAttr("download")) return null
+        return contentUrl(anchor.attr("href"))?.takeUnless {
+            it == displayUrl || it == originalUrl || isImageLinkUrl(it)
+        }
     }
 
     private fun pictureBlockOf(img: Element): CookedBlock.Picture? {
@@ -336,6 +348,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             originalUrl = urls.second,
             width = w,
             height = h,
+            linkUrl = pictureLinkOf(img, urls.first, urls.second),
         )
     }
 
@@ -357,6 +370,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             width = w,
             height = h,
             svgMarkup = markup,
+            linkUrl = pictureLinkOf(svg, "", ""),
         )
     }
 
@@ -611,9 +625,15 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     } else null
                     val innerPictures = element.select(CONTENT_IMAGES).mapNotNull(::pictureBlockOf) +
                         element.select("svg:not(.d-icon):not(.svg-icon):not(.fa)").mapNotNull(::svgBlockOf)
-                    if (innerPictures.isNotEmpty() && element.text().isBlank()) {
+                    val isMediaOrAttachment = href != null || audio != null || image != null ||
+                        element.hasClass("attachment") || element.hasAttr("download")
+                    if (innerPictures.isNotEmpty() && (element.text().isBlank() || !isMediaOrAttachment)) {
                         flush()
                         output += innerPictures
+                        val caption = inline(element.clone().apply { select("$CONTENT_IMAGES, svg").remove() })
+                        if (caption.any { it.text.isNotBlank() }) {
+                            output += CookedBlock.Paragraph(caption)
+                        }
                     } else if (href != null) {
                         flush()
                         output += CookedBlock.Video(href, title = element.text().ifBlank { "播放视频" })

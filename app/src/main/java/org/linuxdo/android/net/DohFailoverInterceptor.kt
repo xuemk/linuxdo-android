@@ -37,25 +37,30 @@ class DohFailoverInterceptor(
                 coordinator.reportFailure(currentEpoch.generation, currentEpoch.server.id, e)
             }
 
-            // 2. 幂等安全重试检查
+            // 2. 幂等安全重试检查（显式附件/媒体下载由下载编排层自行控制超时、取消与通道切换，不在拦截器内同步重放）
+            val isExplicitDownload = request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null
             val isIdempotent = request.method in listOf("GET", "HEAD")
             val isOneShot = request.body?.isOneShot() == true
             val hasRetried = request.header(HEADER_RETRIED) != null
 
-            if (isIdempotent && !isOneShot && !hasRetried && coordinator.isFailoverEligible(e)) {
-                Log.w(TAG, "只读请求 ${request.method} ${request.url} 遭遇网络异常: ${e.message}，等待协调器代次切换后重试...")
+            if (!isExplicitDownload && isIdempotent && !isOneShot && !hasRetried && coordinator.isFailoverEligible(e)) {
+                Log.w(TAG, "只读请求 ${request.method} ${request.url} 遭遇网络异常: ${e.message}，等待协调器恢复后重试...")
                 // 同步等待新代次（至多 1.5 秒）
                 val nextEpoch = runBlocking {
                     coordinator.awaitOrGetNextEpoch(currentEpoch.generation)
                 }
 
+                val retryRequest = request.newBuilder()
+                    .header(HEADER_RETRIED, "1")
+                    .build()
                 if (nextEpoch.generation > currentEpoch.generation) {
-                    val retryRequest = request.newBuilder()
-                        .header(HEADER_RETRIED, "1")
-                        .build()
                     Log.i(TAG, "使用新代次 [gen ${nextEpoch.generation}: ${nextEpoch.server.name}] 发起单次重试")
                     return nextEpoch.client.newCall(retryRequest).execute()
                 }
+                // 首次抖动尚未跨代次时，淘汰当前卡死的连接/Anycast 节点并在同代次发起 1 次无感重试
+                coordinator.onIdempotentSingleFailureRetry(currentEpoch.generation)
+                Log.i(TAG, "单次故障尚未切换代次，轮换直连节点并清理空闲连接后发起 1 次幂等重试")
+                return nextEpoch.client.newCall(retryRequest).execute()
             }
 
             // 凡是不符合重试条件（如 POST 请求、已重试过、或无新代次），如实抛出原始异常

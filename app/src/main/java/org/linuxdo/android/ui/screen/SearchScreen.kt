@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -43,8 +44,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import org.linuxdo.android.data.Topic
 import org.linuxdo.android.data.TopicListItem
 import org.linuxdo.android.data.SearchOrder
@@ -394,13 +393,13 @@ fun SearchScreen(
 
     // 底部“搜索排序”抽屉 (BottomSheet 样式)
     if (showSort) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { showSort = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
                     .imePadding(),
                 contentAlignment = Alignment.BottomCenter,
             ) {
@@ -427,6 +426,8 @@ fun SearchScreen(
                             indication = null,
                             onClick = {},
                         )
+                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal))
+                        .verticalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {

@@ -25,6 +25,14 @@ interface PushSessionProvider {
     fun isBackgroundNotificationEnabled(): Boolean
     /** 临时验证或限流只推迟网络请求，不改变登录或后台服务开关。 */
     fun backgroundRequestDelayMs(): Long = 0L
+    suspend fun tryAcquireBackgroundPoll(includeUnreadQuota: Boolean = true): Boolean = backgroundRequestDelayMs() <= 0L
+    fun recordBackgroundPollResponse(
+        path: String,
+        status: Int,
+        cfMitigated: String?,
+        retryAfterSeconds: Long?,
+        sentClearanceFp: String,
+    ): Long = 0L
     fun getCookie(): String
     fun getUserAgent(): String
     fun getUserId(): Long

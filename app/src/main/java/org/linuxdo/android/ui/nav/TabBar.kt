@@ -60,7 +60,7 @@ fun TabBar(
                 .height(0.5.dp)
                 .background(IosTheme.colors.separator.copy(alpha = 0.32f))
         )
-        Row(Modifier.height(52.dp)) {
+        Row(Modifier.heightIn(min = 52.dp).height(IntrinsicSize.Min)) {
             MainTab.entries.forEach { tab ->
                 val isSelected = tab == selected
                 val color = if (isSelected) activeTint else inactiveTint
@@ -73,7 +73,8 @@ fun TabBar(
                             selected = isSelected,
                             role = Role.Tab,
                             onClick = { onSelect(tab) }
-                        ),
+                        )
+                        .padding(vertical = 4.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
@@ -241,6 +242,8 @@ fun TabBar(
                         fontSize = 10.sp,
                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
                         lineHeight = 12.sp,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                     )
                 }
             }

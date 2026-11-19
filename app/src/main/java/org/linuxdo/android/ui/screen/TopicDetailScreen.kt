@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.drop
 import org.linuxdo.android.data.TopicReadingPosition
 import org.linuxdo.android.ui.html.segmentCookedBlocks
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -111,6 +112,10 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -151,6 +156,7 @@ import android.graphics.drawable.ColorDrawable
 import android.view.WindowManager
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.MutableTransitionState
@@ -168,7 +174,6 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
@@ -178,7 +183,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.LruCache
+import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.widget.Toast
@@ -194,23 +202,39 @@ import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import coil.size.Size
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.net.URLDecoder
+import java.util.concurrent.ConcurrentHashMap
 import org.jsoup.Jsoup
 import kotlin.math.min
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import org.linuxdo.android.App
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Post
 import org.linuxdo.android.data.Boost
 import org.linuxdo.android.data.PostFlagReason
+import org.linuxdo.android.data.SignaturePolicy
+import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.effectiveReplyToPostNumber
 import org.linuxdo.android.data.flatPostRows
 import org.linuxdo.android.data.BoostLength
@@ -233,8 +257,11 @@ import org.linuxdo.android.ui.format.RelativeTime
 import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
+import org.linuxdo.android.ui.html.isDownloadableAttachmentUrl
 import org.linuxdo.android.ui.html.isImageLinkUrl
 import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
+import org.linuxdo.android.net.HttpHeaderUtils
+import org.linuxdo.android.net.SiteImageGateInterceptor
 import org.linuxdo.android.net.awaitImageRetrySlot
 import org.linuxdo.android.net.isTransientImageError
 
@@ -289,6 +316,21 @@ private data class ReadingFloorIndicator(
         } else {
             "$rootFloor / $total"
         }
+}
+
+internal object TopicFloorNavigation {
+    fun floorAtFraction(fraction: Float, total: Int, descending: Boolean): Int {
+        val lastFloor = total.coerceAtLeast(1)
+        val progress = if (fraction.isFinite()) fraction.coerceIn(0f, 1f) else 0f
+        val floor = (1.0 + progress.toDouble() * (lastFloor - 1)).roundToInt().coerceIn(1, lastFloor)
+        return if (descending) lastFloor - floor + 1 else floor
+    }
+
+    fun fractionOfFloor(floor: Int, total: Int, descending: Boolean): Float {
+        if (total <= 1) return 0f
+        val fraction = (floor.coerceIn(1, total) - 1).toFloat() / (total - 1)
+        return if (descending) 1f - fraction else fraction
+    }
 }
 
 private class SelectionClipboard(private val delegate: androidx.compose.ui.platform.ClipboardManager) :
@@ -443,6 +485,7 @@ fun TopicDetailScreen(
     signedIn: Boolean = false,
     showUnreadDot: Boolean = true,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     initialPostNumber: Int? = null,
     onPostsVisible: (List<Int>) -> Unit = {},
     onLiveViewport: (Boolean, Boolean) -> Unit = { _, _ -> },
@@ -465,6 +508,7 @@ fun TopicDetailScreen(
     savedTopicCount: Int = 0,
     onOpenSavedTopics: () -> Unit = {},
     onOpenTag: (String) -> Unit = {},
+    showTopicScrollbar: Boolean = true,
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -693,17 +737,19 @@ fun TopicDetailScreen(
         sessionReadPosts = sessionReadPosts + pending
     }
     val totalPosts = maxOf(state.topic?.postsCount ?: 0, state.topic?.postStream?.stream?.size ?: 0)
+    val highestFloor = maxOf(totalPosts, state.topic?.highestPostNumber ?: 0, state.posts.maxOfOrNull { it.postNumber } ?: 1)
     val maxRootFloor = remember(rows, treeView) {
         if (treeView) rows.filter { it.depth == 0 }.maxOfOrNull { it.post.postNumber } else null
     }
-    val effectiveFloorTotal = remember(totalPosts, maxRootFloor, state.remaining.isEmpty(), treeView) {
+    val effectiveFloorTotal = remember(highestFloor, maxRootFloor, state.remaining.isEmpty(), treeView) {
         if (treeView && state.remaining.isEmpty() && maxRootFloor != null && maxRootFloor > 0) {
             maxRootFloor
         } else {
-            totalPosts
+            highestFloor
         }
     }
-    val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView) {
+    val hasSideNavigation = showTopicScrollbar && effectiveFloorTotal > 1 && rows.isNotEmpty()
+    val readingFloorIndicator by remember(rows, list.firstVisibleItemIndex, effectiveFloorTotal, treeView, state.descending) {
         derivedStateOf {
             val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { postIdFromListKey(it.key) }.toSet()
             val visibleRows = rows.filter { it.post.id in visibleIds }
@@ -711,7 +757,9 @@ fun TopicDetailScreen(
                 val first = rows.firstOrNull()?.post?.postNumber ?: 1
                 ReadingFloorIndicator(rootFloor = first, subFloor = null, total = effectiveFloorTotal)
             } else {
-                val activeRow = visibleRows.last()
+                val firstPostVisible = visibleRows.any { it.post.postNumber == 1 }
+                val atTopicTop = !list.canScrollBackward || (firstPostVisible && list.firstVisibleItemIndex <= 1)
+                val activeRow = if (!state.descending && atTopicTop) visibleRows.first() else visibleRows.last()
                 val rootPost = if (activeRow.depth == 0) {
                     activeRow.post
                 } else {
@@ -762,12 +810,9 @@ fun TopicDetailScreen(
     val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
     val topErrorCount = if (showTopError && state.error != null) 1 else 0
 
-    // 1 楼（主帖）是话题的起点，物理上其上方绝无更早的可见楼层。
-    // 若列表中已包含 1 楼，前序残留的 previousIds 仅为服务端历史流水中的被删帖或系统幽灵 ID。
-    // 此时坚决收口关闭前序缺口，彻底避免因占位反复插入与重排引发的楼层横跳。
-    // 从后序楼层跳进来且未加载到 1 楼时，hasHeadPost 为 false，缺口仍正常展示供向上回溯加载。
-    val hasHeadPost = rows.any { it.post.postNumber == 1 }
-    val showPreviousGap = state.previousIds.isNotEmpty() && !hasHeadPost
+    // 从后序楼层（如 #46）跳入时列表为 [#1, #28..#46]，必须保留前序缺口供向上补齐。是否连续只看 stream、窗口起点与 consumedIds（即 previousIds）：树形回复可能提前载入 #2，
+    // 仅凭"1 楼下方是 #2"会把 [#1, #2, #28…] 误判为连续，漏掉 #3～#27。倒序时 previousIds 恒为空。
+    val showPreviousGap = state.previousIds.isNotEmpty()
 
     fun lazyIndexOf(rowIndex: Int, partIndex: Int = 0): Int {
         val afterHead = rowIndex >= headRows.size
@@ -872,6 +917,11 @@ fun TopicDetailScreen(
 
     val performJumpToFloor: (Int) -> Unit = performJumpToFloor@{ targetFloor ->
         val clamped = targetFloor.coerceIn(1, effectiveFloorTotal)
+        if (clamped == 1 && !state.descending && showPreviousGap) {
+            scope.launch { list.scrollToItem(0) }
+            onReloadFromStart()
+            return@performJumpToFloor
+        }
         if (treeView) {
             // 楼中楼模式: 目标只对齐到主楼(depth == 0)
             val rootRows = rows.filter { it.depth == 0 }
@@ -983,9 +1033,9 @@ fun TopicDetailScreen(
     var upwardAnchor by remember { mutableStateOf<Triple<Long, Int, Int>?>(null) }
     var upwardPrevRowCount by remember { mutableIntStateOf(0) }
     val triggerLoadPrevious = {
-        // 已包含 1 楼时不存在"更早的可见楼层"，前序仅剩被删除/占位的幽灵 id。
-        // 再触发只会让列表围绕锚点重排，产生顶部反复跳动。
-        if (!hasHeadPost && !state.loading && state.previousIds.isNotEmpty()) {
+        // 仅当窗口起点之前仍有未取楼层时才拉取；每批完成后窗口起点前移到本批首个 ID，
+        // 服务端未返回的已删楼层不会被重复请求。
+        if (showPreviousGap && !state.loading && state.previousIds.isNotEmpty()) {
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
             val anchorItem = list.layoutInfo.visibleItemsInfo.firstOrNull { info ->
                 val key = postIdFromListKey(info.key) ?: return@firstOrNull false
@@ -1013,13 +1063,22 @@ fun TopicDetailScreen(
             if (!showPreviousGap) return@derivedStateOf false
             val info = list.layoutInfo.visibleItemsInfo
             val hasGap = info.any { it.key == "load-previous" }
-            val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
-            val firstPostAtTop = firstPostId != null && postIdFromListKey(info.firstOrNull()?.key) == firstPostId
-            hasGap && !firstPostAtTop && list.isScrollInProgress
+            hasGap && located && pendingTargetFloor == null && (list.isScrollInProgress || !list.canScrollBackward)
         }
     }
-    LaunchedEffect(active, nearGapFromBelow, state.loading, state.previousIds.size, state.error) {
-        if (active && nearGapFromBelow && showPreviousGap && !state.loading && state.error == null && state.previousIds.isNotEmpty()) {
+    // 自动补页预算：每次用户拖动只放行一批。静止在顶部且缺口持续可见时，不会每批完成后自动连拉整段前序楼层；
+    // 程序滚动（锚点恢复）不产生拖动交互，不会重置预算。点击缺口按钮属于明确操作，不受此限制。
+    var previousAutoBatches by remember { mutableIntStateOf(0) }
+    LaunchedEffect(list) {
+        list.interactionSource.interactions.collect { interaction ->
+            if (interaction is androidx.compose.foundation.interaction.DragInteraction.Start) previousAutoBatches = 0
+        }
+    }
+    LaunchedEffect(active, nearGapFromBelow, state.loading, state.previousIds.size, state.error, previousAutoBatches) {
+        if (active && nearGapFromBelow && showPreviousGap && !state.loading && state.error == null &&
+            state.previousIds.isNotEmpty() && previousAutoBatches < MAX_AUTO_PREVIOUS_BATCHES_PER_DRAG
+        ) {
+            previousAutoBatches++
             triggerLoadPrevious()
         }
     }
@@ -1071,6 +1130,7 @@ fun TopicDetailScreen(
                     showReplyToHint = !treeView,
                     unreadDotVisible = unreadDotVisible,
                     unreadDotPosition = unreadDotPosition,
+                    showSignatures = showSignatures,
                     onPicture = { list, idx -> pictureGallery = list to idx },
                     reactions = state.topic?.validReactions.orEmpty(),
                     emojiUrls = state.emojiUrls,
@@ -1165,6 +1225,7 @@ fun TopicDetailScreen(
                         isTopicAuthor = isTopicAuthor,
                         unreadDotVisible = unreadDotVisible,
                         unreadDotPosition = unreadDotPosition,
+                        showSignatures = showSignatures,
                         onPicture = { list, idx -> pictureGallery = list to idx },
                         reactions = state.topic?.validReactions.orEmpty(),
                         emojiUrls = state.emojiUrls,
@@ -1533,6 +1594,24 @@ fun TopicDetailScreen(
                                 }
                             }
                         }
+                        if (hasSideNavigation && !showJumpBar) {
+                            TopicFloorScrollbar(
+                                currentFloor = readingFloorIndicator.rootFloor,
+                                total = effectiveFloorTotal,
+                                descending = state.descending,
+                                onJumpToFloor = { floor ->
+                                    val hiddenLocalFloor = state.posts.any { it.postNumber == floor } &&
+                                        rows.none { it.post.postNumber == floor }
+                                    val target = if (state.filterUserId != null || hiddenLocalFloor) {
+                                        rows.asSequence().filter { !treeView || it.depth == 0 }
+                                            .minByOrNull { abs(it.post.postNumber - floor) }?.post?.postNumber
+                                    } else floor
+                                    if (target != null) performJumpToFloor(target)
+                                },
+                                modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight(0.65f),
+                            )
+                        }
+
                         // 全屏透明遮罩: 当跳楼浮卡展开时，点击任意外部区域收起浮卡
                         if (showJumpBar) {
                             Box(
@@ -1575,7 +1654,12 @@ fun TopicDetailScreen(
                                 onOpenSavedTopics = onOpenSavedTopics,
                                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
                                 onScrollToTop = {
-                                    if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                                    if (firstPostLoaded && !showPreviousGap) {
+                                        scope.launch { list.animateScrollToItem(0) }
+                                    } else {
+                                        scope.launch { list.scrollToItem(0) }
+                                        onReloadFromStart()
+                                    }
                                 },
                                 onOpenJumpBar = {
                                     showJumpBar = !showJumpBar
@@ -1698,9 +1782,8 @@ fun TopicDetailScreen(
         )
     }
     if (showToc) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { showToc = false },
-            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
         ) {
             Box(
                 modifier = Modifier
@@ -1710,6 +1793,7 @@ fun TopicDetailScreen(
                         indication = null,
                         onClick = { showToc = false },
                     )
+                    .safeDrawingPadding()
                     .padding(top = 96.dp, start = 20.dp, end = 20.dp),
                 contentAlignment = Alignment.TopCenter,
             ) {
@@ -1805,9 +1889,8 @@ fun TopicDetailScreen(
         }
     }
     if (authorMenuExpanded) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { authorMenuExpanded = false },
-            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
         ) {
             Box(
                 modifier = Modifier
@@ -1817,6 +1900,7 @@ fun TopicDetailScreen(
                         indication = null,
                         onClick = { authorMenuExpanded = false },
                     )
+                    .safeDrawingPadding()
                     .padding(top = 96.dp, start = 20.dp, end = 20.dp),
                 contentAlignment = Alignment.TopCenter,
             ) {
@@ -2029,6 +2113,7 @@ fun TopicDetailScreen(
  * 评论区头部栏:左侧总回复数与筛选药丸(贴吧模式),右侧 iOS 分段控件样式的「正序 / 倒序」胶囊。
  * 固定跟在 1 楼下方 —— 向上滑动触顶时吸顶冻结,方便用户随时切换筛选或翻转排序;非顶部取消冻结。
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CommentOrderBar(
     total: Int,
@@ -2049,68 +2134,69 @@ private fun CommentOrderBar(
             )
             .background(IosTheme.colors.card)
     ) {
-        Row(
+        FlowRow(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // 1. 全部回复标签
-            Text(
-                text = if (total > 0) "全部回复 $total" else "全部回复",
-                style = IosTheme.type.subheadline,
-                fontWeight = FontWeight.SemiBold,
-                color = IosTheme.colors.label,
-            )
+            Row(Modifier.padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                // 1. 全部回复标签
+                Text(
+                    text = if (total > 0) "全部回复 $total" else "全部回复",
+                    style = IosTheme.type.subheadline,
+                    fontWeight = FontWeight.SemiBold,
+                    color = IosTheme.colors.label,
+                )
 
-            // 2. 筛选药丸（放在全部回复后面，参照贴吧模式）
-            if (authorFilterItems.isNotEmpty()) {
-                Spacer(Modifier.width(8.dp))
-                val isFiltered = filterUserId != null
-                val pillBg = when {
-                    authorMenuExpanded -> Color(0xFFE0F2FE)
-                    isFiltered -> IosTheme.colors.accent.copy(alpha = 0.12f)
-                    IosTheme.colors.isDark -> Color(0xFF2C2C2E)
-                    else -> IosTheme.colors.fieldBackground
-                }
-                val pillTextColor = when {
-                    authorMenuExpanded || isFiltered -> Color(0xFF0284C7)
-                    IosTheme.colors.isDark -> Color(0xFFE5E5EA)
-                    else -> IosTheme.colors.label
-                }
-                val selectedName = authorFilterItems.firstOrNull { it.userId == filterUserId }?.username
-                val isDark = IosTheme.colors.isDark
-                val filterShape = RoundedCornerShape(8.dp)
-                val filterBorder = if (authorMenuExpanded) Color(0xFF0284C7) else (if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6))
-                Row(
-                    modifier = Modifier
-                        .widthIn(max = 140.dp)
-                        .height(26.dp)
-                        .clip(filterShape)
-                        .background(pillBg)
-                        .border(if (authorMenuExpanded) 1.2.dp else 0.75.dp, filterBorder, filterShape)
-                        .clickable(onClick = onAuthorMenuClick)
-                        .padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp),
-                ) {
-                    Text(
-                        text = when {
-                            selectedName != null -> "只看 $selectedName ${if (authorMenuExpanded) "▴" else "▾"}"
-                            authorMenuExpanded -> "筛选 ▴"
-                            else -> "筛选 ▾"
-                        },
-                        style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
-                        color = pillTextColor,
-                        fontWeight = if (authorMenuExpanded || isFiltered) FontWeight.SemiBold else FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        softWrap = false,
-                    )
+                // 2. 筛选药丸（放在全部回复后面，参照贴吧模式）
+                if (authorFilterItems.isNotEmpty()) {
+                    Spacer(Modifier.width(8.dp))
+                    val isFiltered = filterUserId != null
+                    val pillBg = when {
+                        authorMenuExpanded -> Color(0xFFE0F2FE)
+                        isFiltered -> IosTheme.colors.accent.copy(alpha = 0.12f)
+                        IosTheme.colors.isDark -> Color(0xFF2C2C2E)
+                        else -> IosTheme.colors.fieldBackground
+                    }
+                    val pillTextColor = when {
+                        authorMenuExpanded || isFiltered -> Color(0xFF0284C7)
+                        IosTheme.colors.isDark -> Color(0xFFE5E5EA)
+                        else -> IosTheme.colors.label
+                    }
+                    val selectedName = authorFilterItems.firstOrNull { it.userId == filterUserId }?.username
+                    val isDark = IosTheme.colors.isDark
+                    val filterShape = RoundedCornerShape(8.dp)
+                    val filterBorder = if (authorMenuExpanded) Color(0xFF0284C7) else (if (isDark) Color(0xFF48484A) else Color(0xFFD1D1D6))
+                    Row(
+                        modifier = Modifier
+                            .widthIn(max = 140.dp)
+                            .heightIn(min = 26.dp)
+                            .clip(filterShape)
+                            .background(pillBg)
+                            .border(if (authorMenuExpanded) 1.2.dp else 0.75.dp, filterBorder, filterShape)
+                            .clickable(onClick = onAuthorMenuClick)
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Text(
+                            text = when {
+                                selectedName != null -> "只看 $selectedName ${if (authorMenuExpanded) "▴" else "▾"}"
+                                authorMenuExpanded -> "筛选 ▴"
+                                else -> "筛选 ▾"
+                            },
+                            style = IosTheme.type.footnote.copy(fontSize = 11.5.sp, lineHeight = 15.sp),
+                            color = pillTextColor,
+                            fontWeight = if (authorMenuExpanded || isFiltered) FontWeight.SemiBold else FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            softWrap = false,
+                        )
+                    }
                 }
             }
-
-            Spacer(Modifier.weight(1f))
 
             // 3. 正序 / 倒序
             Row(
@@ -2652,6 +2738,111 @@ private fun JumpFloorCard(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun TopicFloorScrollbar(
+    currentFloor: Int,
+    total: Int,
+    descending: Boolean,
+    onJumpToFloor: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val latestJump by rememberUpdatedState(onJumpToFloor)
+    var dragFraction by remember(total, descending) { mutableStateOf<Float?>(null) }
+    var pressed by remember(total, descending) { mutableStateOf(false) }
+    val interacting = pressed || dragFraction != null
+    val railAlpha by animateFloatAsState(
+        targetValue = if (interacting) 1f else 0.22f,
+        animationSpec = tween(durationMillis = if (interacting) 0 else 250),
+        label = "floor-navigation-opacity",
+    )
+    val fraction = dragFraction ?: TopicFloorNavigation.fractionOfFloor(currentFloor, total, descending)
+    val previewFloor = TopicFloorNavigation.floorAtFraction(fraction, total, descending)
+    val accent = IosTheme.colors.accent
+
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val density = LocalDensity.current
+        val thumbHeight = minOf(44.dp, maxHeight)
+        val thumbHeightPx = with(density) { thumbHeight.toPx() }
+        val travelPx = with(density) { (maxHeight - thumbHeight).toPx() }.coerceAtLeast(1f)
+        val thumbOffset = (fraction * travelPx).roundToInt()
+
+        fun fractionAt(y: Float): Float = ((y - thumbHeightPx / 2f) / travelPx).coerceIn(0f, 1f)
+
+        Box(
+            Modifier.align(Alignment.CenterEnd).width(32.dp).fillMaxHeight()
+                .graphicsLayer { alpha = railAlpha }
+                .semantics {
+                    contentDescription = "楼层导航条"
+                    stateDescription = "第 $previewFloor 楼，共 $total 楼"
+                    progressBarRangeInfo = ProgressBarRangeInfo(previewFloor.toFloat(), 1f..total.toFloat())
+                    setProgress { value ->
+                        if (!value.isFinite()) false
+                        else {
+                            latestJump(value.roundToInt().coerceIn(1, total))
+                            true
+                        }
+                    }
+                }
+                .pointerInput(total, descending, travelPx) {
+                    detectVerticalDragGestures(
+                        onDragStart = { dragFraction = fractionAt(it.y) },
+                        onVerticalDrag = { change, _ ->
+                            change.consume()
+                            dragFraction = fractionAt(change.position.y)
+                        },
+                        // 拖动只预览，松手才复用跳楼请求，避免逐帧触发网络加载。
+                        onDragEnd = {
+                            val target = dragFraction?.let { TopicFloorNavigation.floorAtFraction(it, total, descending) }
+                            dragFraction = null
+                            if (target != null) latestJump(target)
+                        },
+                        onDragCancel = { dragFraction = null },
+                    )
+                }
+                .pointerInput(total, descending, travelPx) {
+                    // 轻点仅显示按压反馈，跳转只在拖动结束后发起。
+                    detectTapGestures(
+                        onPress = {
+                            pressed = true
+                            try { tryAwaitRelease() } finally { pressed = false }
+                        },
+                    )
+                },
+        ) {
+            Canvas(Modifier.fillMaxSize()) {
+                val centerX = size.width / 2f
+                val top = thumbHeightPx / 2f
+                drawLine(accent.copy(alpha = 0.2f), Offset(centerX, top), Offset(centerX, top + travelPx), 3.dp.toPx(), StrokeCap.Round)
+                repeat(11) { tick ->
+                    val y = top + travelPx * tick / 10f
+                    drawLine(accent.copy(alpha = 0.25f), Offset(centerX + 5.dp.toPx(), y), Offset(centerX + 8.dp.toPx(), y), 1.dp.toPx())
+                }
+            }
+            Box(
+                Modifier.align(Alignment.TopCenter).offset { IntOffset(0, thumbOffset) }
+                    .width(14.dp).height(thumbHeight).clip(RoundedCornerShape(7.dp)).background(accent),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(Modifier.width(2.dp).height(14.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.8f)))
+            }
+        }
+        if (dragFraction != null) {
+            Text(
+                "第 $previewFloor / $total 楼",
+                style = IosTheme.type.footnote,
+                color = IosTheme.colors.label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.align(Alignment.TopEnd).padding(end = 40.dp)
+                    .offset { IntOffset(0, thumbOffset) }
+                    .shadow(4.dp, RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.card, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
         }
     }
 }
@@ -3403,6 +3594,7 @@ private fun ComposerSheet(
             // 中间输入区域 (自适应填满剩余空间，基于原生 EditText + ReplacementSpan 所见即所得图文混排)
             val textColorInt = IosTheme.colors.label.toArgb()
             val hintColorInt = IosTheme.colors.tertiaryLabel.toArgb()
+            val editorTextSizePx = with(LocalDensity.current) { 16.sp.toPx() }
 
             Box(
                 modifier = Modifier
@@ -3434,6 +3626,7 @@ private fun ComposerSheet(
                         },
                         update = { view ->
                             view.updateThemeColors(textColorInt, hintColorInt)
+                            view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, editorTextSizePx)
                             view.setCompletionSource(completionSource, topicId = target.topicId)
                             view.setOnEditPollListener { span, spec ->
                                 editingPollTarget = Pair(span, spec)
@@ -3736,6 +3929,9 @@ private fun AuthorBadge() {
 /** 未读蓝点停留多久才算"读过"并开始淡出。 */
 private const val UNREAD_DOT_DWELL_MS = 1_200L
 
+/** 每次拖动最多自动补齐的前序批次数（每批 20 层）。 */
+private const val MAX_AUTO_PREVIOUS_BATCHES_PER_DRAG = 1
+
 /**
  * 楼层号右侧的未读小蓝点。变为已读时淡出并收起宽度,
  * 让楼层号仍然贴着右边距,不留空位。
@@ -3767,6 +3963,7 @@ private fun PostRow(
     showReplyToHint: Boolean = true,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -3914,6 +4111,12 @@ private fun PostRow(
         }
         if (slice.body == null) PreparingPostBody()
         else CookedContent(blocks, onPicture, postImages = slice.body.images, pollPost = post)
+        if (slice.last && slice.body != null && showSignatures) {
+            PostSignatureBlock(
+                rawSignature = post.userSignature,
+                maxHeight = 150.dp,
+            )
+        }
         if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
@@ -3953,6 +4156,7 @@ private fun SubReplyRow(
     isTopicAuthor: Boolean,
     unreadDotVisible: Boolean = false,
     unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
+    showSignatures: Boolean = false,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
     reactions: List<String>,
     emojiUrls: Map<String, String>,
@@ -4075,6 +4279,13 @@ private fun SubReplyRow(
         }
         if (slice.body == null) PreparingPostBody()
         else CookedContent(blocks, onPicture, postImages = slice.body.images, subReply = true, pollPost = post)
+        if (slice.last && slice.body != null && showSignatures) {
+            PostSignatureBlock(
+                rawSignature = post.userSignature,
+                maxHeight = 96.dp,
+                compact = true,
+            )
+        }
         if (slice.last && slice.body != null) PostActions(
             post = post,
             reactions = reactions,
@@ -5399,8 +5610,13 @@ fun extractPostImages(blocks: List<CookedBlock>): List<ImageViewerItem> {
 
 private val SVG_SCRIPT_REGEX = Regex("<script\\b[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE)
 private val SVG_EVENT_ATTR_REGEX = Regex("\\s+on[a-z0-9_]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)", RegexOption.IGNORE_CASE)
-private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)(?:javascript|vbscript|file)\\s*:")
+private val SVG_DANGEROUS_URI_REGEX = Regex("(?i)\\b(?:javascript|vbscript|file)\\s*:")
 private val SVG_ANIMATION_REGEX = Regex("(?i)(@keyframes|-webkit-keyframes|\\banimation\\s*:|\\banimation-name\\s*:|<animate\\b|<animateTransform\\b|<animateMotion\\b|<animateColor\\b|<set\\b)")
+
+private fun formatSvgDimension(value: Float): String {
+    val asInt = value.toInt()
+    return if (kotlin.math.abs(value - asInt.toFloat()) < 0.001f) asInt.toString() else value.toString()
+}
 
 private fun sanitizeSvgMarkup(raw: String): String {
     val startIdx = raw.indexOf("<svg", ignoreCase = true)
@@ -5416,8 +5632,25 @@ private fun sanitizeSvgMarkup(raw: String): String {
     val tagEnd = svg.indexOf('>')
     if (tagEnd > 0) {
         val openTag = svg.substring(0, tagEnd)
-        if (!openTag.contains("xmlns=", ignoreCase = true)) {
-            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg xmlns=\"http://www.w3.org/2000/svg\"")
+        val extraAttrs = buildString {
+            if (!openTag.contains("xmlns=", ignoreCase = true)) {
+                append(" xmlns=\"http://www.w3.org/2000/svg\"")
+            }
+            if (svg.contains("xlink:", ignoreCase = true) && !openTag.contains("xmlns:xlink=", ignoreCase = true)) {
+                append(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"")
+            }
+            if (!openTag.contains("viewBox=", ignoreCase = true)) {
+                val intrinsic = extractSvgIntrinsicDp(svg)
+                if (intrinsic != null && intrinsic.first > 0f && intrinsic.second > 0f) {
+                    append(" viewBox=\"0 0 ${formatSvgDimension(intrinsic.first)} ${formatSvgDimension(intrinsic.second)}\"")
+                }
+            }
+            if (!openTag.contains("preserveAspectRatio=", ignoreCase = true)) {
+                append(" preserveAspectRatio=\"xMidYMid meet\"")
+            }
+        }
+        if (extraAttrs.isNotEmpty()) {
+            svg = svg.replaceFirst(Regex("(?i)<svg\\b"), "<svg$extraAttrs")
         }
     }
     return svg
@@ -5453,14 +5686,18 @@ private fun InlineSvgView(
     svgMarkup: String,
     modifier: Modifier = Modifier,
 ) {
-    val html = remember(svgMarkup) {
+    val encodedHtml = remember(svgMarkup) {
         val clean = sanitizeSvgMarkup(svgMarkup)
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+        val html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
             "<style>" +
-            "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;display:flex;align-items:center;justify-content:center;}" +
-            "svg{width:100%!important;height:100%!important;max-width:100%;max-height:100%;display:block;object-fit:contain;}" +
+            "html,body{margin:0;padding:0;width:100%;background:transparent;overflow:hidden;}" +
+            "svg{width:100%!important;height:auto!important;max-width:100%;display:block;}" +
             "</style></head><body>$clean</body></html>"
+        android.util.Base64.encodeToString(
+            html.toByteArray(StandardCharsets.UTF_8),
+            android.util.Base64.NO_WRAP,
+        )
     }
     AndroidView(
         modifier = modifier,
@@ -5480,20 +5717,23 @@ private fun InlineSvgView(
                     setSupportZoom(false)
                     defaultTextEncodingName = "UTF-8"
                 }
-                tag = html
-                loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+                onResume()
+                tag = encodedHtml
+                loadData(encodedHtml, "text/html; charset=utf-8", "base64")
             }
         },
         update = { webView ->
-            if (webView.tag != html) {
-                webView.tag = html
-                webView.loadDataWithBaseURL("about:blank", html, "text/html", "UTF-8", null)
+            webView.onResume()
+            if (webView.tag != encodedHtml) {
+                webView.tag = encodedHtml
+                webView.loadData(encodedHtml, "text/html; charset=utf-8", "base64")
             }
         },
     )
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 internal fun CookedContent(
     blocks: List<CookedBlock>,
     onPicture: (List<ImageViewerItem>, Int) -> Unit,
@@ -5502,6 +5742,7 @@ internal fun CookedContent(
     subReply: Boolean = false,
     pollPost: Post? = null,
 ) {
+    val openLinkedImage = rememberLinkedImageOpener()
     CompositionLocalProvider(
         LocalSelectionPost provides pollPost,
         LocalOpenPicture provides onPicture,
@@ -5651,16 +5892,20 @@ internal fun CookedContent(
                     )
 
                     val activeSvgMarkup = inlineSvgContent
+                    val imageActions = if (block.linkUrl != null) {
+                        Modifier.combinedClickable(
+                            onClick = { openLinkedImage(block) },
+                            onLongClick = if (block.svgMarkup == null) ({ onPicture(imageList, clickedIndex) }) else null,
+                        )
+                    } else if (block.svgMarkup == null) {
+                        Modifier.clickable { onPicture(imageList, clickedIndex) }
+                    } else Modifier
                     Box(
                         modifier = ratioModifier.background(IosTheme.colors.fieldBackground),
                         contentAlignment = Alignment.Center,
                     ) {
                         if (activeSvgMarkup != null) {
-                            val clickMod = if (block.svgMarkup == null) {
-                                Modifier.fillMaxSize().clickable { onPicture(imageList, clickedIndex) }
-                            } else {
-                                Modifier.fillMaxSize()
-                            }
+                            val clickMod = Modifier.fillMaxSize().then(imageActions)
                             Box(modifier = clickMod, contentAlignment = Alignment.Center) {
                                 InlineSvgView(
                                     svgMarkup = activeSvgMarkup,
@@ -5677,7 +5922,7 @@ internal fun CookedContent(
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .clickable { onPicture(imageList, clickedIndex) },
+                                    .then(imageActions),
                                 onLoading = {
                                     isLoading = true
                                     isError = false
@@ -5738,6 +5983,9 @@ internal fun CookedContent(
                                 }
                             }
                             }
+                        }
+                        if (block.linkUrl != null) {
+                            LinkedImageBadge(Modifier.align(Alignment.BottomEnd)) { openLinkedImage(block) }
                         }
                     }
                 }
@@ -5822,25 +6070,61 @@ private fun DetailsCard(
 }
 
 @Composable
+private fun rememberLinkedImageOpener(): (CookedBlock.Picture) -> Unit {
+    val context = LocalContext.current
+    val openTopic = LocalOpenTopic.current
+    val openUrl = LocalOpenExternalUrl.current
+    return remember(context, openTopic, openUrl) {
+        { picture ->
+            picture.linkUrl?.let { link ->
+                val topic = parseInternalTopicUrl(link)
+                if (topic != null && openTopic != null) {
+                    openTopic(topic.topicId, "话题 #${topic.topicId}", topic.postNumber)
+                } else if (shouldOpenInAppBrowser(link)) {
+                    openUrl(normalizeInAppTargetUrl(link) ?: link)
+                } else {
+                    openExternal(context, link)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LinkedImageBadge(modifier: Modifier, onClick: () -> Unit) {
+    Text("↗", color = IosTheme.colors.accent, fontSize = 16.sp,
+        modifier = modifier.padding(6.dp).clip(RoundedCornerShape(6.dp))
+            .background(IosTheme.colors.card.copy(alpha = 0.92f)).clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 2.dp).semantics { contentDescription = "打开图片链接" })
+}
+
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun PictureGrid(block: CookedBlock.ImageGrid, onPicture: (List<ImageViewerItem>, Int) -> Unit, postImages: List<ImageViewerItem>) {
     val gallery = postImages.ifEmpty { extractPostImages(block.pictures) }
+    val openLinkedImage = rememberLinkedImageOpener()
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         block.pictures.chunked(block.columns).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 row.forEach { picture ->
                     var imageUrl by remember(picture.url) { mutableStateOf(picture.url) }
-                    SubcomposeAsyncImage(
-                        model = imageUrl,
-                        contentDescription = picture.description,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp))
-                            .background(IosTheme.colors.fieldBackground).clickable {
-                                onPicture(gallery, gallery.indexOfFirst { it.url == picture.originalUrl }.coerceAtLeast(0))
-                            },
-                        loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IosActivityIndicator(diameter = 18.dp) } },
-                        error = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("查看图片", style = IosTheme.type.caption) } },
-                        onError = { if (imageUrl != picture.originalUrl) imageUrl = picture.originalUrl },
-                    )
+                    val preview = { onPicture(gallery, gallery.indexOfFirst { it.url == picture.originalUrl }.coerceAtLeast(0)) }
+                    val actions = if (picture.linkUrl != null) {
+                        Modifier.combinedClickable(onClick = { openLinkedImage(picture) }, onLongClick = preview)
+                    } else Modifier.clickable(onClick = preview)
+                    Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp))
+                        .background(IosTheme.colors.fieldBackground).then(actions)) {
+                        SubcomposeAsyncImage(
+                            model = imageUrl,
+                            contentDescription = picture.description,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                            loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IosActivityIndicator(diameter = 18.dp) } },
+                            error = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("查看图片", style = IosTheme.type.caption) } },
+                            onError = { if (imageUrl != picture.originalUrl) imageUrl = picture.originalUrl },
+                        )
+                        if (picture.linkUrl != null) LinkedImageBadge(Modifier.align(Alignment.BottomEnd)) { openLinkedImage(picture) }
+                    }
                 }
                 repeat(block.columns - row.size) { Spacer(Modifier.weight(1f)) }
             }
@@ -5946,6 +6230,15 @@ private val externalMediaCallFactory: okhttp3.Call.Factory by lazy {
     okhttp3.OkHttpClient.Builder()
         .followRedirects(true)
         .followSslRedirects(true)
+        .build()
+}
+
+private val externalNoRedirectCallFactory: okhttp3.Call.Factory by lazy {
+    (externalMediaCallFactory as okhttp3.OkHttpClient).newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .retryOnConnectionFailure(false)
+        .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 }
 
@@ -6137,8 +6430,8 @@ private fun InlineMediaCard(
         }
     }
     if (fullscreen && player != null) {
-        Dialog(onDismissRequest = { fullscreen = false }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+        FullscreenDialog(onDismissRequest = { fullscreen = false }, darkSystemBars = true) {
+            Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
                 NativePlayerView(player, Modifier.fillMaxSize(), playRequested)
                 TextButton(onClick = { fullscreen = false }, modifier = Modifier.align(Alignment.TopEnd)) {
                     Text("退出全屏", color = Color.White)
@@ -6193,7 +6486,7 @@ private fun SandboxedWebPreview(
     allowTouchIntercept: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    if (isTrustedForumUrl(url)) {
+    if (shouldOpenInAppBrowser(url)) {
         SandboxedGeckoPreview(
             url = url,
             active = active,
@@ -6346,7 +6639,7 @@ private fun SandboxedGeckoPreview(
         }
 
         fun syncClearanceBack(pageUrl: String) {
-            if (disposed || !isTrustedForumUrl(pageUrl)) return
+            if (disposed || !isMainForumSyncUrl(pageUrl)) return
             scope.launch {
                 val clearances = runCatching { bridgeRef?.readCfClearances() }.getOrNull()
                     ?.takeIf { it.isNotEmpty() }
@@ -6354,7 +6647,7 @@ private fun SandboxedGeckoPreview(
                         org.linuxdo.android.net.gecko.GeckoManager.cfClearancesFromDb(context).toList()
                     }
                 if (!disposed) {
-                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览")
+                    browserSession?.syncFreshClearanceFromInAppGecko(clearances, "帖内预览", sessionRef)
                 }
             }
         }
@@ -6413,7 +6706,6 @@ private fun SandboxedGeckoPreview(
                                     bridgeRef?.prepareInAppSessionCookies(cookies, challenged)
                                 }
                                 if (!disposed) {
-                                    syncClearanceBack(readyUrl)
                                     bootstrapping = false
                                     geckoView.alpha = 1f
                                     session.loadUri(url)
@@ -6492,17 +6784,20 @@ private fun SandboxedGeckoPreview(
 @Composable
 private fun OneboxCard(onebox: CookedBlock.Onebox) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val openTopic = LocalOpenTopic.current
     val openUrl = LocalOpenExternalUrl.current
     val view = LocalView.current
     val pageActive = LocalPostPageActive.current
     val internalTopic = remember(onebox.url) { parseInternalTopicUrl(onebox.url) }
-    val canPreview = remember(onebox.url) {
+    val isAttachmentOnebox = remember(onebox.url) { isDownloadableAttachmentUrl(onebox.url) }
+    val canPreview = remember(onebox.url, isAttachmentOnebox) {
         val scheme = runCatching { Uri.parse(onebox.url).scheme?.lowercase() }.getOrNull()
-        (scheme == "http" || scheme == "https") && internalTopic == null
+        (scheme == "http" || scheme == "https") && internalTopic == null && !isAttachmentOnebox
     }
-    val isMiniAppOnebox = remember(onebox.url) { isLinuxDoMiniAppUrl(onebox.url) }
-    val isTrustedOnebox = remember(onebox.url) { isTrustedForumUrl(onebox.url) }
+    val miniAppBadgeLabel = remember(onebox.url) { miniAppBadgeLabelForUrl(onebox.url) }
+    val isMiniAppOnebox = miniAppBadgeLabel != null
+    val isTrustedOnebox = remember(onebox.url) { shouldOpenInAppBrowser(onebox.url) }
     var expanded by rememberSaveable(onebox.url) { mutableStateOf(!isMiniAppOnebox && isAutoPreviewDemoOnebox(onebox)) }
     var fullscreen by rememberSaveable(onebox.url) { mutableStateOf(false) }
     var visible by remember(onebox.url) { mutableStateOf(true) }
@@ -6517,14 +6812,20 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
                 visible = bounds.height > 0 && bounds.width > 0 && bounds.bottom > 0 && bounds.top < view.height
             }
             .clickable {
-                if (internalTopic != null && openTopic != null) {
+                if (isAttachmentOnebox) {
+                    AttachmentDownloadManager.enqueue(
+                        context = context,
+                        url = onebox.url,
+                        suggestedName = onebox.title.trim(),
+                    )
+                } else if (internalTopic != null && openTopic != null) {
                     openTopic(
                         internalTopic.topicId,
                         onebox.title.ifBlank { "话题 #${internalTopic.topicId}" },
                         internalTopic.postNumber,
                     )
-                } else if (isTrustedForumUrl(onebox.url)) {
-                    openUrl(onebox.url)
+                } else if (shouldOpenInAppBrowser(onebox.url)) {
+                    openUrl(normalizeInAppTargetUrl(onebox.url) ?: onebox.url)
                 } else {
                     openExternal(context, onebox.url)
                 }
@@ -6578,7 +6879,7 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                if (isMiniAppOnebox) "linux.do · 小程序" else Uri.parse(onebox.url).host.orEmpty(),
+                miniAppBadgeLabel ?: Uri.parse(onebox.url).host.orEmpty(),
                 style = IosTheme.type.caption,
                 color = if (isMiniAppOnebox) Color(0xFF07C160) else IosTheme.colors.accent,
                 maxLines = 1,
@@ -6634,11 +6935,11 @@ private fun OneboxCard(onebox: CookedBlock.Onebox) {
     }
 
     if (fullscreen && canPreview) {
-        Dialog(
+        FullscreenDialog(
             onDismissRequest = { fullscreen = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+            darkSystemBars = true,
         ) {
-            Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
+            Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
                 SandboxedWebPreview(
                     url = onebox.url,
                     active = true,
@@ -7009,6 +7310,14 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
+    fun regenerate() {
+        if (loading || saving) return
+        loading = true
+        result = null
+        error = null
+        retry++
+    }
+
     val shareUrl = remember(topicId, effectivePost.postNumber) {
         if (effectivePost.postNumber <= 1) "${Config.BASE_URL}/t/topic/$topicId"
         else "${Config.BASE_URL}/t/topic/$topicId/${effectivePost.postNumber}"
@@ -7075,9 +7384,10 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) save() else Toast.makeText(context, "未获得相册保存权限，仍可直接分享", Toast.LENGTH_SHORT).show()
     }
-    Dialog(onDismissRequest = { if (!saving) onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    FullscreenDialog(onDismissRequest = { if (!saving) onDismiss() }) {
         Column(
             Modifier
+                .safeDrawingPadding()
                 .padding(16.dp)
                 .fillMaxWidth()
                 .fillMaxHeight(0.92f)
@@ -7091,10 +7401,21 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                     PostActionIcon(PostAction.Share, false, tint = IosTheme.colors.accent, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("分享卡片 · #${effectivePost.postNumber.coerceAtLeast(1)}", style = IosTheme.type.headline)
+                    Text(
+                        "分享卡片 · #${effectivePost.postNumber.coerceAtLeast(1)}",
+                        style = IosTheme.type.headline,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (selectedTab == 1) {
+                    TextButton(onClick = ::regenerate, enabled = !loading && !saving) {
+                        Text("刷新", style = IosTheme.type.footnote, color = IosTheme.colors.accent)
+                    }
                 }
                 TextButton(onClick = onDismiss, enabled = !saving) {
                     Text("关闭", color = IosTheme.colors.secondaryLabel)
@@ -7115,15 +7436,19 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             .weight(1f)
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (isSelected) IosTheme.colors.accent else IosTheme.colors.groupedBackground)
-                            .clickable { selectedTab = index }
-                            .padding(vertical = 10.dp),
+                            .clickable(enabled = !saving && (index == 0 || !loading)) {
+                                if (index == 1 && selectedTab == 1) regenerate()
+                                else selectedTab = index
+                            }
+                            .padding(horizontal = 6.dp, vertical = 10.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            tabTitle,
+                            if (index == 1 && loading) "生成中…" else tabTitle,
                             style = IosTheme.type.subheadline,
                             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                            color = if (isSelected) Color.White else IosTheme.colors.secondaryLabel
+                            color = if (isSelected) Color.White else IosTheme.colors.secondaryLabel,
+                            textAlign = TextAlign.Center,
                         )
                     }
                 }
@@ -7272,11 +7597,8 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             .padding(horizontal = 10.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Checkbox(checked = includeDetails, onCheckedChange = { includeDetails = it }, enabled = !saving)
+                        Checkbox(checked = includeDetails, onCheckedChange = { includeDetails = it }, enabled = !loading && !saving)
                         Text("包含折叠展开内容", modifier = Modifier.weight(1f), style = IosTheme.type.footnote)
-                        TextButton(onClick = { retry++ }, enabled = !loading && !saving) {
-                            Text("重新生成", style = IosTheme.type.caption, color = IosTheme.colors.accent)
-                        }
                     }
                 }
                 LazyColumn(
@@ -7288,12 +7610,26 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
                     if (loading) item { IosLoadingBox() }
-                    error?.let { item { Text(it, color = IosTheme.colors.destructive, style = IosTheme.type.footnote) } }
+                    error?.let { message ->
+                        item {
+                            Column {
+                                Text(message, color = IosTheme.colors.destructive, style = IosTheme.type.footnote)
+                                TextButton(onClick = ::regenerate, enabled = !loading && !saving) {
+                                    Text("点击重试", style = IosTheme.type.footnote)
+                                }
+                            }
+                        }
+                    }
                     result?.let { images ->
                         if (images.missingImages > 0) item {
-                            Text("有 ${images.missingImages} 张图片未加载，可点击右上角重新生成后再分享", style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
+                            Text(
+                                "有 ${images.missingImages} 张图片未加载，点击此处或右上角刷新重试",
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.destructive,
+                                modifier = Modifier.clickable(enabled = !loading && !saving, onClick = ::regenerate),
+                            )
                         }
-                        items(images.pages, key = { it.name }) { file ->
+                        items(images.pages, key = { it.absolutePath }) { file ->
                             Box(
                                 Modifier
                                     .fillMaxWidth()
@@ -7321,12 +7657,13 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             contentColor = IosTheme.colors.label
                         ),
                         shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         onClick = {
                             clipboardManager.setText(AnnotatedString(shareText))
                             Toast.makeText(context, "已复制话题标题与链接", Toast.LENGTH_SHORT).show()
                         }
                     ) {
-                        Text("复制文本", fontWeight = FontWeight.Medium)
+                        Text("复制文本", fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
                     }
                     Button(
                         modifier = Modifier.weight(1f),
@@ -7335,6 +7672,7 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             contentColor = Color.White
                         ),
                         shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         onClick = {
                             runCatching {
                                 val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -7361,13 +7699,14 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             contentColor = IosTheme.colors.label
                         ),
                         shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         onClick = {
                             if (Build.VERSION.SDK_INT < 29 && androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                                 permission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                             } else save()
                         }
                     ) {
-                        Text(if (saving) "保存中…" else "保存到相册", fontWeight = FontWeight.Medium)
+                        Text(if (saving) "保存中…" else "保存到相册", fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
                     }
                     Button(
                         enabled = !loading && !saving && result != null,
@@ -7377,6 +7716,7 @@ internal fun PostShareSheet(post: Post, title: String, topicId: Long, onDismiss:
                             contentColor = Color.White
                         ),
                         shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         onClick = {
                             val pages = result?.pages.orEmpty()
                             if (pages.isNotEmpty()) runCatching {
@@ -7470,9 +7810,10 @@ internal fun PostRevisionSheet(post: Post, onDismiss: () -> Unit) {
             }
         }
     }
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    FullscreenDialog(onDismissRequest = onDismiss) {
         Column(
             Modifier
+                .safeDrawingPadding()
                 .padding(16.dp)
                 .fillMaxWidth()
                 .fillMaxHeight(0.90f)
@@ -7800,16 +8141,11 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                         link, TextLinkStyles(style = SpanStyle(color = colors.accent)),
                         linkInteractionListener = {
                             if (run.isAttachment) {
-                                Toast.makeText(context, "正在下载文件…", Toast.LENGTH_SHORT).show()
-                                scope.launch {
-                                    val result = saveMediaToPublicStorage(
-                                        context = context,
-                                        url = link,
-                                        suggestedName = run.text.trim(),
-                                        asImage = false,
-                                    )
-                                    Toast.makeText(context, result, Toast.LENGTH_LONG).show()
-                                }
+                                AttachmentDownloadManager.enqueue(
+                                    context = context,
+                                    url = link,
+                                    suggestedName = run.text.trim(),
+                                )
                             } else {
                                 val internalTarget = parseInternalTopicUrl(link)
                                 val opener = updatedOpenTopic
@@ -7833,7 +8169,9 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                 } else {
                                     val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
                                     val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()
-                                    if (host.isNotBlank() && !isTrustedForumHost(host)) {
+                                    if (shouldOpenInAppBrowser(link)) {
+                                        updatedOpenExternal(normalizeInAppTargetUrl(link) ?: link)
+                                    } else if (host.isNotBlank() && !isTrustedForumHost(host)) {
                                         openExternal(context, link)
                                     } else {
                                         updatedOpenExternal(link)
@@ -8504,12 +8842,9 @@ fun ImageViewer(
         isCurrentZoomed = false
     }
 
-    Dialog(
+    FullscreenDialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+        darkSystemBars = true,
     ) {
         val view = LocalView.current
         SideEffect {
@@ -8542,13 +8877,11 @@ fun ImageViewer(
                     .fillMaxSize()
                     .background(Color.Black.copy(alpha = bgAlpha)),
             ) {
-                // 核心修复点：将图片实际显示范围限定在 statusBars 和 navigationBars 之间（避让虚拟按键/手势条）
-                // 彻底杜绝 1x 比例下长截图、竖图被底部的系统导航栏遮挡！
+                // 图片范围同时避让系统栏与横屏挖孔，背景仍铺满窗口。
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
+                        .safeDrawingPadding()
                         .graphicsLayer {
                             translationY = dismissOffsetY.value
                         }
@@ -8580,7 +8913,7 @@ fun ImageViewer(
                         Modifier
                             .align(Alignment.TopCenter)
                             .zIndex(10f)
-                            .statusBarsPadding()
+                            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
                             .padding(top = 16.dp)
                             .graphicsLayer { alpha = uiAlpha },
                     ) {
@@ -8602,7 +8935,7 @@ fun ImageViewer(
                     Modifier
                         .align(Alignment.TopEnd)
                         .zIndex(10f)
-                        .statusBarsPadding()
+                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                         .graphicsLayer { alpha = uiAlpha },
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -8946,99 +9279,809 @@ private fun ImageViewerPage(
     }
 }
 
+internal enum class AttachmentDownloadStage {
+    CONNECTING,
+    SWITCHING_CHANNEL,
+    VERIFYING,
+    DOWNLOADING,
+    SAVING,
+    COMPLETED,
+    FAILED,
+}
+
+internal data class AttachmentDownloadUiState(
+    val id: Long,
+    val url: String,
+    val suggestedName: String?,
+    val fileName: String,
+    val stage: AttachmentDownloadStage,
+    val statusText: String,
+    val downloadedBytes: Long = 0L,
+    val totalBytes: Long = -1L,
+    val speedBytesPerSec: Long = 0L,
+    val pendingCount: Int = 0,
+    val savedUri: Uri? = null,
+    val savedMimeType: String? = null,
+    val resultMessage: String? = null,
+) {
+    val isActive: Boolean
+        get() = stage != AttachmentDownloadStage.COMPLETED && stage != AttachmentDownloadStage.FAILED
+
+    val progressFraction: Float?
+        get() = if (totalBytes > 0L) {
+            (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+        } else {
+            null
+        }
+}
+
+private data class SavedMediaOutcome(
+    val success: Boolean,
+    val message: String,
+    val fileName: String? = null,
+    val copiedBytes: Long = 0L,
+    val savedUri: Uri? = null,
+    val mimeType: String? = null,
+)
+
+/**
+ * 进程级附件下载管理器：独立于单个话题页生命周期运行，切出话题或切换 Tab 仍继续后台下载，
+ * 并通过全局 [state] 驱动 AppShell 顶层悬浮进度胶囊实时展示进度、网速、打开与重试操作。
+ */
+internal object AttachmentDownloadManager {
+    private data class QueuedTask(
+        val id: Long,
+        val url: String,
+        val suggestedName: String?,
+        val initialFileName: String,
+    )
+
+    private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val lock = Any()
+    private val queue = ArrayDeque<QueuedTask>()
+    private var nextTaskId = 1L
+    private var activeTask: QueuedTask? = null
+    private var activeJob: Job? = null
+    private var autoDismissJob: Job? = null
+
+    private val _state = kotlinx.coroutines.flow.MutableStateFlow<AttachmentDownloadUiState?>(null)
+    val state: kotlinx.coroutines.flow.StateFlow<AttachmentDownloadUiState?> = _state
+
+    private fun initialDisplayName(url: String, suggestedName: String?): String {
+        val cleanSuggested = suggestedName
+            ?.replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() && it.length <= 120 }
+        if (cleanSuggested != null) return cleanSuggested
+        val fromUrl = runCatching { Uri.parse(url).lastPathSegment?.trim() }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        return fromUrl ?: "附件文件"
+    }
+
+    fun enqueue(context: Context, url: String, suggestedName: String?) {
+        val appContext = context.applicationContext
+        val cleanUrl = url.trim()
+        if (cleanUrl.isBlank()) return
+        val startImmediately: QueuedTask? = synchronized(lock) {
+            // 同一 URL 正在下载或已在队列中时直接去重，避免重复点击产生多份副本
+            if (activeTask?.url == cleanUrl && activeJob?.isActive == true) {
+                return
+            }
+            if (queue.any { it.url == cleanUrl }) {
+                return
+            }
+            val task = QueuedTask(
+                id = nextTaskId++,
+                url = cleanUrl,
+                suggestedName = suggestedName?.trim()?.takeIf { it.isNotBlank() },
+                initialFileName = initialDisplayName(cleanUrl, suggestedName),
+            )
+            if (activeJob?.isActive == true) {
+                queue.addLast(task)
+                val pending = queue.size
+                _state.value = _state.value?.copy(pendingCount = pending)
+                null
+            } else {
+                autoDismissJob?.cancel()
+                autoDismissJob = null
+                activeTask = task
+                task
+            }
+        }
+        if (startImmediately != null) {
+            launchTask(appContext, startImmediately)
+        }
+    }
+
+    fun retryLast(context: Context) {
+        val current = _state.value ?: return
+        if (current.isActive) return
+        enqueue(context, current.url, current.suggestedName)
+    }
+
+    fun cancelCurrent(context: Context) {
+        val appContext = context.applicationContext
+        val nextTask: QueuedTask? = synchronized(lock) {
+            autoDismissJob?.cancel()
+            autoDismissJob = null
+            activeJob?.cancel()
+            activeJob = null
+            activeTask = null
+            val next = queue.removeFirstOrNull()
+            if (next != null) {
+                activeTask = next
+            } else {
+                _state.value = null
+            }
+            next
+        }
+        if (nextTask != null) {
+            launchTask(appContext, nextTask)
+        }
+    }
+
+    fun dismiss() {
+        synchronized(lock) {
+            val current = _state.value ?: return
+            if (current.isActive) return
+            autoDismissJob?.cancel()
+            autoDismissJob = null
+            _state.value = null
+        }
+    }
+
+    private fun launchTask(appContext: Context, task: QueuedTask) {
+        val pendingCount = synchronized(lock) { queue.size }
+        _state.value = AttachmentDownloadUiState(
+            id = task.id,
+            url = task.url,
+            suggestedName = task.suggestedName,
+            fileName = task.initialFileName,
+            stage = AttachmentDownloadStage.CONNECTING,
+            statusText = "正在连接服务器…",
+            pendingCount = pendingCount,
+        )
+        val job = downloadScope.launch {
+            var lastSpeedAt = android.os.SystemClock.elapsedRealtime()
+            var lastSpeedBytes = 0L
+            var smoothedSpeed = 0L
+            fun updateIfCurrent(transform: (AttachmentDownloadUiState) -> AttachmentDownloadUiState) {
+                val cur = _state.value
+                if (cur != null && cur.id == task.id) {
+                    _state.value = transform(cur)
+                }
+            }
+            try {
+                val outcome = saveMediaToPublicStorageInternal(
+                    context = appContext,
+                    url = task.url,
+                    suggestedName = task.suggestedName,
+                    asImage = false,
+                    onFileNameResolved = { resolvedName ->
+                        if (resolvedName.isNotBlank()) {
+                            updateIfCurrent { it.copy(fileName = resolvedName) }
+                        }
+                    },
+                    onStage = { stage, statusText ->
+                        if (stage == AttachmentDownloadStage.CONNECTING ||
+                            stage == AttachmentDownloadStage.SWITCHING_CHANNEL ||
+                            stage == AttachmentDownloadStage.VERIFYING
+                        ) {
+                            lastSpeedAt = android.os.SystemClock.elapsedRealtime()
+                            lastSpeedBytes = 0L
+                            smoothedSpeed = 0L
+                        }
+                        updateIfCurrent {
+                            it.copy(
+                                stage = stage,
+                                statusText = statusText,
+                                downloadedBytes = if (stage == AttachmentDownloadStage.SWITCHING_CHANNEL || stage == AttachmentDownloadStage.VERIFYING) 0L else it.downloadedBytes,
+                                totalBytes = if (stage == AttachmentDownloadStage.SWITCHING_CHANNEL || stage == AttachmentDownloadStage.VERIFYING) -1L else it.totalBytes,
+                                speedBytesPerSec = if (stage == AttachmentDownloadStage.DOWNLOADING) it.speedBytesPerSec else 0L,
+                            )
+                        }
+                    },
+                    onProgress = { copiedBytes, totalBytes ->
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val deltaMs = now - lastSpeedAt
+                        if (copiedBytes < lastSpeedBytes) {
+                            lastSpeedBytes = copiedBytes
+                            lastSpeedAt = now
+                            smoothedSpeed = 0L
+                        } else if (deltaMs >= 350L) {
+                            val instant = ((copiedBytes - lastSpeedBytes) * 1000L) / deltaMs
+                            smoothedSpeed = if (smoothedSpeed <= 0L) instant else (smoothedSpeed * 7L + instant * 3L) / 10L
+                            lastSpeedBytes = copiedBytes
+                            lastSpeedAt = now
+                        }
+                        updateIfCurrent {
+                            it.copy(
+                                stage = AttachmentDownloadStage.DOWNLOADING,
+                                statusText = "正在下载",
+                                downloadedBytes = copiedBytes,
+                                totalBytes = totalBytes,
+                                speedBytesPerSec = smoothedSpeed,
+                            )
+                        }
+                    },
+                )
+                val nextQueued: QueuedTask? = synchronized(lock) {
+                    if (activeTask?.id == task.id) {
+                        activeTask = null
+                        activeJob = null
+                    }
+                    queue.removeFirstOrNull()?.also { activeTask = it }
+                }
+                val remainingPending = synchronized(lock) { queue.size }
+                if (outcome.success) {
+                    val finalBytes = outcome.copiedBytes.coerceAtLeast(_state.value?.downloadedBytes ?: 0L)
+                    updateIfCurrent {
+                        it.copy(
+                            fileName = outcome.fileName?.takeIf(String::isNotBlank) ?: it.fileName,
+                            stage = AttachmentDownloadStage.COMPLETED,
+                            statusText = "已保存到系统「下载/LinuxDo」",
+                            downloadedBytes = finalBytes,
+                            totalBytes = if (finalBytes > 0L) finalBytes else it.totalBytes,
+                            speedBytesPerSec = 0L,
+                            pendingCount = remainingPending,
+                            savedUri = outcome.savedUri,
+                            savedMimeType = outcome.mimeType,
+                            resultMessage = outcome.message,
+                        )
+                    }
+                } else {
+                    updateIfCurrent {
+                        it.copy(
+                            stage = AttachmentDownloadStage.FAILED,
+                            statusText = outcome.message,
+                            speedBytesPerSec = 0L,
+                            pendingCount = remainingPending,
+                            resultMessage = outcome.message,
+                        )
+                    }
+                }
+                if (nextQueued != null) {
+                    delay(1_200L)
+                    launchTask(appContext, nextQueued)
+                } else if (outcome.success) {
+                    scheduleAutoDismiss(task.id, delayMs = 4_500L)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (err: Throwable) {
+                val nextQueued: QueuedTask? = synchronized(lock) {
+                    if (activeTask?.id == task.id) {
+                        activeTask = null
+                        activeJob = null
+                    }
+                    queue.removeFirstOrNull()?.also { activeTask = it }
+                }
+                val remainingPending = synchronized(lock) { queue.size }
+                updateIfCurrent {
+                    it.copy(
+                        stage = AttachmentDownloadStage.FAILED,
+                        statusText = "保存失败：${err.message ?: "网络异常"}",
+                        speedBytesPerSec = 0L,
+                        pendingCount = remainingPending,
+                    )
+                }
+                if (nextQueued != null) {
+                    delay(1_200L)
+                    launchTask(appContext, nextQueued)
+                }
+            }
+        }
+        synchronized(lock) {
+            if (activeTask?.id == task.id) {
+                activeJob = job
+            }
+        }
+    }
+
+    private fun scheduleAutoDismiss(taskId: Long, delayMs: Long) {
+        synchronized(lock) {
+            autoDismissJob?.cancel()
+            autoDismissJob = downloadScope.launch {
+                delay(delayMs)
+                synchronized(lock) {
+                    val cur = _state.value
+                    if (cur != null && cur.id == taskId && !cur.isActive) {
+                        _state.value = null
+                    }
+                }
+            }
+        }
+    }
+}
+
+private class MediaDownloadBodyReadException(
+    val copiedBytes: Long,
+    val expectedBytes: Long,
+    cause: java.io.IOException,
+) : java.io.IOException(
+    "读取响应体中断($copiedBytes/${if (expectedBytes > 0L) expectedBytes.toString() else "?"}B): ${cause.message ?: cause.javaClass.simpleName}",
+    cause,
+)
+
+private class MediaDownloadLengthMismatchException(
+    val copiedBytes: Long,
+    val expectedBytes: Long,
+) : java.io.IOException("响应体不完整($copiedBytes/${expectedBytes}B)")
+
+private suspend fun copyMediaStreamChecked(
+    inputStream: java.io.InputStream,
+    outputStream: java.io.OutputStream,
+    expectedBytes: Long,
+    onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+): Long {
+    val buffer = ByteArray(32 * 1024)
+    var copied = 0L
+    var lastProgressAt = 0L
+    onProgress?.invoke(0L, expectedBytes)
+    while (true) {
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        val read = try {
+            inputStream.read(buffer)
+        } catch (err: java.io.IOException) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            throw MediaDownloadBodyReadException(copied, expectedBytes, err)
+        }
+        if (read < 0) break
+        if (read == 0) continue
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        outputStream.write(buffer, 0, read)
+        copied += read
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (onProgress != null && now - lastProgressAt >= 80L) {
+            lastProgressAt = now
+            onProgress(copied, expectedBytes)
+        }
+    }
+    outputStream.flush()
+    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+    if (expectedBytes > 0L && copied < expectedBytes) {
+        throw MediaDownloadLengthMismatchException(copied, expectedBytes)
+    }
+    onProgress?.invoke(copied, if (expectedBytes > 0L) expectedBytes else copied)
+    return copied
+}
+
 private suspend fun saveMediaToPublicStorage(
     context: Context,
     url: String,
     suggestedName: String?,
     asImage: Boolean,
-): String {
+): String = saveMediaToPublicStorageInternal(
+    context = context,
+    url = url,
+    suggestedName = suggestedName,
+    asImage = asImage,
+).message
+
+private suspend fun saveMediaToPublicStorageInternal(
+    context: Context,
+    url: String,
+    suggestedName: String?,
+    asImage: Boolean,
+    onFileNameResolved: ((String) -> Unit)? = null,
+    onStage: ((AttachmentDownloadStage, String) -> Unit)? = null,
+    onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+): SavedMediaOutcome {
     val app = context.applicationContext as App
     val container = app.container
     withContext(Dispatchers.Main) { container.sessionStore.syncFromWebView() }
-    return withContext(Dispatchers.IO) {
-        runCatching {
-            val request = Request.Builder().url(url).get().build()
-            var response = container.httpClient.newCall(request).execute()
-            if (response.code == 403 && response.header("cf-mitigated") != null) {
-                val challengedHost = response.request.url.host
-                response.close()
-                val cleared = container.browser.clearChallenge("download", requestHost = challengedHost)
-                if (cleared) {
-                    response = container.httpClient.newCall(request).execute()
-                } else {
-                    return@withContext "下载被安全校验拦截，请重试"
-                }
-            }
-            response.use { resp ->
-                if (!resp.isSuccessful) {
-                    return@withContext "下载失败 (HTTP ${resp.code})"
-                }
-                val body = resp.body ?: return@withContext "下载失败：响应内容为空"
-                val headerMime = resp.header("Content-Type")
-                    ?.substringBefore(';')
-                    ?.trim()
-                    ?.lowercase()
-                    ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
-                val fileName = resolveDownloadFileName(
-                    disposition = resp.header("Content-Disposition"),
-                    finalUrl = resp.request.url.toString(),
-                    suggestedName = suggestedName,
-                    mimeType = headerMime,
-                    asImage = asImage,
-                )
-                val ext = fileName.substringAfterLast('.', "").lowercase()
-                val resolvedMime = headerMime
-                    ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-                    ?: if (asImage) "image/jpeg" else "application/octet-stream"
+    fun buildDownloadRequest(targetUrl: String = url): Request {
+        val activeTag = org.linuxdo.android.net.ActiveSessionRequest(
+            generation = container.sessionStore.sessionGeneration,
+            sendCookies = true,
+        )
+        return Request.Builder()
+            .url(targetUrl)
+            .get()
+            .tag(org.linuxdo.android.net.ActiveSessionRequest::class.java, activeTag)
+            .tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java, SiteImageGateInterceptor.ExplicitDownloadRequest)
+            .build()
+    }
+    suspend fun writeStreamToPublicStorage(
+        inputStream: java.io.InputStream,
+        disposition: String?,
+        finalUrl: String,
+        contentType: String?,
+        expectedBytes: Long = -1L,
+        reportProgress: Boolean = true,
+    ): SavedMediaOutcome {
+        val headerMime = contentType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
+        val fileName = resolveDownloadFileName(
+            disposition = disposition,
+            finalUrl = finalUrl,
+            suggestedName = suggestedName,
+            mimeType = headerMime,
+            asImage = asImage,
+        )
+        onFileNameResolved?.invoke(fileName)
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val resolvedMime = headerMime
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: if (asImage) "image/jpeg" else "application/octet-stream"
 
-                val saveAsPicture = asImage && resolvedMime.startsWith("image/")
-                val resolver = context.contentResolver
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val collection = if (saveAsPicture) {
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                    } else {
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val saveAsPicture = asImage && resolvedMime.startsWith("image/")
+        val resolver = context.contentResolver
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val collection = if (saveAsPicture) {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            }
+            val relativeDir = if (saveAsPicture) {
+                Environment.DIRECTORY_PICTURES + "/LinuxDo"
+            } else {
+                Environment.DIRECTORY_DOWNLOADS + "/LinuxDo"
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val itemUri = resolver.insert(collection, values)
+                ?: throw java.io.IOException("无法创建本地文件")
+            val copied = try {
+                val out = resolver.openOutputStream(itemUri)
+                    ?: throw java.io.IOException("无法写入本地文件")
+                out.use { output ->
+                    inputStream.use { input ->
+                        copyMediaStreamChecked(
+                            inputStream = input,
+                            outputStream = output,
+                            expectedBytes = expectedBytes,
+                            onProgress = if (reportProgress) onProgress else null,
+                        )
                     }
-                    val relativeDir = if (saveAsPicture) {
-                        Environment.DIRECTORY_PICTURES + "/LinuxDo"
-                    } else {
-                        Environment.DIRECTORY_DOWNLOADS + "/LinuxDo"
+                }
+            } catch (e: Throwable) {
+                runCatching { resolver.delete(itemUri, null, null) }
+                throw e
+            }
+            val doneValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(itemUri, doneValues, null, null)
+            val msg = if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
+            SavedMediaOutcome(
+                success = true,
+                message = msg,
+                fileName = fileName,
+                copiedBytes = copied,
+                savedUri = itemUri,
+                mimeType = resolvedMime,
+            )
+        } else {
+            val baseDir = context.getExternalFilesDir(
+                if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
+            ) ?: context.filesDir
+            if (!baseDir.exists()) baseDir.mkdirs()
+            val outFile = File(baseDir, fileName)
+            val partFile = File(baseDir, "$fileName.part.${System.nanoTime()}")
+            val copied = try {
+                partFile.outputStream().use { output ->
+                    inputStream.use { input ->
+                        copyMediaStreamChecked(
+                            inputStream = input,
+                            outputStream = output,
+                            expectedBytes = expectedBytes,
+                            onProgress = if (reportProgress) onProgress else null,
+                        )
                     }
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    }
-                    val itemUri = resolver.insert(collection, values)
-                        ?: return@withContext "无法创建本地文件"
-                    try {
-                        resolver.openOutputStream(itemUri)?.use { out ->
-                            body.byteStream().use { input -> input.copyTo(out) }
-                        } ?: return@withContext "无法写入本地文件"
-                        val doneValues = ContentValues().apply {
-                            put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        }
-                        resolver.update(itemUri, doneValues, null, null)
-                    } catch (e: Throwable) {
-                        resolver.delete(itemUri, null, null)
-                        throw e
-                    }
-                    if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
-                } else {
-                    val baseDir = context.getExternalFilesDir(
-                        if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
-                    ) ?: context.filesDir
-                    if (!baseDir.exists()) baseDir.mkdirs()
-                    val outFile = File(baseDir, fileName)
-                    outFile.outputStream().use { out ->
-                        body.byteStream().use { input -> input.copyTo(out) }
-                    }
-                    "已保存到：${outFile.absolutePath}"
+                }
+            } catch (e: Throwable) {
+                runCatching { partFile.delete() }
+                throw e
+            }
+            if (outFile.exists()) runCatching { outFile.delete() }
+            if (!partFile.renameTo(outFile)) {
+                try {
+                    partFile.copyTo(outFile, overwrite = true)
+                } finally {
+                    runCatching { partFile.delete() }
                 }
             }
-        }.getOrElse { err ->
-            "保存失败：${err.message ?: "网络异常"}"
+            SavedMediaOutcome(
+                success = true,
+                message = "已保存到：${outFile.absolutePath}",
+                fileName = fileName,
+                copiedBytes = copied,
+                savedUri = null,
+                mimeType = resolvedMime,
+            )
+        }
+    }
+    return withContext(Dispatchers.IO) {
+        val activeCallRef = java.util.concurrent.atomic.AtomicReference<okhttp3.Call?>(null)
+        try {
+            val requestHost = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
+            if (!asImage) {
+                container.diagnostics.log("开始下载附件: ${org.linuxdo.android.net.gecko.GeckoManager.diagnosticUrl(url)}")
+                onStage?.invoke(AttachmentDownloadStage.CONNECTING, "正在连接服务器…")
+            }
+            val baseClient = container.httpClient
+            val activeClient = org.linuxdo.android.net.buildActiveMediaDownloadClient(baseClient)
+            var systemClient: okhttp3.OkHttpClient? = null
+            fun getSystemClient(): okhttp3.OkHttpClient =
+                systemClient ?: org.linuxdo.android.net.buildSystemMediaDownloadClient(baseClient).also { systemClient = it }
+
+            var useSystemTransport = false
+            var preferredDirectUrl: String? = null
+            var triedDirectUrlOnSystem = false
+            var fallbackReason: String? = null
+            var failedHost = requestHost.ifBlank { Config.HOST }
+            var failedFp = "-"
+            var lastError: Throwable? = null
+            val maxAttempts = 3
+
+            for (attempt in 1..maxAttempts) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val modeLabel = if (useSystemTransport) "system" else "active"
+                val client = if (useSystemTransport) getSystemClient() else activeClient
+                val usingDirectUrl = useSystemTransport && !preferredDirectUrl.isNullOrBlank()
+                val attemptUrl = if (usingDirectUrl) preferredDirectUrl!! else url
+                if (usingDirectUrl) triedDirectUrlOnSystem = true
+                val request = buildDownloadRequest(attemptUrl)
+                var stage = "connect"
+                var resolvedUrlInAttempt: String? = null
+                try {
+                    val call = client.newCall(request)
+                    activeCallRef.set(call)
+                    val response = try {
+                        call.execute()
+                    } finally {
+                        activeCallRef.compareAndSet(call, null)
+                    }
+                    response.use { resp ->
+                        stage = "headers"
+                        val contentType = resp.header("Content-Type")
+                        val isHtmlPayload = contentType?.contains("text/html", ignoreCase = true) == true
+                        val isChallenged = resp.code in setOf(403, 429, 503) &&
+                            (resp.header("cf-mitigated") != null || (!asImage && isHtmlPayload))
+                        val needAttachmentFallback = !asImage && (isChallenged || !resp.isSuccessful || isHtmlPayload)
+                        if (isChallenged || needAttachmentFallback) {
+                            failedHost = resp.request.url.host
+                            failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
+                            val reason = "HTTP ${resp.code}${if (isHtmlPayload) " (HTML)" else ""}"
+                            if (usingDirectUrl && attempt < maxAttempts) {
+                                // 直链签名失效或拒访时回退原始短链再试
+                                preferredDirectUrl = null
+                                if (!asImage) {
+                                    container.diagnostics.log("附件直链下载受阻[attempt $attempt/$maxAttempts, mode=$modeLabel]: $reason，回退原始地址重试")
+                                }
+                                return@use
+                            }
+                            fallbackReason = reason
+                            return@use
+                        }
+                        if (!resp.isSuccessful) {
+                            return@withContext SavedMediaOutcome(false, "下载失败 (HTTP ${resp.code})")
+                        }
+                        val body = resp.body ?: return@withContext SavedMediaOutcome(false, "下载失败：响应内容为空")
+                        val finalUrl = resp.request.url.toString()
+                        resolvedUrlInAttempt = finalUrl
+                        val expectedBytes = body.contentLength()
+                        if (!asImage) {
+                            container.diagnostics.log(
+                                "附件下载[attempt $attempt/$maxAttempts, mode=$modeLabel] HTTP ${resp.code} " +
+                                    "host=${resp.request.url.host} expected=${if (expectedBytes > 0L) expectedBytes else -1}B",
+                            )
+                            onStage?.invoke(AttachmentDownloadStage.DOWNLOADING, "正在下载")
+                        }
+                        stage = "copy"
+                        val outcome = writeStreamToPublicStorage(
+                            inputStream = body.byteStream(),
+                            disposition = resp.header("Content-Disposition"),
+                            finalUrl = finalUrl,
+                            contentType = contentType,
+                            expectedBytes = expectedBytes,
+                        )
+                        if (!asImage) {
+                            container.diagnostics.log("附件保存成功[mode=$modeLabel, copied=${outcome.copiedBytes}B]: ${outcome.message}")
+                        }
+                        return@withContext outcome
+                    }
+                    if (fallbackReason != null) break
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    activeCallRef.getAndSet(null)?.cancel()
+                    throw cancelled
+                } catch (err: Throwable) {
+                    lastError = err
+                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: failedFp
+                    val retryableNetworkOrBody = err is MediaDownloadBodyReadException ||
+                        err is MediaDownloadLengthMismatchException ||
+                        err is java.io.IOException
+                    if (!asImage) {
+                        container.diagnostics.log(
+                            "附件下载中断[attempt $attempt/$maxAttempts, mode=$modeLabel, stage=$stage]: " +
+                                "${err.javaClass.simpleName}: ${err.message}",
+                        )
+                    }
+                    if (!retryableNetworkOrBody) throw err
+                    if (!resolvedUrlInAttempt.isNullOrBlank() && resolvedUrlInAttempt != url && !triedDirectUrlOnSystem) {
+                        preferredDirectUrl = resolvedUrlInAttempt
+                    } else if (usingDirectUrl) {
+                        preferredDirectUrl = null
+                    }
+                    if (!useSystemTransport) {
+                        useSystemTransport = true
+                        if (!asImage) {
+                            container.diagnostics.log(
+                                "附件下载切换通道: active -> system (reason=$stage, direct=${preferredDirectUrl != null})",
+                            )
+                            onStage?.invoke(AttachmentDownloadStage.SWITCHING_CHANNEL, "正在切换系统高速通道…")
+                        }
+                    } else if (!asImage && attempt < maxAttempts) {
+                        onStage?.invoke(AttachmentDownloadStage.SWITCHING_CHANNEL, "连接中断，正在重试…")
+                    }
+                    if (attempt < maxAttempts) {
+                        kotlinx.coroutines.delay(250L * attempt)
+                        continue
+                    }
+                    fallbackReason = "${err.javaClass.simpleName}: ${err.message ?: "连接异常"}"
+                }
+            }
+
+            if (fallbackReason != null) {
+                if (!asImage) {
+                    container.diagnostics.log("附件 OkHttp 多通道未完成($fallbackReason)，切换后台 Gecko 通道")
+                    if (onStage != null) {
+                        onStage.invoke(AttachmentDownloadStage.VERIFYING, "正在后台安全验证并下载…")
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "正在后台安全验证并下载，请稍候…", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    val prewarm = container.browser.prewarmAttachmentDownload(
+                        url = url,
+                        failedClearanceFp = failedFp,
+                        requestHost = failedHost,
+                        onProgress = onProgress,
+                    )
+                    if (!prewarm.cleared) {
+                        container.diagnostics.log("附件后台 Gecko 下载未能取得凭据或直链")
+                        val failMsg = if (lastError != null) {
+                            "保存失败：多通道下载均中断，请稍后重试"
+                        } else {
+                            "下载被安全校验拦截，请重试"
+                        }
+                        return@withContext SavedMediaOutcome(false, failMsg)
+                    }
+                    val cachedTempFile = prewarm.tempFile
+                    if (cachedTempFile != null) {
+                        try {
+                            if (cachedTempFile.exists() && cachedTempFile.length() > 0L) {
+                                onStage?.invoke(AttachmentDownloadStage.SAVING, "正在写入系统下载目录…")
+                                val tempLen = cachedTempFile.length()
+                                val outcome = cachedTempFile.inputStream().use { input ->
+                                    writeStreamToPublicStorage(
+                                        inputStream = input,
+                                        disposition = prewarm.contentDisposition,
+                                        finalUrl = prewarm.resolvedUrl ?: url,
+                                        contentType = prewarm.contentType,
+                                        expectedBytes = tempLen,
+                                        reportProgress = false,
+                                    )
+                                }
+                                container.diagnostics.log("附件通过 Gecko 流式保存成功[copied=${outcome.copiedBytes}B]: ${outcome.message}")
+                                return@withContext outcome
+                            }
+                        } finally {
+                            runCatching { cachedTempFile.delete() }
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().flush()
+                        container.sessionStore.syncFromWebView()
+                    }
+                    val retryTarget = prewarm.resolvedUrl ?: url
+                    val postGeckoClients = listOf("system" to getSystemClient(), "active" to activeClient)
+                    var postError: Throwable? = null
+                    for ((modeLabel, client) in postGeckoClients) {
+                        val req = buildDownloadRequest(retryTarget)
+                        try {
+                            onStage?.invoke(AttachmentDownloadStage.DOWNLOADING, "正在下载")
+                            val call = client.newCall(req)
+                            activeCallRef.set(call)
+                            val resp = try {
+                                call.execute()
+                            } finally {
+                                activeCallRef.compareAndSet(call, null)
+                            }
+                            resp.use { r ->
+                                if (!r.isSuccessful) {
+                                    container.diagnostics.log("附件 Gecko 后重下失败[mode=$modeLabel]: HTTP ${r.code}")
+                                    postError = java.io.IOException("HTTP ${r.code}")
+                                    return@use
+                                }
+                                val body = r.body ?: throw java.io.IOException("响应内容为空")
+                                val expectedBytes = body.contentLength()
+                                val outcome = writeStreamToPublicStorage(
+                                    inputStream = body.byteStream(),
+                                    disposition = r.header("Content-Disposition"),
+                                    finalUrl = r.request.url.toString(),
+                                    contentType = r.header("Content-Type"),
+                                    expectedBytes = expectedBytes,
+                                )
+                                container.diagnostics.log("附件 Gecko 后重下成功[mode=$modeLabel, copied=${outcome.copiedBytes}B]: ${outcome.message}")
+                                return@withContext outcome
+                            }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            activeCallRef.getAndSet(null)?.cancel()
+                            throw cancelled
+                        } catch (err: Throwable) {
+                            postError = err
+                            container.diagnostics.log("附件 Gecko 后重下中断[mode=$modeLabel]: ${err.javaClass.simpleName}: ${err.message}")
+                        }
+                    }
+                    return@withContext SavedMediaOutcome(false, "保存失败：${postError?.message ?: fallbackReason}")
+                } else {
+                    val cleared = container.browser.clearChallenge(
+                        reason = "download-image",
+                        failedClearanceFp = failedFp,
+                        requestHost = failedHost,
+                    )
+                    if (!cleared) {
+                        return@withContext SavedMediaOutcome(false, "下载被安全校验拦截，请重试")
+                    }
+                    withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().flush()
+                        container.sessionStore.syncFromWebView()
+                    }
+                    val postImageClients = listOf(activeClient, getSystemClient())
+                    var postError: Throwable? = null
+                    for (client in postImageClients) {
+                        val req = buildDownloadRequest()
+                        try {
+                            val call = client.newCall(req)
+                            activeCallRef.set(call)
+                            val resp = try {
+                                call.execute()
+                            } finally {
+                                activeCallRef.compareAndSet(call, null)
+                            }
+                            resp.use { r ->
+                                if (!r.isSuccessful) {
+                                    postError = java.io.IOException("HTTP ${r.code}")
+                                    return@use
+                                }
+                                val body = r.body ?: throw java.io.IOException("响应内容为空")
+                                val outcome = writeStreamToPublicStorage(
+                                    inputStream = body.byteStream(),
+                                    disposition = r.header("Content-Disposition"),
+                                    finalUrl = r.request.url.toString(),
+                                    contentType = r.header("Content-Type"),
+                                    expectedBytes = body.contentLength(),
+                                )
+                                return@withContext outcome
+                            }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            activeCallRef.getAndSet(null)?.cancel()
+                            throw cancelled
+                        } catch (err: Throwable) {
+                            postError = err
+                        }
+                    }
+                    return@withContext SavedMediaOutcome(false, "保存失败：${postError?.message ?: "网络异常"}")
+                }
+            }
+            SavedMediaOutcome(false, "保存失败：${lastError?.message ?: "未收到响应"}")
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            activeCallRef.getAndSet(null)?.cancel()
+            throw cancelled
+        } catch (err: Throwable) {
+            if (!asImage) container.diagnostics.log("附件保存异常: ${err.javaClass.simpleName}: ${err.message}")
+            SavedMediaOutcome(false, "保存失败：${err.message ?: "网络异常"}")
+        } finally {
+            activeCallRef.getAndSet(null)?.cancel()
         }
     }
 }
@@ -9460,4 +10503,458 @@ private fun PreparingPostBody() {
                 .clip(RoundedCornerShape(5.dp)).background(IosTheme.colors.separator.copy(alpha = 0.35f)))
         }
     }
+}
+
+private val SVG_OPEN_TAG_REGEX = Regex("<svg\\b([^>]*)>", RegexOption.IGNORE_CASE)
+private val SVG_ATTR_WIDTH_REGEX = Regex("\\bwidth\\s*=\\s*[\"']\\s*([0-9]+(?:\\.[0-9]+)?)(?:px)?\\s*[\"']", RegexOption.IGNORE_CASE)
+private val SVG_ATTR_HEIGHT_REGEX = Regex("\\bheight\\s*=\\s*[\"']\\s*([0-9]+(?:\\.[0-9]+)?)(?:px)?\\s*[\"']", RegexOption.IGNORE_CASE)
+
+private fun extractSvgIntrinsicDp(svg: String): Pair<Float, Float>? {
+    val attrs = SVG_OPEN_TAG_REGEX.find(svg)?.groupValues?.getOrNull(1) ?: return null
+    val width = SVG_ATTR_WIDTH_REGEX.find(attrs)?.groupValues?.getOrNull(1)?.toFloatOrNull()?.takeIf { it > 0f } ?: return null
+    val height = SVG_ATTR_HEIGHT_REGEX.find(attrs)?.groupValues?.getOrNull(1)?.toFloatOrNull()?.takeIf { it > 0f } ?: return null
+    return width to height
+}
+
+internal sealed interface SignatureMediaState {
+    data object Loading : SignatureMediaState
+    data class Svg(
+        val sanitizedMarkup: String,
+        val aspectRatio: Float?,
+        val intrinsicWidthDp: Float?,
+        val intrinsicHeightDp: Float?,
+    ) : SignatureMediaState
+    data class Raster(val bytes: ByteArray) : SignatureMediaState
+    data class Cooldown(val untilElapsedMs: Long, val retryWhenReady: Boolean = false) : SignatureMediaState
+}
+
+/**
+ * 签名媒体单飞缓存与 429 防护加载器：
+ * 1. 同帖/跨帖相同签名 URL 共享单飞请求与内存 LRU 缓存，避免列表滑动与多楼层重复发起 HTTP 请求；
+ * 2. SVG 与位图都只下载一次，分别交给 InlineSvgView 或 Coil 解码，重定向及取消遵循同一规则；
+ * 3. 冷请求限制 2 并发与 60ms 节拍；只有发送前门禁暂缓才自动等待，HTTP 失败不主动重试。
+ */
+internal object SignatureMediaLoader {
+    private const val MAX_CACHE_ENTRIES = 128
+    private const val MAX_CACHE_BYTES = 8 * 1_048_576
+    private const val MAX_SVG_BYTES = 1_048_576
+    private const val MAX_MEDIA_BYTES = 4 * 1_048_576
+    private const val COLD_PACE_MS = 60L
+    private const val DEFAULT_RATE_LIMIT_COOLDOWN_SEC = 60L
+    private const val FAILURE_COOLDOWN_MS = 35_000L
+    private const val MAIN_SITE_BUSY_DEFER_MS = 3_000L
+    private const val MAX_SIGNATURE_REDIRECTS = 3
+
+    private class InFlightEntry(val generation: Long) {
+        val deferred = CompletableDeferred<SignatureMediaState>()
+        lateinit var job: Job
+    }
+
+    private data class DownloadResponse(
+        val status: Int,
+        val url: okhttp3.HttpUrl,
+        val headers: okhttp3.Headers,
+        val bytes: ByteArray?,
+    )
+
+    private val loaderScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cacheGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    private val _generationFlow = kotlinx.coroutines.flow.MutableStateFlow(0L)
+    val generationFlow: kotlinx.coroutines.flow.StateFlow<Long> = _generationFlow
+    private val memoryCache = object : LruCache<String, SignatureMediaState>(MAX_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: SignatureMediaState): Int {
+            val bytes = when (value) {
+                is SignatureMediaState.Raster -> value.bytes.size
+                is SignatureMediaState.Svg -> value.sanitizedMarkup.length * 2
+                else -> 0
+            }
+            // 每项至少按 64 KiB 计入，缓存同时受 8 MiB 和 128 项约束。
+            return bytes.coerceAtLeast(MAX_CACHE_BYTES / MAX_CACHE_ENTRIES)
+        }
+    }
+    private val hostCooldownUntilMs = ConcurrentHashMap<String, Long>()
+    private val inFlight = ConcurrentHashMap<String, InFlightEntry>()
+    private val inFlightLock = Any()
+    private val coldSemaphore = Semaphore(permits = 2)
+    private val paceMutex = Mutex()
+    private var lastColdFetchAtElapsed = 0L
+
+    fun peek(url: String): SignatureMediaState {
+        val now = SystemClock.elapsedRealtime()
+        val cached = synchronized(inFlightLock) { memoryCache.get(url) }
+        if (cached != null) {
+            if (cached !is SignatureMediaState.Cooldown || now < cached.untilElapsedMs) {
+                return cached
+            }
+        }
+        return activeNetworkCooldown(url, now) ?: SignatureMediaState.Loading
+    }
+
+    suspend fun loadOrAwait(
+        url: String,
+        container: org.linuxdo.android.AppContainer,
+        expectedGeneration: Long = cacheGeneration.get(),
+    ): SignatureMediaState {
+        val entry = synchronized(inFlightLock) {
+            if (cacheGeneration.get() != expectedGeneration) return SignatureMediaState.Cooldown(0L)
+            val initial = peek(url)
+            if (initial !is SignatureMediaState.Loading) return initial
+            inFlight[url] ?: InFlightEntry(expectedGeneration).also { created ->
+                val sessionGeneration = container.sessionStore.sessionGeneration
+                created.job = loaderScope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        val result = try {
+                            fetchOnce(url, container, created.generation, sessionGeneration)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (_: SiteImageGateInterceptor.ThrottledException) {
+                            SignatureMediaState.Cooldown(
+                                SystemClock.elapsedRealtime() + MAIN_SITE_BUSY_DEFER_MS,
+                                retryWhenReady = true,
+                            )
+                        } catch (_: Exception) {
+                            recordFailureCooldown(url, created.generation, FAILURE_COOLDOWN_MS)
+                        }
+                        synchronized(inFlightLock) {
+                            created.deferred.complete(
+                                if (cacheGeneration.get() == created.generation) result else SignatureMediaState.Cooldown(0L),
+                            )
+                        }
+                    } finally {
+                        synchronized(inFlightLock) {
+                            created.deferred.complete(SignatureMediaState.Cooldown(0L))
+                            if (inFlight[url] === created) inFlight.remove(url)
+                        }
+                    }
+                }
+                inFlight[url] = created
+            }
+        }
+        entry.job.start()
+        return entry.deferred.await()
+    }
+
+    fun markRasterError(url: String, expectedGeneration: Long) {
+        recordFailureCooldown(url, expectedGeneration, FAILURE_COOLDOWN_MS)
+    }
+
+    fun clearAccountScopedCache() {
+        val cancelledEntries = synchronized(inFlightLock) {
+            val nextGen = cacheGeneration.incrementAndGet()
+            memoryCache.evictAll()
+            val list = inFlight.values.toList()
+            inFlight.clear()
+            _generationFlow.value = nextGen
+            list
+        }
+        val fallback = SignatureMediaState.Cooldown(0L)
+        cancelledEntries.forEach { entry ->
+            entry.job.cancel()
+            entry.deferred.complete(fallback)
+        }
+    }
+
+    private fun activeNetworkCooldown(url: String, nowElapsed: Long): SignatureMediaState.Cooldown? {
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        val host = parsed.host.lowercase()
+        val perHost = hostCooldownUntilMs[host]?.takeIf { nowElapsed < it } ?: 0L
+        if (perHost > 0L) return SignatureMediaState.Cooldown(perHost)
+        if (!SignaturePolicy.isSiteHostUrl(url)) return null
+        val siteWait = SiteImageGateInterceptor.cooldownRemainingMs()
+        return if (siteWait > 0L) SignatureMediaState.Cooldown(nowElapsed + siteWait, retryWhenReady = true) else null
+    }
+
+    private suspend fun executeCancellable(
+        callFactory: okhttp3.Call.Factory,
+        request: Request,
+    ): DownloadResponse = suspendCancellableCoroutine { continuation ->
+        val call = callFactory.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                if (continuation.isActive) continuation.resumeWith(Result.failure(e))
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!continuation.isActive) {
+                    response.close()
+                    return
+                }
+                // 响应体在回调内读完并关闭，取消同时覆盖等待响应头和读取 body 的阶段。
+                val result = runCatching {
+                    response.use {
+                        DownloadResponse(
+                            status = response.code,
+                            url = response.request.url,
+                            headers = response.headers,
+                            bytes = if (response.isSuccessful) readBoundedBytes(response.body) else null,
+                        )
+                    }
+                }
+                if (continuation.isActive) continuation.resumeWith(result)
+            }
+        })
+    }
+
+    private suspend fun fetchOnce(
+        url: String,
+        container: org.linuxdo.android.AppContainer,
+        expectedGen: Long,
+        expectedSessionGeneration: Long,
+    ): SignatureMediaState = coldSemaphore.withPermit {
+        val recheck = peek(url)
+        if (recheck !is SignatureMediaState.Loading) return recheck
+
+        paceMutex.withLock {
+            val now = SystemClock.elapsedRealtime()
+            val wait = COLD_PACE_MS - (now - lastColdFetchAtElapsed)
+            if (wait > 0L) delay(wait)
+            lastColdFetchAtElapsed = SystemClock.elapsedRealtime()
+        }
+
+        val postPace = peek(url)
+        if (postPace !is SignatureMediaState.Loading) return postPace
+
+        var currentUrl = url.toHttpUrlOrNull() ?: return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+        repeat(MAX_SIGNATURE_REDIRECTS + 1) { redirects ->
+            currentCoroutineContext().ensureActive()
+            if (cacheGeneration.get() != expectedGen) {
+                return SignatureMediaState.Cooldown(0L)
+            }
+            if (!SignaturePolicy.isAllowedImageUrl(currentUrl)) {
+                return recordFailureCooldown(url, expectedGen, 300_000L)
+            }
+            val isSite = SignaturePolicy.isSiteHostUrl(currentUrl.toString())
+            if (container.sessionStore.sessionGeneration != expectedSessionGeneration ||
+                container.sessionStore.sessionChanging || container.sessionStore.isSessionRecoveryPending() ||
+                (isSite && container.sessionStore.isClearanceRecoveryInProgress())
+            ) {
+                return SignatureMediaState.Cooldown(
+                    SystemClock.elapsedRealtime() + MAIN_SITE_BUSY_DEFER_MS,
+                    retryWhenReady = true,
+                )
+            }
+            activeNetworkCooldown(currentUrl.toString(), SystemClock.elapsedRealtime())?.let { return it }
+            val factory: okhttp3.Call.Factory = if (isSite) {
+                container.httpClient.newBuilder()
+                    .followRedirects(false)
+                    .followSslRedirects(false)
+                    .retryOnConnectionFailure(false)
+                    .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .apply {
+                        // 故障拦截器会换用另一个客户端重发，不能让它绕过逐跳校验或当前 Call 的取消。
+                        interceptors().removeAll { it is org.linuxdo.android.net.DohFailoverInterceptor }
+                    }
+                    .build()
+            } else {
+                externalNoRedirectCallFactory
+            }
+            val request = Request.Builder()
+                .url(currentUrl)
+                .header("User-Agent", container.sessionStore.userAgentOrNull() ?: container.userAgent)
+                .header("Accept", "image/svg+xml,image/*;q=0.9,*/*;q=0.1")
+                .tag(
+                    org.linuxdo.android.net.ActiveSessionRequest::class.java,
+                    org.linuxdo.android.net.ActiveSessionRequest(expectedSessionGeneration),
+                )
+                .tag(SiteImageGateInterceptor.SignatureRequest::class.java, SiteImageGateInterceptor.SignatureRequest)
+                .build()
+
+            val response = executeCancellable(factory, request)
+            currentCoroutineContext().ensureActive()
+            if (response.status in setOf(301, 302, 303, 307, 308)) {
+                val location = response.headers["Location"]?.trim()?.takeIf { it.isNotEmpty() }
+                val target = location?.let { response.url.resolve(it) }
+                if (redirects >= MAX_SIGNATURE_REDIRECTS || target == null || !SignaturePolicy.isAllowedImageUrl(target)) {
+                    return recordFailureCooldown(url, expectedGen, 300_000L)
+                }
+                currentUrl = target
+            } else {
+                val cfChallenge = response.headers["cf-mitigated"]
+                    ?.contains("challenge", ignoreCase = true) == true
+                if (response.status == 429 || (response.status in setOf(403, 503) && cfChallenge)) {
+                    val waitMs = HttpHeaderUtils.rateLimitCooldownMs(
+                        HttpHeaderUtils.parseRetryAfter(response.headers["Retry-After"]),
+                        DEFAULT_RATE_LIMIT_COOLDOWN_SEC * 1_000L,
+                    )
+                    return recordHostAndUrlRateLimit(url, expectedGen, waitMs, response.url, cfChallenge)
+                }
+                if (response.status !in 200..299) {
+                    return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                }
+                val contentType = response.headers["Content-Type"]?.lowercase().orEmpty()
+                val bodyBytes = response.bytes?.takeIf { it.isNotEmpty() }
+                    ?: return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                val prefix = String(bodyBytes, 0, minOf(bodyBytes.size, 2_048), StandardCharsets.UTF_8).trimStart()
+                val isSvg = contentType.contains("svg") ||
+                    prefix.contains("<svg", ignoreCase = true)
+                if (isSvg) {
+                    if (bodyBytes.size > MAX_SVG_BYTES) return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                    val sanitized = sanitizeSvgMarkup(bodyBytes.toString(StandardCharsets.UTF_8))
+                    if (!sanitized.contains("</svg>", ignoreCase = true) || sanitized.length <= 32) {
+                        return recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                    }
+                    val intrinsic = extractSvgIntrinsicDp(sanitized)
+                    val ratio = extractSvgAspectRatio(sanitized)
+                        ?: intrinsic?.let { (w, h) -> if (h > 0f) w / h else null }
+                    val state = SignatureMediaState.Svg(
+                        sanitizedMarkup = sanitized,
+                        aspectRatio = ratio,
+                        intrinsicWidthDp = intrinsic?.first,
+                        intrinsicHeightDp = intrinsic?.second,
+                    )
+                    cacheIfCurrent(url, expectedGen, state)
+                    return state
+                }
+                return if (contentType.startsWith("image/") || contentType.isEmpty() || SignaturePolicy.isKnownRasterUrl(url)) {
+                    SignatureMediaState.Raster(bodyBytes).also {
+                        cacheIfCurrent(url, expectedGen, it)
+                    }
+                } else {
+                    recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+                }
+            }
+        }
+        recordFailureCooldown(url, expectedGen, FAILURE_COOLDOWN_MS)
+    }
+
+    private fun readBoundedBytes(body: okhttp3.ResponseBody?): ByteArray? {
+        if (body == null) return null
+        val contentLength = body.contentLength()
+        if (contentLength > MAX_MEDIA_BYTES) return null
+        val buffer = ByteArray(8192)
+        val out = ByteArrayOutputStream()
+        body.byteStream().use { input ->
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                total += read
+                if (total > MAX_MEDIA_BYTES) return null
+                out.write(buffer, 0, read)
+            }
+        }
+        return out.toByteArray()
+    }
+
+    private fun recordFailureCooldown(url: String, expectedGen: Long, cooldownMs: Long): SignatureMediaState.Cooldown {
+        val state = SignatureMediaState.Cooldown(SystemClock.elapsedRealtime() + cooldownMs)
+        cacheIfCurrent(url, expectedGen, state)
+        return state
+    }
+
+    private fun cacheIfCurrent(url: String, expectedGen: Long, state: SignatureMediaState) {
+        synchronized(inFlightLock) {
+            if (cacheGeneration.get() == expectedGen) memoryCache.put(url, state)
+        }
+    }
+
+    private fun recordHostAndUrlRateLimit(
+        url: String,
+        expectedGen: Long,
+        waitMs: Long,
+        responseUrl: okhttp3.HttpUrl,
+        cfChallenge: Boolean,
+    ): SignatureMediaState.Cooldown {
+        val now = SystemClock.elapsedRealtime()
+        val until = now + waitMs
+        hostCooldownUntilMs.merge(responseUrl.host.lowercase(), until) { old, incoming -> maxOf(old, incoming) }
+        if (SignaturePolicy.isSiteHostUrl(responseUrl.toString())) {
+            SiteImageGateInterceptor.recordImageCooldownMs(waitMs, responseUrl.encodedPath, cfChallenge)
+        }
+        val state = SignatureMediaState.Cooldown(until)
+        cacheIfCurrent(url, expectedGen, state)
+        return state
+    }
+}
+
+@Composable
+private fun PostSignatureBlock(
+    rawSignature: String?,
+    maxHeight: Dp,
+    compact: Boolean = false,
+) {
+    val resolvedUrl = remember(rawSignature) { SignaturePolicy.resolveSignatureImageUrl(rawSignature) } ?: return
+    val context = LocalContext.current
+    val container = remember(context) { (context.applicationContext as App).container }
+    val loaderGen by SignatureMediaLoader.generationFlow.collectAsState()
+    var mediaState by remember(resolvedUrl, loaderGen) { mutableStateOf(SignatureMediaLoader.peek(resolvedUrl)) }
+    var rasterFailed by remember(resolvedUrl, loaderGen) { mutableStateOf(false) }
+
+    LaunchedEffect(resolvedUrl, loaderGen) {
+        while (true) {
+            val latest = SignatureMediaLoader.loadOrAwait(resolvedUrl, container, loaderGen)
+            mediaState = latest
+            if (latest !is SignatureMediaState.Cooldown || !latest.retryWhenReady) break
+            delay((latest.untilElapsedMs - SystemClock.elapsedRealtime()).coerceIn(250L, 3_000L))
+        }
+    }
+
+    when (val current = mediaState) {
+        is SignatureMediaState.Svg -> {
+            val screenWidthDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp
+            val availWidthDp = (screenWidthDp - if (compact) 56 else 32).coerceAtLeast(120).toFloat()
+            val maxH = maxHeight.value.coerceAtLeast(24f)
+            val ratio = (current.aspectRatio ?: 4.5f).coerceIn(0.5f, 16f)
+            val effectiveWidthDp = current.intrinsicWidthDp?.let { minOf(availWidthDp, it) } ?: availWidthDp
+            val fullWidthHeight = effectiveWidthDp / ratio
+            val svgModifier = if (fullWidthHeight <= maxH) {
+                if (current.intrinsicWidthDp != null && current.intrinsicWidthDp < availWidthDp) {
+                    Modifier.width(current.intrinsicWidthDp.dp).aspectRatio(ratio)
+                } else {
+                    Modifier.fillMaxWidth().aspectRatio(ratio)
+                }
+            } else {
+                Modifier.height(maxHeight).aspectRatio(ratio, matchHeightConstraintsFirst = true)
+            }
+            Column(modifier = Modifier.fillMaxWidth()) {
+                SignatureSeparator(compact = compact)
+                InlineSvgView(
+                    svgMarkup = current.sanitizedMarkup,
+                    modifier = svgModifier,
+                )
+            }
+        }
+        is SignatureMediaState.Raster -> {
+            if (!rasterFailed) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    SignatureSeparator(compact = compact)
+                    AsyncImage(
+                        model = remember(resolvedUrl, loaderGen, current, context) {
+                            ImageRequest.Builder(context)
+                                .data(current.bytes)
+                                .memoryCacheKey("signature:$loaderGen:$resolvedUrl")
+                                .crossfade(false)
+                                .build()
+                        },
+                        contentDescription = "用户签名",
+                        contentScale = ContentScale.Fit,
+                        alignment = Alignment.CenterStart,
+                        onError = {
+                            rasterFailed = true
+                            SignatureMediaLoader.markRasterError(resolvedUrl, loaderGen)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .widthIn(max = 700.dp)
+                            .heightIn(min = 24.dp, max = maxHeight)
+                            .clip(RoundedCornerShape(6.dp)),
+                    )
+                }
+            }
+        }
+        SignatureMediaState.Loading, is SignatureMediaState.Cooldown -> Unit
+    }
+}
+
+@Composable
+private fun SignatureSeparator(compact: Boolean) {
+    Spacer(Modifier.height(if (compact) 4.dp else 6.dp))
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(0.5.dp)
+            .background(IosTheme.colors.separator.copy(alpha = 0.45f)),
+    )
+    Spacer(Modifier.height(if (compact) 6.dp else 8.dp))
 }
