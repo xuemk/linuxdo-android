@@ -9289,6 +9289,49 @@ private fun ImageViewerPage(
     }
 }
 
+private class MediaDownloadBodyReadException(
+    val copiedBytes: Long,
+    val expectedBytes: Long,
+    cause: java.io.IOException,
+) : java.io.IOException(
+    "读取响应体中断($copiedBytes/${if (expectedBytes > 0L) expectedBytes.toString() else "?"}B): ${cause.message ?: cause.javaClass.simpleName}",
+    cause,
+)
+
+private class MediaDownloadLengthMismatchException(
+    val copiedBytes: Long,
+    val expectedBytes: Long,
+) : java.io.IOException("响应体不完整($copiedBytes/${expectedBytes}B)")
+
+private suspend fun copyMediaStreamChecked(
+    inputStream: java.io.InputStream,
+    outputStream: java.io.OutputStream,
+    expectedBytes: Long,
+): Long {
+    val buffer = ByteArray(32 * 1024)
+    var copied = 0L
+    while (true) {
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        val read = try {
+            inputStream.read(buffer)
+        } catch (err: java.io.IOException) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            throw MediaDownloadBodyReadException(copied, expectedBytes, err)
+        }
+        if (read < 0) break
+        if (read == 0) continue
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        outputStream.write(buffer, 0, read)
+        copied += read
+    }
+    outputStream.flush()
+    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+    if (expectedBytes > 0L && copied < expectedBytes) {
+        throw MediaDownloadLengthMismatchException(copied, expectedBytes)
+    }
+    return copied
+}
+
 private suspend fun saveMediaToPublicStorage(
     context: Context,
     url: String,
@@ -9310,12 +9353,13 @@ private suspend fun saveMediaToPublicStorage(
             .tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java, SiteImageGateInterceptor.ExplicitDownloadRequest)
             .build()
     }
-    fun writeStreamToPublicStorage(
+    suspend fun writeStreamToPublicStorage(
         inputStream: java.io.InputStream,
         disposition: String?,
         finalUrl: String,
         contentType: String?,
-    ): String {
+        expectedBytes: Long = -1L,
+    ): Pair<String, Long> {
         val headerMime = contentType
             ?.substringBefore(';')
             ?.trim()
@@ -9353,71 +9397,182 @@ private suspend fun saveMediaToPublicStorage(
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
             val itemUri = resolver.insert(collection, values)
-                ?: return "无法创建本地文件"
-            try {
-                resolver.openOutputStream(itemUri)?.use { out ->
-                    inputStream.use { input -> input.copyTo(out) }
-                } ?: return "无法写入本地文件"
-                val doneValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                ?: throw java.io.IOException("无法创建本地文件")
+            val copied = try {
+                val out = resolver.openOutputStream(itemUri)
+                    ?: throw java.io.IOException("无法写入本地文件")
+                out.use { output ->
+                    inputStream.use { input ->
+                        copyMediaStreamChecked(input, output, expectedBytes)
+                    }
                 }
-                resolver.update(itemUri, doneValues, null, null)
             } catch (e: Throwable) {
-                resolver.delete(itemUri, null, null)
+                runCatching { resolver.delete(itemUri, null, null) }
                 throw e
             }
-            if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
+            val doneValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(itemUri, doneValues, null, null)
+            val msg = if (saveAsPicture) "已保存到系统相册 (Pictures/LinuxDo)" else "已保存到系统「下载/LinuxDo」：$fileName"
+            msg to copied
         } else {
             val baseDir = context.getExternalFilesDir(
                 if (saveAsPicture) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS,
             ) ?: context.filesDir
             if (!baseDir.exists()) baseDir.mkdirs()
             val outFile = File(baseDir, fileName)
-            outFile.outputStream().use { out ->
-                inputStream.use { input -> input.copyTo(out) }
+            val partFile = File(baseDir, "$fileName.part.${System.nanoTime()}")
+            val copied = try {
+                partFile.outputStream().use { output ->
+                    inputStream.use { input ->
+                        copyMediaStreamChecked(input, output, expectedBytes)
+                    }
+                }
+            } catch (e: Throwable) {
+                runCatching { partFile.delete() }
+                throw e
             }
-            "已保存到：${outFile.absolutePath}"
+            if (outFile.exists()) runCatching { outFile.delete() }
+            if (!partFile.renameTo(outFile)) {
+                try {
+                    partFile.copyTo(outFile, overwrite = true)
+                } finally {
+                    runCatching { partFile.delete() }
+                }
+            }
+            "已保存到：${outFile.absolutePath}" to copied
         }
     }
     return withContext(Dispatchers.IO) {
-        runCatching {
+        val activeCallRef = java.util.concurrent.atomic.AtomicReference<okhttp3.Call?>(null)
+        try {
             val requestHost = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
             if (!asImage) {
                 container.diagnostics.log("开始下载附件: ${org.linuxdo.android.net.gecko.GeckoManager.diagnosticUrl(url)}")
             }
-            var request = buildDownloadRequest()
+            val baseClient = container.httpClient
+            val activeClient = org.linuxdo.android.net.buildActiveMediaDownloadClient(baseClient)
+            var systemClient: okhttp3.OkHttpClient? = null
+            fun getSystemClient(): okhttp3.OkHttpClient =
+                systemClient ?: org.linuxdo.android.net.buildSystemMediaDownloadClient(baseClient).also { systemClient = it }
+
+            var useSystemTransport = false
+            var preferredDirectUrl: String? = null
+            var triedDirectUrlOnSystem = false
             var fallbackReason: String? = null
             var failedHost = requestHost.ifBlank { Config.HOST }
             var failedFp = "-"
-            var response: okhttp3.Response? = null
+            var lastError: Throwable? = null
+            val maxAttempts = 3
 
-            try {
-                val firstResp = container.httpClient.newCall(request).execute()
-                val contentType = firstResp.header("Content-Type")
-                val isHtmlPayload = contentType?.contains("text/html", ignoreCase = true) == true
-                val isChallenged = firstResp.code in setOf(403, 429, 503) &&
-                    (firstResp.header("cf-mitigated") != null || (!asImage && isHtmlPayload))
-                val needAttachmentFallback = !asImage && (isChallenged || !firstResp.isSuccessful || isHtmlPayload)
-                if (isChallenged || needAttachmentFallback) {
-                    failedHost = firstResp.request.url.host
-                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
-                    fallbackReason = "HTTP ${firstResp.code}${if (isHtmlPayload) " (HTML)" else ""}"
-                    firstResp.close()
-                } else {
-                    response = firstResp
-                }
-            } catch (e: Throwable) {
-                if (!asImage) {
-                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
-                    fallbackReason = "${e.javaClass.simpleName}: ${e.message ?: "连接异常"}"
-                } else {
-                    throw e
+            for (attempt in 1..maxAttempts) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val modeLabel = if (useSystemTransport) "system" else "active"
+                val client = if (useSystemTransport) getSystemClient() else activeClient
+                val usingDirectUrl = useSystemTransport && !preferredDirectUrl.isNullOrBlank()
+                val attemptUrl = if (usingDirectUrl) preferredDirectUrl!! else url
+                if (usingDirectUrl) triedDirectUrlOnSystem = true
+                val request = buildDownloadRequest(attemptUrl)
+                var stage = "connect"
+                var resolvedUrlInAttempt: String? = null
+                try {
+                    val call = client.newCall(request)
+                    activeCallRef.set(call)
+                    val response = try {
+                        call.execute()
+                    } finally {
+                        activeCallRef.compareAndSet(call, null)
+                    }
+                    response.use { resp ->
+                        stage = "headers"
+                        val contentType = resp.header("Content-Type")
+                        val isHtmlPayload = contentType?.contains("text/html", ignoreCase = true) == true
+                        val isChallenged = resp.code in setOf(403, 429, 503) &&
+                            (resp.header("cf-mitigated") != null || (!asImage && isHtmlPayload))
+                        val needAttachmentFallback = !asImage && (isChallenged || !resp.isSuccessful || isHtmlPayload)
+                        if (isChallenged || needAttachmentFallback) {
+                            failedHost = resp.request.url.host
+                            failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: "-"
+                            val reason = "HTTP ${resp.code}${if (isHtmlPayload) " (HTML)" else ""}"
+                            if (usingDirectUrl && attempt < maxAttempts) {
+                                // 直链签名失效或拒访时回退原始短链再试
+                                preferredDirectUrl = null
+                                if (!asImage) {
+                                    container.diagnostics.log("附件直链下载受阻[attempt $attempt/$maxAttempts, mode=$modeLabel]: $reason，回退原始地址重试")
+                                }
+                                return@use
+                            }
+                            fallbackReason = reason
+                            return@use
+                        }
+                        if (!resp.isSuccessful) {
+                            return@withContext "下载失败 (HTTP ${resp.code})"
+                        }
+                        val body = resp.body ?: return@withContext "下载失败：响应内容为空"
+                        val finalUrl = resp.request.url.toString()
+                        resolvedUrlInAttempt = finalUrl
+                        val expectedBytes = body.contentLength()
+                        if (!asImage) {
+                            container.diagnostics.log(
+                                "附件下载[attempt $attempt/$maxAttempts, mode=$modeLabel] HTTP ${resp.code} " +
+                                    "host=${resp.request.url.host} expected=${if (expectedBytes > 0L) expectedBytes else -1}B",
+                            )
+                        }
+                        stage = "copy"
+                        val (savedMsg, copiedBytes) = writeStreamToPublicStorage(
+                            inputStream = body.byteStream(),
+                            disposition = resp.header("Content-Disposition"),
+                            finalUrl = finalUrl,
+                            contentType = contentType,
+                            expectedBytes = expectedBytes,
+                        )
+                        if (!asImage) {
+                            container.diagnostics.log("附件保存成功[mode=$modeLabel, copied=${copiedBytes}B]: $savedMsg")
+                        }
+                        return@withContext savedMsg
+                    }
+                    if (fallbackReason != null) break
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    activeCallRef.getAndSet(null)?.cancel()
+                    throw cancelled
+                } catch (err: Throwable) {
+                    lastError = err
+                    failedFp = request.tag(org.linuxdo.android.net.ActiveSessionRequest::class.java)?.sentClearanceFp ?: failedFp
+                    val retryableNetworkOrBody = err is MediaDownloadBodyReadException ||
+                        err is MediaDownloadLengthMismatchException ||
+                        err is java.io.IOException
+                    if (!asImage) {
+                        container.diagnostics.log(
+                            "附件下载中断[attempt $attempt/$maxAttempts, mode=$modeLabel, stage=$stage]: " +
+                                "${err.javaClass.simpleName}: ${err.message}",
+                        )
+                    }
+                    if (!retryableNetworkOrBody) throw err
+                    if (!resolvedUrlInAttempt.isNullOrBlank() && resolvedUrlInAttempt != url && !triedDirectUrlOnSystem) {
+                        preferredDirectUrl = resolvedUrlInAttempt
+                    } else if (usingDirectUrl) {
+                        preferredDirectUrl = null
+                    }
+                    if (!useSystemTransport) {
+                        useSystemTransport = true
+                        if (!asImage) {
+                            container.diagnostics.log(
+                                "附件下载切换通道: active -> system (reason=$stage, direct=${preferredDirectUrl != null})",
+                            )
+                        }
+                    }
+                    if (attempt < maxAttempts) {
+                        kotlinx.coroutines.delay(250L * attempt)
+                        continue
+                    }
+                    fallbackReason = "${err.javaClass.simpleName}: ${err.message ?: "连接异常"}"
                 }
             }
 
             if (fallbackReason != null) {
                 if (!asImage) {
-                    container.diagnostics.log("附件 OkHttp 下载受阻($fallbackReason)，切换后台 Gecko 通道")
+                    container.diagnostics.log("附件 OkHttp 多通道未完成($fallbackReason)，切换后台 Gecko 通道")
                     withContext(Dispatchers.Main) {
                         Toast.makeText(context, "正在后台安全验证并下载，请稍候…", Toast.LENGTH_SHORT).show()
                     }
@@ -9428,20 +9583,28 @@ private suspend fun saveMediaToPublicStorage(
                     )
                     if (!prewarm.cleared) {
                         container.diagnostics.log("附件后台 Gecko 下载未能取得凭据或直链")
-                        return@withContext "下载被安全校验拦截，请重试"
+                        return@withContext if (lastError != null) {
+                            "保存失败：已尝试直连、系统网络与内置浏览器通道仍中断，请稍后重试"
+                        } else {
+                            "下载被安全校验拦截，请重试"
+                        }
                     }
                     val cachedTempFile = prewarm.tempFile
                     if (cachedTempFile != null) {
                         try {
                             if (cachedTempFile.exists() && cachedTempFile.length() > 0L) {
-                                return@withContext cachedTempFile.inputStream().use { input ->
+                                val tempLen = cachedTempFile.length()
+                                val (savedMsg, copiedBytes) = cachedTempFile.inputStream().use { input ->
                                     writeStreamToPublicStorage(
                                         inputStream = input,
                                         disposition = prewarm.contentDisposition,
                                         finalUrl = prewarm.resolvedUrl ?: url,
                                         contentType = prewarm.contentType,
+                                        expectedBytes = tempLen,
                                     )
-                                }.also { container.diagnostics.log("附件通过 Gecko 流式保存成功: $it") }
+                                }
+                                container.diagnostics.log("附件通过 Gecko 流式保存成功[copied=${copiedBytes}B]: $savedMsg")
+                                return@withContext savedMsg
                             }
                         } finally {
                             runCatching { cachedTempFile.delete() }
@@ -9452,45 +9615,104 @@ private suspend fun saveMediaToPublicStorage(
                         container.sessionStore.syncFromWebView()
                     }
                     val retryTarget = prewarm.resolvedUrl ?: url
-                    request = buildDownloadRequest(retryTarget)
-                    response = container.httpClient.newCall(request).execute()
+                    val postGeckoClients = listOf("system" to getSystemClient(), "active" to activeClient)
+                    var postError: Throwable? = null
+                    for ((modeLabel, client) in postGeckoClients) {
+                        val req = buildDownloadRequest(retryTarget)
+                        try {
+                            val call = client.newCall(req)
+                            activeCallRef.set(call)
+                            val resp = try {
+                                call.execute()
+                            } finally {
+                                activeCallRef.compareAndSet(call, null)
+                            }
+                            resp.use { r ->
+                                if (!r.isSuccessful) {
+                                    container.diagnostics.log("附件 Gecko 后重下失败[mode=$modeLabel]: HTTP ${r.code}")
+                                    postError = java.io.IOException("HTTP ${r.code}")
+                                    return@use
+                                }
+                                val body = r.body ?: throw java.io.IOException("响应内容为空")
+                                val expectedBytes = body.contentLength()
+                                val (savedMsg, copiedBytes) = writeStreamToPublicStorage(
+                                    inputStream = body.byteStream(),
+                                    disposition = r.header("Content-Disposition"),
+                                    finalUrl = r.request.url.toString(),
+                                    contentType = r.header("Content-Type"),
+                                    expectedBytes = expectedBytes,
+                                )
+                                container.diagnostics.log("附件 Gecko 后重下成功[mode=$modeLabel, copied=${copiedBytes}B]: $savedMsg")
+                                return@withContext savedMsg
+                            }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            activeCallRef.getAndSet(null)?.cancel()
+                            throw cancelled
+                        } catch (err: Throwable) {
+                            postError = err
+                            container.diagnostics.log("附件 Gecko 后重下中断[mode=$modeLabel]: ${err.javaClass.simpleName}: ${err.message}")
+                        }
+                    }
+                    return@withContext "保存失败：${postError?.message ?: fallbackReason}"
                 } else {
                     val cleared = container.browser.clearChallenge(
                         reason = "download-image",
                         failedClearanceFp = failedFp,
                         requestHost = failedHost,
                     )
-                    if (cleared) {
-                        withContext(Dispatchers.Main) {
-                            CookieManager.getInstance().flush()
-                            container.sessionStore.syncFromWebView()
-                        }
-                        request = buildDownloadRequest()
-                        response = container.httpClient.newCall(request).execute()
-                    } else {
+                    if (!cleared) {
                         return@withContext "下载被安全校验拦截，请重试"
                     }
+                    withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().flush()
+                        container.sessionStore.syncFromWebView()
+                    }
+                    val postImageClients = listOf(activeClient, getSystemClient())
+                    var postError: Throwable? = null
+                    for (client in postImageClients) {
+                        val req = buildDownloadRequest()
+                        try {
+                            val call = client.newCall(req)
+                            activeCallRef.set(call)
+                            val resp = try {
+                                call.execute()
+                            } finally {
+                                activeCallRef.compareAndSet(call, null)
+                            }
+                            resp.use { r ->
+                                if (!r.isSuccessful) {
+                                    postError = java.io.IOException("HTTP ${r.code}")
+                                    return@use
+                                }
+                                val body = r.body ?: throw java.io.IOException("响应内容为空")
+                                val (savedMsg, _) = writeStreamToPublicStorage(
+                                    inputStream = body.byteStream(),
+                                    disposition = r.header("Content-Disposition"),
+                                    finalUrl = r.request.url.toString(),
+                                    contentType = r.header("Content-Type"),
+                                    expectedBytes = body.contentLength(),
+                                )
+                                return@withContext savedMsg
+                            }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            activeCallRef.getAndSet(null)?.cancel()
+                            throw cancelled
+                        } catch (err: Throwable) {
+                            postError = err
+                        }
+                    }
+                    return@withContext "保存失败：${postError?.message ?: "网络异常"}"
                 }
             }
-            val finalResponse = response ?: return@withContext "下载失败：未收到响应"
-            finalResponse.use { resp ->
-                if (!resp.isSuccessful) {
-                    if (!asImage) container.diagnostics.log("附件最终下载失败: HTTP ${resp.code}")
-                    return@withContext "下载失败 (HTTP ${resp.code})"
-                }
-                val body = resp.body ?: return@withContext "下载失败：响应内容为空"
-                writeStreamToPublicStorage(
-                    inputStream = body.byteStream(),
-                    disposition = resp.header("Content-Disposition"),
-                    finalUrl = resp.request.url.toString(),
-                    contentType = resp.header("Content-Type"),
-                ).also {
-                    if (!asImage) container.diagnostics.log("附件 OkHttp 保存完成: $it")
-                }
-            }
-        }.getOrElse { err ->
+            "保存失败：${lastError?.message ?: "未收到响应"}"
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            activeCallRef.getAndSet(null)?.cancel()
+            throw cancelled
+        } catch (err: Throwable) {
             if (!asImage) container.diagnostics.log("附件保存异常: ${err.javaClass.simpleName}: ${err.message}")
             "保存失败：${err.message ?: "网络异常"}"
+        } finally {
+            activeCallRef.getAndSet(null)?.cancel()
         }
     }
 }

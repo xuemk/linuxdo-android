@@ -9,8 +9,8 @@ import kotlin.math.roundToInt
 object AppFontScale {
     const val DEFAULT = 1f
     const val MIN = 0.8f
-    const val MAX = 1.3f
-    const val STEPS = 9
+    const val MAX = 1.2f
+    const val STEPS = 7
 
     fun normalize(value: Float): Float =
         if (value.isFinite()) (value.coerceIn(MIN, MAX) * 20).roundToInt() / 20f else DEFAULT

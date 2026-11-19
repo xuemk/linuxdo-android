@@ -113,6 +113,7 @@ object GeckoManager {
 
         val rt = GeckoRuntime.create(context.applicationContext, settings)
         runtime = rt
+        GeckoAuthBridge.warmUpExtension(rt)
         Log.d(TAG, "GeckoRuntime 已启用 ECH，TRR mode=$trrMode，DoH host=${Uri.parse(dohUri).host}")
         return rt
     }

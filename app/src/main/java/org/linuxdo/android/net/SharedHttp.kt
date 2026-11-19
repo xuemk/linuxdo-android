@@ -96,6 +96,43 @@ fun buildSharedHttpClient(
 }
 
 /**
+ * 显式附件/媒体下载专用活跃客户端：继承当前主通道，延长单次读取与总超时并开启连接重试。
+ * 仅用于 GET/HEAD 下载，不影响全局 API 客户端及任何写操作。
+ */
+internal fun buildActiveMediaDownloadClient(base: OkHttpClient): OkHttpClient =
+    base.newBuilder()
+        .retryOnConnectionFailure(true)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+/**
+ * 显式附件/媒体下载专用系统通道客户端：当原生 Rust DoH/Anycast 通道在读取 CDN 大响应体中途断流时，
+ * 用全新 [OkHttpClient.Builder] 切换到平台默认 Socket/TLS、系统 DNS、系统代理与独立连接池重试，
+ * 保留同源会话/Cookie 拦截器语义并剔除原生 DoH 与 failover 拦截器。
+ */
+internal fun buildSystemMediaDownloadClient(base: OkHttpClient): OkHttpClient =
+    OkHttpClient.Builder()
+        .dns(Dns.SYSTEM)
+        .connectionPool(ConnectionPool(4, 1, TimeUnit.MINUTES))
+        .cookieJar(base.cookieJar)
+        .authenticator(base.authenticator)
+        .proxyAuthenticator(base.proxyAuthenticator)
+        .followRedirects(base.followRedirects)
+        .followSslRedirects(base.followSslRedirects)
+        .connectTimeout(Config.CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .apply {
+            base.interceptors
+                .filterNot { it is DohNoReplayInterceptor || it is DohFailoverInterceptor }
+                .forEach { addInterceptor(it) }
+            base.networkInterceptors.forEach { addNetworkInterceptor(it) }
+        }
+        .build()
+
+/**
  * 结合设置开关以及是否开启 VPN/代理综合判断，解析出当前应走哪个 HTTP 客户端。
  *
  * 判定矩阵：

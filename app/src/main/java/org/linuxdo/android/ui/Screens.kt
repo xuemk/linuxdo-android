@@ -2312,8 +2312,16 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth().semantics { contentDescription = "字体大小" },
                     )
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("较小 · 80%", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
-                        Text("较大 · 130%", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        Text(
+                            "较小 · ${(AppFontScale.MIN * 100).roundToInt()}%",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                        )
+                        Text(
+                            "较大 · ${(AppFontScale.MAX * 100).roundToInt()}%",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                        )
                     }
                     Spacer(Modifier.height(12.dp))
                     Column(

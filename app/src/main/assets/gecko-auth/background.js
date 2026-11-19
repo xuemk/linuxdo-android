@@ -124,16 +124,25 @@ let cookieControlAttempts = 0;
 function connectCookieControl() {
   if (cookieControlPort || cookieControlRetry) return;
   const retry = () => {
-    if (cookieControlAttempts++ >= 30) return;
+    if (cookieControlAttempts >= 25) return;
+    const delayMs = Math.min(2000, 250 * Math.pow(2, Math.min(cookieControlAttempts, 3)));
+    cookieControlAttempts++;
     cookieControlRetry = setTimeout(() => {
       cookieControlRetry = null;
       connectCookieControl();
-    }, 100);
+    }, delayMs);
   };
   try {
     const port = browser.runtime.connectNative("linuxdoCookieControl");
+    let retiredByHost = false;
     cookieControlPort = port;
     port.onMessage.addListener(async request => {
+      if (request && request.command === "disconnect") {
+        retiredByHost = true;
+        if (cookieControlPort === port) cookieControlPort = null;
+        try { port.disconnect(); } catch (error) {}
+        return;
+      }
       cookieControlAttempts = 0;
       try {
         if (request.command === "clearSiteCookies") {
@@ -182,9 +191,8 @@ function connectCookieControl() {
       }
     });
     port.onDisconnect.addListener(() => {
-      if (cookieControlPort !== port) return;
-      cookieControlPort = null;
-      retry();
+      if (cookieControlPort === port) cookieControlPort = null;
+      if (!retiredByHost) retry();
     });
   } catch (error) { retry(); }
 }

@@ -19,6 +19,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import org.linuxdo.android.Config
 import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.WebExtension
 import java.util.UUID
@@ -52,13 +53,15 @@ class GeckoAuthBridge private constructor(
                     if (closed || sender.session !== session || !sender.isTopLevel ||
                         origin.scheme != "https" || !isAllowedHost
                     ) {
-                        port.disconnect()
+                        // 此时尚未调用 setDelegate 注册断开监听；仅发关闭指令交由 JS 侧单向断连，
+                        // 绝不在 Java 侧调用 port.disconnect()，避免与 GeckoView 异步 Disconnect 竞态二次 shutdownNative 崩溃。
+                        runCatching { port.postMessage(JSONObject().put("command", "disconnect")) }
                         return
                     }
                     if (activePort === port) return
                     activePort?.let { oldPort ->
                         disconnect(oldPort)
-                        oldPort.disconnect()
+                        retirePort(oldPort)
                     }
                     activePort = port
                     port.setDelegate(object : WebExtension.PortDelegate {
@@ -221,7 +224,7 @@ class GeckoAuthBridge private constructor(
         waiting.forEach { it.cancel() }
         scope.cancel()
         session.webExtensionController.setMessageDelegate(extension, null, NATIVE_APP)
-        port?.disconnect()
+        port?.let(::retirePort)
     }
 
     companion object {
@@ -235,23 +238,63 @@ class GeckoAuthBridge private constructor(
         private var cookieConnection = CompletableDeferred<WebExtension.Port>()
         private val cookieRequests = mutableMapOf<String, CompletableDeferred<JSONObject>>()
 
+        /**
+         * GeckoView 135 缺陷兜底：WebExtension.Port.disconnectFromExtension() 未判空 delegate、也未检查 disconnected，
+         * 若 Java 侧主动调 port.disconnect() 先执行了一次 EventDispatcher.shutdown() + dispose(false)，
+         * 主线程 Looper 中已排队的 GeckoView:WebExtension:Disconnect 再次触发 shutdownNative() 会直接 NullHandle() 闪退。
+         * 因此退役旧端口时仅切换为空回调释放引用并通知 JS 侧单向断连，确保 shutdown() 仅执行一次。
+         */
+        private val NOOP_PORT_DELEGATE = object : WebExtension.PortDelegate {
+            override fun onPortMessage(message: Any, port: WebExtension.Port) = Unit
+            override fun onDisconnect(port: WebExtension.Port) = Unit
+        }
+
+        private fun retirePort(port: WebExtension.Port) {
+            runCatching { port.setDelegate(NOOP_PORT_DELEGATE) }
+            runCatching { port.postMessage(JSONObject().put("command", "disconnect")) }
+        }
+
+        private fun ensureExtensionResult(runtime: GeckoRuntime): GeckoResult<WebExtension> {
+            extensionResult?.let { return it }
+            val result = runtime.webExtensionController.ensureBuiltIn("resource://android/assets/gecko-auth/", EXTENSION_ID)
+            extensionResult = result
+            result.accept(
+                { value ->
+                    if (value != null) {
+                        bindCookieControl(value)
+                    } else if (extensionResult === result) {
+                        extensionResult = null
+                    }
+                },
+                {
+                    if (extensionResult === result) {
+                        extensionResult = null
+                    }
+                },
+            )
+            return result
+        }
+
+        /** GeckoRuntime 刚创建时尽早安装并绑定 Cookie 控制桥，避免 background.js 冷启动空窗期反复建连/断连。 */
+        internal fun warmUpExtension(runtime: GeckoRuntime) {
+            runCatching { ensureExtensionResult(runtime) }
+        }
+
         private suspend fun installedExtension(context: Context): WebExtension {
-            val controller = GeckoManager.getOrCreateRuntime(context).webExtensionController
-            val result = extensionResult ?: controller.ensureBuiltIn("resource://android/assets/gecko-auth/", EXTENSION_ID)
-                .also { extensionResult = it }
+            val result = ensureExtensionResult(GeckoManager.getOrCreateRuntime(context))
             val extension = suspendCancellableCoroutine<WebExtension> { continuation ->
                 result.accept(
                     { value ->
                         if (continuation.isActive) {
                             if (value != null) continuation.resume(value)
                             else {
-                                extensionResult = null
+                                if (extensionResult === result) extensionResult = null
                                 continuation.resumeWithException(IllegalStateException("认证扩展未安装"))
                             }
                         }
                     },
                     { error ->
-                        extensionResult = null
+                        if (extensionResult === result) extensionResult = null
                         if (continuation.isActive) continuation.resumeWithException(error ?: IllegalStateException("认证扩展安装失败"))
                     },
                 )
@@ -271,18 +314,24 @@ class GeckoAuthBridge private constructor(
 
         private fun bindCookieControl(extension: WebExtension) {
             if (cookieExtension === extension) return
-            cookiePort?.let { old -> disconnectCookieControl(old); old.disconnect() }
+            cookiePort?.let { old ->
+                disconnectCookieControl(old)
+                retirePort(old)
+            }
             cookieExtension = extension
             extension.setMessageDelegate(object : WebExtension.MessageDelegate {
                 override fun onConnect(port: WebExtension.Port) {
                     val sender = port.sender
                     if (sender.webExtension.id != EXTENSION_ID || sender.session != null ||
                         sender.environmentType != WebExtension.MessageSender.ENV_TYPE_EXTENSION) {
-                        port.disconnect()
+                        runCatching { port.postMessage(JSONObject().put("command", "disconnect")) }
                         return
                     }
                     if (cookiePort === port) return
-                    cookiePort?.let { old -> disconnectCookieControl(old); old.disconnect() }
+                    cookiePort?.let { old ->
+                        disconnectCookieControl(old)
+                        retirePort(old)
+                    }
                     cookiePort = port
                     port.setDelegate(object : WebExtension.PortDelegate {
                         override fun onPortMessage(message: Any, port: WebExtension.Port) {

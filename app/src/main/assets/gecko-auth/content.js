@@ -249,6 +249,10 @@
 
   installPageBridge();
   port.onMessage.addListener(async request => {
+    if (request && request.command === "disconnect") {
+      try { port.disconnect(); } catch (_) {}
+      return;
+    }
     try {
       let value;
       if (request.command === "evaluate") {

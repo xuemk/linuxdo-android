@@ -2,8 +2,10 @@ package org.linuxdo.android.net
 
 import okhttp3.ConnectionSpec
 import okhttp3.Dns
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.*
@@ -24,6 +26,18 @@ private val CipherSuites = arrayOf(
     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
 )
+
+internal class DohNoReplayInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response =
+        chain.proceed(dohRequestWithoutReplay(chain.request()))
+}
+
+internal fun normalizeNativeConnectFailure(error: IOException): IOException {
+    if (error.javaClass == IOException::class.java && error.message == "DoH: connection_failed") {
+        return ConnectException("DoH: connection_failed").apply { initCause(error) }
+    }
+    return error
+}
 
 class DohTransport(
     val serverUrl: String,
@@ -93,7 +107,7 @@ class DohTransport(
         }.trustManagers
         val trust = managers.filterIsInstance<X509TrustManager>().single()
         return builder.dns(dns).socketFactory(socketFactory).sslSocketFactory(tlsFactory, trust)
-            .addInterceptor { chain -> chain.proceed(dohRequestWithoutReplay(chain.request())) }
+            .addInterceptor(DohNoReplayInterceptor())
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
             .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT))
             .proxy(Proxy.NO_PROXY).retryOnConnectionFailure(false)
@@ -139,7 +153,11 @@ private class RustSocket(val handle: Long, private val dns: Dns, private val onC
         if (closed.get()) throw SocketException("Socket closed")
         val address = endpoint as? InetSocketAddress ?: throw SocketException("Unsupported address")
         val ip = address.address ?: dns.lookup(address.hostString).first()
-        NativeDoh.connect(handle, ip.hostAddress.orEmpty(), address.port, timeout)
+        try {
+            NativeDoh.connect(handle, ip.hostAddress.orEmpty(), address.port, timeout)
+        } catch (error: IOException) {
+            throw normalizeNativeConnectFailure(error)
+        }
         remote = InetSocketAddress(ip, address.port)
         NativeDoh.timeout(handle, readTimeout)
     }

@@ -37,12 +37,13 @@ class DohFailoverInterceptor(
                 coordinator.reportFailure(currentEpoch.generation, currentEpoch.server.id, e)
             }
 
-            // 2. 幂等安全重试检查
+            // 2. 幂等安全重试检查（显式附件/媒体下载由下载编排层自行控制超时、取消与通道切换，不在拦截器内同步重放）
+            val isExplicitDownload = request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null
             val isIdempotent = request.method in listOf("GET", "HEAD")
             val isOneShot = request.body?.isOneShot() == true
             val hasRetried = request.header(HEADER_RETRIED) != null
 
-            if (isIdempotent && !isOneShot && !hasRetried && coordinator.isFailoverEligible(e)) {
+            if (!isExplicitDownload && isIdempotent && !isOneShot && !hasRetried && coordinator.isFailoverEligible(e)) {
                 Log.w(TAG, "只读请求 ${request.method} ${request.url} 遭遇网络异常: ${e.message}，等待协调器恢复后重试...")
                 // 同步等待新代次（至多 1.5 秒）
                 val nextEpoch = runBlocking {
