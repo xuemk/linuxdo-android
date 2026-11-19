@@ -98,21 +98,20 @@ object Config {
      */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
-          "versionCode": 18,
-          "versionName": "1.6.0",
+          "versionCode": 19,
+          "versionName": "1.6.1",
           "forceUpdate": false,
           "minVersionCode": 1,
-          "title": "LINUX DO Android v1.6.0 正式版更新说明",
+          "title": "LINUX DO Android v1.6.1 正式版更新说明",
           "changelog": [
-            "1、微信式下拉应用广场：自由拖拽排序，完整小程序容器与直连体验",
-            "2、话题暂存工作台：感兴趣的话题随时存放，长帖分段流畅看，想看一键直达",
-            "3、所见即所得发起投票：发帖左下角投票构建器，卡片内即时编辑回显",
-            "4、一键卡片分享：长按预览，双Tab精致卡片一键转发佬友",
-            "5、多媒体与排版升级：音视频帖内内联播放、@/#智能补全与折叠表格渲染",
-            "6、网络稳定性与体验加固：429速率挑战智能退避换线、阅读同步与会话保护"
+            "1、专属邮箱原生收发：内置 LINUX DO 邮箱收件箱、读信与写信，支持 H5 网页邮箱一键自动登录",
+            "2、附件高速下载与灵动进度条：三通道智能防截断（直连/系统通道/内置浏览器），支持顶部悬浮进度条与离开话题后台持续下载",
+            "3、阅读与交互体验升级：支持全局字体缩放（80%~120%）、右侧悬浮楼层导航条、用户签名小尾巴与超链接大图/商店直跳",
+            "4、后台通知与角标进化：前台高敏轮询 + 息屏阶梯闹钟低功耗守护，深度适配主流国产系统桌面未读角标",
+            "5、网络与风控稳定性加固：彻底根治新安装与日常 429 速率挑战循环，优化 Anycast 冷启动选优、VPN 智能让渡与会话保护"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.6.0/linuxdo-1.6.0-release.apk",
-          "apkSha256": "f220a65278cee2790bc010d8a5251aade15ed0bc76c68eb4c88f0099466e25f8"
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.6.1/linuxdo-1.6.1-release.apk",
+          "apkSha256": "a776f371cc95175a32cd2906c8684f6045c9175218a691a733010dc8bf7a1f8c"
         }
     """
 }
