@@ -114,6 +114,7 @@ import org.linuxdo.android.Config
 import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.NotificationPollInterval
 import org.linuxdo.android.data.compactCategoryGroups
+import org.linuxdo.android.ui.design.boundedTabSwipe
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosTheme
@@ -131,7 +132,6 @@ import org.linuxdo.android.ui.screen.HistoryScreen
 import org.linuxdo.android.ui.screen.ConnectWebSheet
 import org.linuxdo.android.ui.screen.InAppBrowserSheet
 import org.linuxdo.android.ui.screen.openExternal
-import org.linuxdo.android.ui.screen.ChatListScreen
 import org.linuxdo.android.ui.screen.ChatRoomScreen
 import org.linuxdo.android.ui.screen.FollowListScreen
 import org.linuxdo.android.ui.screen.BlacklistScreen
@@ -657,6 +657,24 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val ldcState by viewModel.ldcState.collectAsStateWithLifecycle()
     val cdkScoreState by viewModel.cdkScore.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
+    val pendingChatChannel by viewModel.pendingChatChannel.collectAsStateWithLifecycle()
+    val chatUnread = chat.channels.filter { it.membership?.muted != true }.sumOf { it.unreadCount }
+    var messageSection by rememberSaveable { mutableStateOf(MessageSection.Notifications) }
+    var directMessages by rememberSaveable { mutableStateOf(true) }
+    val openChat = {
+        messageSection = MessageSection.Chat
+        selected = MainTab.Messages
+        stacks.getValue(MainTab.Messages).popToRoot()
+    }
+    LaunchedEffect(pendingChatChannel) {
+        pendingChatChannel?.let { channelId ->
+            openChat()
+            directMessages = true
+            val messagesStack = stacks.getValue(MainTab.Messages)
+            messagesStack.push(Route.ChatRoom(channelId, "直接消息"))
+            viewModel.clearChatNotification()
+        }
+    }
     val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
     val userRepliesStates by viewModel.userRepliesStates.collectAsStateWithLifecycle()
     val topicSortOrder by viewModel.topicSortOrder.collectAsStateWithLifecycle()
@@ -677,7 +695,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val signatureSyncNotice by viewModel.signatureSyncNotice.collectAsStateWithLifecycle()
     val showTopicUnreadDot by viewModel.showTopicUnreadDot.collectAsStateWithLifecycle()
     val topicUnreadDotPosition by viewModel.topicUnreadDotPosition.collectAsStateWithLifecycle()
-    val isBottomBarVisible by viewModel.isBottomBarVisible.collectAsStateWithLifecycle()
+    val listBars = remember(selected, stack.entries.last().id) { mutableStateOf(true) }
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val autoRefreshIncoming by viewModel.autoRefreshIncoming.collectAsStateWithLifecycle()
@@ -741,15 +759,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         viewModel.clearPendingNotificationTarget()
     }
 
-    LaunchedEffect(stack.current) {
-        val currentRoute = stack.current
-        val isList = currentRoute is Route.TopicList || currentRoute is Route.CategoryTopics || currentRoute is Route.UserTopics || currentRoute is Route.TagTopics
-        val isDetail = currentRoute is Route.TopicDetail || currentRoute is Route.Chat || currentRoute is Route.ChatRoom
-        if (!isList && !isDetail) {
-            viewModel.setBarsVisible(true)
-        }
-    }
-
     val context = LocalContext.current
 
     LaunchedEffect(autoReadClipboardEnabled) {
@@ -789,8 +798,37 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         showConnectSheet || globalBrowserUrl != null || privateMessageRecipient != null || accountState.switching ||
         userCard.loading || userCard.user != null || userCard.error != null
     val visibleRoute = stack.current
+    val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val isDetailRoute = visibleRoute is Route.TopicDetail || visibleRoute == Route.Chat || visibleRoute is Route.ChatRoom
     val navigationLifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
     val listForeground = navigationLifecycleState.isAtLeast(Lifecycle.State.RESUMED) && !contentObscured
+    DisposableEffect(lifecycle, browsing, accountState.activeUserId) {
+        fun updateChatConnection() {
+            viewModel.setChatForeground(browsing && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+        }
+        val observer = LifecycleEventObserver { _, _ -> updateChatConnection() }
+        lifecycle.addObserver(observer)
+        updateChatConnection()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            viewModel.setChatForeground(false)
+        }
+    }
+    DisposableEffect(lifecycle, browsing, visibleRoute, contentObscured) {
+        fun updateChatVisibility() {
+            val foreground = browsing && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            viewModel.setVisibleChatChannel((visibleRoute as? Route.ChatRoom)?.channelId?.takeIf {
+                foreground && !contentObscured && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            })
+        }
+        val observer = LifecycleEventObserver { _, _ -> updateChatVisibility() }
+        lifecycle.addObserver(observer)
+        updateChatVisibility()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            viewModel.setVisibleChatChannel(null)
+        }
+    }
     DisposableEffect(lifecycle, visibleRoute, browsing, contentObscured, state.homeFeed) {
         fun updateProbeVisibility() {
             val category = visibleRoute as? Route.CategoryTopics
@@ -812,17 +850,21 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             viewModel.setPreviewListVisible(false)
         }
     }
-    val openNotifications = {
-        if (stack.current != Route.Notifications) stack.push(Route.Notifications)
-        viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true)
-        viewModel.refreshUnread(force = true)
+    fun selectBoard(tab: MainTab) {
+        selected = tab
     }
-
+    val boardSwipe = Modifier.boundedTabSwipe(selected.ordinal, MainTab.entries.size,
+        enabled = browsing && !contentObscured) { selectBoard(MainTab.entries[it]) }
+    // 有分类的列表自行处理横滑；单页板块可以直接在内容区切换主导航。
+    val singlePage = visibleRoute == Route.Search || visibleRoute == Route.Profile
     Box(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().then(if (singlePage) boardSwipe else Modifier)) {
             holder.SaveableStateProvider(selected.name) {
                 key(selected) {
-                    IosNavHost(stack, interactive = browsing && !topicCreator.open && !showSavedTopics && !topicSearch.open && !metadataEditor.open) { route ->
+                    IosNavHost(stack,
+                        interactive = browsing && !topicCreator.open && !showSavedTopics && !topicSearch.open && !metadataEditor.open,
+                        listBars = listBars.takeIf { browsing && listForeground && !isDetailRoute && !isKeyboardOpen },
+                    ) { route ->
                         val active = browsing && stack.current == route
                         // 仅回写标题时保持加载身份，避免保存后重新按阅读游标跳楼。
                         val routeLoadIdentity = if (route is Route.TopicDetail) route.copy(title = "") else route
@@ -865,7 +907,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     if (!categories.loaded && !categories.loading) viewModel.loadCategories()
                                     viewModel.loadDrafts(refresh = true)
                                 }
-                                Route.Chat -> viewModel.loadChatChannels()
                                 is Route.FollowList -> viewModel.loadFollowing(route.username)
                                 else -> Unit
                             }
@@ -891,8 +932,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
                                 onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
                                 onScrollBusyChanged = viewModel::setTopicListScrollBusy,
-                                onBarsVisibilityChange = viewModel::setBottomBarVisible,
-                                barsVisible = isBottomBarVisible,
                                 active = active && listForeground,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = {},
@@ -927,7 +966,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onNavigateToCategories = { selected = MainTab.Categories },
                                 onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                 onNavigateToConnect = { showConnectSheet = true },
-                                onNavigateToChat = { stack.push(Route.Chat) },
+                                onNavigateToChat = openChat,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1192,8 +1231,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
                                     onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
                                     onScrollBusyChanged = viewModel::setTopicListScrollBusy,
-                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
-                                    barsVisible = isBottomBarVisible,
                                     onBack = { stack.pop() },
                                     active = active && listForeground,
                                     trailing = {},
@@ -1215,7 +1252,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChat,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1272,8 +1309,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
                                     onPrefetchExcerpts = viewModel::prefetchTopicExcerpts,
                                     onScrollBusyChanged = viewModel::setTopicListScrollBusy,
-                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
-                                    barsVisible = isBottomBarVisible,
                                     onBack = { stack.pop() },
                                     active = active && listForeground,
                                     trailing = {},
@@ -1311,7 +1346,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChat,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1363,18 +1398,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                             )
 
                             Route.Profile -> ProfileScreen(state.username, profile, viewModel::loadProfile,
-                                onOpenTopic = { id, title, postNumber ->
-                                    val currentRoute = stack.current
-                                    if (currentRoute is Route.TopicDetail && currentRoute.topicId == id) {
-                                        viewModel.loadTopic(
-                                            id,
-                                            postNumber = postNumber,
-                                            resumePostNumber = viewModel.resolveResumePostNumber(id, postNumber),
-                                        )
-                                    } else {
-                                        stack.push(Route.TopicDetail(id, title, postNumber))
-                                    }
-                                },
                                 onOpenUserTopics = { username, title, isBookmark ->
                                     stack.push(Route.UserTopics(username, title, isBookmark))
                                 },
@@ -1396,7 +1419,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenConnect = { showConnectSheet = true },
                                 onOpenHistory = { stack.push(Route.BrowsingHistory) },
                                 onOpenFollowing = { state.username?.let { stack.push(Route.FollowList(it)) } },
-                                onOpenChat = { stack.push(Route.Chat) },
+                                onOpenAppsPlaza = { globalBrowserUrl = "${Config.BASE_URL}/apps" },
                                 onOpenBlacklist = { stack.push(Route.Blacklist) },
                                 onOpenLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onOpenLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1413,10 +1436,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 },
                                 onLoadCdkScore = { viewModel.loadCdkScore() },
                                 active = active,
-                                onReadNotification = viewModel::readNotification,
-                                notificationFilter = notificationFilter,
-                                onNotificationFilter = viewModel::setNotificationFilter,
-                                unreadFilters = state.unreadFilters,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = {})
 
@@ -1450,18 +1469,17 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onBack = { stack.pop() },
                             )
 
-                            Route.Chat -> ChatListScreen(
-                                state = chat,
-                                active = active,
-                                onLoad = { viewModel.loadChatChannels() },
-                                onRefresh = { viewModel.loadChatChannels(refresh = true) },
-                                onOpenChannel = { channel -> stack.push(Route.ChatRoom(channel.id, channel.displayTitle)) },
-                                onBack = if (stack.canPop) ({ stack.pop() }) else null,
-                            )
+                            // 恢复旧版保存的聊天路由时转到消息页。
+                            Route.Chat -> LaunchedEffect(active) {
+                                if (active) {
+                                    stack.pop()
+                                    openChat()
+                                }
+                            }
 
                             is Route.ChatRoom -> {
                                 val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
-                                val roomActive = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                                val roomActive = active && !contentObscured && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
                                 val channel = chat.channels.firstOrNull { it.id == route.channelId }
                                     ?: org.linuxdo.android.data.ChatChannelSummary(id = route.channelId, title = route.title)
                                 val currentUsername = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }?.username
@@ -1472,6 +1490,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     currentUsername = currentUsername,
                                     onLoad = viewModel::loadChatRoom,
                                     onLoadPast = viewModel::loadMoreChatHistory,
+                                    onMessagesVisible = viewModel::markChatMessagesVisible,
                                     onSend = viewModel::sendChatMessage,
                                     onUploadAttachment = viewModel::uploadChatAttachment,
                                     onOpenUser = viewModel::openUserCard,
@@ -1518,8 +1537,6 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     },
                                     onRemoveBookmark = if (route.isBookmark && route.username.equals(state.username, ignoreCase = true)) viewModel::removeBookmarkFromList else null,
                                     onScrollBusyChanged = viewModel::setTopicListScrollBusy,
-                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
-                                    barsVisible = isBottomBarVisible,
                                     onOpenUser = { username, primaryAvatarUrl, staticAvatarUrl, displayName ->
                                         viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
                                     },
@@ -1551,7 +1568,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChat,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1708,7 +1725,27 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onSelfHealNetwork = { viewModel.selfHealNetwork(context) },
                             )
 
-                            Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
+                            Route.Notifications -> MessagesScreen(
+                                feedDisplayMode = feedDisplayMode,
+                                section = messageSection,
+                                onSection = { messageSection = it },
+                                directMessages = directMessages,
+                                onDirectMessages = { directMessages = it },
+                                notifications = profile[org.linuxdo.android.data.ProfileSection.Notifications] ?: ProfileUiState(),
+                                notificationPages = viewModel.notificationPages.collectAsStateWithLifecycle().value,
+                                chat = chat,
+                                filter = notificationFilter,
+                                unreadFilters = state.unreadFilters,
+                                unreadNotifications = state.unreadCount,
+                                active = active && listForeground,
+                                scrollToTopRequest = scrollToTopRequest,
+                                onFilter = viewModel::setNotificationFilter,
+                                onRefreshNotifications = { viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true) },
+                                onMore = { viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, more = true) },
+                                onMarkAllRead = viewModel::markAllNotificationsRead,
+                                onRead = viewModel::readNotification,
+                                onRefreshChat = { viewModel.loadChatChannels(refresh = true) },
+                                onOpenChannel = { stack.push(Route.ChatRoom(it.id, it.displayTitle)) },
                                 onOpenTopic = { id, title, postNumber ->
                                     viewModel.markNotificationTopicPending(id, postNumber)
                                     val currentRoute = stack.current
@@ -1724,14 +1761,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     }
                                 },
                                 onOpenUser = viewModel::openUserCard,
-                                onDiagnostics = { stack.push(Route.Diagnostics) }, onSettings = { stack.push(Route.Settings) },
-                                active = active, notificationOnly = true, onBack = null,
-                                onReadNotification = viewModel::readNotification,
-                                onMarkAllNotificationsRead = viewModel::markAllNotificationsRead,
-                                notificationFilter = notificationFilter,
-                                onNotificationFilter = viewModel::setNotificationFilter,
-                                unreadFilters = state.unreadFilters)
-
+                            )
 
                             Route.Diagnostics -> DiagnosticsScreen(
                                 state = state,
@@ -1766,11 +1796,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                 )
             }
         }
-        val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        val isDetailRoute = stack.current is Route.TopicDetail || stack.current is Route.Chat || stack.current is Route.ChatRoom
-        val isTopicListRoute = stack.current is Route.TopicList || stack.current is Route.CategoryTopics || stack.current is Route.UserTopics || stack.current is Route.TagTopics
-        val effectiveBottomBarVisible = isBottomBarVisible || !isTopicListRoute
-        val shouldShowTabBar = effectiveBottomBarVisible && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
+        val shouldShowTabBar = listBars.value && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
         if (savedTopics.isNotEmpty() && !isDetailRoute && browsing && !contentObscured && !isKeyboardOpen) {
             SavedTopicChip(
                 savedTopics.size, { showSavedTopics = true },
@@ -1820,17 +1846,17 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         ) {
             TabBar(
                 selected,
+                modifier = boardSwipe,
                 homeFeedLabel = state.homeFeed.label,
                 categoriesTabLabel = if (categorySubTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) "标签" else "分类",
-                unreadCount = state.unreadCount,
+                unreadCount = state.unreadCount + chatUnread,
             ) { tab ->
                 if (browsing) {
                     if (tab == selected) {
                         stacks.getValue(tab).popToRoot()
                         scrollRequests.getValue(tab).intValue++
                     } else {
-                        selected = tab
-                        viewModel.setBottomBarVisible(true)
+                        selectBoard(tab)
                     }
                 }
             }

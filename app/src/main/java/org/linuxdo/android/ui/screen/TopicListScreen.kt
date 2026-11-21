@@ -15,9 +15,6 @@ import org.linuxdo.android.data.FloatingAction
 import org.linuxdo.android.data.ExcerptCache
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -30,7 +27,8 @@ import kotlin.math.cos
 import kotlin.math.sin
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animate
+import kotlinx.coroutines.Job
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -41,6 +39,8 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
@@ -101,11 +101,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -156,7 +153,11 @@ import org.linuxdo.android.data.TopicSortOrder
 import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.TopicListItem
 import org.linuxdo.android.ui.TopicUnreadDotPosition
+import org.linuxdo.android.ui.design.SectionHeader
+import org.linuxdo.android.ui.design.rememberTabBoundaryFeedback
+import org.linuxdo.android.ui.design.tabSwipeGesture
 import org.linuxdo.android.ui.design.IosActivityIndicator
+import org.linuxdo.android.ui.design.FeedItemDivider
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosLoadingBox
@@ -241,8 +242,6 @@ fun TopicListScreen(
     onPrefetchExcerpt: ((Any, List<Long>, () -> Set<Long>) -> Unit)? = null,
     onPrefetchExcerpts: ((List<Topic>) -> Unit)? = null,
     onScrollBusyChanged: ((Any, Boolean) -> Unit)? = null,
-    onBarsVisibilityChange: ((Boolean) -> Unit)? = null,
-    barsVisible: Boolean = true,
     blockedUsernames: Set<String> = emptySet(),
 ) {
     // 每个 feed 的滚动位置用 rememberLazyListState（内部走 rememberSaveable），
@@ -264,7 +263,7 @@ fun TopicListScreen(
     }
     val effectiveFeed = pendingSettledFeed ?: currentFeed
     val effectiveState = if (effectiveFeed != null && effectiveFeed != currentFeed) {
-        feedStates[effectiveFeed] ?: state
+        feedStates[effectiveFeed] ?: TopicListUiState(initialLoading = true)
     } else {
         state
     }
@@ -293,34 +292,6 @@ fun TopicListScreen(
         onDispose { onScrollBusyChanged?.invoke(scrollBusySource, false) }
     }
 
-    val nestedScrollConnection = remember(listState) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (!active) return Offset.Zero
-                val deltaY = available.y
-                if (deltaY < -15f) {
-                    onBarsVisibilityChange?.invoke(false)
-                } else if (deltaY > 15f) {
-                    onBarsVisibilityChange?.invoke(true)
-                }
-                return Offset.Zero
-            }
-        }
-    }
-
-    LaunchedEffect(active, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset) {
-        if (!active) return@LaunchedEffect
-        if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20) {
-            onBarsVisibilityChange?.invoke(true)
-        }
-    }
-    DisposableEffect(active) {
-        onDispose {
-            if (!active || onBack != null) {
-                onBarsVisibilityChange?.invoke(true)
-            }
-        }
-    }
     val pullState = rememberPullToRefreshState()
     val latestOnOpenMiniApps by rememberUpdatedState(onNavigateToApps)
     val miniAppsHeaderThreshold = with(LocalDensity.current) { 72.dp.toPx() }
@@ -442,40 +413,53 @@ fun TopicListScreen(
     }
 
     var containerWidthPx by remember { mutableFloatStateOf(0f) }
-    val feedDragOffsetPx = remember { Animatable(0f) }
-    var manualTargetFeed by remember { mutableStateOf<HomeFeedType?>(null) }
+    var feedOffset by remember { mutableFloatStateOf(0f) }
+    var incomingFeed by remember { mutableStateOf<HomeFeedType?>(null) }
+    var settleJob by remember { mutableStateOf<Job?>(null) }
 
     val latestEffectiveFeed by rememberUpdatedState(effectiveFeed)
     val latestOnFeedSelect by rememberUpdatedState(onFeedSelect)
-    val latestOnPreloadFeed by rememberUpdatedState(onPreloadFeed)
     val latestContainerWidthPx by rememberUpdatedState(containerWidthPx)
-    val feedSwipeEdgeMarginPx = with(LocalDensity.current) { 32.dp.toPx() }
-    val feedSwipeThresholdPx = with(LocalDensity.current) { 48.dp.toPx() }
+    val feedBoundary = rememberTabBoundaryFeedback()
 
-    val incomingFeed: HomeFeedType? = if (effectiveFeed != null && feedDragOffsetPx.value != 0f) {
-        if (manualTargetFeed != null && manualTargetFeed != effectiveFeed) {
-            manualTargetFeed
-        } else {
-            val feeds = HomeFeedType.entries
-            if (feedDragOffsetPx.value < 0f) {
-                feeds[(effectiveFeed.ordinal + 1) % feeds.size]
-            } else {
-                feeds[(effectiveFeed.ordinal - 1 + feeds.size) % feeds.size]
-            }
-        }
-    } else null
-
-    LaunchedEffect(incomingFeed) {
-        if (incomingFeed != null) {
-            onPreloadFeed?.invoke(incomingFeed)
+    LaunchedEffect(incomingFeed) { incomingFeed?.let { onPreloadFeed?.invoke(it) } }
+    DisposableEffect(active, containerWidthPx) {
+        onDispose {
+            settleJob?.cancel()
+            feedOffset = 0f
+            incomingFeed = null
         }
     }
 
-    val transitionProgress = if (containerWidthPx > 0f && incomingFeed != null) {
-        (abs(feedDragOffsetPx.value) / containerWidthPx).coerceIn(0f, 1f)
-    } else 0f
+    // 拖动时只改位移。位移由列表图层和指示线读取，不让整屏帖子随每一帧重组。
+    fun dragTo(rawOffset: Float, width: Float) {
+        val feed = latestEffectiveFeed ?: return
+        val next = rawOffset.coerceIn(-width, width)
+        val step = if (next < 0f) 1 else -1
+        incomingFeed = HomeFeedType.entries.getOrNull(feed.ordinal + step).takeIf { next != 0f }
+        feedOffset = if (incomingFeed != null) next else 0f
+    }
 
-    val secondaryListState = incomingFeed?.let { feedListStates[it] ?: feedStateLatest }
+    fun settle(target: HomeFeedType?, end: Float, width: Float) {
+        settleJob?.cancel()
+        settleJob = scope.launch {
+            val duration = (220 * abs(end - feedOffset) / width).toInt().coerceIn(85, 220)
+            animate(feedOffset, end, animationSpec = tween(duration, easing = FastOutSlowInEasing)) { value, _ ->
+                feedOffset = value
+            }
+            // 同一帧交接页面和位移，不让已选中的新页再吃到上一页的满屏偏移。
+            if (target != null) pendingSettledFeed = target
+            incomingFeed = null
+            feedOffset = 0f
+            if (target != null) latestOnFeedSelect?.invoke(target)
+        }
+    }
+
+    val slideProgress = remember {
+        { if (containerWidthPx > 0f) (abs(feedOffset) / containerWidthPx).coerceIn(0f, 1f) else 0f }
+    }
+    val previewFeed = incomingFeed
+    val secondaryListState = previewFeed?.let { feedListStates[it] ?: feedStateLatest }
     val incomingFeedState = incomingFeed?.let { feedStates[it] ?: TopicListUiState(initialLoading = true) }
     val incomingFilteredItems = remember(incomingFeedState?.items, blockedUsernames) {
         val raw = incomingFeedState?.items.orEmpty()
@@ -490,127 +474,42 @@ fun TopicListScreen(
         val cur = latestEffectiveFeed
         val width = latestContainerWidthPx
         val select = latestOnFeedSelect
-        if (cur == null || targetFeed == cur || width <= 0f || select == null) {
+        if (cur == null || width <= 0f || select == null) {
             select?.invoke(targetFeed)
+        } else if (targetFeed == cur) {
+            if (incomingFeed != null) settle(null, 0f, width)
         } else {
-            latestOnPreloadFeed?.invoke(targetFeed)
-            val dir = if (targetFeed.ordinal > cur.ordinal) -1f else 1f
-            scope.launch {
-                manualTargetFeed = targetFeed
-                feedDragOffsetPx.snapTo(0f)
-                feedDragOffsetPx.animateTo(
-                    targetValue = dir * width,
-                    animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
-                )
-                pendingSettledFeed = targetFeed
-                manualTargetFeed = null
-                select(targetFeed)
-                feedDragOffsetPx.snapTo(0f)
-            }
+            if (incomingFeed != targetFeed) feedOffset = 0f
+            incomingFeed = targetFeed
+            val end = if (targetFeed.ordinal > cur.ordinal) -width else width
+            settle(targetFeed, end, width)
         }
     }
 
-    val homeFeedSwipeModifier = if (currentFeed != null && onFeedSelect != null) {
-        Modifier.pointerInput(feedSwipeEdgeMarginPx, feedSwipeThresholdPx) {
-            awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
-                if (down.position.x < feedSwipeEdgeMarginPx ||
-                    (size.width > 0 && down.position.x > size.width - feedSwipeEdgeMarginPx)
-                ) {
-                    return@awaitEachGesture
-                }
-                var dragMode = 0 // 0: 未定, 1: 水平切标签, 2: 垂直滚动或其他手势
-                var totalPan = Offset.Zero
-                var horizontalDrag = 0f
-                val touchSlop = viewConfiguration.touchSlop
-
-                do {
-                    val event = awaitPointerEvent()
-                    val activePointers = event.changes.filter { it.pressed }
-                    if (activePointers.isEmpty()) break
-                    if (activePointers.size > 1) {
-                        dragMode = 2
-                        break
-                    }
-                    val change = activePointers.first()
-                    if (change.isConsumed && dragMode == 0) {
-                        dragMode = 2
-                        break
-                    }
-                    val delta = change.positionChange()
-                    when (dragMode) {
-                        1 -> {
-                            horizontalDrag += delta.x
-                            val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
-                            val clamped = horizontalDrag.coerceIn(-maxW, maxW)
-                            scope.launch { feedDragOffsetPx.snapTo(clamped) }
-                            change.consume()
-                        }
-                        0 -> {
-                            totalPan += delta
-                            if (totalPan.getDistance() > touchSlop) {
-                                if (abs(totalPan.x) > abs(totalPan.y) * 1.35f) {
-                                    dragMode = 1
-                                    manualTargetFeed = null
-                                    horizontalDrag = totalPan.x
-                                    val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
-                                    val clamped = horizontalDrag.coerceIn(-maxW, maxW)
-                                    scope.launch { feedDragOffsetPx.snapTo(clamped) }
-                                    change.consume()
-                                } else {
-                                    dragMode = 2
-                                    break
-                                }
-                            }
-                        }
-                    }
-                } while (event.changes.any { it.pressed })
-
-                if (dragMode == 1) {
-                    val maxW = latestContainerWidthPx.takeIf { it > 0f } ?: size.width.toFloat()
-                    val currentOffset = feedDragOffsetPx.value
-                    val threshold = if (maxW > 0f) maxOf(feedSwipeThresholdPx, maxW * 0.16f) else feedSwipeThresholdPx
-                    val feed = latestEffectiveFeed
-                    val select = latestOnFeedSelect
-                    if (feed != null && select != null && maxW > 0f && abs(currentOffset) >= threshold) {
-                        val feeds = HomeFeedType.entries
-                        val nextIndex = if (currentOffset < 0f) {
-                            (feed.ordinal + 1) % feeds.size
-                        } else {
-                            (feed.ordinal - 1 + feeds.size) % feeds.size
-                        }
-                        val targetFeed = feeds[nextIndex]
-                        val targetX = if (currentOffset < 0f) -maxW else maxW
-                        val remaining = (1f - abs(currentOffset) / maxW).coerceIn(0.15f, 1f)
-                        val durationMs = (220f * remaining).toInt().coerceIn(85, 220)
-                        scope.launch {
-                            feedDragOffsetPx.animateTo(
-                                targetValue = targetX,
-                                animationSpec = tween(durationMillis = durationMs, easing = FastOutSlowInEasing),
-                            )
-                            pendingSettledFeed = targetFeed
-                            manualTargetFeed = null
-                            select(targetFeed)
-                            feedDragOffsetPx.snapTo(0f)
-                        }
-                    } else {
-                        scope.launch {
-                            feedDragOffsetPx.animateTo(
-                                targetValue = 0f,
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioNoBouncy,
-                                    stiffness = Spring.StiffnessMediumLow,
-                                ),
-                            )
-                            manualTargetFeed = null
-                        }
-                    }
-                }
+    var rawDragOffset by remember { mutableFloatStateOf(0f) }
+    val homeFeedSwipeModifier = Modifier.tabSwipeGesture(
+        enabled = active && currentFeed != null && onFeedSelect != null,
+        onStart = {
+            settleJob?.cancel()
+            rawDragOffset = feedOffset
+        },
+        onDrag = { dx ->
+            rawDragOffset += dx
+            dragTo(rawDragOffset, latestContainerWidthPx)
+        },
+        onEnd = { step ->
+            val width = latestContainerWidthPx
+            val target = incomingFeed
+            val feed = latestEffectiveFeed
+            val commit = step != 0 && target != null && feed != null && target.ordinal == feed.ordinal + step
+            if (step != 0 && feed != null && feed.ordinal + step !in HomeFeedType.entries.indices) {
+                feedBoundary()
             }
-        }
-    } else {
-        Modifier
-    }
+            if (width > 0f && (feedOffset != 0f || commit)) {
+                settle(if (commit) target else null, if (commit) -step * width else 0f, width)
+            }
+        },
+    )
 
     fun LazyListScope.renderFeedItems(
         pageState: TopicListUiState,
@@ -632,8 +531,6 @@ fun TopicListScreen(
             items = pagePinnedGroups,
             key = { _, group -> "${keyPrefix}_pinned_${group.first().topic.id}" },
         ) { _, group ->
-            val isGraphic = feedDisplayMode == "graphic"
-            val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
             Column(modifier = Modifier.fillMaxWidth()) {
                 PinnedGroupCard(
                     items = group,
@@ -647,16 +544,7 @@ fun TopicListScreen(
                     showTopicUnreadDot = showTopicUnreadDot,
                     topicUnreadDotPosition = topicUnreadDotPosition,
                 )
-                if (isCardStyle) {
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(3.dp)
-                            .background(IosTheme.colors.groupedBackground)
-                    )
-                } else {
-                    IosDivider(startIndent = IosMetrics.screenPadding)
-                }
+                FeedItemDivider(feedDisplayMode)
             }
         }
 
@@ -674,7 +562,6 @@ fun TopicListScreen(
         ) { index, item ->
             val isHighlighted = item.topic.id in pageState.highlightedTopicIds
             val isGraphic = feedDisplayMode == "graphic"
-            val isCardStyle = isGraphic || feedDisplayMode == "no_excerpt"
             Column(modifier = Modifier.fillMaxWidth()) {
                 if (item.bookmarkId != null) {
                     var removing by remember(item.bookmarkId) { mutableStateOf(false) }
@@ -711,16 +598,7 @@ fun TopicListScreen(
                     topicUnreadDotPosition = topicUnreadDotPosition,
                 )
                 if (index < pagePlainItems.lastIndex) {
-                    if (isCardStyle) {
-                        Box(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(3.dp)
-                                .background(IosTheme.colors.groupedBackground)
-                        )
-                    } else {
-                        IosDivider(startIndent = IosMetrics.screenPadding)
-                    }
+                    FeedItemDivider(feedDisplayMode)
                 }
             }
         }
@@ -742,8 +620,7 @@ fun TopicListScreen(
         state = pullState,
         modifier = modifier
             .onSizeChanged { containerWidthPx = it.width.toFloat() }
-            .then(homeFeedSwipeModifier)
-            .nestedScroll(nestedScrollConnection),
+            .then(homeFeedSwipeModifier),
         indicator = {
             val fraction = pullState.distanceFraction
             // 初始加载时列表中央已有加载指示，这里再叠一个下拉转圈就成了两个圈。
@@ -774,37 +651,39 @@ fun TopicListScreen(
             onBack = onBack,
             compactTop = onBack == null,
             showLargeTitle = showLargeTitle,
-            barsVisible = barsVisible,
             scrollToTopRequest = scrollToTopRequest,
             trailing = trailing,
-            pageOffsetXProvider = if (effectiveFeed != null) ({ feedDragOffsetPx.value }) else null,
+            pageOffsetXProvider = if (effectiveFeed != null) ({ feedOffset }) else null,
             secondaryListState = secondaryListState,
             secondaryPageOffsetXProvider = if (incomingFeed != null) {
                 {
-                    val offset = feedDragOffsetPx.value
+                    val offset = feedOffset
                     if (offset < 0f) containerWidthPx + offset else -containerWidthPx + offset
                 }
             } else null,
-            secondaryContent = if (incomingFeed != null && incomingFeedState != null) {
+            secondaryContent = if (previewFeed != null && incomingFeedState != null) {
                 {
                     renderFeedItems(
                         pageState = incomingFeedState,
                         pagePinnedGroups = incomingPinnedGroups,
                         pagePlainItems = incomingPlainItems,
-                        keyPrefix = incomingFeed.name,
+                        keyPrefix = previewFeed.name,
                     )
                 }
             } else null,
             customLargeTitle = when {
                 effectiveFeed != null && onFeedSelect != null -> {
                     {
-                        Box(miniAppsHeaderGesture) { HomeFeedTitleBar(
-                            currentFeed = effectiveFeed,
-                            targetFeed = incomingFeed,
-                            transitionProgress = transitionProgress,
-                            onFeedSelect = animateSelectFeed,
-                            trailing = trailing,
-                        ) }
+                        Box(miniAppsHeaderGesture) {
+                            SectionHeader(
+                                labels = remember { HomeFeedType.entries.map { it.label } },
+                                selected = effectiveFeed.ordinal,
+                                onSelect = { animateSelectFeed(HomeFeedType.entries[it]) },
+                                indicatorPosition = {
+                                    effectiveFeed.ordinal + ((previewFeed ?: effectiveFeed).ordinal - effectiveFeed.ordinal) * slideProgress()
+                                },
+                            )
+                        }
                     }
                 }
                 hasCategoryDropdown -> {
@@ -821,16 +700,6 @@ fun TopicListScreen(
                 else -> null
             },
             customCollapsedTitle = when {
-                effectiveFeed != null && onFeedSelect != null -> {
-                    {
-                        Box(miniAppsHeaderGesture) { HomeFeedCollapsedBar(
-                            currentFeed = effectiveFeed,
-                            targetFeed = incomingFeed,
-                            transitionProgress = transitionProgress,
-                            onFeedSelect = animateSelectFeed,
-                        ) }
-                    }
-                }
                 hasCategoryDropdown -> {
                     {
                         CategoryVariantSelector(
@@ -3241,156 +3110,6 @@ fun parseCategoryColor(hex: String?): Color? {
     val cleaned = hex?.removePrefix("#")?.trim() ?: return null
     if (cleaned.length != 6) return null
     return runCatching { Color(cleaned.toLong(16) or 0xFF000000L) }.getOrNull()
-}
-
-@Composable
-private fun HomeFeedTitleBar(
-    currentFeed: HomeFeedType,
-    targetFeed: HomeFeedType?,
-    transitionProgress: Float,
-    onFeedSelect: (HomeFeedType) -> Unit,
-    trailing: @Composable () -> Unit,
-) {
-    val activeColor = IosTheme.colors.label
-    val inactiveColor = IosTheme.colors.secondaryLabel
-    val indicatorColor = IosTheme.colors.accent
-    val feeds = HomeFeedType.entries
-    val tabCenters = remember { FloatArray(feeds.size) }
-    val p = transitionProgress.coerceIn(0f, 1f)
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(IosMetrics.largeTitleHeight)
-            .padding(bottom = 4.dp),
-        contentAlignment = Alignment.BottomCenter,
-    ) {
-        Row(
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(22.dp),
-            modifier = Modifier.drawWithContent {
-                drawContent()
-                val curIdx = currentFeed.ordinal
-                val curCenter = tabCenters[curIdx]
-                if (curCenter > 0f) {
-                    val dstIdx = (targetFeed ?: currentFeed).ordinal
-                    val dstCenter = tabCenters[dstIdx].takeIf { it > 0f } ?: curCenter
-                    val center = curCenter + (dstCenter - curCenter) * p
-                    val baseWidth = 18.dp.toPx()
-                    val stretch = min(abs(dstCenter - curCenter) * 0.35f, 16.dp.toPx()) *
-                        sin(p * Math.PI.toFloat())
-                    val indicatorWidth = baseWidth + stretch
-                    val indicatorHeight = 3.dp.toPx()
-                    val topY = size.height - 2.dp.toPx() - indicatorHeight
-                    drawRoundRect(
-                        color = indicatorColor,
-                        topLeft = Offset(center - indicatorWidth / 2f, topY),
-                        size = Size(indicatorWidth, indicatorHeight),
-                        cornerRadius = CornerRadius(indicatorHeight / 2f, indicatorHeight / 2f),
-                    )
-                }
-            },
-        ) {
-            feeds.forEachIndexed { index, feed ->
-                val weight = when {
-                    targetFeed != null && targetFeed != currentFeed && feed == currentFeed -> 1f - p
-                    targetFeed != null && targetFeed != currentFeed && feed == targetFeed -> p
-                    feed == currentFeed -> 1f
-                    else -> 0f
-                }
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .onGloballyPositioned { coords ->
-                            tabCenters[index] = coords.positionInParent().x + coords.size.width / 2f
-                        }
-                        .clip(RoundedCornerShape(6.dp))
-                        .clickable { onFeedSelect(feed) }
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                ) {
-                    Text(
-                        text = feed.label,
-                        fontSize = (15f + 2.5f * weight).sp,
-                        fontWeight = if (weight >= 0.5f) FontWeight.Bold else FontWeight.Normal,
-                        color = lerp(inactiveColor, activeColor, weight),
-                    )
-                    Spacer(Modifier.height(7.dp))
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun HomeFeedCollapsedBar(
-    currentFeed: HomeFeedType,
-    targetFeed: HomeFeedType?,
-    transitionProgress: Float,
-    onFeedSelect: (HomeFeedType) -> Unit,
-) {
-    val activeColor = IosTheme.colors.label
-    val inactiveColor = IosTheme.colors.secondaryLabel
-    val indicatorColor = IosTheme.colors.accent
-    val feeds = HomeFeedType.entries
-    val tabCenters = remember { FloatArray(feeds.size) }
-    val p = transitionProgress.coerceIn(0f, 1f)
-    Box(
-        modifier = Modifier.fillMaxWidth(),
-        contentAlignment = Alignment.Center,
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(20.dp),
-            modifier = Modifier.drawWithContent {
-                drawContent()
-                val curIdx = currentFeed.ordinal
-                val curCenter = tabCenters[curIdx]
-                if (curCenter > 0f) {
-                    val dstIdx = (targetFeed ?: currentFeed).ordinal
-                    val dstCenter = tabCenters[dstIdx].takeIf { it > 0f } ?: curCenter
-                    val center = curCenter + (dstCenter - curCenter) * p
-                    val baseWidth = 16.dp.toPx()
-                    val stretch = min(abs(dstCenter - curCenter) * 0.35f, 14.dp.toPx()) *
-                        sin(p * Math.PI.toFloat())
-                    val indicatorWidth = baseWidth + stretch
-                    val indicatorHeight = 2.5.dp.toPx()
-                    val topY = size.height - 2.dp.toPx() - indicatorHeight
-                    drawRoundRect(
-                        color = indicatorColor,
-                        topLeft = Offset(center - indicatorWidth / 2f, topY),
-                        size = Size(indicatorWidth, indicatorHeight),
-                        cornerRadius = CornerRadius(indicatorHeight / 2f, indicatorHeight / 2f),
-                    )
-                }
-            },
-        ) {
-            feeds.forEachIndexed { index, feed ->
-                val weight = when {
-                    targetFeed != null && targetFeed != currentFeed && feed == currentFeed -> 1f - p
-                    targetFeed != null && targetFeed != currentFeed && feed == targetFeed -> p
-                    feed == currentFeed -> 1f
-                    else -> 0f
-                }
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .onGloballyPositioned { coords ->
-                            tabCenters[index] = coords.positionInParent().x + coords.size.width / 2f
-                        }
-                        .clip(RoundedCornerShape(6.dp))
-                        .clickable { onFeedSelect(feed) }
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                ) {
-                    Text(
-                        text = feed.label,
-                        fontSize = (14f + 1.5f * weight).sp,
-                        fontWeight = if (weight >= 0.5f) FontWeight.Bold else FontWeight.Normal,
-                        color = lerp(inactiveColor, activeColor, weight),
-                    )
-                    Spacer(Modifier.height(4.5.dp))
-                }
-            }
-        }
-    }
 }
 
 private val CATEGORY_LEVEL_REGEX = Regex("[,，\\s]*Lv\\s*(\\d+)\\s*$", RegexOption.IGNORE_CASE)

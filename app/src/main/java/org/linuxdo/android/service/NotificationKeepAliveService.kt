@@ -260,6 +260,7 @@ class NotificationKeepAliveService : Service() {
     }
 
     private fun exitScreenOffGrace() {
+        (application as? org.linuxdo.android.App)?.container?.chatRealtime?.setBackground(false)
         logService("退出息屏宽限期，停止长轮询")
         inScreenOffGrace = false
         graceOffJob?.cancel()
@@ -308,6 +309,7 @@ class NotificationKeepAliveService : Service() {
     }
 
     private fun startPollLoopIfNeeded() {
+        (application as? org.linuxdo.android.App)?.container?.chatRealtime?.setBackground(true)
         if (pollJob?.isActive == true) return
         logService("启动后台通知定期守护任务")
         pollJob = serviceScope.launch {
@@ -362,6 +364,7 @@ class NotificationKeepAliveService : Service() {
             delay(SCREEN_OFF_GRACE_MS)
             if (!isScreenInteractive(this@NotificationKeepAliveService)) {
                 inScreenOffGrace = false
+                (application as? org.linuxdo.android.App)?.container?.chatRealtime?.setBackground(false)
                 pollJob?.cancel()
                 pollJob = null
                 releaseGraceWakeLock()
@@ -396,6 +399,7 @@ class NotificationKeepAliveService : Service() {
     }
 
     private fun stopForSystemLimit(reason: String, startId: Int? = null) {
+        (application as? org.linuxdo.android.App)?.container?.chatRealtime?.setBackground(false)
         isStopping = true
         if (startId == null) {
             // 超时回调必须立即停止整个服务，不能使用可能过期的 startId。
@@ -413,6 +417,7 @@ class NotificationKeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        (application as? org.linuxdo.android.App)?.container?.chatRealtime?.setBackground(false)
         isStopping = true
         logService("服务销毁")
         unregisterScreenReceiver()

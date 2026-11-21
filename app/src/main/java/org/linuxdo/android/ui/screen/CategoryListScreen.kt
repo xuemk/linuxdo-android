@@ -94,6 +94,7 @@ import org.linuxdo.android.data.CustomSection
 import org.linuxdo.android.data.CustomSectionLink
 import org.linuxdo.android.data.flattenCategories
 import org.linuxdo.android.data.orderedCategoryGroups
+import org.linuxdo.android.ui.CategorySectionTab
 import org.linuxdo.android.ui.CategoriesUiState
 import org.linuxdo.android.ui.design.*
 
@@ -175,8 +176,8 @@ fun CategoryListScreen(
     scrollToTopRequest: Int = 0,
     onSaveOrder: (List<Long>) -> Unit = {},
     onResetOrder: () -> Unit = {},
-    currentTab: org.linuxdo.android.ui.CategorySectionTab = org.linuxdo.android.ui.CategorySectionTab.CATEGORIES,
-    onTabChange: (org.linuxdo.android.ui.CategorySectionTab) -> Unit = {},
+    currentTab: CategorySectionTab = CategorySectionTab.CATEGORIES,
+    onTabChange: (CategorySectionTab) -> Unit = {},
     tagsState: org.linuxdo.android.ui.TagsUiState = org.linuxdo.android.ui.TagsUiState(),
     tagSearchQuery: String = "",
     onTagSearchQueryChange: (String) -> Unit = {},
@@ -184,7 +185,9 @@ fun CategoryListScreen(
     onOpenTag: (String) -> Unit = {},
     trailing: @Composable () -> Unit = {},
 ) {
-    val listState = rememberLazyListState()
+    val categoriesList = rememberLazyListState()
+    val tagsList = rememberLazyListState()
+    val listState = if (currentTab == CategorySectionTab.CATEGORIES) categoriesList else tagsList
     val topScrollZone = with(LocalDensity.current) { 130.dp.toPx() }
     val bottomScrollZone = with(LocalDensity.current) { 140.dp.toPx() }
     val maxScrollSpeed = with(LocalDensity.current) { 14.dp.toPx() }
@@ -322,7 +325,7 @@ fun CategoryListScreen(
     }
 
     LaunchedEffect(currentTab) {
-        if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS && !tagsState.loaded && !tagsState.loading) {
+        if (currentTab == CategorySectionTab.TAGS && !tagsState.loaded && !tagsState.loading) {
             onRetryTags()
         }
     }
@@ -372,136 +375,24 @@ fun CategoryListScreen(
         }
     }
 
-    val latestCurrentTab by rememberUpdatedState(currentTab)
-    val latestOnTabChange by rememberUpdatedState(onTabChange)
-    val latestDraggedId by rememberUpdatedState(draggedId)
-    val tabSwipeEdgeMarginPx = with(LocalDensity.current) { 32.dp.toPx() }
-    val tabSwipeThresholdPx = with(LocalDensity.current) { 48.dp.toPx() }
-
-    val segmentTitle: @Composable () -> Unit = {
-        Box(
-            modifier = Modifier.fillMaxWidth(),
-            contentAlignment = Alignment.Center,
-        ) {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(IosTheme.colors.fieldBackground)
-                    .padding(2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val isDark = IosTheme.colors.isDark
-                val activeCardBg = if (isDark) Color(0xFF32353E) else Color.White
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) activeCardBg else Color.Transparent)
-                        .clickable { onTabChange(org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) }
-                        .padding(horizontal = 20.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        text = "分类",
-                        style = IosTheme.type.footnote,
-                        fontWeight = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
-                    )
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) activeCardBg else Color.Transparent)
-                        .clickable { onTabChange(org.linuxdo.android.ui.CategorySectionTab.TAGS) }
-                        .padding(horizontal = 20.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        text = "标签",
-                        style = IosTheme.type.footnote,
-                        fontWeight = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
-                    )
-                }
-            }
-        }
-    }
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInput(tabSwipeEdgeMarginPx, tabSwipeThresholdPx) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    if (latestDraggedId != null ||
-                        down.position.x < tabSwipeEdgeMarginPx ||
-                        (size.width > 0 && down.position.x > size.width - tabSwipeEdgeMarginPx)
-                    ) {
-                        return@awaitEachGesture
-                    }
-                    var dragMode = 0 // 0: 未定, 1: 水平切标签, 2: 垂直滚动或其他手势
-                    var totalPan = Offset.Zero
-                    var horizontalDrag = 0f
-                    val touchSlop = viewConfiguration.touchSlop
-
-                    do {
-                        val event = awaitPointerEvent()
-                        if (latestDraggedId != null) {
-                            dragMode = 2
-                            break
-                        }
-                        val activePointers = event.changes.filter { it.pressed }
-                        if (activePointers.isEmpty()) break
-                        if (activePointers.size > 1) {
-                            dragMode = 2
-                            break
-                        }
-                        val change = activePointers.first()
-                        if (change.isConsumed && dragMode == 0) {
-                            dragMode = 2
-                            break
-                        }
-                        val delta = change.positionChange()
-                        when (dragMode) {
-                            1 -> {
-                                horizontalDrag += delta.x
-                                change.consume()
-                            }
-                            0 -> {
-                                totalPan += delta
-                                if (totalPan.getDistance() > touchSlop) {
-                                    if (abs(totalPan.x) > abs(totalPan.y) * 1.35f) {
-                                        dragMode = 1
-                                        horizontalDrag = totalPan.x
-                                        change.consume()
-                                    } else {
-                                        dragMode = 2
-                                        break
-                                    }
-                                }
-                            }
-                        }
-                    } while (event.changes.any { it.pressed })
-
-                    if (dragMode == 1 && abs(horizontalDrag) >= tabSwipeThresholdPx) {
-                        val tabs = org.linuxdo.android.ui.CategorySectionTab.entries
-                        val nextIndex = if (horizontalDrag < 0f) {
-                            (latestCurrentTab.ordinal + 1) % tabs.size
-                        } else {
-                            (latestCurrentTab.ordinal - 1 + tabs.size) % tabs.size
-                        }
-                        latestOnTabChange(tabs[nextIndex])
-                    }
-                }
-            }
-    ) {
     IosLargeTitleScaffold(
-        title = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) "标签" else "分类",
+        title = if (currentTab == CategorySectionTab.TAGS) "标签" else "分类",
+        modifier = Modifier.boundedTabSwipe(currentTab.ordinal, CategorySectionTab.entries.size,
+            enabled = draggedId == null) { onTabChange(CategorySectionTab.entries[it]) },
         showLargeTitle = false,
         listState = listState,
-        compactTop = false,
         scrollToTopRequest = scrollToTopRequest,
-        trailing = if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) combinedTrailing else trailing,
-        customCollapsedTitle = segmentTitle,
+        fixedHeader = {
+            SectionHeader(
+                labels = listOf("分类", "标签"),
+                selected = currentTab.ordinal,
+                onSelect = { onTabChange(CategorySectionTab.entries[it]) },
+                actionWidth = 44.dp,
+                actions = if (currentTab == CategorySectionTab.CATEGORIES) combinedTrailing else trailing,
+            )
+        },
     ) {
-        if (currentTab == org.linuxdo.android.ui.CategorySectionTab.CATEGORIES) {
+        if (currentTab == CategorySectionTab.CATEGORIES) {
             if (state.loading) item("loading") { IosLoadingBox() }
             state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
             if (state.loaded && state.items.isEmpty()) item("empty") { EmptyNotice() }
@@ -732,7 +623,6 @@ fun CategoryListScreen(
                 }
             }
         }
-    }
     }
 
     if (showCustomSectionDialog) {

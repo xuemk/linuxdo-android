@@ -1242,6 +1242,7 @@ data class ChatMessageSummary(
 
 @Serializable
 data class ChatUserSummary(
+    val id: Long = 0L,
     val username: String = "",
     val name: String? = null,
     @SerialName("avatar_template") val avatarTemplate: String? = null,

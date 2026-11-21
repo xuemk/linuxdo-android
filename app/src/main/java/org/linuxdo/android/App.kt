@@ -141,6 +141,23 @@ class App : Application(), ImageLoaderFactory {
 }
 
 class AppContainer(context: Context) {
+    val chatRealtime by lazy {
+        org.linuxdo.android.data.ChatRealtime(topicRepository, sessionStore) { channel, message ->
+            val key = "chat_notified_${sessionStore.currentUserId()}_${channel.id}"
+            if (message.id > preferences.getLong(key, 0L)) {
+                val shown = org.linuxdo.android.service.NotificationHelper.showNotification(
+                    context = context,
+                    notificationId = message.id,
+                    title = "直接消息 · ${channel.displayTitle}",
+                    content = message.message.ifBlank { "收到一条新消息" },
+                    chatChannelId = channel.id,
+                    chatUserId = sessionStore.currentUserId(),
+                )
+                if (shown) preferences.edit().putLong(key, message.id).apply()
+            }
+        }
+    }
+
     val preferences = context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE)
     val diagnostics = Diagnostics(File(context.filesDir, "diagnostics.log")).also {
         org.linuxdo.android.net.NetDiagnostics.sink = it

@@ -79,6 +79,8 @@ import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosLoadingBox
+import org.linuxdo.android.ui.design.ListNavigationHeader
+import org.linuxdo.android.ui.design.scrollListBars
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosTheme
 
@@ -469,231 +471,233 @@ fun UserProfileScreen(
             .fillMaxSize()
             .background(if (isDark) Color(0xFF0F0F10) else Color(0xFFF7F8FA))
     ) {
-        // 顶部黑色星空微光头部卡片 (Header)
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF141416))
-        ) {
-            val bgUrl = userCard?.backgroundUrl
-            if (bgUrl != null) {
-                val bgRequest = org.linuxdo.android.ui.design.rememberAnimatedImageRequest(bgUrl)
-                AsyncImage(
-                    model = bgRequest ?: bgUrl,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.matchParentSize(),
-                )
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .background(
-                            androidx.compose.ui.graphics.Brush.verticalGradient(
-                                colors = listOf(
-                                    Color(0xFF141416).copy(alpha = 0.45f),
-                                    Color(0xFF141416).copy(alpha = 0.95f),
-                                ),
-                            ),
-                        ),
-                )
-            }
-            Column(
+        ListNavigationHeader {
+            // 顶部黑色星空微光头部卡片 (Header)
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(bottom = 12.dp)
+                    .background(Color(0xFF141416))
             ) {
-                Row(
+                val bgUrl = userCard?.backgroundUrl
+                if (bgUrl != null) {
+                    val bgRequest = org.linuxdo.android.ui.design.rememberAnimatedImageRequest(bgUrl)
+                    AsyncImage(
+                        model = bgRequest ?: bgUrl,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.matchParentSize(),
+                    )
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .background(
+                                androidx.compose.ui.graphics.Brush.verticalGradient(
+                                    colors = listOf(
+                                        Color(0xFF141416).copy(alpha = 0.45f),
+                                        Color(0xFF141416).copy(alpha = 0.95f),
+                                    ),
+                                ),
+                            ),
+                    )
+                }
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 6.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                        .statusBarsPadding()
+                        .padding(bottom = 12.dp)
                 ) {
-                    IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                            tint = Color.White,
-                        )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "返回",
+                                tint = Color.White,
+                            )
+                        }
+                        Spacer(Modifier.weight(1f))
+                        if (onComposePrivateMessage != null) {
+                            IconButton(
+                                onClick = { onComposePrivateMessage(username) },
+                                modifier = Modifier.size(40.dp)
+                            ) {
+                                Icon(Icons.Default.Email, contentDescription = "私信", tint = Color.White)
+                            }
+                        }
                     }
-                    Spacer(Modifier.weight(1f))
-                    if (onComposePrivateMessage != null) {
-                        IconButton(
-                            onClick = { onComposePrivateMessage(username) },
-                            modifier = Modifier.size(40.dp)
+
+                    val card = userCard
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 18.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.size(80.dp)) {
+                            val animCandidate = card?.animatedAvatar ?: AvatarCache.get(username) ?: initialAvatarUrl?.takeIf(::isAnimatedAvatarPath)
+                            val animUrl = avatarUrlOf(
+                                template = card?.avatarTemplate,
+                                animatedAvatar = animCandidate,
+                                size = 120,
+                                username = username,
+                            )
+                            val staticUrl = avatarUrlOf(template = card?.avatarTemplate, size = 120) ?: initialStaticAvatarUrl
+                            val avatar = if (isAnimatedAvatarPath(animCandidate)) {
+                                animUrl
+                            } else {
+                                animUrl ?: initialAvatarUrl ?: staticUrl
+                            }
+                            val avatarShape = org.linuxdo.android.ui.design.avatarShape(username, avatar, 12.dp)
+                            org.linuxdo.android.ui.design.UserAvatar(
+                                avatarUrl = avatar,
+                                fallbackUrl = staticUrl,
+                                username = username,
+                                modifier = Modifier
+                                    .size(76.dp)
+                                    .border(2.5.dp, Color.White, avatarShape),
+                                cornerRadius = 12.dp,
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .align(Alignment.BottomEnd)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF262628)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text("🔥", fontSize = 12.sp)
+                            }
+                        }
+
+                        Spacer(Modifier.width(16.dp))
+
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = card?.cleanDisplayName ?: username,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Icon(Icons.Default.Email, contentDescription = "私信", tint = Color.White)
+                            Text(
+                                text = "@$username",
+                                fontSize = 14.sp,
+                                color = Color(0xFFA1A1AA),
+                                maxLines = 1,
+                            )
+                            LevelBadge(card?.trustLevel ?: 2)
                         }
                     }
                 }
 
-                val card = userCard
+                // 个性签名药丸卡片
+                val bio = card?.bioExcerpt?.let {
+                    org.jsoup.Jsoup.parse(it).text()
+                }?.takeIf { it.isNotBlank() } ?: "这个人很懒，什么都没写"
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFF222226))
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = bio,
+                        fontSize = 13.5.sp,
+                        color = Color(0xFFD4D4D8),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text("›", fontSize = 16.sp, color = Color(0xFF71717A))
+                }
+
+                // 获赞、访问、话题、回复指标行
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 18.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Box(Modifier.size(80.dp)) {
-                        val animCandidate = card?.animatedAvatar ?: AvatarCache.get(username) ?: initialAvatarUrl?.takeIf(::isAnimatedAvatarPath)
-                        val animUrl = avatarUrlOf(
-                            template = card?.avatarTemplate,
-                            animatedAvatar = animCandidate,
-                            size = 120,
-                            username = username,
-                        )
-                        val staticUrl = avatarUrlOf(template = card?.avatarTemplate, size = 120) ?: initialStaticAvatarUrl
-                        val avatar = if (isAnimatedAvatarPath(animCandidate)) {
-                            animUrl
-                        } else {
-                            animUrl ?: initialAvatarUrl ?: staticUrl
-                        }
-                        val avatarShape = org.linuxdo.android.ui.design.avatarShape(username, avatar, 12.dp)
-                        org.linuxdo.android.ui.design.UserAvatar(
-                            avatarUrl = avatar,
-                            fallbackUrl = staticUrl,
-                            username = username,
-                            modifier = Modifier
-                                .size(76.dp)
-                                .border(2.5.dp, Color.White, avatarShape),
-                            cornerRadius = 12.dp,
-                        )
-                        Box(
-                            modifier = Modifier
-                                .size(24.dp)
-                                .align(Alignment.BottomEnd)
-                                .clip(CircleShape)
-                                .background(Color(0xFF262628)),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text("🔥", fontSize = 12.sp)
-                        }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(formatCount(summaryData?.likesReceived ?: card?.likesReceived ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
+                        Text("获赞", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
                     }
-
-                    Spacer(Modifier.width(16.dp))
-
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = card?.cleanDisplayName ?: username,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            text = "@$username",
-                            fontSize = 14.sp,
-                            color = Color(0xFFA1A1AA),
-                            maxLines = 1,
-                        )
-                        LevelBadge(card?.trustLevel ?: 2)
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val days = summaryData?.daysVisited
+                        Text(if (days != null) formatCount(days) else "-", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
+                        Text("访问", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(formatCount(summaryData?.topicCount ?: card?.topicCount ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
+                        Text("话题", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(formatCount(summaryData?.postCount ?: card?.postCount ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
+                        Text("回复", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
                     }
                 }
-            }
 
-            // 个性签名药丸卡片
-            val bio = card?.bioExcerpt?.let {
-                org.jsoup.Jsoup.parse(it).text()
-            }?.takeIf { it.isNotBlank() } ?: "这个人很懒，什么都没写"
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 6.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Color(0xFF222226))
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = bio,
-                    fontSize = 13.5.sp,
-                    color = Color(0xFFD4D4D8),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                Text("›", fontSize = 16.sp, color = Color(0xFF71717A))
-            }
-
-            // 获赞、访问、话题、回复指标行
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(formatCount(summaryData?.likesReceived ?: card?.likesReceived ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
-                    Text("获赞", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    val days = summaryData?.daysVisited
-                    Text(if (days != null) formatCount(days) else "-", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
-                    Text("访问", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(formatCount(summaryData?.topicCount ?: card?.topicCount ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
-                    Text("话题", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(formatCount(summaryData?.postCount ?: card?.postCount ?: 0), fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.5.sp)
-                    Text("回复", color = Color(0xFFA1A1AA), fontSize = 13.5.sp)
-                }
-            }
-
-            // 最后活跃状态小标
-            Box(
-                modifier = Modifier
-                    .padding(start = 18.dp, top = 4.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(Color(0xFF26262A))
-                    .padding(horizontal = 9.dp, vertical = 3.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("📍", fontSize = 10.sp)
-                    Text("活跃用户", fontSize = 11.5.sp, color = Color(0xFFA1A1AA))
+                // 最后活跃状态小标
+                Box(
+                    modifier = Modifier
+                        .padding(start = 18.dp, top = 4.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(Color(0xFF26262A))
+                        .padding(horizontal = 9.dp, vertical = 3.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("📍", fontSize = 10.sp)
+                        Text("活跃用户", fontSize = 11.5.sp, color = Color(0xFFA1A1AA))
+                    }
                 }
             }
         }
-    }
 
-        // ── 下半部分: 横向滑动 TabRow (总结、动态、话题、回复、赞、回应、Boost、投票、已解决) ──
-        ScrollableTabRow(
-            selectedTabIndex = selectedTab,
-            containerColor = if (isDark) Color(0xFF18181A) else Color.White,
-            contentColor = IosTheme.colors.accent,
-            edgePadding = 12.dp,
-            indicator = { tabPositions ->
-                if (selectedTab < tabPositions.size) {
-                    TabRowDefaults.SecondaryIndicator(
-                        Modifier.tabIndicatorOffset(tabPositions[selectedTab]),
-                        color = IosTheme.colors.accent,
-                        height = 2.5.dp,
+            // ── 下半部分: 横向滑动 TabRow (总结、动态、话题、回复、赞、回应、Boost、投票、已解决) ──
+            ScrollableTabRow(
+                selectedTabIndex = selectedTab,
+                containerColor = if (isDark) Color(0xFF18181A) else Color.White,
+                contentColor = IosTheme.colors.accent,
+                edgePadding = 12.dp,
+                indicator = { tabPositions ->
+                    if (selectedTab < tabPositions.size) {
+                        TabRowDefaults.SecondaryIndicator(
+                            Modifier.tabIndicatorOffset(tabPositions[selectedTab]),
+                            color = IosTheme.colors.accent,
+                            height = 2.5.dp,
+                        )
+                    }
+                },
+                divider = { IosDivider() },
+            ) {
+                tabEntries.forEachIndexed { index, tab ->
+                    val selected = selectedTab == index
+                    Tab(
+                        selected = selected,
+                        onClick = { selectedTab = index },
+                        text = {
+                            Text(
+                                text = tab.label,
+                                fontSize = 14.5.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                color = if (selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+                            )
+                        },
                     )
                 }
-            },
-            divider = { IosDivider() },
-        ) {
-            tabEntries.forEachIndexed { index, tab ->
-                val selected = selectedTab == index
-                Tab(
-                    selected = selected,
-                    onClick = { selectedTab = index },
-                    text = {
-                        Text(
-                            text = tab.label,
-                            fontSize = 14.5.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                            color = if (selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
-                        )
-                    },
-                )
             }
         }
 
@@ -764,7 +768,7 @@ fun UserProfileScreen(
             } else {
                 androidx.compose.foundation.lazy.LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.fillMaxSize().scrollListBars(listState),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
                 ) {
                     items(items, key = { it.id }) { item ->
@@ -805,6 +809,7 @@ private fun UserSummaryView(
 ) {
     val context = LocalContext.current
     val isDark = IosTheme.colors.isDark
+    val summaryScroll = rememberScrollState()
     val cardBg = if (isDark) Color(0xFF18181A) else Color.White
     val cardBorder = if (isDark) Color(0xFF262628) else Color(0xFFE5E7EB)
     val textPrimary = if (isDark) Color.White else Color(0xFF111827)
@@ -813,7 +818,8 @@ private fun UserSummaryView(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .scrollListBars(summaryScroll)
+            .verticalScroll(summaryScroll)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {

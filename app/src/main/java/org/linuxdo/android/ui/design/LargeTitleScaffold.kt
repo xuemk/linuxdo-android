@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -79,11 +80,11 @@ fun IosLargeTitleScaffold(
     onBack: (() -> Unit)? = null,
     compactTop: Boolean = false,
     showLargeTitle: Boolean = true,
-    barsVisible: Boolean = true,
     bottomPadding: Dp = 64.dp,
     backLabel: String = "返回",
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
+    fixedHeader: (@Composable () -> Unit)? = null,
     customLargeTitle: (@Composable () -> Unit)? = null,
     customCollapsedTitle: (@Composable () -> Unit)? = null,
     floatingOverlay: (@Composable BoxScope.() -> Unit)? = null,
@@ -95,7 +96,9 @@ fun IosLargeTitleScaffold(
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
     val density = LocalDensity.current
-    var navBarHeight by remember { mutableStateOf(IosMetrics.navBarHeight) }
+    var navBarHeight by remember(fixedHeader != null) {
+        mutableStateOf(if (fixedHeader != null) IosMetrics.largeTitleHeight else IosMetrics.navBarHeight)
+    }
     val titleBoxHeight = maxOf(
         if (compactTop) IosMetrics.largeTitleHeight else 34.dp,
         with(density) { IosTheme.type.largeTitle.lineHeight.toDp() } + 6.dp,
@@ -116,108 +119,97 @@ fun IosLargeTitleScaffold(
     }
 
     Box(modifier.fillMaxSize().clipToBounds().background(IosTheme.colors.groupedBackground)) {
-        if (secondaryContent != null && secondaryListState != null && secondaryPageOffsetXProvider != null) {
+        val feedHeader = pageOffsetXProvider != null && customLargeTitle != null && showLargeTitle
+        if (feedHeader) {
+            // 分类切换复用已显示的目标列表；顶部栏是两页共享的兄弟节点，不在任一横移裁剪区内。
+            val pages = listOfNotNull(secondaryListState, listState)
+            pages.forEach { page ->
+                androidx.compose.runtime.key(page) {
+                    val current = page === listState
+                    val offset = if (current) pageOffsetXProvider else secondaryPageOffsetXProvider
+                    val items = if (current) content else secondaryContent
+                    LazyColumn(
+                        state = page,
+                        userScrollEnabled = current,
+                        modifier = Modifier.fillMaxSize().scrollListBars(page, enabled = current)
+                            .graphicsLayer { translationX = offset?.invoke() ?: 0f },
+                        contentPadding = PaddingValues(bottom = bottomPadding),
+                    ) {
+                        item(key = "ios-large-title") { Spacer(Modifier.height(titleBoxHeight)) }
+                        items?.invoke(this)
+                    }
+                }
+            }
+        } else {
             LazyColumn(
-                state = secondaryListState,
-                userScrollEnabled = false,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        translationX = secondaryPageOffsetXProvider()
-                    },
+                state = listState,
+                modifier = Modifier.fillMaxSize().scrollListBars(listState),
                 contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding),
             ) {
                 if (showLargeTitle) {
-                    item(key = "ios-large-title-secondary-spacer") {
+                    item(key = "ios-large-title") {
                         Box(
                             Modifier
                                 .fillMaxWidth()
-                                .height(titleBoxHeight),
-                        )
-                    }
-                }
-                secondaryContent()
-            }
-        }
-
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .then(
-                    if (pageOffsetXProvider != null) {
-                        Modifier.graphicsLayer {
-                            translationX = pageOffsetXProvider()
-                        }
-                    } else {
-                        Modifier
-                    }
-                ),
-            contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding),
-        ) {
-            if (showLargeTitle) {
-                item(key = "ios-large-title") {
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(titleBoxHeight)
-                            .then(
-                                if (pageOffsetXProvider != null) {
-                                    Modifier.graphicsLayer {
-                                        translationX = -pageOffsetXProvider()
-                                    }
-                                } else {
-                                    Modifier
+                                .height(titleBoxHeight)
+                                .padding(horizontal = IosMetrics.screenPadding),
+                            contentAlignment = Alignment.BottomStart,
+                        ) {
+                            if (customLargeTitle != null) {
+                                customLargeTitle()
+                            } else {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = title,
+                                        style = IosTheme.type.largeTitle,
+                                        color = IosTheme.colors.label,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f).padding(bottom = 6.dp),
+                                    )
+                                    if (compactTop) trailing()
                                 }
-                            )
-                            .padding(horizontal = IosMetrics.screenPadding),
-                        contentAlignment = Alignment.BottomStart,
-                    ) {
-                        if (customLargeTitle != null) {
-                            customLargeTitle()
-                        } else {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = title,
-                                    style = IosTheme.type.largeTitle,
-                                    color = IosTheme.colors.label,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f).padding(bottom = 6.dp),
-                                )
-                                if (compactTop) trailing()
                             }
                         }
                     }
                 }
+                content()
             }
-            content()
+
         }
 
-        val showNavBar = (!compactTop || collapse > 0.01f || !showLargeTitle)
-        val atTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20
+        val showNavBar = feedHeader || !compactTop || collapse > 0.01f || !showLargeTitle
         AnimatedVisibility(
-            visible = showNavBar && (barsVisible || atTop),
+            visible = showNavBar && LocalListBars.current?.value != false,
             enter = slideInVertically(animationSpec = tween(220)) { -it } + fadeIn(animationSpec = tween(180)),
             exit = slideOutVertically(animationSpec = tween(220)) { -it } + fadeOut(animationSpec = tween(180)),
             modifier = Modifier.align(Alignment.TopStart),
         ) {
-            IosNavBar(
-                title = title,
-                modifier = Modifier.onSizeChanged { navBarHeight = with(density) { it.height.toDp() } },
-                titleAlpha = if (!showLargeTitle) 1f else collapse,
-                showDivider = if (!showLargeTitle) true else collapse > 0.01f,
-                backLabel = backLabel,
-                // 顶部时与大标题区同色、看起来融为一体,折叠后过渡成实色条。
-                background = if (!showLargeTitle) IosTheme.colors.card else lerp(
-                    IosTheme.colors.groupedBackground,
-                    IosTheme.colors.card,
-                    collapse,
-                ),
-                onBack = onBack,
-                trailing = trailing,
-                customTitle = customCollapsedTitle,
-            )
+            if (feedHeader) {
+                Box(Modifier.fillMaxWidth().height(titleBoxHeight)
+                    .background(IosTheme.colors.groupedBackground), contentAlignment = Alignment.Center) {
+                    customLargeTitle?.invoke()
+                }
+            } else if (fixedHeader != null) {
+                fixedHeader()
+            } else {
+                IosNavBar(
+                    title = title,
+                    modifier = Modifier.onSizeChanged { navBarHeight = with(density) { it.height.toDp() } },
+                    titleAlpha = if (!showLargeTitle) 1f else collapse,
+                    showDivider = if (!showLargeTitle) true else collapse > 0.01f,
+                    backLabel = backLabel,
+                    // 顶部时与大标题区同色、看起来融为一体,折叠后过渡成实色条。
+                    background = if (!showLargeTitle) IosTheme.colors.card else lerp(
+                        IosTheme.colors.groupedBackground,
+                        IosTheme.colors.card,
+                        collapse,
+                    ),
+                    onBack = onBack,
+                    trailing = trailing,
+                    customTitle = customCollapsedTitle,
+                )
+            }
         }
 
         floatingOverlay?.invoke(this)

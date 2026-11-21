@@ -224,12 +224,16 @@ object NotificationHelper {
         notificationType: Int? = null,
         badgeCount: Int? = null,
         dedupKey: String? = null,
+        chatChannelId: Long? = null,
+        chatUserId: Long? = null,
     ): Boolean {
         ensureNotificationChannels(context)
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return false
         val config = LinuxDoPushSdk.getConfig()
 
-        val notifIntId = if (topicId != null && postNumber != null && topicId > 0L) {
+        val notifIntId = if (chatChannelId != null) {
+            ("chat_${chatUserId}_${chatChannelId}").hashCode()
+        } else if (topicId != null && postNumber != null && topicId > 0L) {
             ("t_${topicId}_p_${postNumber}").hashCode()
         } else {
             (notificationId % Int.MAX_VALUE).toInt()
@@ -238,6 +242,11 @@ object NotificationHelper {
             action = "org.linuxdo.android.NOTIFICATION_CLICK_${notificationId}"
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("notification_id", notificationId)
+            if (chatChannelId != null) {
+                removeExtra("notification_id")
+                putExtra("chat_channel_id", chatChannelId)
+                putExtra("chat_user_id", chatUserId)
+            }
             if (notificationType != null) {
                 putExtra("notification_type", notificationType)
             }
