@@ -82,6 +82,7 @@ import org.linuxdo.android.data.AvatarCache
 import org.linuxdo.android.data.isAnimatedAvatarPath
 import org.linuxdo.android.data.ChatChannelSummary
 import org.linuxdo.android.data.ChatMessageSummary
+import org.linuxdo.android.data.mergeChatMessages
 import org.linuxdo.android.data.TrustReport
 import org.linuxdo.android.data.LdcUserInfo
 import org.linuxdo.android.data.FollowUser
@@ -601,6 +602,7 @@ data class ChatUiState(
     val loadingChannelId: Long? = null,
     val sendingChannelId: Long? = null,
     val error: String? = null,
+    val channelsError: String? = null,
 )
 
 data class SearchUiState(
@@ -988,7 +990,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 通知各分类的数据。`_profile` 的键是 ProfileSection,四个分类挤同一个槽位,
      * 所以额外按分类留一份,切标签才能命中缓存直接显示。
      */
-    private val notificationCache = mutableMapOf<NotificationFilter, ProfileUiState>()
+    private val notificationCache = MutableStateFlow<Map<NotificationFilter, ProfileUiState>>(emptyMap())
+    val notificationPages = notificationCache.asStateFlow()
     private val _composer = MutableStateFlow(ComposerUiState())
     val composer = _composer.asStateFlow()
     private val _topicCreator = MutableStateFlow(TopicCreatorUiState())
@@ -1245,6 +1248,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
     private val _chat = MutableStateFlow(ChatUiState())
     val chat: StateFlow<ChatUiState> = _chat.asStateFlow()
+    private val chatSyncedMessageIds = mutableMapOf<Long, Long>()
+    private val _pendingChatChannel = MutableStateFlow<Long?>(null)
+    val pendingChatChannel = _pendingChatChannel.asStateFlow()
+    fun openChatNotification(channelId: Long) { _pendingChatChannel.value = channelId }
+    fun clearChatNotification() { _pendingChatChannel.value = null }
+    fun setChatForeground(active: Boolean) = container.chatRealtime.setForeground(active)
+    fun setVisibleChatChannel(channelId: Long?) { container.chatRealtime.visibleChannelId = channelId }
+    fun markChatMessagesVisible(channelId: Long, messageId: Long) = container.chatRealtime.markRead(channelId, messageId)
     private val _treeView = MutableStateFlow(container.preferences.getBoolean("tree_view", true))
     val treeView = _treeView.asStateFlow()
     private val _showUnreadDot = MutableStateFlow(container.preferences.getBoolean("show_post_unread_dot", true))
@@ -1267,16 +1278,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         TopicUnreadDotPosition.fromId(container.preferences.getString("topic_unread_dot_position", "avatar"))
     )
     val topicUnreadDotPosition = _topicUnreadDotPosition.asStateFlow()
-    private val _isBarsVisible = MutableStateFlow(true)
-    val isBarsVisible: StateFlow<Boolean> = _isBarsVisible.asStateFlow()
-    val isBottomBarVisible: StateFlow<Boolean> get() = _isBarsVisible.asStateFlow()
-
-    fun setBarsVisible(visible: Boolean) {
-        if (_isBarsVisible.value != visible) {
-            _isBarsVisible.value = visible
-        }
-    }
-    fun setBottomBarVisible(visible: Boolean) = setBarsVisible(visible)
     private val _syncReadProgress = MutableStateFlow(container.reading.syncReadProgress)
     val syncReadProgress = _syncReadProgress.asStateFlow()
     data class NotificationTarget(val topicId: Long, val postNumber: Int?)
@@ -1331,7 +1332,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        notificationCache.values.forEach { cached ->
+        notificationCache.value.values.forEach { cached ->
             cached.content.entries.forEach { entry ->
                 if (entry.topicId == topicId && entry.unread) {
                     entry.id.toLongOrNull()?.let { id ->
@@ -3961,43 +3962,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadChatChannels(refresh: Boolean = false) {
-        if (_chat.value.loadingChannels) return
         if (!refresh && _chat.value.channels.isNotEmpty()) return
-        _chat.update { it.copy(loadingChannels = true, error = null) }
-        pageJobs["chatChannels"] = viewModelScope.launch {
-            try {
-                val channels = repository.fetchChatChannels()
-                _chat.update { it.copy(channels = channels, loadingChannels = false, error = null) }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                _chat.update { it.copy(loadingChannels = false, error = error.message ?: "Chat 频道加载失败") }
-            }
-        }
+        container.chatRealtime.refresh()
     }
 
     fun loadChatRoom(channelId: Long, refresh: Boolean = false) {
         val jobKey = "chatRoom:$channelId"
         if (pageJobs[jobKey]?.isActive == true) return
+        val generation = accountScopeGeneration
         pageJobs[jobKey] = viewModelScope.launch {
             if (!refresh) _chat.update { it.copy(loadingChannelId = channelId, error = null) }
             try {
-                val page = repository.fetchChatMessages(channelId, fromLastRead = !refresh)
-                val messages = page.messages
-                val oldMaxId = _chat.value.messagesByChannel[channelId].orEmpty().maxOfOrNull { it.id } ?: 0L
-                val newMaxId = messages.maxOfOrNull { it.id } ?: 0L
-                if (newMaxId > oldMaxId) repository.markChatChannelRead(channelId, newMaxId)
+                // 首次进入取最新窗口；重连从已加载末尾逐页补齐，不能只取最后 50 条造成缺口。
+                val existing = _chat.value.messagesByChannel[channelId].orEmpty()
+                val anchor = chatSyncedMessageIds[channelId]
+                val page = repository.fetchChatMessages(channelId, fromLastRead = false,
+                    direction = if (anchor != null) "future" else null, targetMessageId = anchor)
+                if (generation != accountScopeGeneration) return@launch
+                var messages = page.messages
+                var more = page.canLoadMoreFuture
+                var last = messages.maxOfOrNull { it.id } ?: anchor
+                while (more && last != null) {
+                    val next = repository.fetchChatMessages(channelId, fromLastRead = false, direction = "future", targetMessageId = last)
+                    if (generation != accountScopeGeneration) return@launch
+                    val nextLast = next.messages.maxOfOrNull { it.id }
+                    if (nextLast == null || nextLast <= last) break
+                    messages = mergeChatMessages(messages, next.messages)
+                    last = nextLast
+                    more = next.canLoadMoreFuture
+                }
+                messages.maxOfOrNull { it.id }?.let { chatSyncedMessageIds[channelId] = it }
                 _chat.update { current ->
-                    val merged = if (refresh) {
-                        (current.messagesByChannel[channelId].orEmpty() + messages)
-                            .distinctBy { it.id }
-                            .sortedBy { it.id }
-                    } else messages.sortedBy { it.id }
+                    val currentMessages = current.messagesByChannel[channelId].orEmpty()
+                    val before = existing.associateBy { it.id }
+                    val changedWhileLoading = currentMessages.filter { before[it.id] != it }
+                    val merged = mergeChatMessages(mergeChatMessages(currentMessages, messages), changedWhileLoading)
                     current.copy(
                         loadingChannelId = null,
                         error = null,
                         messagesByChannel = current.messagesByChannel + (channelId to merged),
-                        canLoadMorePastByChannel = current.canLoadMorePastByChannel + (channelId to page.canLoadMorePast),
+                        canLoadMorePastByChannel = if (anchor == null) current.canLoadMorePastByChannel + (channelId to page.canLoadMorePast)
+                            else current.canLoadMorePastByChannel,
                     )
                 }
             } catch (error: CancellationException) {
@@ -4042,14 +4047,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendChatMessage(channelId: Long, raw: String, uploadIds: List<Long> = emptyList()) {
+    fun sendChatMessage(channelId: Long, raw: String, uploadIds: List<Long> = emptyList(), onSent: () -> Unit = {}) {
         val message = raw.trim()
-        if (message.isBlank() || _chat.value.sendingChannelId != null) return
+        if ((message.isBlank() && uploadIds.isEmpty()) || _chat.value.sendingChannelId != null) return
+        val generation = accountScopeGeneration
         pageJobs["chatSend"] = viewModelScope.launch {
             _chat.update { it.copy(sendingChannelId = channelId, error = null) }
             try {
-                repository.sendChatMessage(channelId, message, uploadIds)
+                val sent = repository.sendChatMessage(channelId, message, uploadIds)
+                if (generation != accountScopeGeneration) return@launch
+                if (sent != null) _chat.update { current -> current.copy(messagesByChannel = current.messagesByChannel +
+                    (channelId to mergeChatMessages(current.messagesByChannel[channelId].orEmpty(), listOf(sent)))) }
+                onSent()
                 loadChatRoom(channelId, refresh = true)
+                loadChatChannels(refresh = true)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -4415,13 +4426,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (previous.loading) return
         if (!refresh && !more && previous.loaded && isCacheUsable(section, filter, previous)) return
         if (more && !previous.content.hasMore) return
-        val cursor = if (more) previous.content.nextCursor else 0
         pageJobs["profile:$section"] = viewModelScope.launch {
             _profile.update { it + (section to previous.copy(loading = true, error = null)) }
             try {
                 val fresh = fetchProfilePage(username, section, filter, previous, more)
                 _profile.update { it + (section to fresh) }
-                if (section == ProfileSection.Notifications) notificationCache[filter] = fresh
+                if (section == ProfileSection.Notifications) notificationCache.update { it + (filter to fresh) }
                 if (section == ProfileSection.Summary && !more) {
                     prewarmCurrentUserAvatar(username)
                     loadUserBadges(username, refresh = refresh)
@@ -4432,7 +4442,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _profile.update { it + (section to previous.copy(error = error.message ?: "加载失败")) }
                 handlePageFailure(error) { loadProfile(section, refresh = true) }
             } finally {
-                _profile.update { states -> states[section]?.let { states + (section to it.copy(loading = false)) } ?: states }
+                if (section != ProfileSection.Notifications || (isActive && _notificationFilter.value == filter)) {
+                    _profile.update { states -> states[section]?.let { states + (section to it.copy(loading = false)) } ?: states }
+                }
             }
         }
     }
@@ -4551,8 +4563,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         pageJobs["profile:${ProfileSection.Notifications}"]?.cancel()
         _notificationFilter.value = filter
 
-        val cached = notificationCache[filter]
-        val allCached = notificationCache[NotificationFilter.All]
+        val cached = notificationCache.value[filter]
+        val allCached = notificationCache.value[NotificationFilter.All]
 
         // 1. 若该分类已有新鲜缓存，且“全部”未产生更新的数据，直接秒显
         val isCachedFresh = cached != null && isCacheUsable(ProfileSection.Notifications, filter, cached)
@@ -4576,7 +4588,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 loadedAt = allCached.loadedAt,
                 unreadAtLoad = unreadBaseline(ProfileSection.Notifications, filter),
             )
-            notificationCache[filter] = derivedState
+            notificationCache.update { it + (filter to derivedState) }
             _profile.update { it + (ProfileSection.Notifications to derivedState.copy(loading = false, error = null)) }
 
             // 若本地派生出的条目足够丰富 (>= 15 条) 或全部通知已无更多，无需发起网络请求
@@ -4588,11 +4600,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 3. 冷启动无 All 缓存场景，保留现有旧数据静默加载，绝不清空抹白
-        if (cached != null) {
-            _profile.update { it + (ProfileSection.Notifications to cached.copy(loading = true, error = null)) }
-        }
-        loadProfile(ProfileSection.Notifications)
+        // 冷启动时先绑定目标分类，避免把上一页的列表或加载标记带进来。
+        _profile.update { it + (ProfileSection.Notifications to (cached ?: ProfileUiState()).copy(loading = false)) }
+        loadProfile(ProfileSection.Notifications, refresh = true)
     }
 
     fun setTopicListScrollBusy(source: Any, isBusy: Boolean) {
@@ -5117,7 +5127,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         loadedAt = settledAt,
                         unreadAtLoad = summary.unreadByFilter[NotificationFilter.All] ?: 0,
                     )
-                    notificationCache[NotificationFilter.All] = cachedPage
+                    notificationCache.update { it + (NotificationFilter.All to cachedPage) }
                 }
                 _state.update { it.copy(
                     unreadCount = summary.count,
@@ -5167,7 +5177,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val target = (listOf(current) + NotificationFilter.entries).distinct()
             .filter { it == current || it in unread }
             .firstOrNull { filter ->
-                val cached = notificationCache[filter]
+                val cached = notificationCache.value[filter]
                 cached == null || !isCacheUsable(ProfileSection.Notifications, filter, cached)
             } ?: return
 
@@ -5183,7 +5193,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             try {
                 val fresh = fetchProfilePage(username, ProfileSection.Notifications, target, ProfileUiState(), more = false)
-                notificationCache[target] = fresh
+                notificationCache.update { it + (target to fresh) }
                 if (_notificationFilter.value == target) {
                     _profile.update { it + (ProfileSection.Notifications to fresh) }
                 }
@@ -5194,7 +5204,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // 用户还没点进来,预取失败不该弹错误;真点进去时会正常重试并展示错误。
                 diagnostics.log("预取通知失败: ${error.javaClass.simpleName}")
             } finally {
-                if (showing) {
+                if (showing && isActive && _notificationFilter.value == target) {
                     _profile.update { states ->
                         states[ProfileSection.Notifications]?.let {
                             states + (ProfileSection.Notifications to it.copy(loading = false))
@@ -5215,7 +5225,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 panels + (ProfileSection.Notifications to notices.copy(content = markAllReadInPage(notices.content)))
             } ?: panels
         }
-        notificationCache.replaceAll { _, cached -> cached.copy(content = markAllReadInPage(cached.content)) }
+        notificationCache.update { pages -> pages.mapValues { (_, cached) -> cached.copy(content = markAllReadInPage(cached.content)) } }
         _state.update { state ->
             state.copy(
                 unreadCount = 0,
@@ -5250,7 +5260,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 两趟请求(各自还有 1 秒节流 + 往返)才更新,用户点进去再退回来会看到它还亮着。
         val type = knownType ?: _profile.value[ProfileSection.Notifications]?.content?.entries
             ?.firstOrNull { it.id == id.toString() }?.notificationType
-            ?: notificationCache.values.firstNotNullOfOrNull { page ->
+            ?: notificationCache.value.values.firstNotNullOfOrNull { page ->
                 page.content.entries.firstOrNull { it.id == id.toString() }?.notificationType
             }
         markReadLocally(id, type)
@@ -5284,7 +5294,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } ?: panels
         }
         // 按分类的缓存也要跟着改,否则切出去再切回来这条又变回未读。
-        notificationCache.replaceAll { _, cached -> cached.copy(content = markRead(cached.content)) }
+        notificationCache.update { pages -> pages.mapValues { (_, cached) -> cached.copy(content = markRead(cached.content)) } }
         if (type == null) {
             _state.update { state ->
                 state.copy(unreadCount = (state.unreadCount - 1).coerceAtLeast(0))
@@ -7691,6 +7701,27 @@ fun openTopicSearch(topicId: Long, title: String) {
 
     init {
         val app = getApplication<Application>()
+        viewModelScope.launch {
+            container.chatRealtime.state.collect { live ->
+                if (live.generation == store.sessionGeneration) _chat.update {
+                    it.copy(channels = live.channels, loadingChannels = live.loading, channelsError = live.error)
+                }
+            }
+        }
+        viewModelScope.launch {
+            container.chatRealtime.events.collect { event ->
+                if (event.generation != store.sessionGeneration) return@collect
+                if (event.resync) {
+                    container.chatRealtime.visibleChannelId?.let { loadChatRoom(it, refresh = true) }
+                } else if (event.channelId in _chat.value.messagesByChannel || event.channelId == container.chatRealtime.visibleChannelId) {
+                    _chat.update { current ->
+                        val messages = mergeChatMessages(current.messagesByChannel[event.channelId].orEmpty(), listOfNotNull(event.message))
+                            .filterNot { it.id in event.deletedIds }
+                        current.copy(messagesByChannel = current.messagesByChannel + (event.channelId to messages))
+                    }
+                }
+            }
+        }
         ExcerptCache.initialize(TopicOpStore(app))
         repository.onAutoHealRequested = {
             selfHealNetwork(context = null, silent = true)
@@ -8870,6 +8901,9 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     private fun clearAccountScopedState() {
+        container.chatRealtime.reset()
+        chatSyncedMessageIds.clear()
+        _pendingChatChannel.value = null
         signatureSyncJob?.cancel()
         signatureSyncJob = null
         _signatureSyncBusy.value = false
@@ -8942,7 +8976,7 @@ fun openTopicSearch(topicId: Long, title: String) {
         _profile.value = emptyMap()
         _userBadges.value = null
         _isUserBadgesLoading.value = false
-        notificationCache.clear()
+        notificationCache.value = emptyMap()
         _notificationFilter.value = NotificationFilter.All
         _pendingNotificationTarget.value = null
         synchronized(pendingNotificationRefreshTopics) {

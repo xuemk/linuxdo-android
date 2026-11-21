@@ -272,6 +272,15 @@ fun IosDivider(startIndent: Dp = IosMetrics.screenPadding, modifier: Modifier = 
     )
 }
 
+@Composable
+internal fun FeedItemDivider(feedDisplayMode: String) {
+    if (feedDisplayMode == "graphic" || feedDisplayMode == "no_excerpt") {
+        Box(Modifier.fillMaxWidth().height(3.dp).background(IosTheme.colors.groupedBackground))
+    } else {
+        IosDivider(startIndent = IosMetrics.screenPadding)
+    }
+}
+
 /** 通栏分隔线,用于导航栏与 TabBar 的边界。 */
 @Composable
 fun IosFullDivider(modifier: Modifier = Modifier) {

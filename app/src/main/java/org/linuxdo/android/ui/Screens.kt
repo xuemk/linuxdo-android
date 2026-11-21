@@ -124,6 +124,10 @@ import kotlinx.coroutines.cancel
 import org.linuxdo.android.data.EditorSuggestion
 import org.linuxdo.android.data.EditorCompletionRequest
 import org.linuxdo.android.ui.design.IosActivityIndicator
+import org.linuxdo.android.ui.design.ListNavigationHeader
+import org.linuxdo.android.ui.design.scrollListBars
+import org.linuxdo.android.ui.design.MessageFeedRow
+import org.linuxdo.android.ui.design.SectionHeader
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosRow
@@ -134,7 +138,6 @@ import org.linuxdo.android.ui.design.IosSwitch
 import org.linuxdo.android.ui.design.UserAvatar
 import org.linuxdo.android.ui.nav.SettingsPage
 import org.linuxdo.android.data.ProfileSection
-import org.linuxdo.android.data.NotificationFilter
 import org.linuxdo.android.ui.AccountUiState
 import org.linuxdo.android.ui.screen.AccountSwitchBottomSheet
 import coil.compose.AsyncImage
@@ -226,7 +229,6 @@ import org.linuxdo.android.ui.screen.levelPillColors
 import org.linuxdo.android.ui.screen.parseCategoryColor
 
 /** 列表攒够这么多条才允许继续自动翻页;不足则改成手动按钮。 */
-private const val AUTO_LOAD_THRESHOLD = 20
 
 /**
  * 角标实测下发后,桌面保持人造数字的时长。
@@ -477,17 +479,10 @@ fun ProfileScreen(
     username: String?,
     states: Map<ProfileSection, ProfileUiState>,
     onLoad: (ProfileSection, Boolean, Boolean) -> Unit,
-    onOpenTopic: (Long, String, Int?) -> Unit,
     onDiagnostics: () -> Unit,
     onSettings: () -> Unit,
     onLogout: () -> Unit = {},
     active: Boolean,
-    notificationOnly: Boolean = false,
-    onBack: (() -> Unit)? = null,
-    onReadNotification: (Long) -> Unit = {},
-    notificationFilter: NotificationFilter = NotificationFilter.All,
-    onNotificationFilter: (NotificationFilter) -> Unit = {},
-    unreadFilters: Set<NotificationFilter> = emptySet(),
     onOpenUserTopics: ((username: String, title: String, isBookmark: Boolean) -> Unit)? = null,
     draftCount: String = "0",
     onOpenDrafts: (() -> Unit)? = null,
@@ -499,7 +494,7 @@ fun ProfileScreen(
     onOpenConnect: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
     onOpenFollowing: () -> Unit = {},
-    onOpenChat: () -> Unit = {},
+    onOpenAppsPlaza: () -> Unit = {},
     onOpenBlacklist: () -> Unit = {},
     onOpenLdcStore: () -> Unit = {},
     onOpenLdcMail: () -> Unit = {},
@@ -508,7 +503,6 @@ fun ProfileScreen(
     onOpenUserReplies: ((String) -> Unit)? = null,
     onOpenUserActions: ((username: String, title: String, filter: String) -> Unit)? = null,
     scrollToTopRequest: Int = 0,
-    onMarkAllNotificationsRead: (() -> Unit)? = null,
     userBadges: List<UserBadgeItem>? = null,
     isUserBadgesLoading: Boolean = false,
     onRefreshUserBadges: (() -> Unit)? = null,
@@ -517,44 +511,17 @@ fun ProfileScreen(
     trailing: @Composable () -> Unit = {},
 ) {
     var selectedBadge by remember { mutableStateOf<UserBadgeItem?>(null) }
-    var section by rememberSaveable { mutableStateOf(if (notificationOnly) ProfileSection.Notifications else ProfileSection.Summary) }
-    var previousSection by rememberSaveable { mutableStateOf(section) }
     val list = rememberLazyListState()
-    val state = states[section] ?: ProfileUiState()
-    val summaryState = states[ProfileSection.Summary] ?: ProfileUiState()
-    val summaryFields = summaryState.content.fields
-
-    val visibleEntries = state.content.entries
-    val nearEnd by remember { derivedStateOf {
-        (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= list.layoutInfo.totalItemsCount - 3
-    } }
-    LaunchedEffect(section, active) {
+    val state = states[ProfileSection.Summary] ?: ProfileUiState()
+    val summaryFields = state.content.fields
+    LaunchedEffect(active) {
         if (active) {
-            onLoad(section, section == ProfileSection.Notifications, false)
-            if (section != ProfileSection.Summary && summaryFields.isEmpty()) {
-                onLoad(ProfileSection.Summary, false, false)
-            }
-            if (section != ProfileSection.Summary && !notificationOnly && userBadges == null && !isUserBadgesLoading) {
-                onRefreshUserBadges?.invoke()
-            }
-            if (!notificationOnly) {
-                kotlinx.coroutines.delay(600L)
-                onLoadCdkScore()
-            }
-        }
-        if (previousSection != section) {
-            previousSection = section
-            list.scrollToItem(0)
-        }
-    }
-    LaunchedEffect(active, nearEnd, state, notificationFilter) {
-        if (active && nearEnd && state.loaded && !state.loading && state.error == null &&
-            state.content.hasMore && visibleEntries.size >= AUTO_LOAD_THRESHOLD) {
-            onLoad(section, false, true)
+            onLoad(ProfileSection.Summary, false, false)
+            kotlinx.coroutines.delay(600L)
+            onLoadCdkScore()
         }
     }
     var showLogoutDialog by remember { mutableStateOf(false) }
-    var showMarkAllReadConfirmDialog by remember { mutableStateOf(false) }
     var showAccountSwitchSheet by remember { mutableStateOf(false) }
     val activeAccount = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }
 
@@ -571,642 +538,464 @@ fun ProfileScreen(
     val bookmarkCount = remember(summaryFields) { findMetric(summaryFields, "我的收藏") }
 
     IosLargeTitleScaffold(
-        title = if (notificationOnly) "通知" else "我的",
+        title = "我的",
         listState = list,
-        onBack = if (notificationOnly) null else onBack,
         showLargeTitle = false,
-        backLabel = if (notificationOnly) "" else "返回",
         scrollToTopRequest = scrollToTopRequest,
-        trailing = {
-            if (!notificationOnly) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    trailing()
-                    Spacer(Modifier.width(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .clickable(onClick = onSettings),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ProfileSettingsGearIcon(tint = IosTheme.colors.secondaryLabel)
-                    }
-                }
-            } else {
-                if (onMarkAllNotificationsRead != null) {
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .clickable {
-                                showMarkAllReadConfirmDialog = true
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        BroomGlyph(tint = IosTheme.colors.label)
-                    }
+        fixedHeader = { SectionHeader(labels = listOf("我的"), actionWidth = 48.dp) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                trailing()
+                Spacer(Modifier.width(10.dp))
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onSettings),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ProfileSettingsGearIcon(tint = IosTheme.colors.secondaryLabel)
                 }
             }
-        },
+        } },
     ) {
-        if (!notificationOnly) {
-            // ── 贴吧风格全新现代化个人主页 (顶部身份 + 晋级卡片 + 4列仪表盘 + 5宫格金刚位) ──
-            item("tieba-profile-header") {
-                val animCandidate = activeAccount?.animatedAvatar ?: AvatarCache.get(username)
-                val avatarUrl = avatarUrlOf(
-                    activeAccount?.avatarTemplate,
-                    animCandidate,
-                    size = 120,
-                    username = username,
-                )
-                val staticAvatarUrl = avatarUrlOf(activeAccount?.avatarTemplate, size = 120)
-                val level = activeAccount?.trustLevel ?: 0
+        // ── 贴吧风格全新现代化个人主页 (顶部身份 + 晋级卡片 + 4列仪表盘 + 5宫格金刚位) ──
+        item("tieba-profile-header") {
+            val animCandidate = activeAccount?.animatedAvatar ?: AvatarCache.get(username)
+            val avatarUrl = avatarUrlOf(
+                activeAccount?.avatarTemplate,
+                animCandidate,
+                size = 120,
+                username = username,
+            )
+            val staticAvatarUrl = avatarUrlOf(activeAccount?.avatarTemplate, size = 120)
+            val level = activeAccount?.trustLevel ?: 0
 
-                Column(
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val isDark = IosTheme.colors.isDark
+
+                // 1. 用户身份主卡片 (顶部大圆角，支持点击头像查看资料)
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(
+                            Brush.verticalGradient(
+                                if (isDark) {
+                                    listOf(Color(0xFF1E2430), Color(0xFF151922))
+                                } else {
+                                    listOf(Color(0xFFF8FAFC), Color(0xFFFFFFFF))
+                                }
+                            )
+                        )
+                        .border(
+                            1.dp,
+                            if (isDark) Color(0xFF2B3342) else Color(0xFFE2E8F0),
+                            RoundedCornerShape(16.dp)
+                        )
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
                 ) {
-                    val isDark = IosTheme.colors.isDark
-
-                    // 1. 用户身份主卡片 (顶部大圆角，支持点击头像查看资料)
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(
-                                Brush.verticalGradient(
-                                    if (isDark) {
-                                        listOf(Color(0xFF1E2430), Color(0xFF151922))
-                                    } else {
-                                        listOf(Color(0xFFF8FAFC), Color(0xFFFFFFFF))
-                                    }
-                                )
-                            )
-                            .border(
-                                1.dp,
-                                if (isDark) Color(0xFF2B3342) else Color(0xFFE2E8F0),
-                                RoundedCornerShape(16.dp)
-                            )
-                            .padding(horizontal = 14.dp, vertical = 12.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
+                        // 大头像 (外圈光环)
+                        Box(
+                            modifier = Modifier
+                                .size(58.dp)
+                                .clip(CircleShape)
+                                .border(
+                                    2.dp,
+                                    if (isDark) Color(0xFF0284C7) else Color(0xFFBAE6FD),
+                                    CircleShape
+                                )
+                                .clickable {
+                                    if (!username.isNullOrBlank()) {
+                                        val animPath = animCandidate?.takeIf(::isAnimatedAvatarPath)
+                                        val primaryToSend = if (animPath != null) avatarUrl else null
+                                        onOpenUser(username, primaryToSend, staticAvatarUrl)
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
                         ) {
-                            // 大头像 (外圈光环)
-                            Box(
-                                modifier = Modifier
-                                    .size(58.dp)
-                                    .clip(CircleShape)
-                                    .border(
-                                        2.dp,
-                                        if (isDark) Color(0xFF0284C7) else Color(0xFFBAE6FD),
-                                        CircleShape
-                                    )
-                                    .clickable {
-                                        if (!username.isNullOrBlank()) {
-                                            val animPath = animCandidate?.takeIf(::isAnimatedAvatarPath)
-                                            val primaryToSend = if (animPath != null) avatarUrl else null
-                                            onOpenUser(username, primaryToSend, staticAvatarUrl)
-                                        }
-                                    },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                UserAvatar(
-                                    avatarUrl = avatarUrl,
-                                    fallbackUrl = staticAvatarUrl,
-                                    username = username,
-                                    modifier = Modifier.fillMaxSize(),
-                                    cornerRadius = 29.dp,
-                                )
-                            }
-
-                            Spacer(Modifier.width(14.dp))
-
-                            // 用户信息
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(5.dp),
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    Text(
-                                        text = username ?: "尚未确认登录",
-                                        style = IosTheme.type.headline.copy(fontSize = 19.sp, fontWeight = FontWeight.Bold),
-                                        color = IosTheme.colors.label,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    ProfileVerifiedBadge()
-                                }
-
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    // 社区分胶囊
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(50))
-                                            .background(
-                                                if (isDark) Color(0x332B3950) else Color(0x181890FF)
-                                            )
-                                            .border(
-                                                1.dp,
-                                                if (isDark) Color(0x5538BDF8) else Color(0x351890FF),
-                                                RoundedCornerShape(50)
-                                            )
-                                            .padding(horizontal = 8.dp, vertical = 2.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            text = "社区分 ${cdkScore ?: "-"}",
-                                            style = IosTheme.type.caption.copy(
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = if (isDark) Color(0xFF7DD3FC) else Color(0xFF096DD9),
-                                            ),
-                                        )
-                                    }
-
-                                    // 获赞胶囊
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(50))
-                                            .background(
-                                                if (isDark) Color(0x20334155) else Color(0x1264748B)
-                                            )
-                                            .border(
-                                                1.dp,
-                                                if (isDark) Color(0x30475569) else Color(0x20CBD5E1),
-                                                RoundedCornerShape(50)
-                                            )
-                                            .padding(horizontal = 8.dp, vertical = 2.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            text = "获赞 $likesReceived",
-                                            style = IosTheme.type.caption.copy(
-                                                fontSize = 11.sp,
-                                                color = IosTheme.colors.secondaryLabel
-                                            ),
-                                        )
-                                    }
-                                }
-                            }
-
-                            // 切换账号胶囊 (参考图右侧圆角胶囊按钮)
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .background(if (isDark) Color(0x30334155) else Color(0xFFF1F5F9))
-                                    .border(
-                                        1.dp,
-                                        if (isDark) Color(0x50475569) else Color(0xFFE2E8F0),
-                                        RoundedCornerShape(50)
-                                    )
-                                    .clickable {
-                                        onRefreshAccounts()
-                                        showAccountSwitchSheet = true
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text(
-                                    text = "切换 ⇄",
-                                    style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
-                                    color = IosTheme.colors.secondaryLabel,
-                                )
-                            }
-                        }
-                    }
-
-                    // 2. 贴吧式「信任等级进阶微横幅」 (立体发光微光盾牌 + 严格联动用户等级设计规范配色)
-                    val bannerTheme = when (level) {
-                        1 -> ProfileBannerTheme(
-                            // Lv.1 活跃成员：科技冰蓝
-                            bgColors = if (isDark) listOf(Color(0xFF092032), Color(0xFF133854)) else listOf(Color(0xFFEBF5FF), Color(0xFFD0E8FF)),
-                            borderColor = if (isDark) Color(0xFF0369A1) else Color(0xFFBAE6FD),
-                            textColor = if (isDark) Color(0xFF7DD3FC) else Color(0xFF0369A1),
-                            btnColors = listOf(Color(0xFF0284C7), Color(0xFF0369A1)),
-                            shieldPrimary = Color(0xFF38BDF8),
-                            shieldAccent = Color(0xFF0284C7)
-                        )
-                        2 -> ProfileBannerTheme(
-                            // Lv.2 进阶成员：温润琥珀流金 (严格杜绝绿色！)
-                            bgColors = if (isDark) listOf(Color(0xFF2E1F0A), Color(0xFF463012)) else listOf(Color(0xFFFFF7E6), Color(0xFFFFE8BA)),
-                            borderColor = if (isDark) Color(0xFF784F12) else Color(0xFFFFD591),
-                            textColor = if (isDark) Color(0xFFFFD166) else Color(0xFF874D00),
-                            btnColors = listOf(Color(0xFFF59E0B), Color(0xFFD97706)),
-                            shieldPrimary = Color(0xFFFBBF24),
-                            shieldAccent = Color(0xFFD97706)
-                        )
-                        3 -> ProfileBannerTheme(
-                            // Lv.3 资深核心：华贵深鎏金皇冠
-                            bgColors = if (isDark) listOf(Color(0xFF382305), Color(0xFF523508)) else listOf(Color(0xFFFFF2E8), Color(0xFFFFDBB5)),
-                            borderColor = if (isDark) Color(0xFF92400E) else Color(0xFFFFBB96),
-                            textColor = if (isDark) Color(0xFFFFC069) else Color(0xFF9A3412),
-                            btnColors = listOf(Color(0xFFEA580C), Color(0xFFC2410C)),
-                            shieldPrimary = Color(0xFFFCD34D),
-                            shieldAccent = Color(0xFFD97706)
-                        )
-                        4 -> ProfileBannerTheme(
-                            // Lv.4 领袖成员：尊贵紫晶
-                            bgColors = if (isDark) listOf(Color(0xFF2B1038), Color(0xFF3F1952)) else listOf(Color(0xFFFAF5FF), Color(0xFFE9D5FF)),
-                            borderColor = if (isDark) Color(0xFF6B21A8) else Color(0xFFD8B4FE),
-                            textColor = if (isDark) Color(0xFFD8B4FE) else Color(0xFF6B21A8),
-                            btnColors = listOf(Color(0xFF9333EA), Color(0xFF7E22CE)),
-                            shieldPrimary = Color(0xFFD8B4FE),
-                            shieldAccent = Color(0xFF9333EA)
-                        )
-                        else -> ProfileBannerTheme(
-                            // Lv.0 探索者：钛金银灰
-                            bgColors = if (isDark) listOf(Color(0xFF1E2128), Color(0xFF2B2F38)) else listOf(Color(0xFFF1F3F5), Color(0xFFE2E8F0)),
-                            borderColor = if (isDark) Color(0xFF475569) else Color(0xFFCBD5E1),
-                            textColor = if (isDark) Color(0xFFCBD5E1) else Color(0xFF475569),
-                            btnColors = listOf(Color(0xFF64748B), Color(0xFF475569)),
-                            shieldPrimary = Color(0xFFCBD5E1),
-                            shieldAccent = Color(0xFF64748B)
-                        )
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Brush.horizontalGradient(bannerTheme.bgColors))
-                            .border(
-                                1.dp,
-                                bannerTheme.borderColor,
-                                RoundedCornerShape(16.dp)
+                            UserAvatar(
+                                avatarUrl = avatarUrl,
+                                fallbackUrl = staticAvatarUrl,
+                                username = username,
+                                modifier = Modifier.fillMaxSize(),
+                                cornerRadius = 29.dp,
                             )
-                            .clickable(onClick = onOpenConnect)
-                            .padding(horizontal = 14.dp, vertical = 10.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                        }
+
+                        Spacer(Modifier.width(14.dp))
+
+                        // 用户信息
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                // 左侧立体微光盾牌
-                                ProfileShieldBadge(
-                                    level = level,
-                                    primaryColor = bannerTheme.shieldPrimary,
-                                    accentColor = bannerTheme.shieldAccent
-                                )
-                                val levelStatusText = if (level >= 3) "继续保持" else "继续加油"
-                                Text(
-                                    text = "信任等级 Lv.$level · $levelStatusText",
-                                    style = IosTheme.type.caption.copy(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold),
-                                    color = bannerTheme.textColor,
-                                )
-                            }
-                            // 右侧发光胶囊按钮
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .background(Brush.horizontalGradient(bannerTheme.btnColors))
-                                    .border(1.dp, Color(0x60FFFFFF), RoundedCornerShape(50))
-                                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                                contentAlignment = Alignment.Center,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
                                 Text(
-                                    text = "等级积分",
-                                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Bold),
-                                    color = Color.White,
-                                )
-                            }
-                        }
-                    }
-
-                    // 3. 4 列核心大数字横排仪表盘
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(IosTheme.colors.card)
-                            .border(
-                                1.dp,
-                                if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
-                                RoundedCornerShape(16.dp)
-                            )
-                            .padding(vertical = 12.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceAround,
-                        ) {
-                            // 我的发帖
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable {
-                                        if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "创建的话题", false)
-                                    }
-                            ) {
-                                Text(
-                                    text = topicCount,
-                                    style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
-                                    color = IosTheme.colors.label,
-                                )
-                                Spacer(Modifier.height(4.dp))
-                                Text("发帖", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
-                            }
-                            // 我的回帖
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable {
-                                        if (!username.isNullOrBlank()) onOpenUserReplies?.invoke(username)
-                                    }
-                            ) {
-                                Text(
-                                    text = postCount,
-                                    style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
-                                    color = IosTheme.colors.label,
-                                )
-                                Spacer(Modifier.height(4.dp))
-                                Text("我的回帖", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
-                            }
-                            // 阅读时长
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.2f)) {
-                                Text(
-                                    text = timeRead,
-                                    style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
+                                    text = username ?: "尚未确认登录",
+                                    style = IosTheme.type.headline.copy(fontSize = 19.sp, fontWeight = FontWeight.Bold),
                                     color = IosTheme.colors.label,
                                     maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
-                                Spacer(Modifier.height(4.dp))
-                                Text("阅读时长", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
+                                ProfileVerifiedBadge()
                             }
-                            // 访问天数
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = daysVisited,
-                                    style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
-                                    color = IosTheme.colors.label,
-                                )
-                                Spacer(Modifier.height(4.dp))
-                                Text("访问天数", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
-                            }
-                        }
-                    }
 
-                    // 4. 5 联微光玻璃球拟态金刚位 (参考图通透悬浮排列)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // 1: 我的收藏 (金色星芒)
-                        SphereIconButton(
-                            title = "我的收藏",
-                            iconGlyph = "⭐",
-                            glowColor = Color(0xFFFAAD14),
-                            onClick = {
-                                if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "我的收藏", true)
-                            },
-                            modifier = Modifier.weight(1f)
-                        )
-                        // 2: 我的点赞 (珊瑚暖橙赞)
-                        SphereIconButton(
-                            title = "我的点赞",
-                            iconGlyph = "👍",
-                            glowColor = Color(0xFFFF5722),
-                            onClick = {
-                                if (!username.isNullOrBlank() && onOpenUserActions != null) {
-                                    onOpenUserActions(username, "我的点赞", "1")
-                                } else {
-                                    section = ProfileSection.Summary
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
-                        )
-                        // 3: 浏览历史 (科技冰蓝钟)
-                        SphereIconButton(
-                            title = "浏览历史",
-                            iconGlyph = "🕒",
-                            glowColor = Color(0xFF1890FF),
-                            onClick = onOpenHistory,
-                            modifier = Modifier.weight(1f)
-                        )
-                        // 4: 我的关注 (天蓝双人群组)
-                        SphereIconButton(
-                            title = "我的关注",
-                            iconGlyph = "👥",
-                            glowColor = Color(0xFF2F54EB),
-                            onClick = onOpenFollowing,
-                            modifier = Modifier.weight(1f)
-                        )
-                        // 5: 草稿箱 (翡翠薄荷铅笔)
-                        SphereIconButton(
-                            title = "草稿箱",
-                            iconGlyph = "✏️",
-                            glowColor = Color(0xFF52C41A),
-                            onClick = { onOpenDrafts?.invoke() },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, Modifier.weight(1f).fillMaxHeight())
-                        ProfileQuickLink("专属邮箱", "✉️", onOpenLdcMail, Modifier.weight(1f).fillMaxHeight())
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        ProfileQuickLink("实时聊天", "💬", onOpenChat, Modifier.weight(1f).fillMaxHeight())
-                        ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
-                    }
-
-                    // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
-                    UserBadgesSectionCard(
-                        badges = userBadges,
-                        isLoading = isUserBadgesLoading,
-                        onRefresh = onRefreshUserBadges,
-                        onBadgeClick = { selectedBadge = it },
-                    )
-                }
-            }
-        }
-
-        // 通知分类 Tab (全部、回复、点赞、私信)
-        if (section == ProfileSection.Notifications) item("notification-filters") {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                NotificationFilter.entries.forEach { filter ->
-                    val selected = notificationFilter == filter
-                    val color = if (selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel
-                    val hasUnread = filter != NotificationFilter.All && (
-                        filter in unreadFilters || visibleEntries.any { it.unread && filter.includes(it.notificationType) }
-                    )
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (selected) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card)
-                            .clickable { onNotificationFilter(filter) }
-                            .padding(vertical = 10.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (hasUnread) {
-                            Box(
-                                Modifier
-                                    .size(6.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFFFF3B30)),
-                            )
-                            Spacer(Modifier.width(4.dp))
-                        }
-                        NotificationTabIcon(filter, color)
-                        Text(
-                            text = filter.label,
-                            style = IosTheme.type.subheadline,
-                            color = color,
-                            modifier = Modifier.padding(start = 5.dp),
-                        )
-                    }
-                }
-            }
-        }
-
-
-        if (state.loading && !state.loaded) item("loading") { IosLoadingBox() }
-        state.error?.let { message -> item("error") { ErrorNotice(message) { onLoad(section, true, false) } } }
-
-        if (section != ProfileSection.Summary) {
-            items(visibleEntries, key = { it.id }) { entry ->
-                val notification = section == ProfileSection.Notifications
-                IosGroupCard(Modifier.padding(bottom = if (notification) 4.dp else 8.dp)) {
-                    IosRow(onClick = {
-                        if (section == ProfileSection.Notifications && entry.unread) entry.id.toLongOrNull()?.let(onReadNotification)
-                        entry.topicId?.let { onOpenTopic(it, entry.title, entry.postNumber) }
-                    }) {
-                        if (entry.unread) Text("•", color = IosTheme.colors.accent, modifier = Modifier.padding(end = 6.dp))
-                        if (notification) {
-                            NotificationAvatarWithBadge(
-                                avatarUrl = entry.avatarUrl,
-                                actor = entry.actor,
-                                notificationType = entry.notificationType,
-                                unread = entry.unread,
-                                onClick = { entry.actor?.let { onOpenUser(it, entry.avatarUrl, null) } },
-                            )
-                            Spacer(Modifier.width(10.dp))
-                        } else {
-                            entry.avatarUrl?.let { url ->
-                                AsyncImage(
-                                    url,
-                                    entry.actor,
-                                    modifier = Modifier.size(32.dp).clip(avatarShape(entry.actor, url, 4.dp))
-                                        .clickable(enabled = !entry.actor.isNullOrBlank()) { entry.actor?.let { onOpenUser(it, url, null) } },
-                                )
-                                Spacer(Modifier.width(10.dp))
-                            }
-                        }
-                        Column(Modifier.weight(1f).padding(vertical = if (notification) 0.dp else 4.dp)) {
-                            if (notification) {
-                                val typeTag = notificationTypeTag(entry.notificationType)
-                                val dateStr = entry.subtitle.substringAfterLast(" · ").takeLast(5)
-                                Row(
-                                    Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Row(
-                                        Modifier.weight(1f),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        if (!entry.actor.isNullOrBlank()) {
-                                            Text(
-                                                text = entry.actor,
-                                                style = IosTheme.type.footnote,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                            )
-                                            Spacer(Modifier.width(6.dp))
-                                        }
-                                        Box(
-                                            Modifier
-                                                .clip(RoundedCornerShape(4.dp))
-                                                .background(notificationTypeTint(entry.notificationType).copy(alpha = 0.13f))
-                                                .padding(horizontal = 5.dp, vertical = 1.dp),
-                                        ) {
-                                            Text(
-                                                text = typeTag,
-                                                style = IosTheme.type.caption.copy(fontSize = 11.sp),
-                                                fontWeight = FontWeight.Medium,
-                                                color = notificationTypeTint(entry.notificationType),
-                                            )
-                                        }
-                                    }
-                                    if (dateStr.isNotBlank()) {
-                                        Text(
-                                            text = dateStr,
-                                            style = IosTheme.type.caption,
-                                            color = IosTheme.colors.secondaryLabel,
-                                            modifier = Modifier.padding(start = 6.dp),
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                // 社区分胶囊
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(
+                                            if (isDark) Color(0x332B3950) else Color(0x181890FF)
                                         )
-                                    }
+                                        .border(
+                                            1.dp,
+                                            if (isDark) Color(0x5538BDF8) else Color(0x351890FF),
+                                            RoundedCornerShape(50)
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "社区分 ${cdkScore ?: "-"}",
+                                        style = IosTheme.type.caption.copy(
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (isDark) Color(0xFF7DD3FC) else Color(0xFF096DD9),
+                                        ),
+                                    )
                                 }
-                            } else {
-                                entry.actor?.let { actor ->
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(actor, style = IosTheme.type.footnote, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                                    }
+
+                                // 获赞胶囊
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(
+                                            if (isDark) Color(0x20334155) else Color(0x1264748B)
+                                        )
+                                        .border(
+                                            1.dp,
+                                            if (isDark) Color(0x30475569) else Color(0x20CBD5E1),
+                                            RoundedCornerShape(50)
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "获赞 $likesReceived",
+                                        style = IosTheme.type.caption.copy(
+                                            fontSize = 11.sp,
+                                            color = IosTheme.colors.secondaryLabel
+                                        ),
+                                    )
                                 }
                             }
+                        }
+
+                        // 切换账号胶囊 (参考图右侧圆角胶囊按钮)
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(if (isDark) Color(0x30334155) else Color(0xFFF1F5F9))
+                                .border(
+                                    1.dp,
+                                    if (isDark) Color(0x50475569) else Color(0xFFE2E8F0),
+                                    RoundedCornerShape(50)
+                                )
+                                .clickable {
+                                    onRefreshAccounts()
+                                    showAccountSwitchSheet = true
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
                             Text(
-                                text = entry.title,
-                                style = if (notification) IosTheme.type.subheadline else IosTheme.type.body,
-                                maxLines = if (notification) 2 else 3,
-                                modifier = Modifier.padding(top = if (notification) 2.dp else 0.dp),
+                                text = "切换 ⇄",
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
                             )
-                            if (!notification && entry.subtitle.isNotBlank()) Text(entry.subtitle, style = IosTheme.type.footnote,
-                                color = IosTheme.colors.secondaryLabel, maxLines = 3, modifier = Modifier.padding(top = 6.dp))
                         }
                     }
                 }
-            }
-        }
 
-        // 还有更多但不足一屏: 给手动加载入口
-        if (state.loaded && !state.loading && state.error == null && state.content.hasMore &&
-            visibleEntries.size < AUTO_LOAD_THRESHOLD && state.content.fields.isEmpty()) {
-            item("load-more") {
-                Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
-                    IosTextAction(if (visibleEntries.isEmpty()) "这一页没有更多，继续往前找" else "加载更早的记录") {
-                        onLoad(section, false, true)
+                // 2. 贴吧式「信任等级进阶微横幅」 (立体发光微光盾牌 + 严格联动用户等级设计规范配色)
+                val bannerTheme = when (level) {
+                    1 -> ProfileBannerTheme(
+                        // Lv.1 活跃成员：科技冰蓝
+                        bgColors = if (isDark) listOf(Color(0xFF092032), Color(0xFF133854)) else listOf(Color(0xFFEBF5FF), Color(0xFFD0E8FF)),
+                        borderColor = if (isDark) Color(0xFF0369A1) else Color(0xFFBAE6FD),
+                        textColor = if (isDark) Color(0xFF7DD3FC) else Color(0xFF0369A1),
+                        btnColors = listOf(Color(0xFF0284C7), Color(0xFF0369A1)),
+                        shieldPrimary = Color(0xFF38BDF8),
+                        shieldAccent = Color(0xFF0284C7)
+                    )
+                    2 -> ProfileBannerTheme(
+                        // Lv.2 进阶成员：温润琥珀流金 (严格杜绝绿色！)
+                        bgColors = if (isDark) listOf(Color(0xFF2E1F0A), Color(0xFF463012)) else listOf(Color(0xFFFFF7E6), Color(0xFFFFE8BA)),
+                        borderColor = if (isDark) Color(0xFF784F12) else Color(0xFFFFD591),
+                        textColor = if (isDark) Color(0xFFFFD166) else Color(0xFF874D00),
+                        btnColors = listOf(Color(0xFFF59E0B), Color(0xFFD97706)),
+                        shieldPrimary = Color(0xFFFBBF24),
+                        shieldAccent = Color(0xFFD97706)
+                    )
+                    3 -> ProfileBannerTheme(
+                        // Lv.3 资深核心：华贵深鎏金皇冠
+                        bgColors = if (isDark) listOf(Color(0xFF382305), Color(0xFF523508)) else listOf(Color(0xFFFFF2E8), Color(0xFFFFDBB5)),
+                        borderColor = if (isDark) Color(0xFF92400E) else Color(0xFFFFBB96),
+                        textColor = if (isDark) Color(0xFFFFC069) else Color(0xFF9A3412),
+                        btnColors = listOf(Color(0xFFEA580C), Color(0xFFC2410C)),
+                        shieldPrimary = Color(0xFFFCD34D),
+                        shieldAccent = Color(0xFFD97706)
+                    )
+                    4 -> ProfileBannerTheme(
+                        // Lv.4 领袖成员：尊贵紫晶
+                        bgColors = if (isDark) listOf(Color(0xFF2B1038), Color(0xFF3F1952)) else listOf(Color(0xFFFAF5FF), Color(0xFFE9D5FF)),
+                        borderColor = if (isDark) Color(0xFF6B21A8) else Color(0xFFD8B4FE),
+                        textColor = if (isDark) Color(0xFFD8B4FE) else Color(0xFF6B21A8),
+                        btnColors = listOf(Color(0xFF9333EA), Color(0xFF7E22CE)),
+                        shieldPrimary = Color(0xFFD8B4FE),
+                        shieldAccent = Color(0xFF9333EA)
+                    )
+                    else -> ProfileBannerTheme(
+                        // Lv.0 探索者：钛金银灰
+                        bgColors = if (isDark) listOf(Color(0xFF1E2128), Color(0xFF2B2F38)) else listOf(Color(0xFFF1F3F5), Color(0xFFE2E8F0)),
+                        borderColor = if (isDark) Color(0xFF475569) else Color(0xFFCBD5E1),
+                        textColor = if (isDark) Color(0xFFCBD5E1) else Color(0xFF475569),
+                        btnColors = listOf(Color(0xFF64748B), Color(0xFF475569)),
+                        shieldPrimary = Color(0xFFCBD5E1),
+                        shieldAccent = Color(0xFF64748B)
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Brush.horizontalGradient(bannerTheme.bgColors))
+                        .border(
+                            1.dp,
+                            bannerTheme.borderColor,
+                            RoundedCornerShape(16.dp)
+                        )
+                        .clickable(onClick = onOpenConnect)
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            // 左侧立体微光盾牌
+                            ProfileShieldBadge(
+                                level = level,
+                                primaryColor = bannerTheme.shieldPrimary,
+                                accentColor = bannerTheme.shieldAccent
+                            )
+                            val levelStatusText = if (level >= 3) "继续保持" else "继续加油"
+                            Text(
+                                text = "信任等级 Lv.$level · $levelStatusText",
+                                style = IosTheme.type.caption.copy(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold),
+                                color = bannerTheme.textColor,
+                            )
+                        }
+                        // 右侧发光胶囊按钮
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Brush.horizontalGradient(bannerTheme.btnColors))
+                                .border(1.dp, Color(0x60FFFFFF), RoundedCornerShape(50))
+                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "等级积分",
+                                style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Bold),
+                                color = Color.White,
+                            )
+                        }
                     }
                 }
+
+                // 3. 4 列核心大数字横排仪表盘
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(IosTheme.colors.card)
+                        .border(
+                            1.dp,
+                            if (isDark) Color(0xFF2C2D30) else Color(0xFFEFF1F4),
+                            RoundedCornerShape(16.dp)
+                        )
+                        .padding(vertical = 12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceAround,
+                    ) {
+                        // 我的发帖
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "创建的话题", false)
+                                }
+                        ) {
+                            Text(
+                                text = topicCount,
+                                style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
+                                color = IosTheme.colors.label,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text("发帖", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
+                        }
+                        // 我的回帖
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    if (!username.isNullOrBlank()) onOpenUserReplies?.invoke(username)
+                                }
+                        ) {
+                            Text(
+                                text = postCount,
+                                style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
+                                color = IosTheme.colors.label,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text("我的回帖", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
+                        }
+                        // 阅读时长
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.2f)) {
+                            Text(
+                                text = timeRead,
+                                style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
+                                color = IosTheme.colors.label,
+                                maxLines = 1,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text("阅读时长", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
+                        }
+                        // 访问天数
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = daysVisited,
+                                style = IosTheme.type.headline.copy(fontSize = 17.5.sp, fontWeight = FontWeight.Bold),
+                                color = IosTheme.colors.label,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text("访问天数", style = IosTheme.type.caption.copy(fontSize = 11.sp), color = IosTheme.colors.secondaryLabel)
+                        }
+                    }
+                }
+
+                // 4. 5 联微光玻璃球拟态金刚位 (参考图通透悬浮排列)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 1: 我的收藏 (金色星芒)
+                    SphereIconButton(
+                        title = "我的收藏",
+                        iconGlyph = "⭐",
+                        glowColor = Color(0xFFFAAD14),
+                        onClick = {
+                            if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "我的收藏", true)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 2: 我的点赞 (珊瑚暖橙赞)
+                    SphereIconButton(
+                        title = "我的点赞",
+                        iconGlyph = "👍",
+                        glowColor = Color(0xFFFF5722),
+                        onClick = {
+                            if (!username.isNullOrBlank() && onOpenUserActions != null) {
+                                onOpenUserActions(username, "我的点赞", "1")
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 3: 浏览历史 (科技冰蓝钟)
+                    SphereIconButton(
+                        title = "浏览历史",
+                        iconGlyph = "🕒",
+                        glowColor = Color(0xFF1890FF),
+                        onClick = onOpenHistory,
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 4: 我的关注 (天蓝双人群组)
+                    SphereIconButton(
+                        title = "我的关注",
+                        iconGlyph = "👥",
+                        glowColor = Color(0xFF2F54EB),
+                        onClick = onOpenFollowing,
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 5: 草稿箱 (翡翠薄荷铅笔)
+                    SphereIconButton(
+                        title = "草稿箱",
+                        iconGlyph = "✏️",
+                        glowColor = Color(0xFF52C41A),
+                        onClick = { onOpenDrafts?.invoke() },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, Modifier.weight(1f).fillMaxHeight())
+                    ProfileQuickLink("专属邮箱", "✉️", onOpenLdcMail, Modifier.weight(1f).fillMaxHeight())
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    ProfileQuickLink("应用广场", "🧩", onOpenAppsPlaza, Modifier.weight(1f).fillMaxHeight())
+                    ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
+                }
+
+                // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
+                UserBadgesSectionCard(
+                    badges = userBadges,
+                    isLoading = isUserBadgesLoading,
+                    onRefresh = onRefreshUserBadges,
+                    onBadgeClick = { selectedBadge = it },
+                )
             }
         }
-        if (state.loaded && visibleEntries.isEmpty() && state.content.fields.isEmpty() &&
-            state.error == null && !state.content.hasMore) {
-            item("empty") { EmptyNotice() }
+        if (state.loading) item("loading") { IosLoadingBox() }
+        state.error?.let { message ->
+            item("error") { ErrorNotice(message) { onLoad(ProfileSection.Summary, true, false) } }
         }
-        if (state.loading && state.loaded) item("more") { IosLoadingBox() }
     }
 
     if (showAccountSwitchSheet) {
@@ -1233,87 +1022,121 @@ fun ProfileScreen(
         )
     }
 
-    // 标记全部已读确认对话框 (参考图高保真对齐: 居中加粗标题 + 左灰右红双胶囊按键)
-    if (showMarkAllReadConfirmDialog) {
-        Dialog(
-            onDismissRequest = { showMarkAllReadConfirmDialog = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 36.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(IosTheme.colors.card)
-                    .padding(horizontal = 20.dp, vertical = 22.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        text = "确定将所有消息标记为已读吗？",
-                        fontSize = 16.5.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = IosTheme.colors.label,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Spacer(modifier = Modifier.height(22.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        // 取消按钮
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(42.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (IosTheme.colors.isDark) Color(0xFF2C2C2E) else Color(0xFFF4F5F7))
-                                .clickable { showMarkAllReadConfirmDialog = false },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "取消",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = IosTheme.colors.label,
-                            )
-                        }
-                        // 确定按钮
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(42.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(Color(0xFFFF3B30))
-                                .clickable {
-                                    showMarkAllReadConfirmDialog = false
-                                    onMarkAllNotificationsRead?.invoke()
-                                    Toast.makeText(context, "已全部标记为已读", Toast.LENGTH_SHORT).show()
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "确定",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color.White,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     selectedBadge?.let { badge ->
         BadgeDetailDialog(
             badge = badge,
             onDismiss = { selectedBadge = null },
         )
+    }
+}
+
+@Composable
+internal fun NotificationRow(
+    entry: org.linuxdo.android.data.ProfileEntry,
+    onOpenTopic: (Long, String, Int?) -> Unit,
+    onRead: (Long) -> Unit,
+    onOpenUser: (String) -> Unit,
+) {
+    val typeTag = notificationTypeTag(entry.notificationType)
+    val date = entry.subtitle.substringAfterLast(" · ", "").takeIf { it.length == 10 && it[4] == '-' }
+    MessageFeedRow(
+        name = entry.actor?.takeIf { it.isNotBlank() } ?: "系统通知",
+        preview = entry.title,
+        date = date?.takeLast(5).orEmpty(),
+        onClick = {
+            if (entry.unread) entry.id.toLongOrNull()?.let(onRead)
+            entry.topicId?.let { onOpenTopic(it, entry.title, entry.postNumber) }
+        },
+        avatar = {
+            NotificationAvatarWithBadge(entry.avatarUrl, entry.actor, entry.notificationType, entry.unread) {
+                entry.actor?.let(onOpenUser)
+            }
+        },
+        badge = {
+            val tint = notificationTypeTint(entry.notificationType)
+            Text(typeTag, style = IosTheme.type.caption.copy(fontSize = 11.sp), color = tint,
+                modifier = Modifier.background(tint.copy(alpha = 0.13f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 5.dp, vertical = 1.dp))
+            if (entry.unread) Spacer(Modifier.size(6.dp).background(IosTheme.colors.accent, CircleShape)
+                .semantics { contentDescription = "未读" })
+        },
+    )
+}
+
+@Composable
+internal fun ConfirmReadNotifications(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val context = LocalContext.current
+    Dialog(
+        onDismissRequest = { onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 36.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(horizontal = 20.dp, vertical = 22.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = "确定将所有通知标记为已读吗？",
+                    fontSize = 16.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = IosTheme.colors.label,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(modifier = Modifier.height(22.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    // 取消按钮
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(42.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (IosTheme.colors.isDark) Color(0xFF2C2C2E) else Color(0xFFF4F5F7))
+                            .clickable { onDismiss() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "取消",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = IosTheme.colors.label,
+                        )
+                    }
+                    // 确定按钮
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(42.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFFFF3B30))
+                            .clickable {
+                                onDismiss()
+                                onConfirm()
+                                Toast.makeText(context, "已全部标记为已读", Toast.LENGTH_SHORT).show()
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "确定",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1395,7 +1218,7 @@ private fun ProfileSettingsGearIcon(tint: Color) {
 }
 
 @Composable
-private fun BroomGlyph(tint: Color) {
+internal fun BroomGlyph(tint: Color) {
     Canvas(Modifier.size(20.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val stroke = Stroke(width = 1.7f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
@@ -1758,21 +1581,21 @@ private fun NotificationAvatarWithBadge(
         IosTheme.colors.isDark -> Color(0xFFD1D1D6)
         else -> Color(0xFF3A3A3C)
     }
-    Box(Modifier.size(38.dp).clickable(enabled = !actor.isNullOrBlank(), onClick = onClick)) {
+    Box(Modifier.size(32.dp).clickable(enabled = !actor.isNullOrBlank(), onClick = onClick)) {
         if (avatarUrl != null) {
             AsyncImage(
                 model = avatarUrl,
                 contentDescription = actor,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
-                    .size(34.dp)
+                    .size(32.dp)
                     .clip(avatarShape(actor, avatarUrl, 4.dp)),
             )
         } else {
             Box(
                 Modifier
                     .align(Alignment.BottomStart)
-                    .size(34.dp)
+                    .size(32.dp)
                     .clip(avatarShape(actor, null, 4.dp))
                     .background(IosTheme.colors.fieldBackground),
                 contentAlignment = Alignment.Center,
@@ -1788,7 +1611,7 @@ private fun NotificationAvatarWithBadge(
         Box(
             Modifier
                 .align(Alignment.TopEnd)
-                .size(18.dp)
+                .size(16.dp)
                 .clip(CircleShape)
                 .background(badgeBgColor)
                 .then(
@@ -1937,41 +1760,6 @@ private fun NotificationAvatarWithBadge(
                             drawCircle(badgeIconColor, 1.8f, Offset(12f, 20f))
                         }
                     }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun NotificationTabIcon(filter: NotificationFilter, color: Color) {
-    Canvas(Modifier.size(17.dp)) {
-        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val shape = Path()
-            when (filter) {
-                NotificationFilter.All -> {
-                    shape.moveTo(5f, 17f); shape.lineTo(7f, 14f); shape.lineTo(7f, 9f)
-                    shape.cubicTo(7f, 2f, 17f, 2f, 17f, 9f)
-                    shape.lineTo(17f, 14f); shape.lineTo(19f, 17f); shape.close()
-                    drawPath(shape, color, style = Stroke(1.7f))
-                    drawCircle(color, 1.5f, Offset(12f, 20f))
-                }
-                NotificationFilter.Replies -> {
-                    shape.moveTo(10f, 5f); shape.lineTo(3f, 11f); shape.lineTo(10f, 17f)
-                    shape.lineTo(10f, 13f); shape.cubicTo(17f, 12f, 19f, 15f, 21f, 20f)
-                    shape.cubicTo(21f, 10f, 17f, 8f, 10f, 9f); shape.close()
-                    drawPath(shape, color)
-                }
-                NotificationFilter.Messages -> {
-                    shape.moveTo(3f, 5f); shape.lineTo(21f, 5f); shape.lineTo(21f, 19f)
-                    shape.lineTo(3f, 19f); shape.close()
-                    shape.moveTo(3f, 6f); shape.lineTo(12f, 13f); shape.lineTo(21f, 6f)
-                    drawPath(shape, color, style = Stroke(1.7f))
-                }
-                NotificationFilter.Likes -> {
-                    shape.moveTo(12f, 21f); shape.cubicTo(10f, 19f, 3f, 13f, 3f, 8f)
-                    shape.cubicTo(3f, 2f, 10f, 1f, 12f, 6f); shape.cubicTo(14f, 1f, 21f, 2f, 21f, 8f)
-                    shape.cubicTo(21f, 13f, 14f, 19f, 12f, 21f); shape.close(); drawPath(shape, color)
                 }
             }
         }
@@ -6183,17 +5971,20 @@ fun DraftsScreen(
     val categoryById = remember(categories) { categories.associateBy { it.id.toInt() } }
     var draftPendingDelete by remember { mutableStateOf<DraftItem?>(null) }
     val pullState = rememberPullToRefreshState()
+    val list = rememberLazyListState()
 
     Column(
         Modifier
             .fillMaxSize()
             .background(IosTheme.colors.groupedBackground),
     ) {
-        IosNavBar(
-            title = "我的草稿",
-            onBack = onBack,
-            trailing = trailing,
-        )
+        ListNavigationHeader {
+            IosNavBar(
+                title = "我的草稿",
+                onBack = onBack,
+                trailing = trailing,
+            )
+        }
 
         PullToRefreshBox(
             isRefreshing = state.loading && state.loaded,
@@ -6219,7 +6010,8 @@ fun DraftsScreen(
             },
         ) {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
+                state = list,
+                modifier = Modifier.fillMaxSize().scrollListBars(list),
             ) {
                 if (state.loading && !state.loaded) {
                     item("loading") { IosLoadingBox() }

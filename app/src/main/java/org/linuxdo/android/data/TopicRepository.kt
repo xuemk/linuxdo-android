@@ -1427,8 +1427,15 @@ class TopicRepository(
 
     /** MessageBus 的 Dont-Chunk 长轮询；不占用整个后台 GET 闸门等待服务端消息。 */
     suspend fun pollTopicMessages(topicId: Long, clientId: String, cursor: Long, sequence: Long): List<TopicBusMessage> =
-        topicPollGate.withLock {
-            val generation = sessionStore?.sessionGeneration ?: return@withLock emptyList()
+        topicPollGate.withLock { pollMessageBus(clientId, mapOf("/topic/$topicId" to cursor), sequence, "/t/$topicId") }
+
+    // 聊天和话题各自保持一个长连接，不能让聊天等待话题的 70 秒长轮询释放锁。
+    private val chatPollGate = Mutex()
+    suspend fun pollChatMessages(clientId: String, cursors: Map<String, Long>, sequence: Long): List<TopicBusMessage> =
+        chatPollGate.withLock { pollMessageBus(clientId, cursors, sequence, "/chat") }
+
+    private suspend fun pollMessageBus(clientId: String, cursors: Map<String, Long>, sequence: Long, referer: String): List<TopicBusMessage> {
+            val generation = sessionStore?.sessionGeneration ?: return emptyList()
             val path = "/message-bus/$clientId/poll"
             val config = getPollingConfiguration(generation)
             var pollRound = currentRateLimitRound()
@@ -1466,13 +1473,13 @@ class TopicRepository(
                 .header("Discourse-Background", "true")
                 .header("X-SILENCE-LOGGER", "true")
                 .header("Origin", Config.BASE_URL)
-                .header("Referer", "${Config.BASE_URL}/t/$topicId")
+                .header("Referer", "${Config.BASE_URL}$referer")
                 .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation, sendCookies = config.sendCookies))
                 .apply {
                     config.sharedSessionKey?.let { header("X-Shared-Session-Key", it) }
                     sessionStore.userAgentOrNull()?.let { header("User-Agent", it) }
                 }
-                .post(FormBody.Builder().add("/topic/$topicId", cursor.toString())
+                .post(FormBody.Builder().apply { cursors.forEach { (channel, cursor) -> add(channel, cursor.toString()) } }
                     .add("__seq", sequence.toString()).build())
                 .build()
             val result = suspendCancellableCoroutine<TransportResult> { continuation ->
@@ -1510,7 +1517,7 @@ class TopicRepository(
                 pollingConfig = null
                 nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 120_000L
             }
-            when {
+            return when {
                 result.status == 429 -> {
                     if (result.challenged) enterSilentPrefetchBackoff(NeedsInteractiveVerification("话题订阅被挑战拦截"))
                     throw enterRateLimitCooldown(
@@ -2080,8 +2087,8 @@ class TopicRepository(
         }
     }
 
-    suspend fun fetchChatChannels(): List<ChatChannelSummary> {
-        val root = objectRequest("/chat/api/me/channels")
+    suspend fun fetchChatChannels(silent: Boolean = false): List<ChatChannelSummary> {
+        val root = objectRequest("/chat/api/me/channels", present = !silent, retryAllowed = !silent)
         val tracking = ((root["tracking"] as? JsonObject)?.get("channel_tracking") as? JsonObject)
             ?: JsonObject(emptyMap())
         return (root.objects("public_channels") + root.objects("direct_message_channels"))
@@ -2101,6 +2108,7 @@ class TopicRepository(
                             createdAt = message.text("created_at").ifBlank { null },
                             user = user?.let { rawUser ->
                                 ChatUserSummary(
+                                    id = rawUser.number("id") ?: 0L,
                                     username = rawUser.text("username"),
                                     name = rawUser.text("name").ifBlank { null },
                                     avatarTemplate = rawUser.text("avatar_template").ifBlank { null },
@@ -2114,6 +2122,7 @@ class TopicRepository(
                     val username = rawUser.text("username")
                     if (username.isBlank()) null
                     else ChatUserSummary(
+                        id = rawUser.number("id") ?: 0L,
                         username = username,
                         name = rawUser.text("name").ifBlank { null },
                         avatarTemplate = rawUser.text("avatar_template").ifBlank { null },
@@ -2183,8 +2192,8 @@ class TopicRepository(
         channelId: Long,
         message: String,
         uploadIds: List<Long> = emptyList(),
-    ) {
-        require(message.isNotBlank())
+    ): ChatMessageSummary? {
+        require(message.isNotBlank() || uploadIds.isNotEmpty())
         val fields = mutableMapOf<String, JsonElement>(
             "message" to JsonPrimitive(message.trim())
         )
@@ -2192,7 +2201,14 @@ class TopicRepository(
             fields["upload_ids"] = JsonArray(uploadIds.map { JsonPrimitive(it) })
         }
         val body = JsonObject(fields).toString()
-        mutate("/chat/$channelId", "POST", body)
+        val response = mutate("/chat/$channelId", "POST", body)
+        // 发送已成功时，响应结构差异只回退到刷新，不能当作发送失败诱发重复发送。
+        return runCatching {
+            val result = json.parseToJsonElement(response).jsonObject
+            (result["chat_message"] as? JsonObject)?.let {
+                json.decodeFromJsonElement<ChatMessageSummary>(it).copy(channelId = channelId)
+            }
+        }.getOrNull()
     }
 
     suspend fun createOrGetDirectMessageChannel(targetUsername: String): ChatChannelSummary {

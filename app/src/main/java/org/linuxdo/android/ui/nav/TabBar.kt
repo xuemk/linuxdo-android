@@ -36,6 +36,7 @@ enum class MainTab(val label: String, val root: Route) {
 @Composable
 fun TabBar(
     selected: MainTab,
+    modifier: Modifier = Modifier,
     homeFeedLabel: String = "首页",
     categoriesTabLabel: String = "分类",
     unreadCount: Int = 0,
@@ -50,7 +51,7 @@ fun TabBar(
     val barBackground = IosTheme.colors.card.copy(alpha = if (isDark) 0.82f else 0.85f)
 
     Column(
-        Modifier
+        modifier
             .fillMaxWidth()
             .background(barBackground)
     ) {

@@ -122,155 +122,159 @@ fun SearchScreen(
     }
 
     Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
-        // 顶部大标题栏
-        IosNavBar(title = "搜索", trailing = trailing)
+        ListNavigationHeader {
+            SectionHeader(labels = listOf("发现"), actions = trailing)
 
-        // 搜索输入栏 (透明玻璃胶囊 + 放大镜 Icon + 右侧取消)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+            // 搜索输入栏 (透明玻璃胶囊 + 放大镜 Icon + 右侧取消)
             Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .shadow(
-                        elevation = 2.dp,
-                        shape = CircleShape,
-                        ambientColor = Color.Black.copy(alpha = 0.04f),
-                        spotColor = Color.Black.copy(alpha = 0.08f),
-                    )
-                    .clip(CircleShape)
-                    .background(glassBg)
-                    .border(1.dp, glassBorder, CircleShape)
-                    .padding(horizontal = 14.dp, vertical = 9.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                SearchLoupeIcon(
-                    tint = IosTheme.colors.secondaryLabel,
-                    modifier = Modifier.size(16.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                BasicTextField(
-                    value = state.query,
-                    onValueChange = onQuery,
-                    singleLine = true,
-                    textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label, fontSize = 14.5.sp),
-                    cursorBrush = SolidColor(IosTheme.colors.accent),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = {
-                        focusManager.clearFocus()
-                        if (state.query.isNotBlank()) onSelectHistory(state.query.trim())
-                    }),
+                Row(
                     modifier = Modifier
                         .weight(1f)
-                        .focusRequester(focusRequester)
-                        .onFocusChanged { focused = it.isFocused },
-                    decorationBox = { field ->
-                        Box {
-                            if (state.query.isEmpty()) {
-                                Text(
-                                    "输入关键词查找话题",
-                                    style = IosTheme.type.body.copy(fontSize = 14.5.sp),
-                                    color = IosTheme.colors.secondaryLabel,
-                                )
-                            }
-                            field()
-                        }
-                    },
-                )
-                if (state.query.isNotEmpty()) {
-                    Box(
+                        .shadow(
+                            elevation = 2.dp,
+                            shape = CircleShape,
+                            ambientColor = Color.Black.copy(alpha = 0.04f),
+                            spotColor = Color.Black.copy(alpha = 0.08f),
+                        )
+                        .clip(CircleShape)
+                        .background(glassBg)
+                        .border(1.dp, glassBorder, CircleShape)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SearchLoupeIcon(
+                        tint = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    BasicTextField(
+                        value = state.query,
+                        onValueChange = onQuery,
+                        singleLine = true,
+                        textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label, fontSize = 14.5.sp),
+                        cursorBrush = SolidColor(IosTheme.colors.accent),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = {
+                            focusManager.clearFocus()
+                            if (state.query.isNotBlank()) onSelectHistory(state.query.trim())
+                        }),
                         modifier = Modifier
-                            .size(18.dp)
-                            .clip(CircleShape)
-                            .background(IosTheme.colors.secondaryLabel.copy(alpha = 0.2f))
-                            .clickable { onQuery("") },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text("✕", fontSize = 10.sp, color = IosTheme.colors.secondaryLabel)
+                            .weight(1f)
+                            .focusRequester(focusRequester)
+                            .onFocusChanged { focused = it.isFocused },
+                        decorationBox = { field ->
+                            Box {
+                                if (state.query.isEmpty()) {
+                                    Text(
+                                        "输入关键词查找话题",
+                                        style = IosTheme.type.body.copy(fontSize = 14.5.sp),
+                                        color = IosTheme.colors.secondaryLabel,
+                                    )
+                                }
+                                field()
+                            }
+                        },
+                    )
+                    if (state.query.isNotEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .size(18.dp)
+                                .clip(CircleShape)
+                                .background(IosTheme.colors.secondaryLabel.copy(alpha = 0.2f))
+                                .clickable { onQuery("") },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("✕", fontSize = 10.sp, color = IosTheme.colors.secondaryLabel)
+                        }
                     }
                 }
-            }
-            val hasQuery = state.query.isNotBlank()
-            Text(
-                text = if (hasQuery) "搜索" else "取消",
-                style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = if (hasQuery) FontWeight.Medium else FontWeight.Normal),
-                color = if (hasQuery) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
-                modifier = Modifier
-                    .clickable {
-                        if (hasQuery) {
-                            onSelectHistory(state.query)
-                            focusManager.clearFocus()
-                        } else {
-                            onQuery("")
-                            focusManager.clearFocus()
+                val hasQuery = state.query.isNotBlank()
+                Text(
+                    text = if (hasQuery) "搜索" else "取消",
+                    style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = if (hasQuery) FontWeight.Medium else FontWeight.Normal),
+                    color = if (hasQuery) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                    modifier = Modifier
+                        .clickable {
+                            if (hasQuery) {
+                                onSelectHistory(state.query)
+                                focusManager.clearFocus()
+                            } else {
+                                onQuery("")
+                                focusManager.clearFocus()
+                            }
                         }
-                    }
-                    .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
-            )
-        }
+                        .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
+                )
+            }
 
-        // 筛选标签栏 (排序依据 + 透明玻璃胶囊)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = "排序依据",
-                style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                color = IosTheme.colors.secondaryLabel,
-            )
-            // 当前排序胶囊 (透明玻璃质感)
+            // 筛选标签栏 (排序依据 + 透明玻璃胶囊)
             Row(
                 modifier = Modifier
-                    .shadow(
-                        elevation = 1.dp,
-                        shape = CircleShape,
-                        ambientColor = Color.Black.copy(alpha = 0.03f),
-                        spotColor = Color.Black.copy(alpha = 0.06f),
-                    )
-                    .clip(CircleShape)
-                    .background(glassBg)
-                    .border(1.dp, glassBorder, CircleShape)
-                    .clickable {
-                        focusManager.clearFocus()
-                        showSort = true
-                    }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    text = state.order.label,
+                    text = "排序依据",
                     style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                    fontWeight = FontWeight.Medium,
-                    color = IosTheme.colors.label,
-                )
-                Text(
-                    text = "⌄",
-                    style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                    fontWeight = FontWeight.Medium,
                     color = IosTheme.colors.secondaryLabel,
                 )
+                // 当前排序胶囊 (透明玻璃质感)
+                Row(
+                    modifier = Modifier
+                        .shadow(
+                            elevation = 1.dp,
+                            shape = CircleShape,
+                            ambientColor = Color.Black.copy(alpha = 0.03f),
+                            spotColor = Color.Black.copy(alpha = 0.06f),
+                        )
+                        .clip(CircleShape)
+                        .background(glassBg)
+                        .border(1.dp, glassBorder, CircleShape)
+                        .clickable {
+                            focusManager.clearFocus()
+                            showSort = true
+                        }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = state.order.label,
+                        style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                        fontWeight = FontWeight.Medium,
+                        color = IosTheme.colors.label,
+                    )
+                    Text(
+                        text = "⌄",
+                        style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                        fontWeight = FontWeight.Medium,
+                        color = IosTheme.colors.secondaryLabel,
+                    )
+                }
             }
-        }
 
-        Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(4.dp))
+        }
 
         val showHistory = state.query.isBlank() && state.results.items.isEmpty() && !state.results.initialLoading
 
         if (showHistory) {
+            val historyScroll = rememberScrollState()
             // 搜索历史模块 (参考图 3：标题 + 垃圾桶图标 + 流式玻璃药丸标签)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
+                    .scrollListBars(historyScroll)
+                    .verticalScroll(historyScroll)
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 if (searchHistory.isNotEmpty()) {
@@ -346,7 +350,7 @@ fun SearchScreen(
             // 搜索结果卡片列表 (全宽扁平纯平流式排版：直抵屏幕边缘，呼吸留白 16dp，移除悬浮外边距与硬描边)
             LazyColumn(
                 state = list,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).scrollListBars(list),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 64.dp),
             ) {
                 if (state.results.initialLoading) item("loading") { IosLoadingBox() }

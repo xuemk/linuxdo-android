@@ -15,6 +15,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.MutableState
+import org.linuxdo.android.ui.design.LocalListBars
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +67,7 @@ fun IosNavHost(
     stack: NavStack,
     modifier: Modifier = Modifier,
     interactive: Boolean = true,
+    listBars: MutableState<Boolean>? = null,
     content: @Composable (Route) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -172,7 +176,11 @@ fun IosNavHost(
                             ),
                     )
 
-                    holder.SaveableStateProvider(entry.id) { content(entry.route) }
+                    holder.SaveableStateProvider(entry.id) {
+                        CompositionLocalProvider(LocalListBars provides listBars.takeIf { entry.id == stack.entries.last().id }) {
+                            content(entry.route)
+                        }
+                    }
 
                     // 下层页面在转场中被压暗。
                     Box(

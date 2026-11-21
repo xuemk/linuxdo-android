@@ -1356,6 +1356,13 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
     fun currentUserId(): Long = plainPrefs.getLong(KEY_CURRENT_USER_ID, 0L)
 
+    fun hasChatNotificationBaseline(): Boolean = plainPrefs.getBoolean("chat_baseline_${currentUserId()}", false)
+    fun chatLastSeenMessageId(channelId: Long): Long = plainPrefs.getLong("chat_seen_${currentUserId()}_$channelId", 0L)
+    fun saveChatLastSeenMessageId(channelId: Long, messageId: Long) {
+        plainPrefs.edit().putLong("chat_seen_${currentUserId()}_$channelId", maxOf(messageId, chatLastSeenMessageId(channelId))).apply()
+    }
+    fun markChatNotificationBaseline() { plainPrefs.edit().putBoolean("chat_baseline_${currentUserId()}", true).apply() }
+
     fun saveCurrentUserId(id: Long) {
         if (!prefs.edit().putLong(KEY_COOKIE_OWNER, id).commit() ||
             !plainPrefs.edit().putLong(KEY_CURRENT_USER_ID, id).commit()) throw EncryptedStorageUnavailableException()

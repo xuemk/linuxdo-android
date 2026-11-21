@@ -171,6 +171,14 @@ class MainActivity : ComponentActivity() {
 
     private fun handleNotificationIntent(intent: Intent?) {
         if (intent == null) return
+        val chatChannelId = intent.getLongExtra("chat_channel_id", -1L)
+        val chatUserId = intent.getLongExtra("chat_user_id", -1L)
+        intent.removeExtra("chat_channel_id")
+        intent.removeExtra("chat_user_id")
+        if (chatChannelId > 0L && chatUserId == (application as App).container.sessionStore.currentUserId()) {
+            viewModel.openChatNotification(chatChannelId)
+            return
+        }
         val topicId = intent.getLongExtra("topic_id", -1L)
         val notificationId = intent.getLongExtra("notification_id", -1L).takeIf { it > 0L }
         val notificationType = intent.getIntExtra("notification_type", -1).takeIf { it > 0 }

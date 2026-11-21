@@ -204,6 +204,7 @@ class NotificationWorker(
                 if (shouldDeferPoll(context, pollingSession)) return@withContext
                 pollOnce(context, pollingSession, isFinalAttempt = true)
             }
+            (context.applicationContext as? org.linuxdo.android.App)?.container?.chatRealtime?.pollWhenDisconnected()
         }
 
         private fun fetchPostExcerpt(
