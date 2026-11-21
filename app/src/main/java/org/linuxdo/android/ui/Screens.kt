@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
@@ -51,6 +53,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.pager.HorizontalPager
@@ -85,6 +89,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -2077,6 +2082,7 @@ fun SettingsScreen(
     var showNotificationScopeDialog by remember { mutableStateOf(false) }
     var showTestPushLabDialog by remember { mutableStateOf(false) }
     var showSignatureSyncDialog by remember { mutableStateOf(false) }
+    var showFloorNavigationDialog by remember { mutableStateOf(false) }
 
     val prefs = remember { context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE) }
     var devOptionsUnlocked by remember {
@@ -2339,22 +2345,12 @@ fun SettingsScreen(
         if (page == SettingsPage.Reading) item("group-reading") {
             SectionTitle("列表与阅读偏好")
             IosGroupCard {
-                IosRow(onClick = { onShowTopicScrollbar(!showTopicScrollbar) }) {
-                    SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
-                        SettingBookIcon(tint = IosTheme.colors.accent)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                        Text("右侧楼层导航条", style = IosTheme.type.body.copy(fontSize = 14.5.sp))
-                        Text(
-                            "半透明悬浮于右侧，按住时显示清晰，拖动并松手跳转楼层；轻触不会跳转",
-                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.padding(top = 3.dp),
-                        )
-                    }
-                    IosSwitch(checked = showTopicScrollbar, onCheckedChange = onShowTopicScrollbar)
-                }
+                SettingsEntryRow(
+                    title = "选楼方式",
+                    badgeColor = Color(0xFFE8F3FF),
+                    value = if (showTopicScrollbar) "右侧滑动条" else "左下角浮窗",
+                    onClick = { showFloorNavigationDialog = true },
+                ) { SettingBookIcon(tint = IosTheme.colors.accent) }
                 IosDivider()
                 // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
                 // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
@@ -3994,6 +3990,70 @@ fun SettingsScreen(
                 }
             }
             Spacer(Modifier.height(36.dp))
+        }
+    }
+
+    if (showFloorNavigationDialog) {
+        Dialog(onDismissRequest = { showFloorNavigationDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 280.dp, max = 340.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(IosTheme.colors.card)
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("选楼方式", style = IosTheme.type.headline, fontWeight = FontWeight.Bold)
+                Text(
+                    "浏览帖子时只显示选中的一种，选择后立即生效。",
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+                Column(Modifier.selectableGroup()) {
+                    listOf(false, true).forEach { useScrollbar ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .selectable(
+                                    selected = showTopicScrollbar == useScrollbar,
+                                    role = Role.RadioButton,
+                                    onClick = {
+                                        onShowTopicScrollbar(useScrollbar)
+                                        showFloorNavigationDialog = false
+                                    },
+                                )
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = showTopicScrollbar == useScrollbar,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = IosTheme.colors.accent,
+                                    unselectedColor = IosTheme.colors.secondaryLabel,
+                                ),
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    if (useScrollbar) "右侧滑动条" else "左下角浮窗",
+                                    style = IosTheme.type.body,
+                                )
+                                Text(
+                                    if (useScrollbar) "沿右侧滑动，松手跳转楼层" else "点击浮窗，可输入楼层或拖动选楼",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.secondaryLabel,
+                                )
+                            }
+                        }
+                    }
+                }
+                TextButton(
+                    onClick = { showFloorNavigationDialog = false },
+                    modifier = Modifier.align(Alignment.End),
+                ) { Text("取消", color = IosTheme.colors.accent) }
+            }
         }
     }
 
