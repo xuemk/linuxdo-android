@@ -4394,26 +4394,28 @@ private fun PostActions(
                 onClick = onSolution,
             )
         }
-        val selected = post.currentUserReaction?.id
-        val canReact = signedIn && !busy && !post.yours && (selected == null || post.currentUserReaction?.canUndo == true)
-        Box {
-            TiebaPostActionButton(
-                label = "点赞",
-                action = PostAction.Like,
-                selected = selected != null,
-                enabled = canReact,
-                compact = compact,
-                onClick = { onReact("heart") },
-                onLongClick = { chooseReaction = true },
-            )
-            if (chooseReaction) {
-                ReactionBubblePopup(
-                    reactions = reactions,
-                    emojiUrls = emojiUrls,
-                    busy = busy,
-                    onReact = onReact,
-                    onDismiss = { chooseReaction = false },
+        if (!post.yours) {
+            val selected = post.currentUserReaction?.id
+            val canReact = signedIn && !busy && (selected == null || post.currentUserReaction?.canUndo == true)
+            Box {
+                TiebaPostActionButton(
+                    label = "点赞",
+                    action = PostAction.Like,
+                    selected = selected != null,
+                    enabled = canReact,
+                    compact = compact,
+                    onClick = { onReact("heart") },
+                    onLongClick = { chooseReaction = true },
                 )
+                if (chooseReaction) {
+                    ReactionBubblePopup(
+                        reactions = reactions,
+                        emojiUrls = emojiUrls,
+                        busy = busy,
+                        onReact = onReact,
+                        onDismiss = { chooseReaction = false },
+                    )
+                }
             }
         }
         if (canReply) {
