@@ -1551,7 +1551,8 @@ class TopicRepository(
 
     suspend fun toggleReaction(postId: Long, reaction: String): Post {
         require(reaction.matches(Regex("[a-zA-Z0-9_+:-]+")))
-        return json.decodeFromString(mutate("/discourse-reactions/posts/$postId/custom-reactions/${encode(reaction)}/toggle.json", "PUT"))
+        val path = "/discourse-reactions/posts/$postId/custom-reactions/${encode(reaction)}/toggle.json"
+        return json.decodeFromString(mutate(path, "PUT", reactionToggle = true))
     }
 
     suspend fun createBoost(postId: Long, raw: String): Boost {
@@ -2836,6 +2837,7 @@ class TopicRepository(
         body: String? = null,
         contentType: String = Transport.JSON_CONTENT_TYPE,
         beforeAttempt: () -> Unit = {},
+        reactionToggle: Boolean = false,
     ): String {
         ensureRequestAllowed()
         val expectedUserId = sessionStore?.currentUserId()
@@ -2906,6 +2908,15 @@ class TopicRepository(
                             receivedAtElapsedMs = receivedAt,
                         )
                     }
+                    // Discourse 的点赞额度属于帖子回应。全站请求限流和 Cloudflare 响应继续走原有冷却。
+                    if (reactionToggle && !result.challenged &&
+                        result.cfMitigated?.contains("challenge", ignoreCase = true) != true
+                    ) {
+                        val error = parseErrorBody(result.body)
+                        if ((error?.get("error_type") as? JsonPrimitive)?.contentOrNull == "rate_limit") {
+                            throw ReactionRateLimitException(error.serverErrorMessage() ?: "回应次数已达上限，请稍后重试")
+                        }
+                    }
                     val cooldownEx = enterRateLimitCooldown(
                         path = path,
                         retryAfterSeconds = result.retryAfterSeconds,
@@ -2973,17 +2984,22 @@ class TopicRepository(
                 if (result.status == 403) {
                     notify403OrChallenged("mutate $path 403")
                 }
-                val serverMessage = runCatching {
-                    (json.parseToJsonElement(result.body).jsonObject["errors"] as? JsonArray)
-                        ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.joinToString("\n")?.take(400)
-                }.getOrNull()
                 val message = if (result.status >= 500) "结果未确认，请刷新楼层后检查提交状态"
-                    else serverMessage?.takeIf { it.isNotBlank() } ?: "操作未提交，请稍后重试"
+                    else parseErrorBody(result.body).serverErrorMessage() ?: "操作未提交，请稍后重试"
                 throw HttpStatusException(result.status, message)
             }
             return result.body
         }
     }
+
+    private class ReactionRateLimitException(message: String) : Exception(message)
+
+    private fun parseErrorBody(body: String): JsonObject? =
+        runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+
+    private fun JsonObject?.serverErrorMessage(): String? =
+        (this?.get("errors") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            ?.joinToString("\n")?.take(400)?.takeIf { it.isNotBlank() }
 
     private fun checkWriteSession(userId: Long?, generation: Long?) {
         val store = sessionStore ?: return
