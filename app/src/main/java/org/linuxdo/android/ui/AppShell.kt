@@ -167,7 +167,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     LaunchedEffect(lifecycle, state.screen, state.latest.initialLoading, notificationPollInterval, customRealtimeSeconds) {
         if (state.screen == Screen.List && !state.latest.initialLoading) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshUnread(force = true)
-            // 前台未读角标与后台通知设置解耦：可见时始终按 10 秒基线轮询，
+            // 前台未读角标与后台通知设置解耦：可见时按 Config.UNREAD_POLL_INTERVAL_MS（20 秒）基线轮询，
             // 只有“实时”且自定义间隔更短时才加快，下限 5 秒避免触发限频。
             val pollDelayMs = when (notificationPollInterval) {
                 NotificationPollInterval.REALTIME ->
@@ -175,7 +175,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 else -> Config.UNREAD_POLL_INTERVAL_MS
             }
             while (true) {
-                // 限流冷却期间直接睡到解封，不再每 10 秒空转一次
+                // 限流冷却期间直接睡到解封，避免按基线间隔空转
                 delay(viewModel.nextUnreadPollDelayMs(pollDelayMs))
                 viewModel.refreshUnread()
             }
@@ -209,6 +209,17 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
         }
     }
     val readSyncVerifyBanner by viewModel.readSyncVerifyBanner.collectAsStateWithLifecycle()
+    val challengeCircuitUntil by viewModel.challengeCircuitUntil.collectAsStateWithLifecycle()
+    var challengeCircuitRemainingSec by remember { mutableStateOf(0L) }
+    LaunchedEffect(challengeCircuitUntil) {
+        while (true) {
+            val remainingMs = if (challengeCircuitUntil <= 0L) 0L
+                else challengeCircuitUntil - android.os.SystemClock.elapsedRealtime()
+            challengeCircuitRemainingSec = ((remainingMs + 999L) / 1_000L).coerceAtLeast(0L)
+            if (remainingMs <= 0L) break
+            delay(1_000L)
+        }
+    }
     val attachmentDownload by AttachmentDownloadManager.state.collectAsStateWithLifecycle()
 
     val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
@@ -234,7 +245,17 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
             if (state.screen == Screen.Boot) BootScreen()
 
-            if (readSyncVerifyBanner && state.screen == Screen.List) {
+            if (challengeCircuitRemainingSec > 0L && state.screen == Screen.List) {
+                ChallengeCircuitBanner(
+                    remainingSec = challengeCircuitRemainingSec,
+                    onRetry = viewModel::retryAfterChallengeCircuit,
+                    dark = dark,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = IosMetrics.navBarHeight + 4.dp, start = 12.dp, end = 12.dp)
+                        .zIndex(1f),
+                )
+            } else if (readSyncVerifyBanner && state.screen == Screen.List) {
                 ReadSyncVerifyBanner(
                     onVerify = viewModel::openReadSyncVerification,
                     onDismiss = viewModel::dismissReadSyncVerifyBanner,
@@ -392,6 +413,42 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     onDismiss = viewModel::dismissUpdateDialog,
                 )
             }
+        }
+    }
+}
+
+/** 挑战型 429 熔断期间的提示条：自动请求已全部暂停，「重试」每分钟最多放行一次前台探测。 */
+@Composable
+private fun ChallengeCircuitBanner(
+    remainingSec: Long,
+    onRetry: () -> Unit,
+    dark: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val warnBg = if (dark) Color(0xFF3A2E12) else Color(0xFFFEF3C7)
+    val warnText = if (dark) Color(0xFFFDE68A) else Color(0xFF92400E)
+    val warnBtn = if (dark) Color(0xFFF59E0B) else Color(0xFFB45309)
+    val minutes = remainingSec / 60L
+    val seconds = remainingSec % 60L
+    val countdown = if (minutes > 0L) "${minutes}分${seconds}秒" else "${seconds}秒"
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(warnBg)
+            .padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "站点暂时限制访问，已暂停自动刷新（约 $countdown 后恢复）。可稍后重试或切换网络",
+            color = warnText,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onRetry) {
+            Text("重试", fontSize = 13.sp, color = warnBtn, fontWeight = FontWeight.Medium)
         }
     }
 }
@@ -1412,6 +1469,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     cdkScoreState.username.equals(state.username, ignoreCase = true)
                                 },
                                 onLoadCdkScore = { viewModel.loadCdkScore() },
+                                cdkNeedsAuthorization = cdkScoreState.needsAuthorization &&
+                                    cdkScoreState.username.equals(state.username, ignoreCase = true),
+                                cdkLoading = cdkScoreState.loading &&
+                                    cdkScoreState.username.equals(state.username, ignoreCase = true),
+                                onAuthorizeCdk = viewModel::authorizeCdk,
                                 active = active,
                                 onReadNotification = viewModel::readNotification,
                                 notificationFilter = notificationFilter,

@@ -85,6 +85,31 @@ data class AttachmentPrewarmResult(
     val contentDisposition: String? = null,
 )
 
+/** 自动触发入口的失败退避；调用方只结算实际尝试，取消和已有凭据直接跳过不结算失败。 */
+internal class AutomaticPrewarmBackoff(private val cooldownMs: Long) {
+    private var generation = Long.MIN_VALUE
+    private var retryAfterElapsed = 0L
+
+    init { require(cooldownMs > 0L) }
+
+    @Synchronized
+    fun remainingMs(currentGeneration: Long, nowElapsed: Long): Long {
+        if (generation != currentGeneration) {
+            generation = currentGeneration
+            retryAfterElapsed = 0L
+        }
+        return (retryAfterElapsed - nowElapsed).coerceAtLeast(0L)
+    }
+
+    @Synchronized
+    fun recordResult(expectedGeneration: Long, currentGeneration: Long, nowElapsed: Long, succeeded: Boolean): Boolean {
+        if (expectedGeneration != currentGeneration) return false
+        generation = currentGeneration
+        retryAfterElapsed = if (succeeded) 0L else nowElapsed + cooldownMs
+        return true
+    }
+}
+
 @Suppress("DEPRECATION")
 internal fun Dialog.showVerificationSheet(content: View, dark: Boolean) {
     val container = FrameLayout(context)
@@ -218,6 +243,7 @@ class BrowserSession(
     private var verifyStaleClearances: Set<String> = emptySet()
     private var verifyProbeJob: Job? = null
     private var prewarmJob: Job? = null
+    private val automaticPrewarmBackoff = AutomaticPrewarmBackoff(2 * 60_000L)
     private var mainGeckoInitJob: Job? = null
 
     /** 系统 WebView 的 /challenge 导航是否已穿过 Cloudflare 到达 Discourse 源站（返回源站 404），供路径 B 判断就绪。 */
@@ -1273,6 +1299,9 @@ class BrowserSession(
             ?: SessionStore.parseCookieHeader(header2)[CF_CLEARANCE_COOKIE])
             ?.takeIf { it.isNotBlank() && !store.isClearanceChallenged(it) }
     }
+
+    private fun currentHealthyCfClearance(): String? =
+        currentCfClearance()?.takeUnless { store.isClearanceChallenged(it) }
 
     private fun isFreshCfClearance(value: String?): Boolean =
         !value.isNullOrBlank() &&
@@ -3093,7 +3122,19 @@ class BrowserSession(
         }
         if (verifyPhase == VerifyPhase.RUNNING || verifyProbeJob?.isActive == true || prewarmJob?.isActive == true) return
         if (authGeckoView != null || isInCfMode || awaitingSecondFactorLogin) return
-        if (currentCfClearance() != null) return
+        val generation = store.sessionGeneration
+        val now = SystemClock.elapsedRealtime()
+        val clearance = currentHealthyCfClearance()
+        if (clearance != null && !store.isClearanceChallenged(clearance)) {
+            automaticPrewarmBackoff.recordResult(generation, generation, now, succeeded = true)
+            return
+        }
+        if (store.sessionChanging || org.linuxdo.android.data.TopicRepository.isMainSiteGateBusy()) return
+        val remaining = automaticPrewarmBackoff.remainingMs(generation, now)
+        if (remaining > 0L) {
+            diagnostics.logThrottled("automatic-cf-prewarm-backoff", "自动凭据预热退避中，还剩 ${remaining / 1_000L}s ($reason)")
+            return
+        }
         val view = mainGeckoView
         if (view != null) {
             if (mainGeckoInitJob?.isActive == true) return
@@ -3101,25 +3142,46 @@ class BrowserSession(
         } else {
             if (solveMutex.isLocked) return
             prewarmJob = scope.launch {
-                runCatching { ensureCfClearance(reason) }
+                try {
+                    finishAutomaticPrewarm(generation, ensureCfClearance(reason), reason)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    diagnostics.log("自动凭据预热准备失败: ${error.javaClass.simpleName}")
+                    finishAutomaticPrewarm(generation, succeeded = false, reason = reason)
+                }
             }
+        }
+    }
+
+    private fun finishAutomaticPrewarm(generation: Long, succeeded: Boolean, reason: String) {
+        if (store.sessionChanging || generation != store.sessionGeneration) return
+        val clearance = currentCfClearance()
+        val hasHealthyClearance = clearance != null && !store.isClearanceChallenged(clearance)
+        val passed = hasHealthyClearance || (succeeded && challengeOriginReached)
+        if (automaticPrewarmBackoff.recordResult(generation, store.sessionGeneration, SystemClock.elapsedRealtime(), passed) && !passed) {
+            diagnostics.log("自动凭据预热未取得可用凭据，退避 2 分钟 ($reason)")
         }
     }
 
     private fun startSilentPrewarmLoad(view: GeckoView, reason: String) {
         verifyProbeJob?.cancel()
         verifyProbeJob = scope.launch(Dispatchers.Main) {
+            val generation = store.sessionGeneration
             val recoveryId = store.beginClearanceRecovery()
+            var attempted = false
+            var wasCancelled = false
+            var obtainedClearance = false
             try {
-                val generation = store.sessionGeneration
                 val session = view.session ?: return@launch
                 val stillCurrent = {
                     !store.sessionChanging && generation == store.sessionGeneration &&
                         mainGeckoView === view && mainGeckoSession === session &&
                         verifyPhase != VerifyPhase.RUNNING && authGeckoView == null &&
-                        !isInCfMode && !awaitingSecondFactorLogin && currentCfClearance() == null
+                        !isInCfMode && !awaitingSecondFactorLogin && currentHealthyCfClearance() == null
                 }
                 if (!stillCurrent()) return@launch
+                attempted = true
                 synchronizeGeckoUserAgent(session, "后台预热", stillCurrent)
                 val context = attachedActivityContext ?: appContext
                 val geckoStale = withContext(Dispatchers.IO) {
@@ -3133,7 +3195,7 @@ class BrowserSession(
                     authGeckoView != null ||
                     isInCfMode ||
                     awaitingSecondFactorLogin ||
-                    currentCfClearance() != null
+                    currentHealthyCfClearance() != null
                 ) return@launch
                 if (!org.linuxdo.android.net.gecko.GeckoManager.clearSiteCookies(context)) {
                     diagnostics.log("后台预热清理 Gecko 旧凭据失败，按旧值基线判定 ($reason)")
@@ -3144,7 +3206,7 @@ class BrowserSession(
                     authGeckoView != null ||
                     isInCfMode ||
                     awaitingSecondFactorLogin ||
-                    currentCfClearance() != null
+                    currentHealthyCfClearance() != null
                 ) return@launch
                 diagnostics.log(
                     "GeckoView 后台静默预热 cf_clearance 开始: $reason (排除旧凭据 ${staleSet.size} 枚, " +
@@ -3181,6 +3243,7 @@ class BrowserSession(
                         val active = currentCfClearance()
                         if (active == fresh) {
                             lastAdopted = fresh
+                            obtainedClearance = true
                             lastClearedAtElapsed = SystemClock.elapsedRealtime()
                             diagnostics.log("GeckoView 后台静默预热取得新 cf_clearance ($reason): ${clearanceFingerprint(fresh)}")
                         } else {
@@ -3211,11 +3274,16 @@ class BrowserSession(
                     }
                 }
             } catch (cancelled: CancellationException) {
+                wasCancelled = true
                 throw cancelled
             } catch (error: Exception) {
                 diagnostics.log("Gecko 后台预热准备失败: ${error.javaClass.simpleName}")
             } finally {
                 store.endClearanceRecovery(recoveryId)
+                if (attempted && !wasCancelled && mainGeckoView === view && verifyPhase != VerifyPhase.RUNNING &&
+                    authGeckoView == null && !isInCfMode && !awaitingSecondFactorLogin) {
+                    finishAutomaticPrewarm(generation, obtainedClearance, reason)
+                }
             }
         }
     }
@@ -3862,7 +3930,7 @@ class BrowserSession(
      * 超时返回 false,由调用方决定是否转入可见的交互验证。
      */
     /** 当前 WebView 里是否已有 cf_clearance。 */
-    suspend fun hasCfClearance(): Boolean = withContext(Dispatchers.Main) { currentCfClearance() != null }
+    suspend fun hasCfClearance(): Boolean = withContext(Dispatchers.Main) { currentHealthyCfClearance() != null }
 
     /**
      * 没有 cf_clearance 时，在隐藏 WebView 里静默打开 /challenge 换取一枚。已有则直接返回 true。

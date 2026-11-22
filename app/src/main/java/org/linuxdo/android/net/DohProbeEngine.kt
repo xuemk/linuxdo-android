@@ -32,6 +32,12 @@ data class DohProbeResult(
  *    - ECH 未协商 / 被拒 / 缺少 ECH 配置
  *    - TLS 握手失败 / DNS 超时
  */
+internal fun buildDohProbeRequest(url: String, userAgent: String, headOnly: Boolean = false): Request {
+    require(userAgent.isNotBlank()) { "测速缺少统一客户端标识" }
+    return Request.Builder().url(url).header("User-Agent", userAgent)
+        .apply { if (headOnly) head() }.build()
+}
+
 object DohProbeEngine {
 
     private const val TAG = "DohProbe"
@@ -41,17 +47,17 @@ object DohProbeEngine {
      * 测试单个 DoH 节点的端到端延迟（兼容既有接口）。
      * 返回毫秒级直连延迟；失败/超时返回 null。
      */
-    fun testLatency(server: DohServer, testHost: String = "linux.do"): Long? {
-        return probeDetailed(server, testHost).latencyMs
+    fun testLatency(server: DohServer, testHost: String = "linux.do", userAgent: String): Long? {
+        return probeDetailed(server, testHost, userAgent).latencyMs
     }
 
     /**
      * 对单节点发起端到端真实校验，返回详细诊断结果与延迟。
      */
-    fun probeDetailed(server: DohServer, testHost: String = "linux.do"): DohProbeResult {
+    fun probeDetailed(server: DohServer, testHost: String = "linux.do", userAgent: String): DohProbeResult {
         // 优先使用 Rust 原生 ECH 传输层进行端到端探测
         return try {
-            probeWithNativeEch(server)
+            probeWithNativeEch(server, userAgent)
         } catch (e: LinkageError) {
             Log.w(TAG, "DoH 原生库不可用，降级为常规 DNS 探测: ${e.message}")
             probeFallbackDns(server, testHost)
@@ -64,7 +70,7 @@ object DohProbeEngine {
 
     /**
      * 对指定传输发起真实 TLS+ECH 握手探测（轻量 HEAD /robots.txt）。
-     * 完全不消耗业务流量与 API 限额，仅验证 TCP 连接、TLS 1.3 握手与 ECH 协商。
+     * 仍会发出轻量 HTTP 请求，调用方须遵守冷却并优先复用近期业务成功记录。
      *
      * @param server DoH 节点配置（用于初始化 Transport）
      * @param overrideDns 若传入（如 AnycastDns），则走内置 IP 池直连；若为 null，则走该 server 的 DoH DNS 解析
@@ -73,7 +79,10 @@ object DohProbeEngine {
         server: DohServer,
         overrideDns: okhttp3.Dns? = null,
         timeoutSeconds: Long = 6L,
+        canProbe: () -> Boolean = { true },
+        userAgent: String,
     ): DohProbeResult {
+        if (!canProbe()) return DohProbeResult(null, false, "测速暂缓")
         var accepted = false
         val probeTransport = runCatching {
             DohTransport(server) { host, ech ->
@@ -96,12 +105,9 @@ object DohProbeEngine {
             }
 
             val probeClient = builder.build()
-            val request = Request.Builder()
-                .url("https://linux.do/robots.txt")
-                .head()
-                .header("User-Agent", "xmk2025-DoH-Check/1")
-                .build()
+            val request = buildDohProbeRequest("https://linux.do/robots.txt", userAgent, headOnly = true)
 
+            if (!canProbe()) return DohProbeResult(null, false, "测速暂缓")
             probeClient.newCall(request).execute().use { response ->
                 val latency = System.currentTimeMillis() - startMs
                 val isUsable = accepted && (response.isSuccessful || response.code in 300..499 && !isCloudflareChallenge(response, ""))
@@ -127,7 +133,7 @@ object DohProbeEngine {
     /**
      * 使用 Rust 原生 DohTransport 发起端到端请求 https://linux.do/latest.json
      */
-    private fun probeWithNativeEch(server: DohServer): DohProbeResult {
+    private fun probeWithNativeEch(server: DohServer, userAgent: String): DohProbeResult {
         var accepted = false
         val probeTransport = DohTransport(server) { host, ech ->
             if (host == "linux.do") accepted = ech
@@ -143,10 +149,7 @@ object DohProbeEngine {
                     .callTimeout(PROBE_TIMEOUT_SECONDS + 2, TimeUnit.SECONDS)
             ).build()
 
-            val request = Request.Builder()
-                .url("https://linux.do/latest.json")
-                .header("User-Agent", "xmk2025-DoH-Check/1")
-                .build()
+            val request = buildDohProbeRequest("https://linux.do/latest.json", userAgent)
 
             probeClient.newCall(request).execute().use { response ->
                 val latency = System.currentTimeMillis() - startMs

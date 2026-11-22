@@ -1304,6 +1304,15 @@ object MiniAppSessionPool {
         var webmailManualLogout = false
         var lastWebmailFillDocId: String? = null
         var webmailFillingDocId: String? = null
+        /** 安全验证页循环检测：同一容器在窗口内反复进入验证页且始终未通过时停止自动刷新。 */
+        /** 窗口内每次进入验证页的时间（滑动窗口）。 */
+        val challengeLoadTimes = ArrayDeque<Long>()
+        var challengeCountedEpoch = -1
+        /** 页面脚本按 DOM 判定为验证页的加载代次；标题不匹配时也据此保持验证状态，避免被标题事件刷掉。 */
+        var challengeDomEpoch = -1
+        var challengeShownAt by mutableStateOf(0L)
+        var challengeWidgetSeen = false
+        var challengeHaltMessage: String? = null
 
         fun toggleDesktopMode() {
             val useDesktop = !desktopMode
@@ -1414,9 +1423,59 @@ object MiniAppSessionPool {
     fun relaunchCurrent(targetUrl: String? = null) {
         val holder = activeHolder ?: return
         val loadTarget = targetUrl ?: holder.entryUrl
+        holder.challengeHaltMessage = null
+        holder.challengeLoadTimes.clear()
         holder.mainFrameError = null
         holder.progress = 0.08f
         holder.session.loadUri(miniAppLaunchUrl(loadTarget))
+    }
+
+    private const val CHALLENGE_LOOP_WINDOW_MS = 3 * 60_000L
+    private const val CHALLENGE_LOOP_LIMIT = 3
+    const val CHALLENGE_STALL_HINT_MS = 20_000L
+
+    /** 停止安全验证页的自动刷新循环：卸载页面并给出提示，用户点「重新加载」才会再次尝试。 */
+    fun haltChallengeLoop(holder: HeldSession, reason: String, userInitiated: Boolean = false) {
+        if (activeHolder !== holder) return
+        holder.challengeLoadTimes.clear()
+        holder.challengeShownAt = 0L
+        holder.challengeHaltMessage = if (userInitiated) {
+            "已停止安全验证。可稍后点击重新加载，或切换网络后再试"
+        } else {
+            "安全验证多次未完成，已停止自动刷新。请稍后点击重新加载，或切换网络后再试"
+        }
+        holder.showChallenge = false
+        holder.mainFrameError = holder.challengeHaltMessage
+        org.linuxdo.android.net.NetDiagnostics.log(
+            "H5 容器停止安全验证循环: $reason (验证组件出现=${holder.challengeWidgetSeen}，仅供参考) url=${holder.documentUrl.take(80)}",
+        )
+        runCatching { holder.session.stop() }
+        runCatching { holder.session.loadUri("about:blank") }
+    }
+
+    /** 每次加载最多计一次进入验证页；滑动窗口内累计达到上限即停止循环。 */
+    internal fun noteChallengeState(holder: HeldSession) {
+        if (activeHolder !== holder) return
+        if (!holder.showChallenge) {
+            if (holder.challengeShownAt != 0L) holder.challengeShownAt = 0L
+            return
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        // 同一次加载内验证状态短暂抖动后恢复时，重新开始 20 秒停滞计时，但不重复计次。
+        if (holder.challengeShownAt == 0L) holder.challengeShownAt = now
+        if (holder.challengeCountedEpoch == holder.loadEpoch) return
+        holder.challengeCountedEpoch = holder.loadEpoch
+        holder.challengeShownAt = now
+        val times = holder.challengeLoadTimes
+        times.addLast(now)
+        while (times.isNotEmpty() && now - times.first() > CHALLENGE_LOOP_WINDOW_MS) times.removeFirst()
+        org.linuxdo.android.net.NetDiagnostics.log(
+            "H5 容器进入安全验证页(${CHALLENGE_LOOP_WINDOW_MS / 60_000L} 分钟内第 ${times.size} 次) " +
+                "url=${holder.documentUrl.take(80)}",
+        )
+        if (times.size >= CHALLENGE_LOOP_LIMIT) {
+            haltChallengeLoop(holder, "${CHALLENGE_LOOP_WINDOW_MS / 60_000L} 分钟内 ${times.size} 次进入验证页且期间未正常打开页面")
+        }
     }
 
     fun destroyCurrent() {
@@ -1539,7 +1598,13 @@ object MiniAppSessionPool {
                 }
             }
             val phase = state.optString("phase")
+            holder.challengeDomEpoch = if (phase == "challenge") holder.loadEpoch else -1
             holder.showChallenge = phase == "challenge" || InAppViewport.isChallengeTitle(holder.documentTitle)
+            if (holder.showChallenge && state.optBoolean("challengeWidget") && !holder.challengeWidgetSeen) {
+                holder.challengeWidgetSeen = true
+                org.linuxdo.android.net.NetDiagnostics.log("H5 容器验证组件已出现 url=${documentUrl.take(80)}")
+            }
+            noteChallengeState(holder)
             if (isBootstrapLocation(documentUrl)) {
                 holder.contentReady = false
                 holder.hasRenderedFirstPage = false
@@ -1547,6 +1612,7 @@ object MiniAppSessionPool {
                 return
             }
             holder.contentReady = phase == "ready" || phase == "permission"
+            if (holder.contentReady && !holder.showChallenge) holder.challengeLoadTimes.clear()
             if (holder.contentReady) holder.bootstrapping = false
             holder.hasRenderedFirstPage = holder.contentReady && holder.targetPainted
             if (phase == "error" || phase == "unavailable") {
@@ -1607,7 +1673,12 @@ object MiniAppSessionPool {
             contextId = isolatedContextId,
             onLocationChanged = { navUrl ->
                 holder.documentUrl = navUrl
-                if (!isBootstrapLocation(navUrl)) {
+                // 内置浏览器里走 connect OAuth（如 LD士多 登录）同样会让主站随后被挑战，App 主站请求一并静默。
+                if (navUrl.toHttpUrlOrNull()?.let { it.host == "connect.linux.do" && it.encodedPath.startsWith("/oauth2/") } == true) {
+                    org.linuxdo.android.data.TopicRepository.enterPostOAuthQuietWindow("内置浏览器 connect OAuth")
+                }
+                // about:blank 只在停止验证循环时出现，保留原页面地址供「重新加载 / 外部打开」使用。
+                if (!isBootstrapLocation(navUrl) && !navUrl.startsWith("about:")) {
                     holder.currentUrl = navUrl
                 }
             },
@@ -1623,11 +1694,14 @@ object MiniAppSessionPool {
                 holder.revealTarget = false
                 holder.documentTitle = ""
                 holder.bootstrapping = isBootstrapLocation(startUrl)
-                if (!isBootstrapLocation(startUrl)) {
+                if (!isBootstrapLocation(startUrl) && !startUrl.startsWith("about:")) {
                     holder.currentUrl = startUrl
                 }
                 holder.progress = 0.08f
-                holder.mainFrameError = null
+                holder.challengeWidgetSeen = false
+                // 停止验证循环时会加载 about:blank，此时保留提示，不能被新页面开始事件清掉。
+                holder.mainFrameError = if (startUrl.startsWith("about:")) holder.challengeHaltMessage else null
+                noteChallengeState(holder)
             },
             onProgressChanged = { newProgress ->
                 if (!isBootstrapLocation(holder.documentUrl)) {
@@ -1637,7 +1711,9 @@ object MiniAppSessionPool {
             onTitleChanged = { newTitle ->
                 if (!isCurrentHolder()) return@createChallengeSession
                 holder.documentTitle = newTitle
-                holder.showChallenge = InAppViewport.isChallengeTitle(newTitle)
+                // 页面脚本已按 DOM 判定为验证页时，标题不匹配（如初始域名标题）也不能把验证状态刷掉。
+                holder.showChallenge = InAppViewport.isChallengeTitle(newTitle) || holder.challengeDomEpoch == holder.loadEpoch
+                noteChallengeState(holder)
                 if (!holder.bootstrapping && !isBootstrapLocation(holder.documentUrl) &&
                     MiniAppEntry.idFromUrl(holder.entryUrl) == null && newTitle.isNotBlank()) {
                     val cleaned = newTitle
@@ -1651,7 +1727,7 @@ object MiniAppSessionPool {
                 holder.canGoBack = back && !holder.bootstrapping
             },
             onPageFinished = { finishedUrl ->
-                if (isBootstrapLocation(finishedUrl)) {
+                if (isBootstrapLocation(finishedUrl) || (finishedUrl.startsWith("about:") && holder.challengeHaltMessage != null)) {
                     return@createChallengeSession
                 }
                 holder.bootstrapping = false
@@ -1660,6 +1736,8 @@ object MiniAppSessionPool {
                 if (MiniAppEntry.idFromUrl(finishedUrl) == null) {
                     holder.contentReady = true
                     holder.hasRenderedFirstPage = holder.targetPainted
+                    // 非 *.linux.do 页面（如 LD士多）没有页面脚本回报状态，正常页面加载完成即视为验证已通过，清空循环计数。
+                    if (!holder.showChallenge) holder.challengeLoadTimes.clear()
                 } else if (holder.bridge == null) {
                     holder.mainFrameError = "小程序加载组件未就绪，请重试"
                 }
@@ -1710,7 +1788,8 @@ object MiniAppSessionPool {
                 }
             },
             onDiagnostic = { message ->
-                if (isCurrentHolder()) org.linuxdo.android.net.NetDiagnostics.log(
+                // 加载进度档位对排查价值低且占行数，开始/结束/挑战等事件已足够还原时间线。
+                if (isCurrentHolder() && !message.startsWith("加载进度")) org.linuxdo.android.net.NetDiagnostics.log(
                     "H5 容器 epoch=${holder.loadEpoch} challenge=${holder.showChallenge} " +
                         "ready=${holder.hasRenderedFirstPage} $message " + GeckoManager.runtimeNetworkSummary(appContext),
                 )
@@ -1923,6 +2002,21 @@ fun InAppBrowserSheet(
         }
     }
     var isTimeout by remember(holder) { mutableStateOf(false) }
+    var challengeStalled by remember(holder) { mutableStateOf(false) }
+    LaunchedEffect(holder, holder.challengeShownAt) {
+        challengeStalled = false
+        val shownAt = holder.challengeShownAt
+        if (shownAt > 0L) {
+            delay(MiniAppSessionPool.CHALLENGE_STALL_HINT_MS)
+            if (holder.challengeShownAt == shownAt && holder.showChallenge && holder.mainFrameError == null) {
+                challengeStalled = true
+                org.linuxdo.android.net.NetDiagnostics.log(
+                    "H5 容器安全验证 ${MiniAppSessionPool.CHALLENGE_STALL_HINT_MS / 1_000L}s 未完成 " +
+                        "(验证组件出现=${holder.challengeWidgetSeen}，仅供参考)，提示用户",
+                )
+            }
+        }
+    }
     LaunchedEffect(holder, holder.loadEpoch, holder.hasRenderedFirstPage, holder.showChallenge, holder.mainFrameError) {
         isTimeout = false
         if (!holder.hasRenderedFirstPage && !holder.showChallenge && holder.mainFrameError == null) {
@@ -1933,6 +2027,8 @@ fun InAppBrowserSheet(
 
     DisposableEffect(holder, geckoView) {
         MiniAppSessionPool.markContainerEntered()
+        // 内置浏览器可见期间暂停未读轮询、新话题探测与摘要预取，关闭后随机静默 3~5 秒再恢复。
+        org.linuxdo.android.data.ApiQuotaPool.onInAppBrowserVisible(true)
         (geckoView.parent as? ViewGroup)?.removeView(geckoView)
         geckoView.alpha = if (showPage) 1f else 0f
         geckoView.setSession(holder.session)
@@ -1976,6 +2072,7 @@ fun InAppBrowserSheet(
 
         onDispose {
             disposed = true
+            org.linuxdo.android.data.ApiQuotaPool.onInAppBrowserVisible(false)
             if (geckoView.viewTreeObserver.isAlive) geckoView.viewTreeObserver.removeOnGlobalLayoutListener(layoutListener)
             geckoView.removeWindowInsetsListener("linuxdo-in-app-viewport")
             geckoView.setVerticalClipping(0)
@@ -2130,6 +2227,28 @@ fun InAppBrowserSheet(
                                 view.alpha = if (showPage) 1f else 0f
                             },
                         )
+                    }
+
+                    if (challengeStalled && holder.showChallenge && holder.mainFrameError == null) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(horizontal = 16.dp, vertical = 20.dp)
+                                .fillMaxWidth()
+                                .background(Color(0xE6202020), RoundedCornerShape(12.dp))
+                                .padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "安全验证长时间未完成，可能未出现验证框。可稍后重试或切换网络",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = { MiniAppSessionPool.haltChallengeLoop(holder, "用户手动停止验证", userInitiated = true) }) {
+                                Text("停止", color = Color(0xFFFFD60A), fontSize = 13.sp)
+                            }
+                        }
                     }
 
                     if (showColdStartOverlay) {

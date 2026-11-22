@@ -220,7 +220,11 @@
     const webmailLogout = !challenge && isWebmailOrigin && isWebmailLogoutUrl();
     const webmailAuthenticated = !challenge && isWebmailOrigin && !webmailEls &&
       !isWebmailLoginPath() && !webmailLogout && document.readyState === "complete";
-    return { url: location.href, documentId: inAppDocumentId, phase,
+    // 验证组件是否已渲染（尽力而为：组件可能位于封闭 Shadow DOM 中而查不到，结果仅用于诊断，不参与放行判断）。
+    const challengeWidget = challenge && !!document.querySelector(
+      'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], #challenge-stage iframe, .cf-turnstile iframe'
+    );
+    return { url: location.href, documentId: inAppDocumentId, phase, challengeWidget,
       webmailLogin: !!webmailEls, webmailLoginError: !!webmailEls?.hasError,
       webmailAuthenticated, webmailLogout,
       detail: phase === "error" ? loader.querySelector('[data-role="detail"]')?.textContent.trim().slice(0, 300) || "小程序启动失败" : "" };

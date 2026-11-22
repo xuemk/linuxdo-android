@@ -1838,6 +1838,8 @@ data class ProfileEntry(
     val avatarUrl: String? = null,
     val actor: String? = null,
     val postNumber: Int? = null,
+    /** 用于打开资料卡的真实用户名；[actor] 是展示文案，合并通知会是「xxx 和其他 N 人」。 */
+    val actorUsername: String? = null,
 )
 
 data class ProfilePage(

@@ -203,6 +203,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     @Volatile var verificationRequired: Boolean = false
         private set
     private val cookieMutationGate = Mutex()
+    private val rateLimitPersistenceLock = Any()
     private val challengedClearanceLock = Any()
     private val challengedClearances = LinkedHashSet<String>()
     private val challengedClearanceFps = LinkedHashSet<String>()
@@ -1562,7 +1563,58 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     fun getRateLimitedUntil(): Long = plainPrefs.getLong(KEY_RATE_LIMITED_UNTIL, 0L)
 
     fun setRateLimitedUntil(timeMs: Long) {
-        plainPrefs.edit().putLong(KEY_RATE_LIMITED_UNTIL, timeMs).apply()
+        synchronized(rateLimitPersistenceLock) {
+            val current = getRateLimitCooldownState()
+            val now = System.currentTimeMillis()
+            val serverUntil = maxOf(timeMs, current.serverUntilWallMs.takeIf { it > now } ?: 0L)
+            val until = maxOf(serverUntil, current.untilWallMs.takeIf { it > now } ?: 0L,
+                current.challengeCircuitUntilWallMs.takeIf { it > now } ?: 0L)
+            // 兼容旧调用只能补充普通硬冷却，不能由迟到的复位抹掉结构化熔断或服务端截止。
+            setRateLimitCooldownState(current.copy(
+                untilWallMs = until,
+                serverUntilWallMs = serverUntil,
+                cfChallenge = current.cfChallenge && timeMs <= 0L,
+                probeRequired = current.probeRequired || until > now,
+            ))
+        }
+    }
+
+    internal data class RateLimitCooldownState(
+        val untilWallMs: Long = 0L,
+        val serverUntilWallMs: Long = 0L,
+        val challengeCircuitUntilWallMs: Long = 0L,
+        val lastManualProbeWallMs: Long = 0L,
+        val cfChallenge: Boolean = false,
+        val probeRequired: Boolean = false,
+    )
+
+    internal fun getRateLimitCooldownState(): RateLimitCooldownState = synchronized(rateLimitPersistenceLock) {
+        val saved = plainPrefs.all
+        val until = saved[KEY_RATE_LIMITED_UNTIL] as? Long ?: 0L
+        // 旧格式没有区分客户端惩罚与服务端等待，保守保留为硬截止。
+        if (saved[KEY_RATE_LIMIT_STATE_VERSION] != 1) {
+            return@synchronized RateLimitCooldownState(untilWallMs = until, serverUntilWallMs = until)
+        }
+        RateLimitCooldownState(
+            untilWallMs = until,
+            serverUntilWallMs = saved[KEY_RATE_LIMIT_SERVER_UNTIL] as? Long ?: 0L,
+            challengeCircuitUntilWallMs = saved[KEY_CHALLENGE_CIRCUIT_UNTIL] as? Long ?: 0L,
+            lastManualProbeWallMs = saved[KEY_CHALLENGE_MANUAL_PROBE_AT] as? Long ?: 0L,
+            cfChallenge = saved[KEY_RATE_LIMIT_CF_CHALLENGE] as? Boolean ?: false,
+            probeRequired = saved[KEY_RATE_LIMIT_PROBE_REQUIRED] as? Boolean ?: false,
+        )
+    }
+
+    internal fun setRateLimitCooldownState(state: RateLimitCooldownState) = synchronized(rateLimitPersistenceLock) {
+        plainPrefs.edit()
+            .putInt(KEY_RATE_LIMIT_STATE_VERSION, 1)
+            .putLong(KEY_RATE_LIMITED_UNTIL, state.untilWallMs)
+            .putLong(KEY_RATE_LIMIT_SERVER_UNTIL, state.serverUntilWallMs)
+            .putLong(KEY_CHALLENGE_CIRCUIT_UNTIL, state.challengeCircuitUntilWallMs)
+            .putLong(KEY_CHALLENGE_MANUAL_PROBE_AT, state.lastManualProbeWallMs)
+            .putBoolean(KEY_RATE_LIMIT_CF_CHALLENGE, state.cfChallenge)
+            .putBoolean(KEY_RATE_LIMIT_PROBE_REQUIRED, state.probeRequired)
+            .apply()
     }
 
     fun clearSearchHistory() {
@@ -1658,6 +1710,12 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         const val KEY_SKIN_PRESET = "skin_preset"
         const val KEY_SEARCH_HISTORY_JSON = "search_history_json"
         const val KEY_RATE_LIMITED_UNTIL = "rate_limited_until_wall_ms"
+        private const val KEY_RATE_LIMIT_STATE_VERSION = "rate_limit_state_version"
+        private const val KEY_RATE_LIMIT_SERVER_UNTIL = "rate_limit_server_until_wall_ms"
+        private const val KEY_CHALLENGE_CIRCUIT_UNTIL = "challenge_circuit_until_wall_ms"
+        private const val KEY_CHALLENGE_MANUAL_PROBE_AT = "challenge_manual_probe_at_wall_ms"
+        private const val KEY_RATE_LIMIT_CF_CHALLENGE = "rate_limit_cf_challenge"
+        private const val KEY_RATE_LIMIT_PROBE_REQUIRED = "rate_limit_probe_required"
 
         fun parseCookieHeader(raw: String?): Map<String, String> =
             raw.orEmpty().split(";").mapNotNull { part ->

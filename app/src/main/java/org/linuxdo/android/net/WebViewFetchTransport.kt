@@ -33,6 +33,13 @@ class WebViewFetchTransport(
     override suspend fun getWithoutRevalidate(path: String, present: Boolean): TransportResult =
         browser.fetchJson(path, present = present, allowRevalidate = false)
 
+    /**
+     * 路径 B 不支持禁止重定向的子站只读请求（等级进度 / LDC / CDK）：WebView fetch 的 redirect=manual 只返回
+     * opaqueredirect，拿不到状态与 Location，无法区分"需要授权"。路径 B 仅 DEBUG 构建可切换，这里明确报错而不是静默跟随跳转。
+     */
+    override suspend fun getWithoutRedirects(path: String, present: Boolean): TransportResult =
+        throw UnsupportedOperationException("路径 B 不支持子站只读请求，请在开发者选项切回路径 A")
+
     override suspend fun getForVerification(path: String, present: Boolean): TransportResult =
         getWithoutRevalidate(path, present)
 

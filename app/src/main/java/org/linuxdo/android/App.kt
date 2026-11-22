@@ -82,6 +82,7 @@ class App : Application(), ImageLoaderFactory {
                         override fun backgroundRequestDelayMs(): Long = maxOf(
                             org.linuxdo.android.data.TopicRepository.mainSiteGateWaitMs(),
                             org.linuxdo.android.data.ApiQuotaPool.UNREAD_POLL.penaltyRemainingMs(),
+                            org.linuxdo.android.data.ApiQuotaPool.inAppBrowserPauseRemainingMs(),
                             if (org.linuxdo.android.data.TopicRepository.isSilentRevalidating() ||
                                 store.isClearanceRecoveryInProgress() ||
                                 store.sessionChanging ||
@@ -149,7 +150,9 @@ class AppContainer(context: Context) {
     init {
         installCrashHandler(context, diagnostics)
     }
-    val sessionStore = SessionStore(context)
+    val sessionStore = SessionStore(context).also {
+        org.linuxdo.android.data.TopicRepository.restoreRateLimitCooldown(it, diagnostics)
+    }
     val reading = ReadingStore(context)
     val accountManager = AccountManager(context).also { manager ->
         sessionStore.accountCookieFallback = { uid ->
@@ -215,6 +218,11 @@ class AppContainer(context: Context) {
         userAgent = userAgent,
         networkMonitor = networkMonitor,
         anycastPool = anycastPool,
+        shouldPauseBackgroundProbe = {
+            sessionStore.sessionChanging || sessionStore.isClearanceRecoveryInProgress() || !sessionStore.isAppInForeground() ||
+                org.linuxdo.android.data.ApiQuotaPool.inAppBrowserPauseRemainingMs() > 0L
+        },
+        probeUserAgentProvider = { userAgent },
         clientFactory = { dns, transport, coordinator, routeMode ->
             buildSharedHttpClient(
                 store = sessionStore,
@@ -231,6 +239,10 @@ class AppContainer(context: Context) {
     /** 动态分发的全局 Call.Factory：新发起的请求永远自动获取当前最新代次的 Client */
     val dynamicCallFactory: okhttp3.Call.Factory = dohCoordinator
 
+    val imageCallFactory: okhttp3.Call.Factory = dohCoordinator.imageCallFactory
+    val imageHttpClient: okhttp3.OkHttpClient
+        get() = dohCoordinator.currentImageClient
+
     /** 保持向后兼容：全局共享的当前活跃 Client */
     val httpClient: okhttp3.OkHttpClient
         get() = dohCoordinator.currentClient
@@ -245,7 +257,7 @@ class AppContainer(context: Context) {
     )
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
-        .callFactory(dynamicCallFactory)
+        .callFactory(imageCallFactory)
         .components {
             if (Build.VERSION.SDK_INT >= 28) {
                 add(ImageDecoderDecoder.Factory(enforceMinimumFrameDelay = true))
@@ -295,16 +307,9 @@ class AppContainer(context: Context) {
             dohCoordinator.recycleConnections("默认网络切换")
             updateWebViewProxyState()
         }
-        // 递增冷却撞满仍持续 429 速率挑战：有限度换一个 Anycast 节点降温（间隔由 TopicRepository 限定为 10 分钟）。
-        org.linuxdo.android.data.TopicRepository.onChallenge429Persistent = { reason ->
-            val next = anycastPool.rotateWinner()
-            if (next != null) {
-                dohCoordinator.recycleConnections("429 速率挑战换线")
-                diagnostics.log("网络链路: $reason，轮换优选节点降温")
-            } else {
-                diagnostics.log("网络链路: $reason，无可用备选节点，维持当前线路")
-            }
-        }
+        // 挑战型 429 不再换线降温：换 Anycast 节点不改变出口 IP，实测换线后立即再次被挑战，改由 TopicRepository 递增冷却与熔断处理。
+        // 内置浏览器打开期间暂停自动轮询只在 App 处于前台时生效，避免切后台后长期压住后台通知。
+        org.linuxdo.android.data.ApiQuotaPool.appForegroundProvider = { sessionStore.isAppInForeground() }
         updateWebViewProxyState()
         dohCoordinator.warmUpAnycastIfNeeded()
     }
@@ -343,6 +348,7 @@ class AppContainer(context: Context) {
      * 必须在回前台的首批请求发出之前调用。
      */
     fun onAppForeground() {
+        org.linuxdo.android.data.ApiQuotaPool.markAppForeground()
         dohCoordinator.setAppForeground(true)
         val since = backgroundSince
         backgroundSince = 0L

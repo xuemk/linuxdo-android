@@ -1,6 +1,7 @@
 package org.linuxdo.android.net
 
 import org.linuxdo.android.Config
+import okhttp3.OkHttpClient
 
 enum class NetworkPath(val label: String) {
     OKHTTP("A: OkHttp"),
@@ -24,6 +25,10 @@ interface Transport {
     val name: String
 
     suspend fun get(path: String, present: Boolean = true): TransportResult
+
+    /** 已授权子站的只读读取；禁止自动跟随可能发起 SSO/OAuth 的重定向。 */
+    suspend fun getWithoutRedirects(path: String, present: Boolean = false): TransportResult =
+        throw UnsupportedOperationException("当前通道不支持禁止重定向的读取")
 
     /** 单次无重验 GET 请求（供 P0-4 切栈兜底使用，前置检查未通过时直接失败不循环重验）。 */
     suspend fun getWithoutRevalidate(path: String, present: Boolean = true): TransportResult =
@@ -125,6 +130,45 @@ class SecondFactorRequiredException(
 
 class HttpStatusException(val status: Int, detail: String = "", val retryAfterSeconds: Long? = null) :
     Exception("HTTP $status $detail".trim())
+
+open class SiteAuthorizationRequiredException(message: String = "需要授权，请点击授权后继续") : Exception(message)
+
+/** 子站需要授权，但当前时机不适合自动授权（主站刚限流、刚回前台、内置浏览器刚用过等），条件满足后会自动重试。 */
+class SiteAuthorizationDeferredException(val retryAfterMs: Long = 15_000L) :
+    SiteAuthorizationRequiredException("正在等待合适时机自动授权")
+
+internal data object NoRedirectRequest
+
+internal fun withoutSiteRedirects(client: OkHttpClient): OkHttpClient =
+    client.newBuilder().followRedirects(false).followSslRedirects(false).build()
+
+/**
+ * 用户操作（[allowAuthorization]）直接允许 OAuth；自动读取由 [autoAuthorization] 判定是否允许本次自动授权
+ * （返回 false 表示不允许，可抛出 [SiteAuthorizationDeferredException] 表示稍后重试）。授权后最多补读一次。
+ */
+internal suspend fun <T> readWithExplicitAuthorization(
+    checkSession: () -> Unit,
+    read: suspend () -> T,
+    authorize: suspend () -> Boolean,
+    allowAuthorization: Boolean = false,
+    autoAuthorization: (() -> Boolean)? = null,
+): T {
+    checkSession()
+    val result = try {
+        read()
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        checkSession()
+        if (error !is SiteAuthorizationRequiredException && !(error is HttpStatusException && error.status == 401)) throw error
+        if (!allowAuthorization && autoAuthorization?.invoke() != true) throw SiteAuthorizationRequiredException()
+        if (!authorize()) throw error
+        checkSession()
+        read()
+    }
+    checkSession()
+    return result
+}
 
 /** 服务端已明确限流。调用方应等待冷却结束，不能把它当作需要过盾的验证失败。 */
 class RateLimitException(

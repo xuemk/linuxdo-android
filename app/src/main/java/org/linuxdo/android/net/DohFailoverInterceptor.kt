@@ -55,12 +55,12 @@ class DohFailoverInterceptor(
                     .build()
                 if (nextEpoch.generation > currentEpoch.generation) {
                     Log.i(TAG, "使用新代次 [gen ${nextEpoch.generation}: ${nextEpoch.server.name}] 发起单次重试")
-                    return nextEpoch.client.newCall(retryRequest).execute()
+                    return coordinator.clientForRequest(retryRequest, nextEpoch).newCall(retryRequest).execute()
                 }
                 // 首次抖动尚未跨代次时，淘汰当前卡死的连接/Anycast 节点并在同代次发起 1 次无感重试
                 coordinator.onIdempotentSingleFailureRetry(currentEpoch.generation)
                 Log.i(TAG, "单次故障尚未切换代次，轮换直连节点并清理空闲连接后发起 1 次幂等重试")
-                return nextEpoch.client.newCall(retryRequest).execute()
+                return coordinator.clientForRequest(retryRequest, nextEpoch).newCall(retryRequest).execute()
             }
 
             // 凡是不符合重试条件（如 POST 请求、已重试过、或无新代次），如实抛出原始异常

@@ -5849,7 +5849,7 @@ internal fun CookedContent(
                                     val host = runCatching { Uri.parse(currentUrl).host?.lowercase() }.getOrNull().orEmpty()
                                     val isSite = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
                                         host == "ldstatic.com" || host.endsWith(".ldstatic.com")
-                                    val factory = if (isSite) container.dynamicCallFactory else externalMediaCallFactory
+                                    val factory = if (isSite) container.imageCallFactory else externalMediaCallFactory
                                     val req = Request.Builder()
                                         .url(currentUrl)
                                         .header("User-Agent", container.userAgent)
@@ -6303,7 +6303,7 @@ private fun InlineMediaCard(
         val host = runCatching { Uri.parse(url).host?.lowercase() }.getOrNull().orEmpty()
         val isSiteHost = host == Config.HOST || host.endsWith(".${Config.HOST}") ||
             host == "ldstatic.com" || host.endsWith(".ldstatic.com")
-        val callFactory = if (isSiteHost && !forceDirect) container.dynamicCallFactory else externalMediaCallFactory
+        val callFactory = if (isSiteHost && !forceDirect) container.imageCallFactory else externalMediaCallFactory
         val dataSource = OkHttpDataSource.Factory(callFactory)
             .setUserAgent(container.sessionStore.userAgentOrNull() ?: container.userAgent)
         val next = ExoPlayer.Builder(context)
@@ -10736,7 +10736,7 @@ internal object SignatureMediaLoader {
             }
             activeNetworkCooldown(currentUrl.toString(), SystemClock.elapsedRealtime())?.let { return it }
             val factory: okhttp3.Call.Factory = if (isSite) {
-                container.httpClient.newBuilder()
+                container.imageHttpClient.newBuilder()
                     .followRedirects(false)
                     .followSslRedirects(false)
                     .retryOnConnectionFailure(false)

@@ -30,6 +30,7 @@ import java.util.Collections
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -575,6 +576,7 @@ data class TrustReportUiState(
     val loading: Boolean = false,
     val error: String? = null,
     val cachedAt: Long = 0L,
+    val needsAuthorization: Boolean = false,
 )
 
 data class LdcUiState(
@@ -590,6 +592,8 @@ data class CdkScoreUiState(
     val username: String = "",
     val score: Int? = null,
     val cachedAt: Long = 0L,
+    val needsAuthorization: Boolean = false,
+    val loading: Boolean = false,
 )
 
 data class ChatUiState(
@@ -1018,6 +1022,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var ldcBackoffUntil: Long = 0L
     private val ldcFetchGate = Mutex()
     private var ldcLastAttempt: Pair<Long, Result<LdcUserInfo>>? = null
+    private var ldcLastAttemptAllowedAuthorization = false
+    private var ldcLastAttemptUsedAuthorization = false
 
     private var lastUserBadgesFetchAt = 0L
     private var lastCustomSectionSyncAt = 0L
@@ -1035,55 +1041,332 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun siteFailureDelayMs(error: Exception): Long = when (error) {
+        is org.linuxdo.android.net.SiteAuthorizationDeferredException -> error.retryAfterMs.coerceAtLeast(1_000L)
+        is org.linuxdo.android.net.SiteAuthorizationRequiredException -> Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
         is RateLimitException -> error.retryAfterMs.coerceAtLeast(1_000L)
-        is NeedsInteractiveVerification -> Config.CONNECT_SILENT_REFRESH_BACKOFF_MS
-        is HttpStatusException -> if (error.status == 401 || error.status == 403) Config.CONNECT_SILENT_REFRESH_BACKOFF_MS else 30_000L
+        is NeedsInteractiveVerification -> 30_000L
+        is HttpStatusException -> maxOf(
+            if (error.status == 401) Config.CONNECT_SILENT_REFRESH_BACKOFF_MS else 30_000L,
+            error.retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L,
+        )
         else -> 30_000L
     }
 
+    /** 需要用户点击授权（自动授权暂缓的情况不算，条件满足后会自动重试）。 */
+    private fun needsSiteAuthorization(error: Exception): Boolean =
+        (error is org.linuxdo.android.net.SiteAuthorizationRequiredException &&
+            error !is org.linuxdo.android.net.SiteAuthorizationDeferredException) ||
+            (error is HttpStatusException && error.status == 401)
+
+    /**
+     * 子站读取：用户点击（[allowAuthorization]）直接授权；自动读取传入 [autoHost]，
+     * 由 [tryConsumeAutoSiteAuthorization] 按五条限制判断这次能否自动授权。
+     */
     private suspend fun <T> readSiteWithAuthorization(
         checkSession: () -> Unit,
         read: suspend () -> T,
         authorize: suspend () -> Boolean,
-    ): T {
-        checkSession()
-        val result = try {
-            repository.readAfterShortCooldown { checkSession(); read() }
-        } catch (error: HttpStatusException) {
+        allowAuthorization: Boolean = false,
+        autoHost: String? = null,
+    ): T = org.linuxdo.android.net.readWithExplicitAuthorization(
+        checkSession,
+        read = { repository.readAfterShortCooldown { checkSession(); read() } },
+        authorize = {
+            val authorized = authorize()
             checkSession()
-            if (error.status != 401) throw error
-            if (!authorize()) throw error
-            checkSession()
-            repository.readAfterShortCooldown { checkSession(); read() }
+            if (authorized) {
+                lastSiteAuthorizationAtElapsed = SystemClock.elapsedRealtime()
+                if (!allowAuthorization && autoHost != null) recordAutoSiteAuthorizationSuccess(autoHost)
+            }
+            authorized
+        },
+        allowAuthorization = allowAuthorization,
+        autoAuthorization = autoHost?.let { host -> { tryConsumeAutoSiteAuthorization(host) } },
+    )
+
+    private var lastAnyAutoSiteAuthAtElapsed = 0L
+    private var lastSiteAuthorizationAtElapsed = 0L
+    private val deferredSiteAuthJobs = mutableMapOf<String, Job>()
+    private val pendingSiteAuthorization = mutableSetOf<String>()
+    private var deferredMainSiteProbeJob: Job? = null
+    private var deferredMainSiteProbeNextAt = 0L
+    private var ldcGamificationScheduleJob: Job? = null
+
+    private fun autoSiteAuthKey(host: String) = "auto_site_auth_success_at_${store.currentUserId()}_$host"
+
+    private fun recordAutoSiteAuthorizationSuccess(host: String) {
+        container.preferences.edit { putLong(autoSiteAuthKey(host), System.currentTimeMillis()) }
+    }
+
+    /**
+     * 仅限制实际 SSO/OAuth，已有会话的读取照常进行。
+     * 成功授权才结算六小时额度；临时失败按短退避重试，恢复后不再追加长时间禁用。
+     */
+    private fun autoSiteAuthorizationBlock(host: String): Pair<String, Boolean>? {
+        val nowWall = System.currentTimeMillis()
+        val last = container.preferences.getLong(autoSiteAuthKey(host), 0L)
+        if (last > 0L && nowWall - last in 0L until AUTO_SITE_AUTH_INTERVAL_MS) return "6 小时内已成功自动授权过" to true
+        if (TopicRepository.challengeCircuitRemainingMs() > 0L || TopicRepository.isRateLimitCoolingDown() ||
+            TopicRepository.hasUnresolvedMainSiteChallengeWithin(AUTO_SITE_AUTH_AFTER_CHALLENGE_MS)
+        ) return "主站限流或挑战尚未恢复" to false
+        if (ApiQuotaPool.inAppBrowserPauseRemainingMs() > 0L) return "内置浏览器正在使用或刚关闭" to false
+        if (!store.isAppInForeground() || ApiQuotaPool.sinceAppForegroundMs() < AUTO_SITE_AUTH_FOREGROUND_SETTLE_MS) {
+            return "等待前台请求稳定" to false
         }
+        if (sinceSessionStartMs() < Config.CONNECT_FIRST_WARMUP_AFTER_START_MS) return "进入首页不足 2 分钟" to false
+        if (store.sessionChanging || store.isClearanceRecoveryInProgress() || TopicRepository.isMainSiteGateBusy() ||
+            TopicRepository.isSilentRevalidating() || ApiQuotaPool.foregroundQuietRemainingMs() > 0L || scrollBusySignal.isBusy
+        ) return "正在操作或站点闸门忙" to false
+        val sinceLastAny = SystemClock.elapsedRealtime() - lastAnyAutoSiteAuthAtElapsed
+        if (lastAnyAutoSiteAuthAtElapsed > 0L && sinceLastAny < AUTO_SITE_AUTH_SPACING_MS) return "与上一个子站自动授权间隔不足 25 秒" to false
+        return null
+    }
+
+    /** 开始尝试只登记跨站间隔，成功后再结算授权额度。 */
+    private fun tryConsumeAutoSiteAuthorization(host: String): Boolean {
+        val block = autoSiteAuthorizationBlock(host)
+        if (block == null) {
+            lastAnyAutoSiteAuthAtElapsed = SystemClock.elapsedRealtime()
+            diagnostics.log("子站自动授权: $host（成功后结算额度）")
+            return true
+        }
+        if (block.second) {
+            diagnostics.logThrottled("auto-site-auth-$host", "子站自动授权跳过: $host，${block.first}，需点击授权")
+            return false
+        }
+        diagnostics.logThrottled("auto-site-auth-defer-$host", "子站自动授权暂缓: $host，${block.first}，条件满足后自动重试")
+        scheduleDeferredSiteAuthorization(host, waitForAuthorization = true)
+        throw org.linuxdo.android.net.SiteAuthorizationDeferredException()
+    }
+
+    /** 到期探针由必要积分读取确认，所有回补共享一次尝试。 */
+    private suspend fun awaitDeferredMainSiteRecovery(username: String, checkSession: () -> Unit): Boolean {
+        if (!TopicRepository.isMainSiteGateBusy()) return true
+        if (deferredMainSiteProbeJob?.isActive != true) {
+            val now = SystemClock.elapsedRealtime()
+            if (!TopicRepository.isMainSiteAutomaticProbeReady() || now < deferredMainSiteProbeNextAt) return false
+            deferredMainSiteProbeNextAt = now + 30_000L
+            deferredMainSiteProbeJob = viewModelScope.launch {
+                var succeeded = false
+                try {
+                    checkSession()
+                    val startedAt = SystemClock.elapsedRealtime()
+                    val score = repository.fetchGamificationScore(username, present = false)
+                    checkSession()
+                    if (score != null && TopicRepository.hasRecentMainSiteSuccess(
+                            (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L))) {
+                        succeeded = true
+                        lastLdcGamificationFetchAt = System.currentTimeMillis()
+                        _ldcState.update { state ->
+                            val info = state.userInfo ?: return@update state
+                            if (!info.username.equals(username, ignoreCase = true)) state
+                            else state.copy(userInfo = info.copy(gamificationScore = score))
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    diagnostics.log("自动回补等待主站恢复: ${error.message}")
+                } finally {
+                    if (!succeeded && runCatching { checkSession() }.isSuccess) {
+                        deferredMainSiteProbeNextAt = SystemClock.elapsedRealtime() + 30_000L
+                    }
+                }
+            }
+        }
+        deferredMainSiteProbeJob?.join()
         checkSession()
-        return result
+        return !TopicRepository.isMainSiteGateBusy()
+    }
+
+    /** 子站回补共用主站恢复读取，避免到期后无人领取探针而一直等待。 */
+    private fun scheduleDeferredSiteAuthorization(host: String, waitForAuthorization: Boolean = false) {
+        val username = _state.value.username ?: return
+        val checkSession = connectSessionCheck(username)
+        if (waitForAuthorization) pendingSiteAuthorization.add(host)
+        if (deferredSiteAuthJobs[host]?.isActive == true) return
+        val generation = accountScopeGeneration
+        deferredSiteAuthJobs[host] = viewModelScope.launch {
+            try {
+                while (isActive) {
+                    delay(if (store.isAppInForeground()) AUTO_SITE_AUTH_DEFER_POLL_MS else 60_000L)
+                    if (generation != accountScopeGeneration ||
+                        !username.equals(_state.value.username, ignoreCase = true)) return@launch
+                    checkSession()
+                    if (!store.isAppInForeground() || store.sessionChanging || store.isClearanceRecoveryInProgress() ||
+                        TopicRepository.isSilentRevalidating() || ApiQuotaPool.foregroundQuietRemainingMs() > 0L) continue
+                    val now = System.currentTimeMillis()
+                    val (needsRead, backoffUntil) = when (host) {
+                        CONNECT_SITE_HOST -> (_trustReport.value.report == null || _trustReport.value.needsAuthorization ||
+                            now - _trustReport.value.cachedAt >= Config.TRUST_REPORT_CACHE_TTL_MS) to connectSilentBackoffUntil
+                        CREDIT_SITE_HOST -> (_ldcState.value.userInfo == null || _ldcState.value.isExpired ||
+                            now - _ldcState.value.cachedAt >= Config.LDC_USER_INFO_CACHE_TTL_MS) to ldcBackoffUntil
+                        CDK_SITE_HOST -> (_cdkScore.value.score == null || _cdkScore.value.needsAuthorization ||
+                            now - _cdkScore.value.cachedAt >= Config.CDK_SCORE_CACHE_TTL_MS) to cdkScoreBackoffUntil
+                        else -> return@launch
+                    }
+                    if (!needsRead) return@launch
+                    if (now < backoffUntil) continue
+                    if (!awaitDeferredMainSiteRecovery(username, checkSession)) continue
+                    if (host in pendingSiteAuthorization) {
+                        val block = autoSiteAuthorizationBlock(host)
+                        if (block?.second == true) {
+                            when (host) {
+                                CONNECT_SITE_HOST -> _trustReport.update { it.copy(needsAuthorization = true) }
+                                CREDIT_SITE_HOST -> _ldcState.update { it.copy(isExpired = true) }
+                                CDK_SITE_HOST -> _cdkScore.update { it.copy(needsAuthorization = true) }
+                            }
+                            return@launch
+                        }
+                        if (block != null) continue
+                        pendingSiteAuthorization.remove(host)
+                    }
+                    diagnostics.log("子站数据自动回补: $host")
+                    when (host) {
+                        CONNECT_SITE_HOST -> {
+                            loadTrustReport(fromWarmup = true)
+                            while (_trustReport.value.loading) { delay(150L); checkSession() }
+                        }
+                        CREDIT_SITE_HOST -> {
+                            loadLdcUserInfo(fromWarmup = true)
+                            while (_ldcState.value.loading) { delay(150L); checkSession() }
+                        }
+                        CDK_SITE_HOST -> {
+                            loadCdkScore(fromWarmup = true)
+                            cdkScoreJob?.join()
+                            if (_cdkScore.value.needsAuthorization) return@launch
+                        }
+                    }
+                    if (host == CONNECT_SITE_HOST && _trustReport.value.needsAuthorization ||
+                        host == CREDIT_SITE_HOST && _ldcState.value.isExpired) return@launch
+                }
+            } finally {
+                if (deferredSiteAuthJobs[host] === currentCoroutineContext()[Job]) {
+                    deferredSiteAuthJobs.remove(host)
+                    pendingSiteAuthorization.remove(host)
+                }
+            }
+        }
+    }
+
+    private fun scheduleDeferredConnectReads() {
+        listOf(CONNECT_SITE_HOST, CREDIT_SITE_HOST, CDK_SITE_HOST).forEach { scheduleDeferredSiteAuthorization(it) }
+    }
+
+    /** Connect 确需 SSO 时让行，只有成功解析出数据才结算自动授权额度。 */
+    private suspend fun fetchTrustReportWithAutoAuthorization(checkSession: () -> Unit, manual: Boolean): TrustReport? =
+        try {
+            repository.readAfterShortCooldown {
+                checkSession()
+                repository.fetchTrustReport(present = false, allowAuthorization = manual)
+            }
+        } catch (e: org.linuxdo.android.net.SiteAuthorizationRequiredException) {
+            if (manual || e is org.linuxdo.android.net.SiteAuthorizationDeferredException ||
+                !tryConsumeAutoSiteAuthorization(CONNECT_SITE_HOST)
+            ) throw e
+            checkSession()
+            repository.readAfterShortCooldown {
+                checkSession()
+                repository.fetchTrustReport(present = false, allowAuthorization = true)
+            }.also { report ->
+                checkSession()
+                if (report != null) {
+                    lastSiteAuthorizationAtElapsed = SystemClock.elapsedRealtime()
+                    recordAutoSiteAuthorizationSuccess(CONNECT_SITE_HOST)
+                }
+            }
+        }
+
+    /** 仅实际 OAuth 后等待；执行前重查新鲜度，暂缓不会丢掉补取任务。 */
+    private fun scheduleLdcGamificationRefreshAfterSiteRead(
+        username: String,
+        checkSession: () -> Unit,
+        requestedAt: Long? = null,
+    ) {
+        if (ldcGamificationScheduleJob?.isActive == true && requestedAt == null) return
+        ldcGamificationScheduleJob?.cancel()
+        ldcGamificationScheduleJob = viewModelScope.launch {
+            while (isActive) {
+                checkSession()
+                val info = _ldcState.value.userInfo ?: return@launch
+                val missingScore = info.gamificationScore == null
+                val manualRefreshPending = requestedAt != null && lastLdcGamificationFetchAt < requestedAt
+                if (!missingScore && !manualRefreshPending &&
+                    System.currentTimeMillis() - lastLdcGamificationFetchAt < 120_000L) return@launch
+                val authWait = if (lastSiteAuthorizationAtElapsed > 0L) {
+                    (lastSiteAuthorizationAtElapsed + LDC_GAMIFICATION_AFTER_SITE_DELAY_MS -
+                        SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                } else 0L
+                val gateWait = maxOf(TopicRepository.mainSiteGateWaitMs(), ApiQuotaPool.foregroundQuietRemainingMs(), authWait)
+                if (store.isAppInForeground() && authWait == 0L && ApiQuotaPool.foregroundQuietRemainingMs() == 0L &&
+                    !store.isClearanceRecoveryInProgress() && !TopicRepository.isSilentRevalidating() &&
+                    TopicRepository.isMainSiteAutomaticProbeReady()) {
+                    if (!awaitDeferredMainSiteRecovery(username, checkSession)) {
+                        delay(maxOf(1_000L, TopicRepository.mainSiteGateWaitMs(),
+                            deferredMainSiteProbeNextAt - SystemClock.elapsedRealtime()))
+                    }
+                    continue
+                }
+                if (!store.isAppInForeground() || TopicRepository.isMainSiteGateBusy() || gateWait > 0L) {
+                    delay(maxOf(1_000L, gateWait, if (store.isAppInForeground()) 0L else 60_000L))
+                    continue
+                }
+                val attemptStartedAt = System.currentTimeMillis()
+                refreshLdcGamificationScoreIfNeeded(
+                    username = username,
+                    checkSession = checkSession,
+                    forceIfMissing = missingScore || manualRefreshPending,
+                    fetchTodayIncome = false,
+                )
+                ldcGamificationRefreshJob?.join()
+                checkSession()
+                if (_ldcState.value.userInfo?.gamificationScore != null && lastLdcGamificationFetchAt >= attemptStartedAt &&
+                    (requestedAt == null || lastLdcGamificationFetchAt >= requestedAt)) return@launch
+                delay(30_000L)
+            }
+        }
     }
 
     private suspend fun fetchAuthorizedLdc(
         username: String,
         checkSession: () -> Unit,
         includeRemoteGamification: Boolean = false,
+        allowAuthorization: Boolean = false,
     ): LdcUserInfo {
         val queuedAt = SystemClock.elapsedRealtime()
         return ldcFetchGate.withLock {
             checkSession()
-            // 同一轮已排队请求共享成功或失败，避免预热失败后手动请求紧接着重复 OAuth。
-            ldcLastAttempt?.takeIf { it.first >= queuedAt }?.let { return@withLock it.second.getOrThrow() }
+            // 自动读取与用户授权分别结算，用户点击不能复用先前后台读取的 401 失败。
+            ldcLastAttempt?.takeIf { it.first >= queuedAt && ldcLastAttemptAllowedAuthorization == allowAuthorization }
+                ?.let { return@withLock it.second.getOrThrow() }
+            var usedAuthorization = false
             try {
                 val info = readSiteWithAuthorization(
                     checkSession,
-                    { repository.fetchLdcUserInfo(includeRemoteGamification = includeRemoteGamification) },
-                    { repository.authorizeLdc() },
+                    {
+                        repository.fetchLdcUserInfo(includeRemoteGamification = includeRemoteGamification && !usedAuthorization)
+                            .also { info ->
+                                checkSession()
+                                if (!info.username.equals(username, ignoreCase = true)) {
+                                    throw org.linuxdo.android.net.SiteAuthorizationRequiredException("积分账号与当前账号不一致，需要重新授权")
+                                }
+                            }
+                    },
+                    { usedAuthorization = true; repository.authorizeLdc() },
+                    allowAuthorization = allowAuthorization,
+                    autoHost = if (allowAuthorization) null else CREDIT_SITE_HOST,
                 )
-                check(info.username.equals(username, ignoreCase = true)) { "积分账号与当前账号不一致，请重新授权" }
                 ldcLastAttempt = SystemClock.elapsedRealtime() to Result.success(info)
+                ldcLastAttemptAllowedAuthorization = allowAuthorization
+                ldcLastAttemptUsedAuthorization = usedAuthorization
                 info
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 checkSession()
                 ldcLastAttempt = SystemClock.elapsedRealtime() to Result.failure(error)
+                ldcLastAttemptAllowedAuthorization = allowAuthorization
+                ldcLastAttemptUsedAuthorization = usedAuthorization
                 throw error
             }
         }
@@ -1145,10 +1428,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 Config.CONNECT_FIRST_WARMUP_AFTER_START_MS - sinceSessionStartMs(),
             ))
             suspend fun awaitQuietWindow() {
-                checkSession()
-                while (!store.isAppInForeground() || store.isClearanceRecoveryInProgress() || repository.isRateLimitCoolingDown()) {
-                    delay(maxOf(5_000L, TopicRepository.rateLimitRemainingMs()))
+                while (true) {
                     checkSession()
+                    scrollBusySignal.awaitIdle()
+                    checkSession()
+                    val quietWait = ApiQuotaPool.foregroundQuietRemainingMs()
+                    // 让回前台首批请求先稳定，已有主站成功后不再追加一分钟等待。
+                    val settleWait = (AUTO_SITE_AUTH_FOREGROUND_SETTLE_MS - ApiQuotaPool.sinceAppForegroundMs()).coerceAtLeast(0L)
+                    if (store.isAppInForeground() && !store.isClearanceRecoveryInProgress() &&
+                        !TopicRepository.isSilentRevalidating() && quietWait == 0L && settleWait == 0L &&
+                        awaitDeferredMainSiteRecovery(username, checkSession)) return
+                    delay(maxOf(5_000L, TopicRepository.mainSiteGateWaitMs(), quietWait, settleWait))
                 }
             }
             repeat(2) { round ->
@@ -1161,13 +1451,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (now >= connectSilentBackoffUntil) {
                         didNetworkCall = true
                         try {
-                            val fresh = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                            val fresh = fetchTrustReportWithAutoAuthorization(checkSession, manual = false)
+                                ?: throw IllegalStateException("无法解析升级进度数据")
                             checkSession()
-                            if (fresh != null) {
-                                val updateTime = System.currentTimeMillis()
-                                repository.saveCachedTrustReport(username, fresh)
-                                _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null) }
-                            }
+                            val updateTime = System.currentTimeMillis()
+                            repository.saveCachedTrustReport(username, fresh)
+                            _trustReport.update { it.copy(report = fresh, cachedAt = updateTime, error = null, needsAuthorization = false) }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: org.linuxdo.android.net.RateLimitException) {
@@ -1175,11 +1464,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             val pause = siteFailureDelayMs(e)
                             connectSilentBackoffUntil = System.currentTimeMillis() + pause
                             diagnostics.log("等级预热遇限流，本轮预热提前退避")
+                            scheduleDeferredConnectReads()
                             return@launch
                         } catch (e: Exception) {
                             checkSession()
                             val pause = siteFailureDelayMs(e)
                             connectSilentBackoffUntil = System.currentTimeMillis() + pause
+                            if (needsSiteAuthorization(e)) {
+                                _trustReport.update { it.copy(error = "升级进度需要授权，请点击授权后继续", needsAuthorization = true) }
+                            } else {
+                                scheduleDeferredSiteAuthorization(CONNECT_SITE_HOST)
+                            }
                             if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
                             diagnostics.log("等级预热暂缓: ${e.message}")
                         }
@@ -1190,6 +1485,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 delay(if (didNetworkCall) 25_000L else 6_000L)
                 if (repository.isRateLimitCoolingDown()) {
                     diagnostics.log("检测到主站限流冷却，中止本轮后台等级与积分预热")
+                    scheduleDeferredConnectReads()
                     return@launch
                 }
                 awaitQuietWindow()
@@ -1205,7 +1501,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             checkSession()
                             val updateTime = System.currentTimeMillis()
                             repository.saveCachedLdcUserInfo(username, fresh)
-                            _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null) }
+                            _ldcState.update { it.copy(userInfo = fresh, cachedAt = updateTime, error = null, isExpired = false) }
+                            if (fresh.gamificationScore == null) {
+                                scheduleLdcGamificationRefreshAfterSiteRead(username, checkSession)
+                            }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: org.linuxdo.android.net.RateLimitException) {
@@ -1214,13 +1513,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             ldcBackoffUntil = System.currentTimeMillis() + pause
                             _ldcState.update { it.copy(error = "积分预热暂缓: ${e.message}") }
                             diagnostics.log("积分预热遇限流，中止本轮后续社区分预热: ${e.message}")
+                            scheduleDeferredConnectReads()
                             return@launch
                         } catch (e: Exception) {
                             checkSession()
                             val pause = siteFailureDelayMs(e)
                             ldcBackoffUntil = System.currentTimeMillis() + pause
                             if (pause <= 60_000L) retryAfterMs = maxOf(retryAfterMs, pause)
-                            _ldcState.update { it.copy(error = "积分预热暂缓: ${e.message}") }
+                            if (e !is org.linuxdo.android.net.SiteAuthorizationDeferredException) {
+                                _ldcState.update { it.copy(
+                                    error = if (needsSiteAuthorization(e)) "积分需要授权，请点击授权后继续" else "积分预热暂缓: ${e.message}",
+                                    isExpired = it.isExpired || needsSiteAuthorization(e),
+                                ) }
+                            }
+                            if (!needsSiteAuthorization(e)) scheduleDeferredSiteAuthorization(CREDIT_SITE_HOST)
                             diagnostics.log("积分预热暂缓: ${e.message}")
                         }
                     }
@@ -1230,6 +1536,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 delay(if (didLdcNetworkCall) 25_000L else 6_000L)
                 if (repository.isRateLimitCoolingDown()) {
                     diagnostics.log("检测到主站限流冷却，跳过本轮 CDK 社区分预热")
+                    scheduleDeferredConnectReads()
                     return@launch
                 }
                 awaitQuietWindow()
@@ -1580,7 +1887,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             // 先置 null（测速中）
             _dohLatencies.update { it + (server.id to null) }
-            val result = org.linuxdo.android.net.DohProbeEngine.probeDetailed(server)
+            val result = org.linuxdo.android.net.DohProbeEngine.probeDetailed(server, userAgent = container.userAgent)
             // -1 表示超时
             _dohLatencies.update { it + (server.id to (result.latencyMs ?: -1L)) }
             _dohSummaries.update { it + (server.id to result.summary) }
@@ -1604,7 +1911,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val jobs = servers.map { server ->
                     launch {
                         _dohLatencies.update { it + (server.id to null) }
-                        val result = org.linuxdo.android.net.DohProbeEngine.probeDetailed(server)
+                        val result = org.linuxdo.android.net.DohProbeEngine.probeDetailed(server, userAgent = container.userAgent)
                         _dohLatencies.update { it + (server.id to (result.latencyMs ?: -1L)) }
                         _dohSummaries.update { it + (server.id to result.summary) }
                     }
@@ -4141,7 +4448,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return (local + remote).distinctBy { it.insertion.lowercase() }.take(8)
     }
 
-    fun loadTrustReport(refresh: Boolean = false) {
+    fun loadTrustReport(refresh: Boolean = false, fromWarmup: Boolean = false) {
         val username = _state.value.username ?: return
         val checkSession = connectSessionCheck(username)
         val current = _trustReport.value
@@ -4157,9 +4464,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 本地还没有任何升级进度缓存：启动 10 分钟内不允许前台拉取，等后台首轮预热
+        // 无缓存的自动读取等待错峰；用户明确点击刷新/授权时可直接执行。
         val firstFetchLockMs = connectFirstFetchLockRemainingMs(hasCache = cached != null)
-        if (firstFetchLockMs > 0L) {
+        if (firstFetchLockMs > 0L && !refresh && !fromWarmup) {
             if (!current.loading) {
                 _trustReport.update { it.copy(error = connectFirstFetchLockMessage(firstFetchLockMs)) }
             }
@@ -4169,11 +4476,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新（首次进入或后台触发）
         if (!refresh) {
             if (current.loading) return
-            if (now < connectSilentBackoffUntil) return
+            if (now < connectSilentBackoffUntil) {
+                if (!current.needsAuthorization) scheduleDeferredSiteAuthorization(CONNECT_SITE_HOST)
+                return
+            }
             if (cached != null) {
                 val age = now - cached.second
                 // 若仍在 6 小时缓存有效期内，完全不发网络请求
-                if (age < Config.TRUST_REPORT_CACHE_TTL_MS) return
+                if (age < Config.TRUST_REPORT_CACHE_TTL_MS && !current.needsAuthorization) return
                 // 若处于风控熔断退避期，静默跳过
                 if (now < connectSilentBackoffUntil) return
             }
@@ -4184,31 +4494,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val isSilent = !refresh && cached != null
+        _trustReport.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
             checkSession()
-            if (!isSilent) {
-                _trustReport.update { it.copy(loading = true, error = null) }
-            }
             try {
-                val report = repository.readAfterShortCooldown { checkSession(); repository.fetchTrustReport(present = false) }
+                val report = fetchTrustReportWithAutoAuthorization(checkSession, manual = refresh)
+                    ?: throw IllegalStateException("无法解析升级进度数据")
                 checkSession()
-                if (report != null) {
-                    val updateTime = System.currentTimeMillis()
-                    repository.saveCachedTrustReport(username, report)
-                    _trustReport.update { it.copy(loading = false, report = report, error = null, cachedAt = updateTime) }
-                } else if (!isSilent) {
-                    _trustReport.update { it.copy(loading = false, error = "无法解析升级进度数据") }
-                }
+                val updateTime = System.currentTimeMillis()
+                repository.saveCachedTrustReport(username, report)
+                connectSilentBackoffUntil = 0L
+                _trustReport.update { it.copy(loading = false, report = report, error = null, cachedAt = updateTime, needsAuthorization = false) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 checkSession()
                 connectSilentBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
-                if (!isSilent) {
-                    _trustReport.update { it.copy(loading = false, error = e.message ?: "加载升级进度失败") }
-                }
+                val needsAuthorization = needsSiteAuthorization(e)
+                if (!needsAuthorization) scheduleDeferredSiteAuthorization(CONNECT_SITE_HOST)
+                _trustReport.update { it.copy(
+                        loading = false,
+                        error = if (needsAuthorization) "升级进度需要授权，请点击授权后继续"
+                            else if (!isSilent) e.message ?: "加载升级进度失败" else null,
+                        needsAuthorization = needsAuthorization,
+                    ) }
             } finally {
-                if (!isSilent && runCatching { checkSession() }.isSuccess) {
+                if (runCatching { checkSession() }.isSuccess) {
                     _trustReport.update { it.copy(loading = false) }
                 }
             }
@@ -4218,12 +4529,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * 加载社区分(CDK score)，展示在「我的」头部。
      *
-     * 只读缓存不发请求；缓存过期(6 小时)才静默联网，且受三道保护：
-     * 1. 本地没有缓存时，启动 10 分钟内交给后台预热([fromWarmup])错峰取，前台不抢；
-     * 2. 短冷却到期后仅补取一次，真正授权/挑战失败才长期退避；
-     * 3. 仅 CDK 返回 401(无会话)才做一次 OAuth 握手，握手结果是 Cookie，平时不重复握手。
+     * 有缓存先展示；可见页面无缓存时自动读取，只有确需 OAuth 时才让行首屏请求。
+     * 临时失败持续自动回补，点击重试只是补救入口。
      */
-    fun loadCdkScore(fromWarmup: Boolean = false) {
+    fun loadCdkScore(fromWarmup: Boolean = false, allowAuthorization: Boolean = false) {
         val username = _state.value.username ?: return
         val checkSession = connectSessionCheck(username)
         val now = System.currentTimeMillis()
@@ -4238,13 +4547,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _cdkScore.value = current
             }
         }
-        if (current.score != null && now - current.cachedAt < Config.CDK_SCORE_CACHE_TTL_MS) return
-        if (now < cdkScoreBackoffUntil) return
-        if (current.score == null && !fromWarmup && connectFirstFetchLockRemainingMs(hasCache = false) > 0L) return
+        if (!allowAuthorization && current.score != null && !current.needsAuthorization &&
+            now - current.cachedAt < Config.CDK_SCORE_CACHE_TTL_MS) return
+        if (!allowAuthorization && now < cdkScoreBackoffUntil) {
+            if (!current.needsAuthorization) scheduleDeferredSiteAuthorization(CDK_SITE_HOST)
+            return
+        }
         if (cdkScoreJob?.isActive == true) return
+        if (allowAuthorization && !checkConnectManualRefreshRateLimit()) return
+        _cdkScore.update { it.copy(loading = true) }
         cdkScoreJob = viewModelScope.launch {
             try {
-                val score = readSiteWithAuthorization(checkSession, { repository.fetchCdkScore() }, { repository.authorizeCdk() })
+                val score = readSiteWithAuthorization(
+                    checkSession, { repository.fetchCdkScore() }, { repository.authorizeCdk() }, allowAuthorization,
+                    autoHost = if (allowAuthorization) null else CDK_SITE_HOST,
+                )
                 checkSession()
                 cdkScoreBackoffUntil = 0L
                 repository.saveCachedCdkScore(username, score)
@@ -4255,9 +4572,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 checkSession()
                 val pause = siteFailureDelayMs(e)
                 cdkScoreBackoffUntil = System.currentTimeMillis() + pause
+                val needsAuthorization = needsSiteAuthorization(e)
+                _cdkScore.update { it.copy(needsAuthorization = needsAuthorization) }
+                if (!needsAuthorization) scheduleDeferredSiteAuthorization(CDK_SITE_HOST)
                 diagnostics.log("获取 CDK 社区分暂缓(${(pause + 999L) / 1_000L}s): ${e.message}")
+            } finally {
+                if (runCatching { checkSession() }.isSuccess) _cdkScore.update { it.copy(loading = false) }
             }
         }
+    }
+
+    fun authorizeCdk() {
+        if (cdkScoreJob?.isActive == true) return
+        diagnostics.log("用户点击社区分授权，先读取已有会话，仅在 401 时发起 OAuth")
+        loadCdkScore(allowAuthorization = true)
     }
 
     private var ldcGamificationRefreshJob: Job? = null
@@ -4268,9 +4596,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         checkSession: () -> Unit,
         forceIfMissing: Boolean,
         missingTodayIncome: Boolean = false,
+        fetchTodayIncome: Boolean = true,
     ) {
         if (ldcGamificationRefreshJob?.isActive == true) return
         if (repository.isRateLimitCoolingDown()) return
+        if (lastSiteAuthorizationAtElapsed > 0L &&
+            SystemClock.elapsedRealtime() - lastSiteAuthorizationAtElapsed < LDC_GAMIFICATION_AFTER_SITE_DELAY_MS) {
+            scheduleLdcGamificationRefreshAfterSiteRead(username, checkSession)
+            return
+        }
         val now = System.currentTimeMillis()
         if (!forceIfMissing && now - lastLdcGamificationFetchAt < 120_000L) return
         ldcGamificationRefreshJob = viewModelScope.launch {
@@ -4278,14 +4612,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 checkSession()
                 val score = repository.fetchGamificationScore(username, present = false)
                 checkSession()
-                val income = if (missingTodayIncome) {
-                    runCatching {
+                val income = if (!fetchTodayIncome) {
+                    null
+                } else if (missingTodayIncome) {
+                    try {
                         readSiteWithAuthorization(
                             checkSession,
                             { repository.fetchLdcTodayIncome(username, throwOnUnauthorized = true) },
                             { repository.authorizeLdc() },
+                            autoHost = CREDIT_SITE_HOST,
                         )
-                    }.getOrNull() ?: repository.getCachedLdcTodayIncome(username)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        checkSession()
+                        if (needsSiteAuthorization(error)) {
+                            _ldcState.update { it.copy(error = "今日入账暂未更新，可授权后刷新；已有积分继续显示") }
+                        }
+                        repository.getCachedLdcTodayIncome(username)
+                    }
                 } else {
                     repository.fetchLdcTodayIncome(username, throwOnUnauthorized = false)
                 }
@@ -4308,7 +4653,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun loadLdcUserInfo(refresh: Boolean = false) {
+    fun loadLdcUserInfo(refresh: Boolean = false, fromWarmup: Boolean = false) {
         val username = _state.value.username ?: return
         val checkSession = connectSessionCheck(username)
         val current = _ldcState.value
@@ -4335,9 +4680,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 本地还没有任何积分缓存：启动 10 分钟内不允许前台拉取，等后台首轮预热
+        // 无缓存的自动读取等待错峰；用户明确点击刷新/授权时可直接执行。
         val firstFetchLockMs = connectFirstFetchLockRemainingMs(hasCache = cached != null)
-        if (firstFetchLockMs > 0L) {
+        if (firstFetchLockMs > 0L && !refresh && !fromWarmup) {
             if (!current.loading) {
                 _ldcState.update { it.copy(error = connectFirstFetchLockMessage(firstFetchLockMs), isExpired = false) }
             }
@@ -4347,7 +4692,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. 如果不是手动刷新
         if (!refresh) {
             if (current.loading) return
-            if (now < ldcBackoffUntil) return
+            if (now < ldcBackoffUntil) {
+                if (!current.isExpired) scheduleDeferredSiteAuthorization(CREDIT_SITE_HOST)
+                return
+            }
             if (cached != null) {
                 val missingIncome = cached.first.todayIncome == null
                 refreshLdcGamificationScoreIfNeeded(
@@ -4358,7 +4706,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 val age = now - cached.second
                 // 若仍在 4 小时缓存有效期内（3-6小时区间），完全不发网络请求
-                if (age < Config.LDC_USER_INFO_CACHE_TTL_MS) return
+                if (age < Config.LDC_USER_INFO_CACHE_TTL_MS && !current.isExpired) return
                 // 若处于风控熔断退避期，静默跳过
                 if (now < ldcBackoffUntil) return
             }
@@ -4369,28 +4717,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val isSilent = !refresh && cached != null
-        _ldcState.update { it.copy(loading = true, error = null, isExpired = false) }
+        _ldcState.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
             try {
-                val info = fetchAuthorizedLdc(username, checkSession, includeRemoteGamification = refresh)
+                val info = fetchAuthorizedLdc(username, checkSession, includeRemoteGamification = refresh, allowAuthorization = refresh)
                 checkSession()
                 ldcBackoffUntil = 0L
                 val updateTime = System.currentTimeMillis()
-                if (info.gamificationScore != null) {
+                if (refresh && !ldcLastAttemptUsedAuthorization && info.gamificationScore != null) {
                     lastLdcGamificationFetchAt = updateTime
                 }
                 repository.saveCachedLdcUserInfo(username, info)
                 _ldcState.update { it.copy(loading = false, userInfo = info, error = null, isExpired = false, cachedAt = updateTime) }
+                if (info.gamificationScore == null || refresh && ldcLastAttemptUsedAuthorization) {
+                    scheduleLdcGamificationRefreshAfterSiteRead(
+                        username, checkSession, requestedAt = if (refresh) now else null,
+                    )
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 checkSession()
-                val isExpired = (e as? HttpStatusException)?.status == 401
+                val isExpired = needsSiteAuthorization(e)
                 ldcBackoffUntil = System.currentTimeMillis() + siteFailureDelayMs(e)
-                if (!isSilent) {
-                    val msg = if (isExpired) "积分授权已过期或未登录" else (e.message ?: "加载积分数据失败")
-                    _ldcState.update { it.copy(loading = false, error = msg, isExpired = isExpired) }
-                }
+                if (!isExpired) scheduleDeferredSiteAuthorization(CREDIT_SITE_HOST)
+                val msg = if (isExpired) "积分需要授权，请点击授权后继续"
+                    else if (!isSilent) e.message ?: "加载积分数据失败" else null
+                _ldcState.update { it.copy(loading = false, error = msg, isExpired = isExpired) }
             } finally {
                 if (runCatching { checkSession() }.isSuccess) {
                     _ldcState.update { it.copy(loading = false) }
@@ -4424,7 +4777,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (section == ProfileSection.Notifications) notificationCache[filter] = fresh
                 if (section == ProfileSection.Summary && !more) {
                     prewarmCurrentUserAvatar(username)
-                    loadUserBadges(username, refresh = refresh)
+                    // 延迟 3s 再加载 badges，与 summary 请求错开，避免同一秒内集中发出多个主站请求
+                    viewModelScope.launch {
+                        delay(3_000L)
+                        loadUserBadges(username, refresh = refresh)
+                    }
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -8189,9 +8546,44 @@ fun openTopicSearch(topicId: Long, title: String) {
     }
 
     fun refreshLatest() {
+        refreshLatestFeed(armCircuitProbe = true)
+    }
+
+    /**
+     * 下拉刷新属于用户手动重试：熔断期内每分钟最多放行一次前台探针；未到时间时提示剩余秒数，
+     * 列表照常走冷却拦截（本地直接拒绝，不发网络请求）并收起下拉指示器。
+     */
+    private fun refreshLatestFeed(armCircuitProbe: Boolean) {
         incomingProbeGeneration++
+        if (armCircuitProbe && TopicRepository.challengeCircuitRemainingMs() > 0L) {
+            val waitMs = TopicRepository.armChallengeCircuitManualProbe()
+            if (waitMs > 0L) showChallengeCircuitWait(waitMs)
+            else diagnostics.log("熔断期内用户下拉刷新：放行单个前台探测请求")
+        }
         val feed = _state.value.homeFeed
         viewModelScope.launch { loadFeed(feed, page = 0, pullRefresh = true) }
+    }
+
+    private fun showChallengeCircuitWait(waitMs: Long) {
+        android.widget.Toast.makeText(
+            getApplication(),
+            "站点暂时限制访问，请 ${(waitMs + 999L) / 1_000L} 秒后再重试",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    /** 挑战型 429 熔断截止时间（elapsedRealtime，0 表示未熔断）。 */
+    val challengeCircuitUntil: StateFlow<Long> = TopicRepository.challengeCircuitUntil
+
+    /** 熔断横幅上的「重试」：每分钟最多放行一次前台探测请求，成功即解除熔断。 */
+    fun retryAfterChallengeCircuit() {
+        val waitMs = TopicRepository.armChallengeCircuitManualProbe()
+        if (waitMs > 0L) {
+            showChallengeCircuitWait(waitMs)
+            return
+        }
+        diagnostics.log("熔断期内用户手动重试：放行单个前台探测请求")
+        refreshLatestFeed(armCircuitProbe = false)
     }
 
     fun retryLatest() {
@@ -8963,12 +9355,27 @@ fun openTopicSearch(topicId: Long, title: String) {
         connectSilentBackoffUntil = 0L
         ldcBackoffUntil = 0L
         ldcLastAttempt = null
+        ldcLastAttemptUsedAuthorization = false
+        lastLdcGamificationFetchAt = 0L
+        lastSiteAuthorizationAtElapsed = 0L
+        lastAnyAutoSiteAuthAtElapsed = 0L
         cdkScoreJob?.cancel()
         cdkScoreJob = null
         cdkScoreBackoffUntil = 0L
         _cdkScore.value = CdkScoreUiState()
         idleWarmupJob?.cancel()
         idleWarmupJob = null
+        val deferredJobs = deferredSiteAuthJobs.values.toList()
+        deferredSiteAuthJobs.clear()
+        pendingSiteAuthorization.clear()
+        deferredJobs.forEach { it.cancel() }
+        deferredMainSiteProbeJob?.cancel()
+        deferredMainSiteProbeJob = null
+        deferredMainSiteProbeNextAt = 0L
+        ldcGamificationScheduleJob?.cancel()
+        ldcGamificationScheduleJob = null
+        ldcGamificationRefreshJob?.cancel()
+        ldcGamificationRefreshJob = null
         autoProbeJob?.cancel()
         autoProbeJob = null
         _history.value = HistoryUiState(entries = emptyList())
@@ -9489,6 +9896,17 @@ fun openTopicSearch(topicId: Long, title: String) {
         const val FEED_REFRESH_JOIN_TIMEOUT_MS = 15_000L
 
         private const val EXCERPT_SESSION_BUDGET = 15
+        private const val CONNECT_SITE_HOST = "connect.linux.do"
+        private const val CREDIT_SITE_HOST = "credit.linux.do"
+        private const val CDK_SITE_HOST = "cdk.linux.do"
+        /** 成功授权额度、未恢复挑战的短避让、前台稳定期、跨站间隔。 */
+        private const val AUTO_SITE_AUTH_INTERVAL_MS = 6 * 60 * 60_000L
+        private const val AUTO_SITE_AUTH_AFTER_CHALLENGE_MS = 2 * 60_000L
+        private const val AUTO_SITE_AUTH_FOREGROUND_SETTLE_MS = 5_000L
+        private const val AUTO_SITE_AUTH_SPACING_MS = 25_000L
+        private const val AUTO_SITE_AUTH_DEFER_POLL_MS = 15_000L
+        /** 子站读取完成后再读主站等级分的最短间隔。 */
+        private const val LDC_GAMIFICATION_AFTER_SITE_DELAY_MS = 30_000L
         private val excerptAttemptedIds = mutableSetOf<Long>()
         private var excerptNextAllowedAt = 0L
     }

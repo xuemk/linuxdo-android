@@ -514,6 +514,9 @@ fun ProfileScreen(
     onRefreshUserBadges: (() -> Unit)? = null,
     cdkScore: Int? = null,
     onLoadCdkScore: () -> Unit = {},
+    cdkNeedsAuthorization: Boolean = false,
+    cdkLoading: Boolean = false,
+    onAuthorizeCdk: () -> Unit = {},
     trailing: @Composable () -> Unit = {},
 ) {
     var selectedBadge by remember { mutableStateOf<UserBadgeItem?>(null) }
@@ -720,11 +723,20 @@ fun ProfileScreen(
                                                 if (isDark) Color(0x5538BDF8) else Color(0x351890FF),
                                                 RoundedCornerShape(50)
                                             )
+                                            .clickable(
+                                                enabled = !cdkLoading && (cdkScore == null || cdkNeedsAuthorization),
+                                                onClick = onAuthorizeCdk,
+                                            )
                                             .padding(horizontal = 8.dp, vertical = 2.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Text(
-                                            text = "社区分 ${cdkScore ?: "-"}",
+                                            text = when {
+                                                cdkLoading -> "社区分 ${cdkScore ?: "-"} · 获取中"
+                                                cdkNeedsAuthorization -> "社区分 ${cdkScore ?: "-"} · 点击授权"
+                                                cdkScore == null -> "社区分 - · 点击重试"
+                                                else -> "社区分 $cdkScore"
+                                            },
                                             style = IosTheme.type.caption.copy(
                                                 fontSize = 11.sp,
                                                 fontWeight = FontWeight.SemiBold,
@@ -1112,7 +1124,7 @@ fun ProfileScreen(
                                 actor = entry.actor,
                                 notificationType = entry.notificationType,
                                 unread = entry.unread,
-                                onClick = { entry.actor?.let { onOpenUser(it, entry.avatarUrl, null) } },
+                                onClick = { (entry.actorUsername ?: entry.actor)?.let { onOpenUser(it, entry.avatarUrl, null) } },
                             )
                             Spacer(Modifier.width(10.dp))
                         } else {
@@ -1121,7 +1133,9 @@ fun ProfileScreen(
                                     url,
                                     entry.actor,
                                     modifier = Modifier.size(32.dp).clip(avatarShape(entry.actor, url, 4.dp))
-                                        .clickable(enabled = !entry.actor.isNullOrBlank()) { entry.actor?.let { onOpenUser(it, url, null) } },
+                                        .clickable(enabled = !entry.actor.isNullOrBlank()) {
+                                            (entry.actorUsername ?: entry.actor)?.let { onOpenUser(it, url, null) }
+                                        },
                                 )
                                 Spacer(Modifier.width(10.dp))
                             }
@@ -5387,6 +5401,9 @@ fun WebTopBar(
     }
 }
 
+/** 开发者选项「复制当前日志」一次复制的最新行数（来自日志文件，文件裁剪后保留约 2000 行）。 */
+private const val DIAGNOSTICS_COPY_LINES = 1_000
+
 /**
  * 开发者选项。承接原型界面的全部调试能力:双路径切换、自动刷新、会话诊断与日志。
  * 这些是排查 Cloudflare 与会话保持问题的主要手段,所以界面改版时只换位置、不削功能。
@@ -5601,12 +5618,17 @@ fun DiagnosticsScreen(state: UiState, viewModel: MainViewModel, onBack: () -> Un
                 IosRow(onClick = {
                     // 与屏幕一致按新→旧排列：粘贴目标（笔记、聊天）截断长文本时丢掉的是最旧的部分，
                     // 按文件顺序复制会把最新几分钟截没。
-                    val newestFirst = viewModel.diagnostics.readLatestLines(300).asReversed()
-                    val range = if (newestFirst.isEmpty()) "" else
-                        "LinuxDo 诊断日志（新→旧，${newestFirst.first().take(14)} ~ ${newestFirst.last().take(14)}，共 ${newestFirst.size} 行）\n"
-                    context.getSystemService(android.content.ClipboardManager::class.java)
-                        ?.setPrimaryClip(android.content.ClipData.newPlainText("LinuxDo 诊断日志", range + newestFirst.joinToString("\n")))
-                    Toast.makeText(context, "已复制最新${newestFirst.size}行日志（新→旧）", Toast.LENGTH_SHORT).show()
+                    // 读文件放到 IO 线程，避免 1000 行时点击卡顿；写剪贴板与提示回到主线程。
+                    zeroDohPocScope.launch {
+                        val newestFirst = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            viewModel.diagnostics.readLatestLines(DIAGNOSTICS_COPY_LINES)
+                        }.asReversed()
+                        val range = if (newestFirst.isEmpty()) "" else
+                            "LinuxDo 诊断日志（新→旧，${newestFirst.first().take(14)} ~ ${newestFirst.last().take(14)}，共 ${newestFirst.size} 行）\n"
+                        context.getSystemService(android.content.ClipboardManager::class.java)
+                            ?.setPrimaryClip(android.content.ClipData.newPlainText("LinuxDo 诊断日志", range + newestFirst.joinToString("\n")))
+                        Toast.makeText(context, "已复制最新${newestFirst.size}行日志（新→旧）", Toast.LENGTH_SHORT).show()
+                    }
                 }) {
                     Text("复制当前日志", style = IosTheme.type.body, color = IosTheme.colors.accent)
                 }

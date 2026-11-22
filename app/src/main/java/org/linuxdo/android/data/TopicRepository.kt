@@ -230,16 +230,7 @@ class TopicRepository(
 
     init {
         sessionStore?.let { store ->
-            val savedWallUntil = store.getRateLimitedUntil()
-            val nowWall = System.currentTimeMillis()
-            if (savedWallUntil > nowWall) {
-                val remaining = (savedWallUntil - nowWall).coerceAtMost(MAX_PERSISTED_COOLDOWN_MS)
-                synchronized(rateLimitLock) {
-                    rateLimitedUntil = maxOf(rateLimitedUntil, SystemClock.elapsedRealtime() + remaining)
-                    // 进程重启后恢复的冷却同样需要到期单探针，不能到期即放开并发。
-                    rateLimitProbeRequired = true
-                }
-            }
+            restoreRateLimitCooldown(store, diagnostics)
         }
     }
 
@@ -413,10 +404,9 @@ class TopicRepository(
         if (remaining <= 0L) {
             diagnostics.log("429 速率挑战迟到旧响应: $path，已恢复或跨会话，不重开冷却")
         } else if (rotated) {
-            // 仅轮换 Anycast 接入节点并不会改变客户端出口 IP，保留 cf_clearance 避免自毁进入 0 凭据裸奔死循环；
-            // 同时清除旧的静默补签冷却锁，允许新节点下必要时即时补签。
-            getRevalidateBlockedUntil = 0L
-            diagnostics.log("429 速率挑战(第 $streak 次): $path，已触发换线降温并保留 cf_clearance，过渡冷却 ${(remaining + 999L) / 1_000L}s")
+            // 第三个返回值表示本次进入（或重新进入）熔断：挑战型 429 不再换线（换 Anycast 节点不改变出口 IP，实测无效）。
+            diagnostics.log("429 速率挑战(第 $streak 次): $path，熔断（${CHALLENGE_CIRCUIT_WINDOW_MS / 60_000L} 分钟内多次挑战或熔断期探测仍被挑战），" +
+                "暂停全部自动请求 ${(remaining + 999L) / 1_000L}s，仅允许用户每 ${CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS / 1_000L}s 手动重试一次")
         } else {
             diagnostics.log("429 速率挑战(第 $streak 次): $path，保留 cf_clearance，递增冷却 ${(remaining + 999L) / 1_000L}s 后自愈")
         }
@@ -3774,6 +3764,7 @@ class TopicRepository(
             ),
             actor = resolvedActor,
             postNumber = resolvedPostNumber,
+            actorUsername = baseActor,
         )
     }
 
@@ -4063,22 +4054,24 @@ class TopicRepository(
         }
     }
 
-    suspend fun fetchTrustReport(present: Boolean = false): TrustReport? {
+    suspend fun fetchTrustReport(present: Boolean = false, allowAuthorization: Boolean = false): TrustReport? {
         val userId = sessionStore?.currentUserId()
         val generation = sessionStore?.sessionGeneration
         val checkSession = { checkSiteSession(userId, generation) }
-        var html = request("https://connect.linux.do/", present = present, beforeDispatch = checkSession)
+        var html = request("https://connect.linux.do/", present = present, beforeDispatch = checkSession,
+            followRedirects = allowAuthorization)
         checkSession()
 
         // 检查是否触发 Discourse Connect SSO 回调跳转
         if (html.contains("redirect_url") && html.contains("sso_callback")) {
+            if (!allowAuthorization) throw org.linuxdo.android.net.SiteAuthorizationRequiredException()
             val redirectUrl = runCatching {
                 json.parseToJsonElement(html).jsonObject["redirect_url"]?.jsonPrimitive?.contentOrNull
             }.getOrNull()
             if (!redirectUrl.isNullOrBlank()) {
                 val redirect = "https://connect.linux.do/".toHttpUrl().resolve(redirectUrl)
                 require(redirect != null && isTrustedOAuthUrl(redirect, "connect.linux.do")) { "Connect SSO 跳转地址不受信任" }
-                diagnostics.log("Connect 触发 SSO 授权，自动完成握手")
+                diagnostics.log("用户触发 Connect SSO 授权，开始握手")
                 val ssoResp = request(redirect.toString(), present = false, retryAllowed = false, beforeDispatch = checkSession)
                 checkSession()
                 html = if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) ssoResp
@@ -4138,7 +4131,8 @@ class TopicRepository(
     suspend fun fetchLdcTodayIncome(username: String, throwOnUnauthorized: Boolean = false): String? {
         val cleanUser = username.trim().removePrefix("@")
         val parsed = try {
-            val raw = request("https://credit.linux.do/api/v1/dashboard/stats/daily?days=1", present = false, retryAllowed = false)
+            val raw = request("https://credit.linux.do/api/v1/dashboard/stats/daily?days=1",
+                present = false, retryAllowed = false, followRedirects = false)
             val root = json.parseToJsonElement(raw).jsonObject
             val dataArr = root["data"] as? JsonArray
             val lastItem = dataArr?.lastOrNull() as? JsonObject
@@ -4159,6 +4153,9 @@ class TopicRepository(
         } catch (e: HttpStatusException) {
             if (throwOnUnauthorized && e.status == 401) throw e
             null
+        } catch (e: org.linuxdo.android.net.SiteAuthorizationRequiredException) {
+            if (throwOnUnauthorized) throw e
+            null
         } catch (_: Exception) {
             null
         }
@@ -4174,7 +4171,7 @@ class TopicRepository(
      * GET https://credit.linux.do/api/v1/oauth/user-info
      */
     suspend fun fetchLdcUserInfo(includeRemoteGamification: Boolean = false): LdcUserInfo {
-        val raw = request("https://credit.linux.do/api/v1/oauth/user-info", present = false)
+        val raw = request("https://credit.linux.do/api/v1/oauth/user-info", present = false, followRedirects = false)
         val root = json.parseToJsonElement(raw).jsonObject
         val dataElem = root["data"] as? JsonObject ?: throw IllegalStateException("LDC 响应缺少 data 字段")
         fun readStr(key: String): String = (dataElem[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
@@ -4217,7 +4214,7 @@ class TopicRepository(
      * 未授权时返回 401,由调用方走 [authorizeCdk] 后重试。
      */
     suspend fun fetchCdkScore(): Int {
-        val raw = request("https://cdk.linux.do/api/v1/oauth/user-info", present = false)
+        val raw = request("https://cdk.linux.do/api/v1/oauth/user-info", present = false, followRedirects = false)
         val root = json.parseToJsonElement(raw).jsonObject
         val data = root["data"] as? JsonObject ?: throw IllegalStateException("CDK 响应缺少 data 字段")
         val primitive = data["score"] as? JsonPrimitive ?: throw IllegalStateException("CDK 响应缺少 score 字段")
@@ -4240,7 +4237,7 @@ class TopicRepository(
 
     /**
      * OAuth 请求接入进程级双轨调度器：
-     * GET 请求受 [getSemaphore] (2 并发) 与滑动窗口 (4次/3秒) 约束；
+     * GET 请求受 [getSemaphore] (3 并发) 与滑动窗口 (6次/3秒) 约束；
      * POST 请求受 [postGate] (1 并发绝对串行) 约束。
      * 遇到 429 时按响应站点退让，子站限流不改写主站冷却。
      */
@@ -4292,7 +4289,16 @@ class TopicRepository(
                     )
                 }
                 if (challenged) {
-                    throw HttpStatusException(response.code, "$label 遇到安全验证，请稍后重试")
+                    throw HttpStatusException(
+                        response.code, "$label 遇到安全验证，请稍后重试",
+                        HttpHeaderUtils.parseRetryAfter(response.header("Retry-After")),
+                    )
+                }
+                if (response.code == 408 || response.code in 500..599) {
+                    throw HttpStatusException(
+                        response.code, "$label 暂时无法完成，请稍后重试",
+                        HttpHeaderUtils.parseRetryAfter(response.header("Retry-After")),
+                    )
                 }
                 LdcOAuthResponse(
                     status = response.code,
@@ -4467,6 +4473,8 @@ class TopicRepository(
             throw error
         } finally {
             synchronized(oauthFlights) { if (oauthFlights[key] === flight) oauthFlights.remove(key) }
+            // 无论授权成败，只要真正走过一次 OAuth 握手，主站都先静默一段时间再发请求。
+            enterPostOAuthQuietWindow("$label OAuth")
         }
     }
 
@@ -4568,6 +4576,8 @@ class TopicRepository(
             } catch (e: HttpStatusException) {
                 throw e
             } catch (e: IllegalStateException) {
+                throw e
+            } catch (e: java.io.IOException) {
                 throw e
             } catch (e: Exception) {
                 checkSiteSession(userId, generation)
@@ -5119,9 +5129,11 @@ class TopicRepository(
         present: Boolean = true,
         retryAllowed: Boolean = true,
         beforeDispatch: (() -> Unit)? = null,
+        followRedirects: Boolean = true,
     ): String {
         try {
-            return pacedGet(path, burst, present, allow429Challenge = retryAllowed, retryAllowed = retryAllowed, beforeDispatch = beforeDispatch)
+            return pacedGet(path, burst, present, allow429Challenge = retryAllowed, retryAllowed = retryAllowed,
+                beforeDispatch = beforeDispatch, followRedirects = followRedirects)
         } catch (challenge: NeedsInteractiveVerification) {
             if (!retryAllowed || !present || requestHost(path) != Config.HOST) {
                 if (challenge.isFrom429 && requestHost(path) == Config.HOST) {
@@ -5250,13 +5262,14 @@ class TopicRepository(
         allow429Challenge: Boolean = true,
         retryAllowed: Boolean = true,
         beforeDispatch: (() -> Unit)? = null,
+        followRedirects: Boolean = true,
     ): String {
-        if (present) return dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch)
+        if (present) return dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch, followRedirects)
         return backgroundGetGate.withLock {
             val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
             if (wait > 0) delay(wait)
             try {
-                dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch)
+                dispatchGet(path, burst, present, allow429Challenge, retryAllowed, beforeDispatch, followRedirects)
             } finally {
                 lastBackgroundGetAt = SystemClock.elapsedRealtime()
             }
@@ -5343,6 +5356,7 @@ class TopicRepository(
         allow429Challenge: Boolean = true,
         retryAllowed: Boolean = true,
         beforeDispatch: (() -> Unit)? = null,
+        followRedirects: Boolean = true,
     ): String {
         val host = requestHost(path)
         val isMainSite = host == Config.HOST
@@ -5368,13 +5382,17 @@ class TopicRepository(
                     val transport = transportProvider()
                     beforeDispatch?.invoke()
                     val result = try {
-                        if (retryAllowed && isMainSite) transport.get(path, present = present)
+                        if (!followRedirects) transport.getWithoutRedirects(path, present = present)
+                        else if (retryAllowed && isMainSite) transport.get(path, present = present)
                         else transport.getWithoutRevalidate(path, present = present)
                     } finally {
                         // 时间戳已在 acquireGetSlot 记录
                     }
                     val receivedAt = result.receivedAtElapsedMs.takeIf { it > 0L } ?: SystemClock.elapsedRealtime()
                     diagnostics.recordStatus(transport.name, result.status, path)
+                    if (!followRedirects && result.status in setOf(301, 302, 303, 307, 308)) {
+                        throw org.linuxdo.android.net.SiteAuthorizationRequiredException()
+                    }
                     if (!isMainSite && result.status == 429) {
                         val challenged = result.challenged || ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
                         if (challenged) noteRequestClearanceChallenged(result.sentClearanceFp, path)
@@ -5434,9 +5452,10 @@ class TopicRepository(
                                         retryAfterSeconds = result.retryAfterSeconds,
                                     )
                                 }
-                                // 速率型挑战：短冷却并在第 2 次命中时立即换线降温；前台请求在阈值内无感退避重放，避免连续弹错。
+                                // 速率型挑战：进入递增冷却（必要时熔断）。挑战期间带同一凭据立即重放预期仍被拦，
+                                // 还会继续累加 CF 计数，所以前台请求也不再自动重试，交由用户在冷却结束后手动重试。
                                 probeSettled = true
-                                val cooldownEx = enterChallenge429Cooldown(
+                                throw enterChallenge429Cooldown(
                                     path = path,
                                     retryAfterSeconds = result.retryAfterSeconds,
                                     sentClearanceFp = result.sentClearanceFp,
@@ -5444,18 +5463,6 @@ class TopicRepository(
                                     requestGeneration = ticket.sessionGeneration,
                                     receivedAtElapsedMs = receivedAt,
                                 )
-                                val waitMs = cooldownEx.retryAfterMs
-                                if (retryAllowed && present && attempt < MAX_RETRIES &&
-                                    waitMs in 1L..(AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L)
-                                ) {
-                                    val jitterMs = (200L..600L).random()
-                                    val totalWaitMs = waitMs + jitterMs
-                                    diagnostics.log("前台请求 429 挑战自动退避 ${totalWaitMs}ms 后无感重试(${attempt + 1}/$MAX_RETRIES): $path")
-                                    delay(totalWaitMs)
-                                    attempt++
-                                    continue
-                                }
-                                throw cooldownEx
                             }
                             probeSettled = true
                             val cooldownEx = enterRateLimitCooldown(
@@ -5579,9 +5586,120 @@ class TopicRepository(
         @Volatile var silentPrefetchBackoffUntil = 0L
         const val SILENT_PREFETCH_BACKOFF_MS = 2 * 60_000L
 
+        /** 最近一次主站 429 / CF 挑战（含子站授权跳转经过主站时被挑战）的时间，用于子站自动授权避让。 */
+        @Volatile private var lastMainSiteChallengeAtElapsed = 0L
+
+        fun noteMainSiteChallengeSignal() {
+            lastMainSiteChallengeAtElapsed = SystemClock.elapsedRealtime()
+        }
+
+        fun hasMainSiteChallengeWithin(withinMs: Long): Boolean {
+            val last = lastMainSiteChallengeAtElapsed
+            return last > 0L && SystemClock.elapsedRealtime() - last < withinMs
+        }
+
         /** 同一应用进程内的所有仓库实例共用一段 429 冷却期。 */
         val rateLimitLock = Any()
+        private var persistedCooldownRestored = false
+        private var cooldownSessionStore: SessionStore? = null
+        @Volatile private var lastMainSiteSuccessAtElapsed = 0L
+
+        fun hasRecentMainSiteSuccess(withinMs: Long): Boolean {
+            val last = lastMainSiteSuccessAtElapsed
+            return last > 0L && SystemClock.elapsedRealtime() - last in 0L..withinMs
+        }
+
+        /**
+         * 子站 OAuth（credit / cdk 经 connect 的 /oauth2/authorize → approve）完成后的主站静默窗口。
+         * 实测 4 次主站挑战型 429 全部出现在一次子站 OAuth 完成后 4~14 秒内；而冷启动 18 秒内连发 12 个主站请求并未触发。
+         * 窗口内主站自动请求直接退让；前台请求在闸门内等到窗口结束再发（显示加载中，不报错，也不会重发被挑战的请求）。
+         * 子站自身请求不受影响。以下字段受 [rateLimitLock] 保护。
+         */
+        private var postOAuthQuietUntil = 0L
+        private var lastOAuthCompletedAt = 0L
+        private var postOAuthOutcomeLogged = true
+
+        fun enterPostOAuthQuietWindow(reason: String) {
+            val now = SystemClock.elapsedRealtime()
+            synchronized(rateLimitLock) {
+                postOAuthQuietUntil = maxOf(postOAuthQuietUntil, now + POST_OAUTH_QUIET_MS)
+                lastOAuthCompletedAt = now
+                postOAuthOutcomeLogged = false
+            }
+            org.linuxdo.android.net.NetDiagnostics.log(
+                "子站授权完成($reason)：后台自动请求静默 ${POST_OAUTH_QUIET_MS / 1_000L}s，前台操作不受影响 | " +
+                    "linux.do 区域近30秒请求 ${org.linuxdo.android.net.ZoneRequestLedger.summary(30_000L)}",
+            )
+        }
+
+        fun postOAuthQuietRemainingMs(): Long = synchronized(rateLimitLock) {
+            postOAuthQuietRemainingLocked(SystemClock.elapsedRealtime())
+        }
+
+        private fun postOAuthQuietRemainingLocked(now: Long): Long = (postOAuthQuietUntil - now).coerceAtLeast(0L)
+
+        /** 授权后首个主站结果（成功或被挑战）只取一次，写进诊断用来校准静默窗口长度。调用方必须持有 [rateLimitLock]。 */
+        private fun takePostOAuthOutcomeLocked(now: Long): Long? {
+            if (postOAuthOutcomeLogged || lastOAuthCompletedAt <= 0L) return null
+            postOAuthOutcomeLogged = true
+            val since = now - lastOAuthCompletedAt
+            return since.takeIf { it in 0L..POST_OAUTH_OUTCOME_TRACK_MS }
+        }
+
+        fun hasUnresolvedMainSiteChallengeWithin(withinMs: Long): Boolean = synchronized(rateLimitLock) {
+            val challenge = lastMainSiteChallengeAtElapsed
+            challenge > 0L && SystemClock.elapsedRealtime() - challenge in 0L..withinMs &&
+                lastMainSiteSuccessAtElapsed <= challenge
+        }
+
+        /** 在后台请求准入前恢复一次；重启不恢复临时放行，但保留熔断类型与手动复核间隔。 */
+        fun restoreRateLimitCooldown(store: SessionStore, diagnostics: Diagnostics? = null) {
+            val remainingMs = synchronized(rateLimitLock) {
+                cooldownSessionStore = store
+                if (persistedCooldownRestored) return
+                val saved = store.getRateLimitCooldownState()
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val nowWall = System.currentTimeMillis()
+                val serverRemaining = (saved.serverUntilWallMs - nowWall).coerceIn(0L, MAX_PERSISTED_COOLDOWN_MS)
+                val circuitRemaining = (saved.challengeCircuitUntilWallMs - nowWall).coerceIn(0L, CHALLENGE_CIRCUIT_OPEN_MS)
+                val remaining = maxOf(
+                    (saved.untilWallMs - nowWall).coerceIn(0L, MAX_PERSISTED_COOLDOWN_MS),
+                    serverRemaining,
+                    circuitRemaining,
+                )
+                if (remaining > 0L) {
+                    rateLimitedByCfChallenge = if (rateLimitedUntil > nowElapsed) {
+                        rateLimitedByCfChallenge && saved.cfChallenge
+                    } else {
+                        saved.cfChallenge
+                    }
+                    rateLimitedUntil = maxOf(rateLimitedUntil, nowElapsed + remaining)
+                }
+                if (serverRemaining > 0L) {
+                    serverRateLimitedUntil = maxOf(serverRateLimitedUntil, nowElapsed + serverRemaining)
+                }
+                if (circuitRemaining > 0L) {
+                    challengeCircuitOpenUntil = maxOf(challengeCircuitOpenUntil, nowElapsed + circuitRemaining)
+                    challengeCircuitUntilFlow.value = challengeCircuitOpenUntil
+                }
+                if (saved.lastManualProbeWallMs > 0L) {
+                    val sinceManualProbe = (nowWall - saved.lastManualProbeWallMs)
+                        .coerceIn(0L, CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS)
+                    if (sinceManualProbe < CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS) {
+                        challengeCircuitNextManualProbeAt = nowElapsed + CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS - sinceManualProbe
+                    }
+                }
+                rateLimitProbeRequired = rateLimitProbeRequired || saved.probeRequired || remaining > 0L
+                persistedCooldownRestored = true
+                remaining
+            }
+            if (remainingMs > 0L) {
+                diagnostics?.log("已恢复上次 429 冷却 ${remainingMs / 1_000L}s，到期后仅放行单个业务探针")
+            }
+        }
         var rateLimitedUntil = 0L
+        /** 服务端明确的 Retry-After 硬截止，不因客户端手动复核而缩短。 */
+        private var serverRateLimitedUntil = 0L
         /** 当前活跃的 429 冷却是否纯由 Cloudflare 质询型 429（cf-mitigated=challenge）触发。 */
         var rateLimitedByCfChallenge = false
         /** 冷却轮次（开启后阻塞同轮叠加，到期放行一条探针并递增轮次以隔离迟到旧响应）。 */
@@ -5632,6 +5750,34 @@ class TopicRepository(
             }
         }
 
+        private fun persistRateLimitCooldownLocked(
+            sessionStore: SessionStore? = cooldownSessionStore,
+            nowElapsed: Long = SystemClock.elapsedRealtime(),
+            nowWall: Long = System.currentTimeMillis(),
+        ) {
+            val store = sessionStore ?: cooldownSessionStore ?: return
+            cooldownSessionStore = store
+            fun toWallTime(deadline: Long): Long = if (deadline > 0L) nowWall + deadline - nowElapsed else 0L
+            // 临时手动许可不能在重启后变成无限放行；持久化仍保留完整的客户端熔断截止。
+            val persistedUntil = if (challengeCircuitManualProbeArmed) {
+                maxOf(rateLimitedUntil, challengeCircuitOpenUntil)
+            } else {
+                rateLimitedUntil
+            }
+            store.setRateLimitCooldownState(SessionStore.RateLimitCooldownState(
+                untilWallMs = toWallTime(persistedUntil),
+                serverUntilWallMs = toWallTime(serverRateLimitedUntil),
+                challengeCircuitUntilWallMs = toWallTime(challengeCircuitOpenUntil),
+                lastManualProbeWallMs = if (challengeCircuitNextManualProbeAt > 0L) {
+                    toWallTime(challengeCircuitNextManualProbeAt) - CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS
+                } else {
+                    0L
+                },
+                cfChallenge = rateLimitedByCfChallenge,
+                probeRequired = rateLimitProbeRequired,
+            ))
+        }
+
         /**
          * 服务端截止时间与客户端轮次分开处理：只要 Retry-After 指向未来且晚于现有截止时间，就延长冷却。
          * 只更新截止时间并要求到期探针，不触碰在途探针的所有权。
@@ -5643,15 +5789,16 @@ class TopicRepository(
             cfChallenge: Boolean,
             sessionStore: SessionStore?,
         ): Boolean {
-            if (serverUntil <= nowElapsed || serverUntil <= rateLimitedUntil) return false
+            if (serverUntil <= nowElapsed || serverUntil <= serverRateLimitedUntil) return false
             val wasActive = rateLimitedUntil > nowElapsed
+            serverRateLimitedUntil = serverUntil
             rateLimitedByCfChallenge = if (wasActive) rateLimitedByCfChallenge && cfChallenge else cfChallenge
-            rateLimitedUntil = serverUntil
+            rateLimitedUntil = maxOf(rateLimitedUntil, serverUntil)
             rateLimitProbeRequired = true
             rateLimitRecoveryUntil = 0L
             rateLimitDeadlineVersion++
             if (activeCooldownRound < 0L) activeCooldownRound = rateLimitRound
-            sessionStore?.setRateLimitedUntil(nowWall + (rateLimitedUntil - nowElapsed))
+            persistRateLimitCooldownLocked(sessionStore, nowElapsed, nowWall)
             return true
         }
 
@@ -5704,7 +5851,9 @@ class TopicRepository(
         }
 
         fun rateLimitRemainingMs(): Long = synchronized(rateLimitLock) {
-            (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            val now = SystemClock.elapsedRealtime()
+            expireManualProbeLocked(now)
+            (rateLimitedUntil - now).coerceAtLeast(0L)
         }
 
         fun enterRateLimitCooldown(
@@ -5717,6 +5866,7 @@ class TopicRepository(
             receivedAtElapsedMs: Long = 0L,
         ): Long {
             val nowElapsed = SystemClock.elapsedRealtime()
+            lastMainSiteChallengeAtElapsed = nowElapsed
             val originElapsed = if (receivedAtElapsedMs in 1L..nowElapsed) receivedAtElapsedMs else nowElapsed
             val nowWall = System.currentTimeMillis()
             val retryAfterMs = retryAfterSeconds?.takeIf { it > 0L }?.coerceIn(1L, 86_400L)?.times(1_000L) ?: 0L
@@ -5732,7 +5882,12 @@ class TopicRepository(
                         if (extendServerDeadlineLocked(serverUntil, nowElapsed, nowWall, cfChallenge, sessionStore)) {
                             shouldNotifyQuota = true
                         }
+                        val wasOwner = requestRound > 0L && rateLimitProbeOwner == requestRound
                         releaseProbeOwnerLocked(requestRound)
+                        // 仅当本次正是熔断手动探针自身（或无轮次外部 429）遇非挑战 429 时撤销放行；迟到旧轮次响应不得干扰在途手动探针。
+                        if (wasOwner || requestRound < 0L) {
+                            disarmManualProbeLocked(nowElapsed)
+                        }
                         (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
                     }
                     CooldownSlotDecision.NewRound -> {
@@ -5747,6 +5902,7 @@ class TopicRepository(
                         } else {
                             nowElapsed + RATE_LIMIT_COOLDOWN_MS
                         }
+                        serverRateLimitedUntil = maxOf(serverRateLimitedUntil, serverUntil)
                         rateLimitedUntil = maxOf(rateLimitedUntil, targetUntil)
                         activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
                         rateLimitProbeRequired = true
@@ -5754,8 +5910,9 @@ class TopicRepository(
                         rateLimitDeadlineVersion++
                         // 只有探针自己的 429 才能交还探针；无轮次的外部 429 保留在途探针，由版本号阻止它解除新冷却。
                         releaseProbeOwnerLocked(requestRound)
+                        disarmManualProbeLocked(nowElapsed)
                         val rem = (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
-                        sessionStore?.setRateLimitedUntil(nowWall + rem)
+                        persistRateLimitCooldownLocked(sessionStore, nowElapsed, nowWall)
                         shouldNotifyQuota = rem > 0L
                         rem
                     }
@@ -5771,14 +5928,28 @@ class TopicRepository(
         private var challenge429Streak = 0
         private var lastChallenge429At = 0L
         private var lastChallenge429StepDownAt = 0L
-        private var lastChallenge429RotateAt = 0L
-
-        /** 递增冷却连续撞满最高档后的有限度换线（由 AppContainer 注入，轮换 Anycast 优选节点并回收连接）。 */
-        @Volatile var onChallenge429Persistent: ((reason: String) -> Unit)? = null
+        /** 最近一次冷却被到期探针证实已恢复的时间。 */
+        private var lastChallengeRecoveredAt = 0L
 
         /**
-         * 速率型 429 挑战进入递增冷却（12s → 24s → 40s），不判废凭据、不弹验证页。
-         * 同轮次并发/重复处理合并计为一次且不重算倒计时；返回冷却毫秒、当前档位与是否需要触发换线。
+         * 挑战型 429 熔断：[CHALLENGE_CIRCUIT_WINDOW_MS] 内命中 [CHALLENGE_CIRCUIT_THRESHOLD] 次即熔断
+         * [CHALLENGE_CIRCUIT_OPEN_MS]。熔断期间全部自动请求停发，只有用户手动重试（每分钟一次）能放行单个前台探针；
+         * 探针成功才解除熔断，并进入更长的低速恢复期。以下字段均受 [rateLimitLock] 保护。
+         */
+        private val challengeHitTimes = ArrayDeque<Long>()
+        private var challengeCircuitOpenUntil = 0L
+        private var challengeCircuitNextManualProbeAt = 0L
+        private var challengeCircuitManualProbeArmed = false
+        /** 手动放行的有效期：到期仍没有探针在途（如列表加载被去重跳过）则撤销放行，恢复熔断冷却。 */
+        private var challengeCircuitManualProbeArmedUntil = 0L
+        private val challengeCircuitUntilFlow = kotlinx.coroutines.flow.MutableStateFlow(0L)
+
+        /** 熔断截止时间（elapsedRealtime，0 表示未熔断），供界面横幅订阅。 */
+        val challengeCircuitUntil: kotlinx.coroutines.flow.StateFlow<Long> get() = challengeCircuitUntilFlow
+
+        /**
+         * 速率型 429 挑战进入递增冷却（30s → 60s → 120s → 300s），不判废凭据、不弹验证页，也不换线。
+         * 同轮次并发/重复处理合并计为一次且不重算倒计时；返回冷却毫秒、当前档位与本次是否刚触发熔断。
          */
         fun enterChallenge429Cooldown(
             path: String,
@@ -5789,10 +5960,12 @@ class TopicRepository(
             receivedAtElapsedMs: Long = 0L,
         ): Triple<Long, Int, Boolean> {
             val nowElapsed = SystemClock.elapsedRealtime()
+            lastMainSiteChallengeAtElapsed = nowElapsed
             val originElapsed = if (receivedAtElapsedMs in 1L..nowElapsed) receivedAtElapsedMs else nowElapsed
             val nowWall = System.currentTimeMillis()
             val retryAfterMs = retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L
             var shouldNotifyQuota = false
+            var postOAuthChallengeSince: Long? = null
             val (remaining, streak, rotate) = synchronized(rateLimitLock) {
                 val serverUntil = if (retryAfterMs > 0L) originElapsed + retryAfterMs else 0L
                 when (classifyCooldownDecisionLocked(nowElapsed, requestRound, requestGeneration, sessionStore)) {
@@ -5805,42 +5978,57 @@ class TopicRepository(
                         Triple((rateLimitedUntil - nowElapsed).coerceAtLeast(0L), activeCooldownStreak.coerceAtLeast(1), false)
                     }
                     CooldownSlotDecision.NewRound -> {
-                        if (nowElapsed - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS) challenge429Streak = 0
-                        lastChallenge429At = nowElapsed
-                        val rawStep = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
-                        challenge429Streak++
-                        val shouldRotate = challenge429Streak >= CHALLENGE_429_STEPS_MS.size &&
-                            nowElapsed - lastChallenge429RotateAt > CHALLENGE_429_ROTATE_INTERVAL_MS
-                        val step = if (shouldRotate) {
-                            lastChallenge429RotateAt = nowElapsed
+                        // 上一轮冷却已被探针证实恢复、且平稳度过恢复期：这次是新的独立触发（例如又一次子站授权），
+                        // 档位与熔断计数从头算，不能沿用上一轮直接拉长到 60 秒以上；恢复期内再撞才说明冷却不够，继续升档。
+                        val recoveredSinceLastHit = lastChallengeRecoveredAt > lastChallenge429At &&
+                            nowElapsed - lastChallengeRecoveredAt >= RATE_LIMIT_RECOVERY_MS
+                        if (nowElapsed - lastChallenge429At > CHALLENGE_429_STREAK_RESET_MS || recoveredSinceLastHit) {
                             challenge429Streak = 0
-                            2_500L
-                        } else {
-                            rawStep
+                            if (challengeCircuitOpenUntil <= 0L) challengeHitTimes.clear()
                         }
+                        postOAuthChallengeSince = takePostOAuthOutcomeLocked(nowElapsed)
+                        lastChallenge429At = nowElapsed
+                        val step = CHALLENGE_429_STEPS_MS[challenge429Streak.coerceAtMost(CHALLENGE_429_STEPS_MS.lastIndex)]
+                        challenge429Streak = (challenge429Streak + 1).coerceAtMost(CHALLENGE_429_STEPS_MS.size)
                         activeCooldownRound = if (requestRound >= 0L) requestRound else rateLimitRound
-                        activeCooldownStreak = if (shouldRotate) CHALLENGE_429_STEPS_MS.size else challenge429Streak
+                        activeCooldownStreak = challenge429Streak
+
+                        // 熔断判定：窗口内多次命中，或熔断尚未被成功探针解除（含手动探针再次被挑战）时，重新熔断整段时长。
+                        challengeHitTimes.addLast(nowElapsed)
+                        while (challengeHitTimes.isNotEmpty() && nowElapsed - challengeHitTimes.first() > CHALLENGE_CIRCUIT_WINDOW_MS) {
+                            challengeHitTimes.removeFirst()
+                        }
+                        val circuitWasOpen = challengeCircuitOpenUntil > 0L &&
+                            nowElapsed - challengeCircuitOpenUntil < CHALLENGE_429_STREAK_RESET_MS
+                        val tripCircuit = circuitWasOpen || challengeHitTimes.size >= CHALLENGE_CIRCUIT_THRESHOLD
+                        challengeCircuitManualProbeArmed = false
+                        challengeCircuitManualProbeArmedUntil = 0L
+                        if (tripCircuit) {
+                            challengeCircuitOpenUntil = nowElapsed + CHALLENGE_CIRCUIT_OPEN_MS
+                            challengeCircuitUntilFlow.value = challengeCircuitOpenUntil
+                        }
 
                         val wasActive = rateLimitedUntil > nowElapsed
                         rateLimitedByCfChallenge = if (wasActive) rateLimitedByCfChallenge else true
-                        val targetUntil = maxOf(nowElapsed + step, serverUntil)
+                        serverRateLimitedUntil = maxOf(serverRateLimitedUntil, serverUntil)
+                        val targetUntil = maxOf(nowElapsed + step, serverUntil, if (tripCircuit) challengeCircuitOpenUntil else 0L)
                         rateLimitedUntil = maxOf(rateLimitedUntil, targetUntil)
                         rateLimitProbeRequired = true
                         rateLimitRecoveryUntil = 0L
                         rateLimitDeadlineVersion++
                         releaseProbeOwnerLocked(requestRound)
                         val rem = (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
-                        sessionStore?.setRateLimitedUntil(nowWall + rem)
+                        persistRateLimitCooldownLocked(sessionStore, nowElapsed, nowWall)
                         shouldNotifyQuota = rem > 0L
-                        Triple(rem, activeCooldownStreak, shouldRotate)
+                        Triple(rem, activeCooldownStreak, tripCircuit)
                     }
                 }
             }
             if (shouldNotifyQuota && remaining > 0L) {
                 ApiQuotaPool.onServerRateLimited(remaining, cfChallenge = true)
             }
-            if (rotate) {
-                runCatching { onChallenge429Persistent?.invoke("连续 $streak 次 429 速率挑战: $path") }
+            postOAuthChallengeSince?.let {
+                org.linuxdo.android.net.NetDiagnostics.log("[授权后校准] 子站授权完成后第 ${it / 1_000L}s 的首个主站结果: 被挑战 ($path)")
             }
             return Triple(remaining, streak, rotate)
         }
@@ -5852,20 +6040,46 @@ class TopicRepository(
                 val isStaleGeneration = sessionStore != null &&
                     ticket.sessionGeneration >= 0L &&
                     ticket.sessionGeneration != currentGen
+                if (!isStaleGeneration) {
+                    lastMainSiteSuccessAtElapsed = now
+                    takePostOAuthOutcomeLocked(now)?.let {
+                        org.linuxdo.android.net.NetDiagnostics.log("[授权后校准] 子站授权完成后第 ${it / 1_000L}s 的首个主站结果: 成功")
+                    }
+                }
                 if (ticket.isProbe && rateLimitProbeOwner == ticket.round) {
                     releaseProbeOwnerLocked(ticket.round)
                     // 跨账号/旧会话探针完成时必须先归还探针锁，再保留当前会话的探针验证要求。
-                    if (isStaleGeneration) return
+                    if (isStaleGeneration) {
+                        disarmManualProbeLocked(now)
+                        return
+                    }
                     // 探针在途期间若有迟到 429 延长了截止时间，本次成功只交还探针，不解除新一段冷却后的探针要求。
-                    if (ticket.deadlineVersion != rateLimitDeadlineVersion || now < rateLimitedUntil) return
+                    if (ticket.deadlineVersion != rateLimitDeadlineVersion || now < maxOf(rateLimitedUntil, serverRateLimitedUntil)) {
+                        disarmManualProbeLocked(now)
+                        return
+                    }
+                    rateLimitedUntil = 0L
+                    serverRateLimitedUntil = 0L
+                    rateLimitedByCfChallenge = false
                     rateLimitProbeRequired = false
                     activeCooldownRound = -1L
                     activeCooldownStreak = -1
                     rateLimitRound++
-                    rateLimitRecoveryUntil = now + RATE_LIMIT_RECOVERY_MS
-                    // 探针刚通过时不立即降档 challenge429Streak，防止 20s 低速恢复期内再撞 429 时卡死在第一档(12s)；
+                    lastChallengeRecoveredAt = now
+                    val circuitWasOpen = challengeCircuitOpenUntil > 0L
+                    if (circuitWasOpen) {
+                        challengeCircuitOpenUntil = 0L
+                        challengeCircuitManualProbeArmed = false
+                        challengeCircuitManualProbeArmedUntil = 0L
+                        challengeHitTimes.clear()
+                        challengeCircuitUntilFlow.value = 0L
+                        ApiQuotaPool.onMainSiteCircuitRecovered(CHALLENGE_CIRCUIT_RECOVERY_MS)
+                    }
+                    rateLimitRecoveryUntil = now + if (circuitWasOpen) CHALLENGE_CIRCUIT_RECOVERY_MS else RATE_LIMIT_RECOVERY_MS
+                    // 探针刚通过时不立即降档 challenge429Streak，防止低速恢复期内再撞 429 时又从最低档(30s)起步；
                     // 待恢复期平稳结束后，再按 CHALLENGE_429_STEP_DOWN_INTERVAL_MS 逐级退档。
                     lastChallenge429StepDownAt = now
+                    persistRateLimitCooldownLocked(sessionStore)
                 } else if (
                     !isStaleGeneration &&
                     !ticket.isProbe &&
@@ -5885,11 +6099,19 @@ class TopicRepository(
 
         private fun releaseGetProbeIfAborted(ticket: GetSlotTicket) {
             if (!ticket.isProbe) return
-            synchronized(rateLimitLock) { releaseProbeOwnerLocked(ticket.round) }
+            releaseGetProbeForRound(ticket.round)
         }
 
+        /** 探针未成功结算（中止、超时、403/5xx、取消）时交还；若它是熔断期的手动探针，一并撤销放行并恢复熔断冷却。 */
         fun releaseGetProbeForRound(round: Long) {
-            synchronized(rateLimitLock) { releaseProbeOwnerLocked(round) }
+            val disarmed = synchronized(rateLimitLock) {
+                val wasOwner = round > 0L && rateLimitProbeOwner == round
+                releaseProbeOwnerLocked(round)
+                wasOwner && disarmManualProbeLocked(SystemClock.elapsedRealtime())
+            }
+            if (disarmed) {
+                org.linuxdo.android.net.NetDiagnostics.log("熔断期手动探测未成功完成，已撤销放行并恢复熔断冷却")
+            }
         }
 
         /** 归还恢复期在途计数；每张票据只在请求真正结束时调用一次。 */
@@ -5924,17 +6146,84 @@ class TopicRepository(
 
         fun clearRateLimitCooldown(sessionStore: SessionStore? = null) {
             synchronized(rateLimitLock) {
-                rateLimitedUntil = 0L
+                val now = SystemClock.elapsedRealtime()
+                val hadCircuit = challengeCircuitOpenUntil > 0L
+                serverRateLimitedUntil = serverRateLimitedUntil.takeIf { it > now } ?: 0L
+                rateLimitedUntil = serverRateLimitedUntil
                 rateLimitedByCfChallenge = false
                 activeCooldownRound = -1L
                 activeCooldownStreak = -1
-                rateLimitProbeRequired = false
+                rateLimitProbeRequired = serverRateLimitedUntil > 0L
                 rateLimitProbeOwner = 0L
-                rateLimitRecoveryUntil = 0L
+                rateLimitRecoveryUntil = if (hadCircuit) maxOf(now, serverRateLimitedUntil) + RATE_LIMIT_RECOVERY_MS else 0L
                 rateLimitDeadlineVersion++
                 rateLimitRound++
-                sessionStore?.setRateLimitedUntil(0L)
+                challengeHitTimes.clear()
+                challengeCircuitOpenUntil = 0L
+                challengeCircuitNextManualProbeAt = 0L
+                challengeCircuitManualProbeArmed = false
+                challengeCircuitManualProbeArmedUntil = 0L
+                challengeCircuitUntilFlow.value = 0L
+                if (hadCircuit) ApiQuotaPool.onMainSiteCircuitRecovered(rateLimitRecoveryUntil - now)
+                persistRateLimitCooldownLocked(sessionStore)
             }
+        }
+
+        /**
+         * 撤销熔断期的手动放行：熔断仍在有效期内时把冷却恢复到熔断截止，并保留单探针要求。
+         * 返回是否确有放行被撤销。调用方必须持有 [rateLimitLock]。
+         */
+        private fun disarmManualProbeLocked(now: Long): Boolean {
+            if (!challengeCircuitManualProbeArmed) return false
+            challengeCircuitManualProbeArmed = false
+            challengeCircuitManualProbeArmedUntil = 0L
+            val enforcedUntil = maxOf(challengeCircuitOpenUntil, serverRateLimitedUntil)
+            if (enforcedUntil > now) {
+                rateLimitedUntil = maxOf(rateLimitedUntil, enforcedUntil)
+                rateLimitProbeRequired = true
+                rateLimitRecoveryUntil = 0L
+                rateLimitDeadlineVersion++
+            }
+            persistRateLimitCooldownLocked()
+            return true
+        }
+
+        /** 放行到期仍没有探针在途时自动撤销（惰性检查，挂在各冷却查询入口）。调用方必须持有 [rateLimitLock]。 */
+        private fun expireManualProbeLocked(now: Long) {
+            if (challengeCircuitManualProbeArmed && rateLimitProbeOwner == 0L && now >= challengeCircuitManualProbeArmedUntil) {
+                disarmManualProbeLocked(now)
+            }
+        }
+
+        fun challengeCircuitRemainingMs(): Long = synchronized(rateLimitLock) {
+            if (challengeCircuitOpenUntil <= 0L) 0L
+            else (challengeCircuitOpenUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+
+        /**
+         * 熔断期内的用户手动重试：每 [CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS] 最多放行一次。
+         * 放行时解除当前冷却但保留单探针要求，且探针只允许前台请求领取（后台任务不能抢走这次放行）。
+         * 返回 0 表示已放行或当前未熔断；大于 0 为还需等待的毫秒数。
+         */
+        fun armChallengeCircuitManualProbe(): Long = synchronized(rateLimitLock) {
+            val now = SystemClock.elapsedRealtime()
+            expireManualProbeLocked(now)
+            if (challengeCircuitOpenUntil <= 0L || now >= challengeCircuitOpenUntil) return@synchronized 0L
+            val serverWait = (serverRateLimitedUntil - now).coerceAtLeast(0L)
+            if (serverWait > 0L) return@synchronized serverWait
+            val wait = challengeCircuitNextManualProbeAt - now
+            if (wait > 0L) return@synchronized wait
+            // 极少数场景下超过 60 秒仍有上一条探针在途：让用户稍候，避免重复放行或漏弹提示。
+            if (challengeCircuitManualProbeArmed) return@synchronized 1_000L
+            challengeCircuitNextManualProbeAt = now + CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS
+            challengeCircuitManualProbeArmed = true
+            challengeCircuitManualProbeArmedUntil = now + CHALLENGE_CIRCUIT_MANUAL_PROBE_ARM_MS
+            rateLimitedUntil = now
+            rateLimitProbeRequired = true
+            rateLimitRecoveryUntil = 0L
+            rateLimitDeadlineVersion++
+            persistRateLimitCooldownLocked()
+            0L
         }
 
         /** 429 响应体是 CF 质询页（Just a moment）而非 Discourse 的 JSON 限流提示。 */
@@ -5963,16 +6252,29 @@ class TopicRepository(
         const val LOGIN_CF_GATE_PATH = "/notifications.json?recent=true&limit=50&silent=true"
         /** 前台请求遇到 429 时允许静默自动等待重放的最大秒数（对齐 fluxdo）。 */
         const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
+        /** 前台请求在冷却 / 授权后静默窗口内最多原地等待的时长：不超过就显示加载中、到点再发，超过才提示稍后重试。 */
+        private const val FOREGROUND_GATE_MAX_WAIT_MS = 45_000L
+        /** 子站 OAuth 完成后的主站静默时长（实测：授权后 4~14 秒主站请求全部被挑战，39 秒时已恢复）。 */
+        private const val POST_OAUTH_QUIET_MS = 15_000L
+        /** 授权后多久内的首个主站结果计入校准诊断。 */
+        private const val POST_OAUTH_OUTCOME_TRACK_MS = 3 * 60_000L
         /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
         const val RATE_LIMIT_COOLDOWN_MS = 10_000L
         /** 进程重启后恢复已持久化的服务端 Retry-After 冷却上限（24 小时），避免截断长冷却。 */
         private const val MAX_PERSISTED_COOLDOWN_MS = 86_400_000L
-        /** 速率型 429 挑战的递增冷却档位（第 2 次即切线降温，不在同一差节点死扛）。 */
-        private val CHALLENGE_429_STEPS_MS = longArrayOf(6_000L, 12_000L)
+        /** 速率型 429 挑战的递增冷却档位；挑战期间换线无效，只靠时间降温。 */
+        private val CHALLENGE_429_STEPS_MS = longArrayOf(30_000L, 60_000L, 120_000L, 300_000L)
         /** 超过该时长无新的 429 挑战，档位从头计。 */
-        private const val CHALLENGE_429_STREAK_RESET_MS = 3 * 60_000L
+        private const val CHALLENGE_429_STREAK_RESET_MS = 10 * 60_000L
         /** 连续 429 档位成功恢复时，每级至少间隔该时长后再向下退档，避免并发 2xx 瞬间清零。 */
-        private const val CHALLENGE_429_STEP_DOWN_INTERVAL_MS = 10_000L
+        private const val CHALLENGE_429_STEP_DOWN_INTERVAL_MS = 60_000L
+        /** 挑战型 429 熔断：统计窗口、触发次数、熔断时长、手动重试最小间隔与解除后的低速恢复期。 */
+        const val CHALLENGE_CIRCUIT_WINDOW_MS = 5 * 60_000L
+        const val CHALLENGE_CIRCUIT_THRESHOLD = 3
+        const val CHALLENGE_CIRCUIT_OPEN_MS = 10 * 60_000L
+        const val CHALLENGE_CIRCUIT_MANUAL_PROBE_INTERVAL_MS = 60_000L
+        private const val CHALLENGE_CIRCUIT_MANUAL_PROBE_ARM_MS = 30_000L
+        private const val CHALLENGE_CIRCUIT_RECOVERY_MS = 60_000L
         /** 探针通过后的低速恢复期时长、并发上限与相邻放行间隔。 */
         private const val RATE_LIMIT_RECOVERY_MS = 20_000L
         private const val RATE_LIMIT_RECOVERY_MAX_IN_FLIGHT = 1
@@ -5981,8 +6283,6 @@ class TopicRepository(
         private const val PROBE_WAIT_POLL_MS = 150L
         /** 到期探针或静默补签在途时，后台请求的轻退避提示。 */
         private const val PROBE_WAIT_BACKOFF_MS = 2_000L
-        /** 换线降温的最小间隔，避免短时间抖动；同时防止被差节点卡死。 */
-        private const val CHALLENGE_429_ROTATE_INTERVAL_MS = 30_000L
         /** timings 遇 429 挑战时仅自身熔断的时长（不写主站全局冷却）。 */
         private const val TIMINGS_CHALLENGE_429_FUSE_MS = 60_000L
         /** timings 遇普通 429 且无 Retry-After 时的自身熔断时长。 */
@@ -6010,7 +6310,12 @@ class TopicRepository(
         ): Long {
             val now = SystemClock.elapsedRealtime()
             val remaining = synchronized(rateLimitLock) {
-                val rem = (rateLimitedUntil - now).coerceAtLeast(0L)
+                expireManualProbeLocked(now)
+                val rem = maxOf(
+                    (rateLimitedUntil - now).coerceAtLeast(0L),
+                    // postOAuth 静默窗口只拦后台自动请求，前台用户操作直接放行
+                    if (isMainSite && !present) postOAuthQuietRemainingLocked(now) else 0L,
+                )
                 if (rem > 0L) {
                     rem
                 } else if (isMainSite && rateLimitProbeRequired && (rateLimitProbeOwner != 0L || !allowClaimProbe)) {
@@ -6026,7 +6331,8 @@ class TopicRepository(
                     throw RateLimitException(remaining)
                 }
                 if (!isMainSite) return 0L
-                if (remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) {
+                // 不超过上限就原地等待（界面显示加载中），到点作为首个请求发出；超过才提示用户稍后重试。
+                if (remaining > FOREGROUND_GATE_MAX_WAIT_MS) {
                     throw RateLimitException(remaining)
                 }
                 return minOf(remaining, 500L)
@@ -6067,10 +6373,15 @@ class TopicRepository(
                 return null
             }
             return synchronized(rateLimitLock) {
-                val remaining = (rateLimitedUntil - now).coerceAtLeast(0L)
+                expireManualProbeLocked(now)
+                val remaining = maxOf(
+                    (rateLimitedUntil - now).coerceAtLeast(0L),
+                    // postOAuth 静默窗口只拦后台自动请求，前台用户操作直接放行
+                    if (isMainSite && !present) postOAuthQuietRemainingLocked(now) else 0L,
+                )
                 if (remaining > 0L) {
                     if (!present) throw RateLimitException(remaining)
-                    if (isMainSite && remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) {
+                    if (isMainSite && remaining > FOREGROUND_GATE_MAX_WAIT_MS) {
                         throw RateLimitException(remaining)
                     }
                     if (isMainSite) return@synchronized null
@@ -6098,7 +6409,8 @@ class TopicRepository(
             sessionGenerationProvider: () -> Long,
         ): GetSlotTicket? {
             if (isMainSite && rateLimitProbeRequired) {
-                if (rateLimitProbeOwner != 0L || !allowClaimProbe) {
+                // 熔断期内的手动放行只允许前台请求领取探针。
+                if (rateLimitProbeOwner != 0L || !allowClaimProbe || (challengeCircuitManualProbeArmed && !present)) {
                     if (!present) throw RateLimitException(PROBE_WAIT_BACKOFF_MS)
                     return null
                 }
@@ -6140,15 +6452,26 @@ class TopicRepository(
         /** 冷却、待探针或低速恢复期内，非关键写请求（如阅读进度）应直接让行。 */
         fun isMainSiteGateBusy(): Boolean = synchronized(rateLimitLock) {
             val now = SystemClock.elapsedRealtime()
-            now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil
+            expireManualProbeLocked(now)
+            now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil || now < postOAuthQuietUntil
+        }
+
+        /** 到期后允许必要业务读取确认恢复；后台不能抢走用户的手动复核许可。 */
+        fun isMainSiteAutomaticProbeReady(): Boolean = synchronized(rateLimitLock) {
+            val now = SystemClock.elapsedRealtime()
+            expireManualProbeLocked(now)
+            now >= maxOf(rateLimitedUntil, serverRateLimitedUntil) && rateLimitProbeRequired &&
+                rateLimitProbeOwner == 0L && !challengeCircuitManualProbeArmed
         }
 
         /** 图片等被动请求只等待业务探针和恢复期结束，不领取探针票据。 */
         fun mainSiteGateWaitMs(): Long = synchronized(rateLimitLock) {
             val now = SystemClock.elapsedRealtime()
+            expireManualProbeLocked(now)
             maxOf(
                 (rateLimitedUntil - now).coerceAtLeast(0L),
                 (rateLimitRecoveryUntil - now).coerceAtLeast(0L),
+                postOAuthQuietRemainingLocked(now),
                 if (rateLimitProbeRequired) PROBE_WAIT_BACKOFF_MS else 0L,
             )
         }
@@ -6167,8 +6490,10 @@ class TopicRepository(
                 }
                 val ticket = synchronized(rateLimitLock) {
                     val now = SystemClock.elapsedRealtime()
+                    expireManualProbeLocked(now)
+                    // 写请求是用户主动操作，不受 postOAuth 静默窗口阻拦
                     val remaining = (rateLimitedUntil - now).coerceAtLeast(0L)
-                    if (remaining > AUTO_RETRY_MAX_WAIT_SECONDS * 1_000L) throw RateLimitException(remaining)
+                    if (remaining > FOREGROUND_GATE_MAX_WAIT_MS) throw RateLimitException(remaining)
                     if (remaining > 0L) null
                     else claimMainSiteTicketLocked(true, present = true, now, allowClaimProbe = true, sessionGenerationProvider)
                 }

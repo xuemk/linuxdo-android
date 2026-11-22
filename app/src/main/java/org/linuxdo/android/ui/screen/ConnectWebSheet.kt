@@ -251,6 +251,13 @@ fun ConnectWebSheet(
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     when {
+                        state.needsAuthorization -> {
+                            Text(state.error ?: "升级进度需要授权", color = Color(0xFFFF453A), fontSize = 14.sp)
+                            TextButton(onClick = onRefresh, enabled = !state.loading) {
+                                Text("授权并读取", color = Color(0xFF00BA7C))
+                            }
+                            state.report?.let { NativeConnectCard(report = it) }
+                        }
                         state.loading && state.report == null -> {
                             Box(
                                 modifier = Modifier
@@ -302,7 +309,7 @@ fun ConnectWebSheet(
                                 IosActivityIndicator(diameter = 24.dp, color = Color(0xFF007AFF))
                             }
                         }
-                        ldcState.isExpired -> {
+                        ldcState.isExpired && ldcState.userInfo == null -> {
                             NativeCreditExpiredCard(
                                 onAuthorize = onAuthorizeLdc,
                                 onRetry = onRefreshLdc,
@@ -316,6 +323,19 @@ fun ConnectWebSheet(
                             )
                         }
                         ldcState.userInfo != null -> {
+                            if (ldcState.isExpired) {
+                                Text(
+                                    text = "积分授权已失效，当前显示上次获取的数据",
+                                    color = Color(0xFFFF453A),
+                                    fontSize = 13.sp,
+                                )
+                                TextButton(onClick = onAuthorizeLdc, enabled = !ldcState.loading) {
+                                    Text(
+                                        if (ldcState.loading) "获取中" else "授权并刷新",
+                                        color = Color(0xFF007AFF),
+                                    )
+                                }
+                            }
                             NativeCreditBalanceCard(userInfo = ldcState.userInfo)
                             NativeCreditMetricsGrid(userInfo = ldcState.userInfo)
                         }

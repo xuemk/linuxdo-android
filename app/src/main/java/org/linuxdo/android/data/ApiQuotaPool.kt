@@ -137,6 +137,10 @@ enum class ApiQuotaPool(
      */
     fun tryAcquire(force: Boolean = false): Boolean {
         if (TopicRepository.isRateLimitCoolingDown()) return false
+        // 子站授权刚完成：主站静默窗口内所有后台池让行（含用户强制刷新的未读，界面会在窗口结束后自然补拉）。
+        if (TopicRepository.postOAuthQuietRemainingMs() > 0L) return false
+        // 内置浏览器（小程序 / 专属邮箱等）打开期间整体让行，用户主动操作也不例外，避免与页面内验证叠加计数。
+        if (inAppBrowserPauseRemainingMs() > 0L) return false
         val now = SystemClock.elapsedRealtime()
         synchronized(this) {
             if (now < penaltyUntil) return false
@@ -161,7 +165,10 @@ enum class ApiQuotaPool(
             maxOf(penaltyUntil - now, lastAcquiredAt + minIntervalMs - now)
         }
         val foregroundWait = if (yieldToForeground) lastActivityAt() + FOREGROUND_QUIET_MS - now else 0L
-        return maxOf(poolWait, TopicRepository.rateLimitRemainingMs(), foregroundWait, 0L)
+        return maxOf(
+            poolWait, TopicRepository.rateLimitRemainingMs(), TopicRepository.postOAuthQuietRemainingMs(),
+            foregroundWait, inAppBrowserPauseRemainingMs(), 0L,
+        )
     }
 
     private fun penalize(globalCooldownMs: Long, cfChallenge: Boolean) {
@@ -176,6 +183,14 @@ enum class ApiQuotaPool(
             // 惩罚期至少要盖过全局冷却，否则冷却一结束所有后台池会同一秒齐射
             penaltyUntil = maxOf(penaltyUntil, now + maxOf(penalty, globalCooldownMs))
             if (!continuingPenalty) strikes = (strikes + 1).coerceAtMost(MAX_STRIKE_SHIFT)
+        }
+    }
+
+    private fun resumeAfterCircuitRecovery(now: Long, recoveryMs: Long) {
+        val staggerMs = (ordinal + 1) * 1_000L + kotlin.random.Random.nextLong(0L, 1_000L)
+        synchronized(this) {
+            strikes = 0
+            penaltyUntil = now + recoveryMs.coerceAtLeast(FOREGROUND_QUIET_MS) + staggerMs
         }
     }
 
@@ -198,12 +213,71 @@ enum class ApiQuotaPool(
 
         private fun lastActivityAt(): Long = maxOf(lastForegroundAt, TopicRepository.lastPostRequestAt)
 
+        fun foregroundQuietRemainingMs(): Long = maxOf(
+            (lastActivityAt() + FOREGROUND_QUIET_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+            inAppBrowserPauseRemainingMs(),
+        )
+
+        /** 内置浏览器关闭后的随机静默窗口，避免关闭瞬间与积压的轮询同秒齐发。 */
+        private const val IN_APP_BROWSER_RESUME_MIN_MS = 3_000L
+        private const val IN_APP_BROWSER_RESUME_MAX_MS = 5_000L
+        /** 内置浏览器可见期间，轮询循环的复查间隔。 */
+        private const val IN_APP_BROWSER_POLL_MS = 2_000L
+        private val inAppBrowserVisibleCount = java.util.concurrent.atomic.AtomicInteger(0)
+        @Volatile private var inAppBrowserQuietUntil = 0L
+        @Volatile private var lastInAppBrowserClosedAt = 0L
+        /** 最近一次回到前台的时间；进程刚启动时视为刚回前台。 */
+        @Volatile private var lastAppForegroundAt = SystemClock.elapsedRealtime()
+
+        fun markAppForeground() {
+            lastAppForegroundAt = SystemClock.elapsedRealtime()
+        }
+
+        fun sinceAppForegroundMs(): Long = (SystemClock.elapsedRealtime() - lastAppForegroundAt).coerceAtLeast(0L)
+
+        /** 内置浏览器正在打开，或在 [withinMs] 内刚关闭（同一出口 IP 刚有页面流量）。 */
+        fun inAppBrowserUsedWithin(withinMs: Long): Boolean {
+            if (inAppBrowserVisibleCount.get() > 0) return true
+            val closedAt = lastInAppBrowserClosedAt
+            return closedAt > 0L && SystemClock.elapsedRealtime() - closedAt < withinMs
+        }
+
+        /** 由 AppContainer 注入；App 切到后台时不因残留的浏览器容器压住后台通知。 */
+        @Volatile var appForegroundProvider: () -> Boolean = { true }
+
+        /** 内置浏览器容器进入/离开可见状态时调用，必须成对出现。 */
+        fun onInAppBrowserVisible(visible: Boolean) {
+            if (visible) {
+                inAppBrowserVisibleCount.incrementAndGet()
+            } else {
+                val left = inAppBrowserVisibleCount.updateAndGet { (it - 1).coerceAtLeast(0) }
+                if (left == 0) {
+                    lastInAppBrowserClosedAt = SystemClock.elapsedRealtime()
+                    inAppBrowserQuietUntil = SystemClock.elapsedRealtime() +
+                        kotlin.random.Random.nextLong(IN_APP_BROWSER_RESUME_MIN_MS, IN_APP_BROWSER_RESUME_MAX_MS + 1)
+                }
+            }
+        }
+
+        /** 内置浏览器打开期间或关闭后的静默窗口内，自动请求应让行的剩余毫秒。 */
+        fun inAppBrowserPauseRemainingMs(): Long {
+            if (!runCatching { appForegroundProvider() }.getOrDefault(true)) return 0L
+            if (inAppBrowserVisibleCount.get() > 0) return IN_APP_BROWSER_POLL_MS
+            return (inAppBrowserQuietUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+
         /**
          * 服务端任意一次 429 都会进到这里：服务端是全局计数的，撞墙说明总量超了，
          * 所有后台池都要退让；被 CF 质询页拦下（cf-mitigated=challenge）时惩罚加倍。
          */
         fun onServerRateLimited(globalCooldownMs: Long, cfChallenge: Boolean) {
             entries.forEach { it.penalize(globalCooldownMs, cfChallenge) }
+        }
+
+        /** 主站探针已解除客户端熔断；后台池按恢复期错峰重启，不再保留原来的长惩罚。 */
+        fun onMainSiteCircuitRecovered(recoveryMs: Long) {
+            val now = SystemClock.elapsedRealtime()
+            entries.forEach { it.resumeAfterCircuitRecovery(now, recoveryMs) }
         }
     }
 }

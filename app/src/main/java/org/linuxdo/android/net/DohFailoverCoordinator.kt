@@ -1,9 +1,11 @@
 package org.linuxdo.android.net
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -63,7 +65,7 @@ data class TransportEpoch(
  *    - 确定性 DoH/ECH 故障（如 ECH 被拒、缺少配置、DNS 超时等）立即切换；
  *    - 普通连接超时/握手抖动设短窗口阈值防抖，避免弱网频繁切换。
  * 4. 偏好分离：用户持久化的“首选节点”与运行时的“有效节点”独立，自动故障转移不擅自覆盖用户配置。
- * 5. 全局动态分发：提供 Call.Factory 供 ImageLoader (Coil)、认证服务等全局共享，永远获取最新 Client。
+ * 5. 动态分发：图片和业务分别调度，新请求都获取当前代次的 Client。
  */
 class DohFailoverCoordinator(
     private val context: Context,
@@ -74,6 +76,8 @@ class DohFailoverCoordinator(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     var onEpochChanged: (TransportEpoch) -> Unit = {},
     var onLatenciesUpdated: ((latencies: Map<String, Long?>, summaries: Map<String, String>, selectedUrl: String) -> Unit)? = null,
+    private val shouldPauseBackgroundProbe: () -> Boolean = { false },
+    private val probeUserAgentProvider: () -> String = { userAgent },
     private val clientFactory: (dns: Dns?, transport: DohTransport?, coordinator: DohFailoverCoordinator, routeMode: NetworkRouteMode) -> OkHttpClient,
 ) : Call.Factory {
 
@@ -89,6 +93,7 @@ class DohFailoverCoordinator(
         private const val JITTER_THRESHOLD = 2
         /** 智能双轨定时探测周期：10 分钟（低频防 CF 风控） */
         private const val SMART_ROUTE_INTERVAL_MS = 10 * 60 * 1000L
+        private const val FOREGROUND_PROBE_DELAY_MS = 30_000L
     }
 
     private val generationCounter = AtomicLong(1L)
@@ -117,6 +122,18 @@ class DohFailoverCoordinator(
     @Volatile private var isAppInForeground: Boolean = true
     private var lastSmartProbeTimeMs = 0L
     private var smartRouteJob: kotlinx.coroutines.Job? = null
+    private var foregroundProbeJob: Job? = null
+    @Volatile private var foregroundProbeNotBeforeElapsed = 0L
+    private val imageClients = SiteImageHttpClientFactory()
+
+    val imageCallFactory: Call.Factory = object : Call.Factory {
+        override fun newCall(request: Request): Call {
+            val tagged = request.newBuilder().tag(
+                SiteImageGateInterceptor.PassiveImageRequest::class.java, SiteImageGateInterceptor.PassiveImageRequest,
+            ).build()
+            return clientForRequest(tagged).newCall(tagged)
+        }
+    }
 
     init {
         val initialServer = resolveInitialServer()
@@ -125,10 +142,22 @@ class DohFailoverCoordinator(
         currentEpoch = AtomicReference(initialEpoch)
     }
 
-    /** 作为 Call.Factory 分发给各业务方（Coil、后台服务等），保证新发请求永远走最新 generation */
+    /** 作为业务 Call.Factory 分发；图片经 imageCallFactory 使用独立 Dispatcher。 */
     override fun newCall(request: Request): Call {
-        return currentEpoch.get().client.newCall(request)
+        return clientForRequest(request).newCall(request)
     }
+
+    internal fun clientForRequest(request: Request, epoch: TransportEpoch = currentEpoch.get()): OkHttpClient {
+        val base = if (request.tag(SiteImageGateInterceptor.PassiveImageRequest::class.java) != null) {
+            imageClients.clientFor(epoch.client)
+        } else epoch.client
+        return if (request.tag(NoRedirectRequest::class.java) != null) {
+            withoutSiteRedirects(base)
+        } else base
+    }
+
+    val currentImageClient: OkHttpClient
+        get() = imageClients.clientFor(currentEpoch.get().client)
 
     val currentClient: OkHttpClient
         get() = currentEpoch.get().client
@@ -466,6 +495,8 @@ class DohFailoverCoordinator(
             return
         }
 
+        if (!force && foregroundProbeQuietRemainingMs() > 0L) return
+
         val netState = networkMonitor.detect()
         if (shouldPauseDohForProxy(netState)) {
             val summary = if (netState.isProxy) "系统代理已开启，直连已让渡系统网络" else "VPN 已开启，直连已让渡系统网络"
@@ -474,6 +505,15 @@ class DohFailoverCoordinator(
             return
         }
 
+        if (!force && shouldDeferSmartRouteProbe()) {
+            lastSmartProbeTimeMs = System.currentTimeMillis()
+            Log.d(TAG, "周期双轨测速暂缓：主站闸门忙或近期业务请求已成功")
+            return
+        }
+
+        val canProbe = { force || !shouldDeferSmartRouteProbe() }
+        val probeUserAgent = probeUserAgentProvider()
+
         val currentServer = effectiveServer.get()
         val directDns = anycastPool?.let { org.linuxdo.android.net.anycast.AnycastDns(it, fallback = okhttp3.Dns.SYSTEM) }
 
@@ -481,13 +521,20 @@ class DohFailoverCoordinator(
         var dohLatency: Long = -1L
         kotlinx.coroutines.coroutineScope {
             val directJob = launch {
-                directLatency = DohProbeEngine.probeTlsHandshake(currentServer, directDns, timeoutSeconds = 6).latencyMs ?: -1L
+                directLatency = DohProbeEngine.probeTlsHandshake(currentServer, directDns, timeoutSeconds = 6,
+                    canProbe = canProbe, userAgent = probeUserAgent).latencyMs ?: -1L
             }
             val dohJob = launch {
-                dohLatency = DohProbeEngine.probeTlsHandshake(currentServer, null, timeoutSeconds = 6).latencyMs ?: -1L
+                dohLatency = DohProbeEngine.probeTlsHandshake(currentServer, null, timeoutSeconds = 6,
+                    canProbe = canProbe, userAgent = probeUserAgent).latencyMs ?: -1L
             }
             directJob.join()
             dohJob.join()
+        }
+
+        if (!canProbe()) {
+            if (foregroundProbeQuietRemainingMs() == 0L) lastSmartProbeTimeMs = System.currentTimeMillis()
+            return
         }
 
         latestDirectLatencyMs.set(directLatency)
@@ -512,6 +559,16 @@ class DohFailoverCoordinator(
         }
     }
 
+    private fun shouldDeferSmartRouteProbe(): Boolean =
+        !isAppInForeground || foregroundProbeQuietRemainingMs() > 0L ||
+            org.linuxdo.android.data.TopicRepository.isMainSiteGateBusy() ||
+            org.linuxdo.android.data.TopicRepository.isSilentRevalidating() ||
+            shouldPauseBackgroundProbe() ||
+            org.linuxdo.android.data.TopicRepository.hasRecentMainSiteSuccess(SMART_ROUTE_INTERVAL_MS)
+
+    private fun foregroundProbeQuietRemainingMs(): Long =
+        (foregroundProbeNotBeforeElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+
     /** 手动触发一次智能双轨评估 */
     fun triggerSmartRouteEvaluation() {
         scope.launch {
@@ -522,12 +579,24 @@ class DohFailoverCoordinator(
     /** 设置应用前后台状态，控制后台静默暂停定时测速 */
     fun setAppForeground(inForeground: Boolean) {
         val wasForeground = isAppInForeground
+        if (!wasForeground && inForeground) {
+            foregroundProbeNotBeforeElapsed = SystemClock.elapsedRealtime() + FOREGROUND_PROBE_DELAY_MS
+        }
         isAppInForeground = inForeground
+        if (!inForeground) {
+            foregroundProbeJob?.cancel()
+            foregroundProbeJob = null
+            return
+        }
         if (!wasForeground && inForeground) {
             val elapsed = System.currentTimeMillis() - lastSmartProbeTimeMs
             if (store.isDohEnabled() && elapsed >= SMART_ROUTE_INTERVAL_MS) {
-                scope.launch {
-                    evaluateSmartRoute()
+                foregroundProbeJob = scope.launch {
+                    delay(foregroundProbeQuietRemainingMs())
+                    if (isAppInForeground && store.isDohEnabled() &&
+                        System.currentTimeMillis() - lastSmartProbeTimeMs >= SMART_ROUTE_INTERVAL_MS) {
+                        evaluateSmartRoute()
+                    }
                 }
             }
         }

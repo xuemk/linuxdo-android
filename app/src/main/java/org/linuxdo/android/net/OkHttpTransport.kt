@@ -41,6 +41,9 @@ class OkHttpTransport(
         return execute(path, present = present)
     }
 
+    override suspend fun getWithoutRedirects(path: String, present: Boolean): TransportResult =
+        execute(path, present = present, withoutRedirects = true)
+
     override suspend fun getForVerification(path: String, present: Boolean): TransportResult =
         execute(path, present = present, isClearanceProbe = true, expectedGeneration = store.sessionGeneration)
 
@@ -98,6 +101,7 @@ class OkHttpTransport(
         present: Boolean = true,
         isClearanceProbe: Boolean = false,
         expectedGeneration: Long? = null,
+        withoutRedirects: Boolean = false,
     ): TransportResult {
         // 先把 WebView 的现场 Cookie 同步进加密存储,共享客户端的 Interceptor 会读这份快照。
         withContext(Dispatchers.Main) {
@@ -120,6 +124,7 @@ class OkHttpTransport(
             .header("Accept", acceptHeader)
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .apply {
+                if (withoutRedirects) tag(NoRedirectRequest::class.java, NoRedirectRequest)
                 if (!isConnect) {
                     header("X-Requested-With", "XMLHttpRequest")
                     if (path.startsWith("/topics/timings")) {
@@ -178,7 +183,10 @@ class OkHttpTransport(
         if (reqGeneration != store.sessionGeneration) throw CancellationException("会话已切换")
         val activeTag = ActiveSessionRequest(reqGeneration, isClearanceProbe = isClearanceProbe)
         val result = suspendCancellableCoroutine<TransportResult> { continuation ->
-            val call = client.newCall(request.newBuilder()
+            val requestClient = if (request.tag(NoRedirectRequest::class.java) != null) {
+                withoutSiteRedirects(client)
+            } else client
+            val call = requestClient.newCall(request.newBuilder()
                 .tag(ActiveSessionRequest::class.java, activeTag).build())
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {

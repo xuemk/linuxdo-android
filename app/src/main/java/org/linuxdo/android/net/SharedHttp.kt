@@ -211,6 +211,7 @@ private class SessionHeaderInterceptor(
 
     private fun interceptSession(chain: Interceptor.Chain): Response {
         val original = chain.request()
+        SiteImageGateInterceptor.awaitSendSlot(chain, original, store)
         val host = original.url.host
         val isLinuxDoHost = host == Config.HOST || host.endsWith(".${Config.HOST}")
         val isChallengePlatformHost = host == CHALLENGES_HOST || host.endsWith(".$CHALLENGES_HOST")
@@ -320,7 +321,24 @@ private class SessionHeaderInterceptor(
                 ?.backgroundRequestDelayMs() ?: 0L) > 0L) {
             throw IOException("后台通知请求暂缓，等待验证或限流结束")
         }
+        ZoneRequestLedger.record(outgoing.url)
         val response = chain.proceed(outgoing)
+        // 主站任何 429 / CF 挑战都记录为风险信号（网络拦截器能看到子站授权重定向经过主站的每一跳）。
+        if (host == Config.HOST && (response.code == 429 || (response.code in setOf(403, 503) &&
+                response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true))) {
+            org.linuxdo.android.data.TopicRepository.noteMainSiteChallengeSignal()
+            if (ZoneRequestLedger.shouldLogSnapshot()) {
+                NetDiagnostics.log(
+                    "主站 HTTP ${response.code} 挑战 $encodedPath | linux.do 区域请求（App 内，含重定向每一跳，不含内置浏览器）" +
+                        "近10秒 ${ZoneRequestLedger.summary(10_000L)}；近30秒 ${ZoneRequestLedger.summary(30_000L)}",
+                )
+            }
+            if (encodedPath == "/session/sso_provider") {
+                // 子站授权跳到主站 SSO 被挑战：说明主站已进入风控，后台自动请求先整体退让，避免紧接着撞主站 429。
+                org.linuxdo.android.data.ApiQuotaPool.onServerRateLimited(60_000L, cfChallenge = true)
+                NetDiagnostics.log("子站授权经主站 /session/sso_provider 被挑战(HTTP ${response.code})，后台请求退让 60s，30 分钟内不再自动授权子站")
+            }
+        }
         val responseMatchesUserAgent = runCatching {
             requestUserAgent == (store.userAgentOrNull() ?: userAgent)
         }.getOrDefault(false)
@@ -472,6 +490,58 @@ suspend fun awaitImageRetrySlot(attempt: Int) {
 /** 每张图自动重试的上限，超过后停在占位，等用户手动重载或重新进入页面。 */
 const val IMAGE_AUTO_RETRY_LIMIT = 2
 
+/** 图片调度跨网络代次共享，连接池、拦截器与 TLS 配置仍来自当前业务客户端。 */
+internal class SiteImageHttpClientFactory {
+    private val dispatcher = Dispatcher().apply {
+        maxRequests = 32
+        maxRequestsPerHost = 8
+    }
+    private var baseClient: OkHttpClient? = null
+    private var imageClient: OkHttpClient? = null
+
+    @Synchronized
+    fun clientFor(base: OkHttpClient): OkHttpClient {
+        if (baseClient !== base) {
+            imageClient = base.newBuilder().dispatcher(dispatcher).build()
+            baseClient = base
+        }
+        return checkNotNull(imageClient)
+    }
+}
+
+/** 头像与正文图片仅在限流后的恢复窗口共用发送预算；未获准的等待不消耗令牌。 */
+internal class SiteImageRequestPacer(
+    private val windowMs: Long = 3_000L,
+    private val maxRequests: Int = 6,
+    private val minSpacingMs: Long = 120L,
+) {
+    private val sentAt = java.util.ArrayDeque<Long>()
+    private var recoveryUntil = 0L
+
+    init {
+        require(windowMs > 0L && maxRequests > 0 && minSpacingMs >= 0L)
+    }
+
+    @Synchronized
+    fun enterRecoveryWindow(untilElapsed: Long) {
+        recoveryUntil = maxOf(recoveryUntil, untilElapsed)
+    }
+
+    @Synchronized
+    fun reserveOrWaitMs(nowElapsed: Long): Long {
+        if (nowElapsed >= recoveryUntil) {
+            sentAt.clear()
+            return 0L
+        }
+        while (sentAt.isNotEmpty() && nowElapsed - sentAt.first >= windowMs) sentAt.removeFirst()
+        val windowWait = if (sentAt.size >= maxRequests) windowMs - (nowElapsed - sentAt.first) else 0L
+        val spacingWait = sentAt.peekLast()?.let { minSpacingMs - (nowElapsed - it) } ?: 0L
+        val wait = maxOf(windowWait, spacingWait, 0L)
+        if (wait == 0L) sentAt.addLast(nowElapsed)
+        return wait
+    }
+}
+
 /**
  * 站内图片（头像 / 字母头像 / 上传图）的独立计量池。
  *
@@ -479,6 +549,7 @@ const val IMAGE_AUTO_RETRY_LIMIT = 2
  * - EMOJI 通道 12 槽（KB 级极小图，RTT 主导）
  * - AVATAR 通道 3 槽（刷长帖时头像与主站 API 共享同一出口的 CF 速率额度，6 槽实测会把正文请求挤进 429 挑战）
  * - MEDIA 通道 4 槽（正文上传大图/附件，独立槽位避免饿死头像）
+ * - 限流后的 30 秒恢复窗口内，AVATAR/MEDIA 合计每 3 秒最多 6 次发送、至少间隔 120ms
  *
  * 主站 [org.linuxdo.android.data.TopicRepository] 处于 429 冷却时，图片与其自动重试同步暂缓，不单独冲锋。
  */
@@ -489,6 +560,9 @@ internal object SiteImageGateInterceptor {
     /** 签名地址不一定有图片后缀或固定路径，显式标记后仍须经过图片门禁。 */
     data object SignatureRequest
 
+    /** 在网络切换后的重试中继续使用图片 Dispatcher。 */
+    data object PassiveImageRequest
+
     /** 用户主动点击触发的显式文件/附件下载，不进列表图片门禁排队与冷却。 */
     data object ExplicitDownloadRequest
 
@@ -497,6 +571,7 @@ internal object SiteImageGateInterceptor {
     private const val MEDIA_CONCURRENT = 4
     private const val ACQUIRE_TIMEOUT_MS = 15_000L
     private const val DEFAULT_COOLDOWN_MS = 4_000L
+    private const val RECOVERY_WINDOW_MS = 30_000L
 
     private const val EMOJI_PREFIX = "/images/emoji/"
     private const val SVG_PREFIX = "/svg-sprite/"
@@ -508,6 +583,7 @@ internal object SiteImageGateInterceptor {
     private val emojiPermits = java.util.concurrent.Semaphore(EMOJI_CONCURRENT, true)
     private val avatarPermits = java.util.concurrent.Semaphore(AVATAR_CONCURRENT, true)
     private val mediaPermits = java.util.concurrent.Semaphore(MEDIA_CONCURRENT, true)
+    private val requestPacer = SiteImageRequestPacer()
     @Volatile private var cooldownUntil = 0L
     @Volatile private var recoveryStore: SessionStore? = null
 
@@ -585,6 +661,31 @@ internal object SiteImageGateInterceptor {
         return response
     }
 
+    /** 网络拦截器逐次准入，重定向与重试也计数；异步图片使用独立 Dispatcher。 */
+    fun awaitSendSlot(chain: Interceptor.Chain, request: okhttp3.Request, store: SessionStore) {
+        if (request.tag(ExplicitDownloadRequest::class.java) != null) return
+        val isSignature = request.tag(SignatureRequest::class.java) != null
+        val category = categorize(request.url, isSignature)
+        if (category != ImageCategory.AVATAR && category != ImageCategory.MEDIA) return
+        val generation = request.tag(ActiveSessionRequest::class.java)?.generation ?: store.sessionGeneration
+        while (true) {
+            if (chain.call().isCanceled()) throw IOException("Canceled")
+            if (generation != store.sessionGeneration || store.sessionChanging || store.isSessionRecoveryPending()) {
+                throw IOException("会话已切换，请重新加载图片")
+            }
+            checkRecovery(request.url, store, isSignature)
+            checkCooldown()
+            val waitMs = requestPacer.reserveOrWaitMs(android.os.SystemClock.elapsedRealtime())
+            if (waitMs == 0L) return
+            try {
+                Thread.sleep(minOf(waitMs, 100L))
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw java.io.InterruptedIOException("图片节流等待被中断").apply { initCause(interrupted) }
+            }
+        }
+    }
+
     /** 图片自身冷却与主站全局 429 冷却取较长者；[retryImageAfterDelay] 的自动重试也据此等待。 */
     fun cooldownRemainingMs(): Long = maxOf(
         (cooldownUntil - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
@@ -593,7 +694,10 @@ internal object SiteImageGateInterceptor {
 
     private fun checkCooldown() {
         val remaining = cooldownRemainingMs()
-        if (remaining > 0L) throw ThrottledException("站内图片限流冷却中，还剩 ${remaining / 1_000L}s")
+        if (remaining > 0L) {
+            requestPacer.enterRecoveryWindow(android.os.SystemClock.elapsedRealtime() + remaining + RECOVERY_WINDOW_MS)
+            throw ThrottledException("站内图片限流冷却中，还剩 ${remaining / 1_000L}s")
+        }
     }
 
     internal fun responseCooldownMs(response: Response): Long {
@@ -611,6 +715,7 @@ internal object SiteImageGateInterceptor {
         val first = synchronized(this) {
             val wasCooling = now < cooldownUntil
             cooldownUntil = maxOf(cooldownUntil, now + cooldownMs)
+            requestPacer.enterRecoveryWindow(cooldownUntil + RECOVERY_WINDOW_MS)
             !wasCooling
         }
         // 隔离改进：图片自身进入冷却即可（头像优雅降级为文字占位头像），不连带锁死前台主 API 计量池
@@ -628,12 +733,70 @@ internal object SiteImageGateInterceptor {
         val first = synchronized(this) {
             val wasCooling = now < cooldownUntil
             cooldownUntil = maxOf(cooldownUntil, now + safeMs)
+            requestPacer.enterRecoveryWindow(cooldownUntil + RECOVERY_WINDOW_MS)
             !wasCooling
         }
         if (!first) return
         NetDiagnostics.log(
             "站内图片限流(${if (cfChallenge) "CF质询" else "429"}): $path，图片暂停 ${safeMs / 1_000L}s (与主API隔离)",
         )
+    }
+}
+
+/**
+ * App 内发往 linux.do 区域（主站与各子站）的请求流水，只记时间与类别，用于在被挑战时还原前 10/30 秒的真实请求量
+ * （接口诊断日志只记业务接口，看不到图片、表情和重定向跳转）。
+ */
+internal object ZoneRequestLedger {
+    private const val KEEP_MS = 60_000L
+    private const val MAX_EVENTS = 3_000
+    private const val SNAPSHOT_LOG_INTERVAL_MS = 5_000L
+    private val labels = arrayOf("主站接口", "子站接口", "头像/图片", "表情")
+    private val imageExtensions = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".ico")
+    private val events = java.util.ArrayDeque<Pair<Long, Int>>()
+    @Volatile private var lastSnapshotLogAt = 0L
+
+    fun record(url: okhttp3.HttpUrl) {
+        val host = url.host.lowercase()
+        if (host != Config.HOST && !host.endsWith(".${Config.HOST}")) return
+        val path = url.encodedPath
+        val lowerPath = path.lowercase()
+        val category = when {
+            path.startsWith("/images/emoji/") || path.startsWith("/svg-sprite/") -> 3
+            path.startsWith("/user_avatar/") || path.startsWith("/letter_avatar") || path.startsWith("/uploads/") ||
+                imageExtensions.any { lowerPath.endsWith(it) } -> 2
+            host == Config.HOST -> 0
+            else -> 1
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(events) {
+            events.addLast(now to category)
+            trimLocked(now)
+        }
+    }
+
+    private fun trimLocked(now: Long) {
+        while (events.isNotEmpty() && (now - events.peekFirst()!!.first > KEEP_MS || events.size > MAX_EVENTS)) {
+            events.removeFirst()
+        }
+    }
+
+    fun summary(windowMs: Long): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val counts = IntArray(labels.size)
+        synchronized(events) {
+            trimLocked(now)
+            events.forEach { (time, category) -> if (now - time <= windowMs) counts[category]++ }
+        }
+        return "共 ${counts.sum()} 次（" + labels.indices.joinToString("，") { "${labels[it]} ${counts[it]}" } + "）"
+    }
+
+    /** 同一波挑战（多张图片同时 429）只记一次快照。 */
+    fun shouldLogSnapshot(): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSnapshotLogAt < SNAPSHOT_LOG_INTERVAL_MS) return false
+        lastSnapshotLogAt = now
+        return true
     }
 }
 
