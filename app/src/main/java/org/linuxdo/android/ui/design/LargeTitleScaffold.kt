@@ -79,6 +79,7 @@ fun IosLargeTitleScaffold(
     onBack: (() -> Unit)? = null,
     compactTop: Boolean = false,
     showLargeTitle: Boolean = true,
+    showNavBar: Boolean = true,
     barsVisible: Boolean = true,
     bottomPadding: Dp = 64.dp,
     backLabel: String = "返回",
@@ -109,7 +110,9 @@ fun IosLargeTitleScaffold(
         }
     }
 
-    val topPadding = if (showLargeTitle) {
+    val topPadding = if (!showNavBar) {
+        0.dp
+    } else if (showLargeTitle) {
         if (compactTop) 0.dp else navBarHeight
     } else {
         navBarHeight
@@ -194,10 +197,10 @@ fun IosLargeTitleScaffold(
             content()
         }
 
-        val showNavBar = (!compactTop || collapse > 0.01f || !showLargeTitle)
+        val showNavBarByScroll = (!compactTop || collapse > 0.01f || !showLargeTitle)
         val atTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20
         AnimatedVisibility(
-            visible = showNavBar && (barsVisible || atTop),
+            visible = showNavBar && showNavBarByScroll && (barsVisible || atTop),
             enter = slideInVertically(animationSpec = tween(220)) { -it } + fadeIn(animationSpec = tween(180)),
             exit = slideOutVertically(animationSpec = tween(220)) { -it } + fadeOut(animationSpec = tween(180)),
             modifier = Modifier.align(Alignment.TopStart),

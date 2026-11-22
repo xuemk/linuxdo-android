@@ -81,6 +81,64 @@ object Config {
     const val SESSION_COOKIE = "_t"
     const val CF_CLEARANCE_COOKIE = "cf_clearance"
 
+    /** 站点静态资源与图片 CDN 域名（默认对齐线上 CDN，首页 #data-discourse-setup 动态提取后覆盖并持久化）。 */
+    const val DEFAULT_CDN_URL = "https://cdn.ldstatic.com"
+    const val DEFAULT_S3_CDN_URL = "https://cdn3.ldstatic.com"
+    @Volatile var cdnUrl: String? = DEFAULT_CDN_URL
+    @Volatile var s3CdnUrl: String? = DEFAULT_S3_CDN_URL
+    @Volatile var s3BaseUrl: String? = null
+
+    fun updateCdnConfig(cdn: String?, s3Cdn: String?, s3Base: String?) {
+        cdn?.trim()?.trimEnd('/')?.takeIf { it.startsWith("https://", ignoreCase = true) }?.let { cdnUrl = it }
+        s3Cdn?.trim()?.trimEnd('/')?.takeIf { it.startsWith("https://", ignoreCase = true) }?.let { s3CdnUrl = it }
+        s3Base?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { s3BaseUrl = it }
+    }
+
+    fun isStaticCdnPath(path: String): Boolean {
+        val p = if (path.startsWith("/")) path else "/$path"
+        if (p.startsWith("/uploads/short-url/")) return false
+        return p.startsWith("/user_avatar/") ||
+            p.startsWith("/letter_avatar") ||
+            p.startsWith("/images/") ||
+            p.startsWith("/svg-sprite/") ||
+            p.startsWith("/uploads/default/") ||
+            p.startsWith("/stylesheets/")
+    }
+
+    /**
+     * 对齐 Fluxdo UrlHelper.resolveUrlWithCdn：将相对静态资源、头像、表情与 S3 上传路径
+     * 自动改写为站点配置的 CDN / S3 CDN 地址，避免静默消耗主站源站限流预算。
+     */
+    fun resolveUrlWithCdn(rawUrl: String): String {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty()) return trimmed
+        val normalized = if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
+        val s3Base = s3BaseUrl
+        val s3Cdn = s3CdnUrl
+        if (!s3Base.isNullOrBlank() && !s3Cdn.isNullOrBlank()) {
+            val fullS3Base = when {
+                s3Base.startsWith("//") -> "https:$s3Base"
+                s3Base.startsWith("http", ignoreCase = true) -> s3Base
+                else -> "https://$s3Base"
+            }
+            if (normalized.startsWith(fullS3Base, ignoreCase = true)) {
+                return s3Cdn + normalized.substring(fullS3Base.length)
+            }
+        }
+        val activeCdn = cdnUrl
+        if (normalized.startsWith("/")) {
+            val base = if (!activeCdn.isNullOrBlank() && isStaticCdnPath(normalized)) activeCdn else BASE_URL
+            return base + normalized
+        }
+        if (!activeCdn.isNullOrBlank() && normalized.startsWith(BASE_URL, ignoreCase = true)) {
+            val rel = normalized.substring(BASE_URL.length)
+            if (rel.startsWith("/") && isStaticCdnPath(rel)) {
+                return activeCdn + rel
+            }
+        }
+        return normalized
+    }
+
     /** 应用版本检查与升级（公开 APK 分发仓库 xuemk/linuxdo-android 根目录 version.json）。 */
     val UPDATE_VERSION_JSON_URLS = listOf(
         "https://api.github.com/repos/xuemk/linuxdo-android/contents/version.json",

@@ -18,8 +18,6 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -117,10 +115,90 @@ data class TopicBusMessage(
     val data: JsonElement = JsonNull,
 )
 
+internal class PriorityCoroutineSemaphore(private val maxPermits: Int = 1) {
+    private class Waiter(val deferred: CompletableDeferred<Unit> = CompletableDeferred()) {
+        var cancelled: Boolean = false
+        var granted: Boolean = false
+    }
+
+    private val lock = Any()
+    private val highWaiters = ArrayDeque<Waiter>()
+    private val normalWaiters = ArrayDeque<Waiter>()
+    private var available = maxPermits
+
+    suspend fun <R> withPermit(highPriority: Boolean = true, action: suspend () -> R): R {
+        acquire(highPriority)
+        try {
+            return action()
+        } finally {
+            release()
+        }
+    }
+
+    private suspend fun acquire(highPriority: Boolean) {
+        currentCoroutineContext().ensureActive()
+        val waiter: Waiter? = synchronized(lock) {
+            if (available > 0 && highWaiters.isEmpty() && normalWaiters.isEmpty()) {
+                available--
+                null
+            } else {
+                Waiter().also { w ->
+                    if (highPriority) highWaiters.addLast(w) else normalWaiters.addLast(w)
+                }
+            }
+        }
+        if (waiter == null) return
+        try {
+            waiter.deferred.await()
+        } catch (t: Throwable) {
+            val needRelease = synchronized(lock) {
+                waiter.cancelled = true
+                highWaiters.remove(waiter)
+                normalWaiters.remove(waiter)
+                waiter.granted
+            }
+            if (needRelease) release()
+            throw t
+        }
+    }
+
+    private fun release() {
+        val nextToComplete = synchronized(lock) {
+            var chosen: Waiter? = null
+            while (highWaiters.isNotEmpty() || normalWaiters.isNotEmpty()) {
+                val candidate = if (highWaiters.isNotEmpty()) highWaiters.removeFirst() else normalWaiters.removeFirst()
+                if (!candidate.cancelled) {
+                    candidate.granted = true
+                    chosen = candidate
+                    break
+                }
+            }
+            if (chosen == null) {
+                available = (available + 1).coerceAtMost(maxPermits)
+            }
+            chosen
+        }
+        nextToComplete?.deferred?.complete(Unit)
+    }
+}
+
 internal class MessageBusConfiguration(
     val baseUrl: HttpUrl,
     val sharedSessionKey: String?,
     val csrfToken: String?,
+    val cdnUrl: String? = null,
+    val s3CdnUrl: String? = null,
+    val s3BaseUrl: String? = null,
+    val topicTrackingStateMeta: Map<String, Long> = emptyMap(),
+    val currentUserId: Long? = null,
+    val currentUsername: String? = null,
+    val gamificationScore: Int? = null,
+    val notificationChannelPosition: Long = -1L,
+    val unreadNotifications: Int = 0,
+    val allUnreadNotificationsCount: Int = 0,
+    val preloadedCategoriesJson: String? = null,
+    val preloadedTopTags: List<DiscourseTag> = emptyList(),
+    val preloadedCustomEmojis: Map<String, String> = emptyMap(),
 ) {
     val sendCookies: Boolean get() {
         val site = Config.BASE_URL.toHttpUrl()
@@ -128,25 +206,37 @@ internal class MessageBusConfiguration(
             baseUrl.host == site.host && baseUrl.port == site.port
     }
 
+    /** 独立域名（如 ping.linux.do）且不携带主站 Cookie 时，全局长轮询不会占用 linux.do 主站速率配额。 */
+    val isIndependentHost: Boolean get() =
+        !baseUrl.host.equals(Config.HOST, ignoreCase = true) && !sendCookies
+
     fun pollUrl(clientId: String): HttpUrl = baseUrl.newBuilder()
         .addPathSegment("message-bus").addPathSegment(clientId).addPathSegment("poll").build()
 
     override fun toString(): String = "MessageBusConfiguration(host=${baseUrl.host})"
 }
 
-/** 读取站点自身发布的轮询地址和凭据，兼容 Discourse 两种预加载 HTML 形式。 */
+/** 读取站点自身发布的轮询地址、凭据与首页聚合预加载状态（CDN、分类、热门标签、频道初始游标、自定义表情）。 */
 internal fun parseMessageBusConfiguration(html: String): MessageBusConfiguration {
     val document = Jsoup.parse(html)
     val element = document.getElementById("data-preloaded") ?: document.selectFirst("[data-preloaded]")
     val raw = if (element?.tagName() == "script") element.data() else element?.attr("data-preloaded")
     require(!raw.isNullOrBlank()) { "页面未包含站点预加载配置" }
     val preloaded = Json.parseToJsonElement(raw) as? JsonObject
-    val settingsValue = preloaded?.get("siteSettings")
-    val settings = when (settingsValue) {
-        is JsonObject -> settingsValue
-        is JsonPrimitive -> settingsValue.contentOrNull?.let { Json.parseToJsonElement(it) as? JsonObject }
+
+    fun embeddedObject(value: JsonElement?): JsonObject? = when (value) {
+        is JsonObject -> value
+        is JsonPrimitive -> value.contentOrNull?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
         else -> null
     }
+
+    fun embeddedArray(value: JsonElement?): JsonArray? = when (value) {
+        is JsonArray -> value
+        is JsonPrimitive -> value.contentOrNull?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
+        else -> null
+    }
+
+    val settings = embeddedObject(preloaded?.get("siteSettings"))
     require(settings != null) { "页面未包含 siteSettings" }
     val pollingValue = settings["long_polling_base_url"]
     require(pollingValue == null || pollingValue == JsonNull || (pollingValue is JsonPrimitive && pollingValue.isString)) {
@@ -160,7 +250,82 @@ internal fun parseMessageBusConfiguration(html: String): MessageBusConfiguration
         ?.trim()?.takeIf { it.isNotEmpty() }?.also { value ->
             require(value.none { it == '\r' || it == '\n' || it == '\u0000' }) { "站点凭据格式无效" }
         }
-    return MessageBusConfiguration(baseUrl, meta("shared_session_key"), meta("csrf-token"))
+
+    val setupEl = document.getElementById("data-discourse-setup")
+    val cdnUrl = setupEl?.attr("data-cdn")?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+    val s3CdnUrl = setupEl?.attr("data-s3-cdn")?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+    val s3BaseUrl = setupEl?.attr("data-s3-base-url")?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+
+    val trackingMeta = buildMap {
+        val obj = runCatching { embeddedObject(preloaded?.get("topicTrackingStateMeta")) }.getOrNull()
+        obj?.forEach { (channel, value) ->
+            val pos = (value as? JsonPrimitive)?.longOrNull
+            if (pos != null && channel.startsWith("/")) {
+                put(channel, pos)
+            }
+        }
+    }
+
+    val currentUserObj = runCatching { embeddedObject(preloaded?.get("currentUser")) }.getOrNull()
+    val currentUserId = (currentUserObj?.get("id") as? JsonPrimitive)?.longOrNull?.takeIf { it > 0L }
+    val currentUsername = (currentUserObj?.get("username") as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+    val gamificationScore = (currentUserObj?.get("gamification_score") as? JsonPrimitive)?.intOrNull
+    val notificationPos = (currentUserObj?.get("notification_channel_position") as? JsonPrimitive)?.longOrNull ?: -1L
+    val unreadNotifications = (currentUserObj?.get("unread_notifications") as? JsonPrimitive)?.intOrNull ?: 0
+    val allUnreadCount = (currentUserObj?.get("all_unread_notifications_count") as? JsonPrimitive)?.intOrNull ?: 0
+
+    val siteObj = runCatching { embeddedObject(preloaded?.get("site")) }.getOrNull()
+    val categoriesJson = (siteObj?.get("categories") as? JsonArray)?.takeIf { it.isNotEmpty() }?.toString()
+    val topTags = runCatching {
+        (siteObj?.get("top_tags") as? JsonArray).orEmpty().mapNotNull { item ->
+            when (item) {
+                is JsonObject -> {
+                    val name = (item["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                    val count = (item["topic_count"] as? JsonPrimitive)?.intOrNull
+                        ?: (item["count"] as? JsonPrimitive)?.intOrNull ?: 0
+                    if (name.isEmpty()) null else DiscourseTag(id = name, name = name, text = name, count = count, topicCount = count)
+                }
+                is JsonPrimitive -> {
+                    val name = item.contentOrNull?.trim().orEmpty()
+                    if (name.isEmpty()) null else DiscourseTag(id = name, name = name, text = name)
+                }
+                else -> null
+            }
+        }
+    }.getOrDefault(emptyList())
+
+    val customEmojis = runCatching {
+        buildMap {
+            val arr = embeddedArray(preloaded?.get("customEmoji")) ?: return@buildMap
+            arr.forEach { el ->
+                val obj = el as? JsonObject ?: return@forEach
+                val name = (obj["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val rawUrl = (obj["url"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                if (name.isNotEmpty() && rawUrl.isNotEmpty()) {
+                    put(name, rawUrl)
+                }
+            }
+        }
+    }.getOrDefault(emptyMap())
+
+    return MessageBusConfiguration(
+        baseUrl = baseUrl,
+        sharedSessionKey = meta("shared_session_key"),
+        csrfToken = meta("csrf-token"),
+        cdnUrl = cdnUrl,
+        s3CdnUrl = s3CdnUrl,
+        s3BaseUrl = s3BaseUrl,
+        topicTrackingStateMeta = trackingMeta,
+        currentUserId = currentUserId,
+        currentUsername = currentUsername,
+        gamificationScore = gamificationScore,
+        notificationChannelPosition = notificationPos,
+        unreadNotifications = unreadNotifications,
+        allUnreadNotificationsCount = allUnreadCount,
+        preloadedCategoriesJson = categoriesJson,
+        preloadedTopTags = topTags,
+        preloadedCustomEmojis = customEmojis,
+    )
 }
 
 @Serializable
@@ -463,14 +628,27 @@ class TopicRepository(
      * 写请求本来每次都要先 GET 一次 /session/csrf.json,统计这种可丢弃的请求不值得为此翻倍;
      * 失效(403/挑战)时清空重取即可。
      */
-    private var cachedCsrfToken: String? = null
+    @Volatile private var cachedCsrfToken: String? = null
+    @Volatile private var cachedCsrfGeneration: Long = -1L
+    @Volatile private var cachedCsrfUserId: Long = 0L
+    @Volatile private var csrfFailureCooldownUntil: Long = 0L
+    @Volatile private var csrfFailureGeneration: Long = -1L
+    @Volatile private var preloadedCustomEmojis: Map<String, String> = emptyMap()
 
     fun clearCachedCsrfToken() {
         cachedCsrfToken = null
+        cachedCsrfGeneration = -1L
+        cachedCsrfUserId = 0L
+        csrfFailureCooldownUntil = 0L
+        sessionStore?.let { store ->
+            val uid = store.currentUserId()
+            if (uid > 0L) store.saveCsrfToken(uid, null)
+        }
     }
 
     fun resetTimingsCooldown() {
         timingsCooldownUntil = 0L
+        csrfFailureCooldownUntil = 0L
     }
 
     suspend fun refreshCsrf(): String = obtainCsrf(forceRefresh = true)
@@ -499,30 +677,55 @@ class TopicRepository(
     private var categoryListCache: List<Category>? = null
     private var tagListCache: List<DiscourseTag>? = null
     private val tagGate = Mutex()
+    private val emojiGate = Mutex()
     private var emojiCache: Map<String, String>? = null
 
     suspend fun emojiUrls(): Map<String, String> {
         emojiCache?.let { return it }
-        val result = mutableMapOf<String, String>()
-        fun visit(element: JsonElement) {
-            when (element) {
-                is JsonArray -> element.forEach(::visit)
-                is JsonObject -> {
-                    val name = element.text("name").ifBlank { element.text("id") }
-                    val url = element.text("url")
-                    if (name.isNotBlank() && url.isNotBlank()) {
-                        runCatching { URI(Config.BASE_URL + "/").resolve(url).toASCIIString() }.getOrNull()?.let { result[name] = it }
+        return emojiGate.withLock {
+            emojiCache?.let { return@withLock it }
+            val result = mutableMapOf<String, String>()
+            preloadedCustomEmojis.forEach { (name, rawUrl) ->
+                resolveEmojiCdnUrl(rawUrl)?.let { result[name] = it }
+            }
+            if (isRateLimitCoolingDown()) {
+                return@withLock result.toMap()
+            }
+            fun visit(element: JsonElement) {
+                when (element) {
+                    is JsonArray -> element.forEach(::visit)
+                    is JsonObject -> {
+                        val name = element.text("name").ifBlank { element.text("id") }
+                        val url = element.text("url")
+                        if (name.isNotBlank() && url.isNotBlank()) {
+                            resolveEmojiCdnUrl(url)?.let { result[name] = it }
+                        }
+                        element.values.forEach(::visit)
                     }
-                    element.values.forEach(::visit)
+                    else -> Unit
                 }
-                else -> Unit
+            }
+            var fetchedRemote = false
+            try {
+                visit(json.parseToJsonElement(request("/emojis.json", present = false, retryAllowed = false)))
+                fetchedRemote = true
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("表情索引加载失败: ${error.message}")
+            }
+            result.toMap().also { map ->
+                if (fetchedRemote || map.isNotEmpty()) {
+                    emojiCache = map
+                }
             }
         }
-        try { visit(json.parseToJsonElement(request("/emojis.json"))) }
-        catch (error: CancellationException) { throw error }
-        catch (error: Exception) { diagnostics.log("表情索引加载失败: ${error.message}") }
-        return result.toMap().also { emojiCache = it }
     }
+
+    private fun resolveEmojiCdnUrl(rawUrl: String): String? = runCatching {
+        val resolved = URI(Config.BASE_URL + "/").resolve(rawUrl.trim()).toASCIIString()
+        Config.resolveUrlWithCdn(resolved)
+    }.getOrNull()
 
     suspend fun fetchFeed(
         feed: HomeFeedType,
@@ -689,9 +892,12 @@ class TopicRepository(
                         (src.startsWith("http") || src.startsWith("/"))
                     }
                     val coverUrl = firstImg?.attr("src")?.let { src ->
-                        if (src.startsWith("//")) "https:$src"
-                        else if (src.startsWith("/")) "${Config.BASE_URL}$src"
-                        else src
+                        val resolved = when {
+                            src.startsWith("//") -> "https:$src"
+                            src.startsWith("/") -> "${Config.BASE_URL}$src"
+                            else -> src
+                        }
+                        Config.resolveUrlWithCdn(resolved)
                     }
                     doc.select(".lightbox-wrapper, .lightbox, .meta, .informations, .filename, img, svg, video, audio").remove()
                     val plainText = doc.text().trim()
@@ -719,12 +925,14 @@ class TopicRepository(
         if (mdMatch != null) {
             val url = mdMatch.groupValues[1]
             if (url.startsWith("upload://")) return "${Config.BASE_URL}/uploads/short-url/${url.removePrefix("upload://")}"
-            return if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+            val resolved = if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+            return Config.resolveUrlWithCdn(resolved)
         }
         val htmlMatch = Regex("""<img\b[^>]*src=["'](https?://[^"'\s]+|/uploads/[^"'\s]+)["']""", RegexOption.IGNORE_CASE).find(raw)
         if (htmlMatch != null) {
             val url = htmlMatch.groupValues[1]
-            return if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+            val resolved = if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+            return Config.resolveUrlWithCdn(resolved)
         }
         return null
     }
@@ -816,7 +1024,11 @@ class TopicRepository(
     private var timingsCooldownUntil = 0L
 
     fun readTimingsCooldownRemainingMs(): Long = maxOf(
-        rateLimitRemainingMs(), timingsCooldownUntil - SystemClock.elapsedRealtime(), 0L,
+        rateLimitRemainingMs(),
+        timingsCooldownUntil - SystemClock.elapsedRealtime(),
+        postOAuthQuietRemainingMs(),
+        backgroundChallengeQuietRemainingMs(),
+        0L,
     )
 
     /**
@@ -851,6 +1063,9 @@ class TopicRepository(
         val retryAfterMs = result.retryAfterSeconds?.takeIf { it > 0L }?.coerceAtMost(86_400L)?.times(1_000L) ?: 0L
         val fuseMs = maxOf(retryAfterMs, if (cfChallenge) TIMINGS_CHALLENGE_429_FUSE_MS else TIMINGS_RATE_LIMIT_FUSE_MS)
         timingsCooldownUntil = maxOf(timingsCooldownUntil, SystemClock.elapsedRealtime() + fuseMs)
+        if (cfChallenge) {
+            Companion.enterBackgroundChallengeQuietWindow(fuseMs)
+        }
         diagnostics.log(
             "阅读进度上报遇 429(${if (cfChallenge) "CF速率挑战" else "限流"}, $stage)，仅熔断阅读同步 ${fuseMs / 1_000L}s，主站请求不受影响",
         )
@@ -859,7 +1074,7 @@ class TopicRepository(
     /** 退出验证页后保留短暂起飞缓冲（替代立即清零），让用户 resume() 的前台读取先单独落地。 */
     fun armPostVerificationRunway(runwayMs: Long) {
         timingsCooldownUntil = SystemClock.elapsedRealtime() + runwayMs
-        cachedCsrfToken = null
+        clearCachedCsrfToken()
         getRevalidateBlockedUntil = 0L
     }
 
@@ -1034,7 +1249,7 @@ class TopicRepository(
     /** 阅读同步触发的手工过盾完成后调用：下一次心跳优先走 WebView 网络栈（起飞缓冲由 [armPostVerificationRunway] 统一设置）。 */
     fun onManualVerificationCompleted() {
         preferWebViewTimings = true
-        cachedCsrfToken = null
+        clearCachedCsrfToken()
     }
 
     suspend fun recordTopicTimings(
@@ -1190,7 +1405,14 @@ class TopicRepository(
                     "排队 ${requestStartedAt - queuedAt}ms, POST ${SystemClock.elapsedRealtime() - requestStartedAt}ms",
             )
             if (primaryResult == null) {
-                diagnostics.log("[诊断] 阅读进度跳过: 发送前进入 429 冷却")
+                val reason = when {
+                    rateLimitRemainingMs() > 0L -> "发送前进入 429 冷却"
+                    isSubsiteAuthInProgress() -> "发送前正在进行子站授权"
+                    postOAuthQuietRemainingMs() > 0L -> "发送前处于子站授权静默期"
+                    backgroundChallengeQuietRemainingMs() > 0L -> "发送前处于挑战后台静默期"
+                    else -> "发送前主站通道忙碌"
+                }
+                diagnostics.log("[诊断] 阅读进度跳过: $reason")
                 return false
             }
 
@@ -1220,7 +1442,7 @@ class TopicRepository(
             val isBadCsrf = primaryResult.status == 403 && !primaryResult.challenged && primaryResult.body.contains("BAD CSRF", ignoreCase = true)
             if (isBadCsrf) {
                 diagnostics.log("阅读进度遇到 BAD CSRF，执行轻度会话校准并重试")
-                cachedCsrfToken = null
+                clearCachedCsrfToken()
                 sessionStore?.calibrateForumSessionForBadCsrf()
                 val newCsrf = runCatching { obtainCsrf(forceRefresh = true) }.getOrNull()
                 ensureReadingActive()
@@ -1260,7 +1482,7 @@ class TopicRepository(
                 ensureReadingActive()
                 if (cleared) {
                     // 补签可能同时更新 _forum_session，必须在写闸门外重新获取与会话匹配的 CSRF。
-                    cachedCsrfToken = null
+                    clearCachedCsrfToken()
                     val retryCsrf = cachedCsrf()
                     ensureReadingActive()
                     if (retryCsrf.isNullOrBlank()) return false
@@ -1347,13 +1569,41 @@ class TopicRepository(
     }
 
     private suspend fun obtainCsrf(forceRefresh: Boolean = false): String = csrfGate.withLock {
+        val generation = sessionStore?.sessionGeneration ?: 0L
+        val userId = sessionStore?.currentUserId() ?: 0L
         if (!forceRefresh) {
-            cachedCsrfToken?.takeIf { it.isNotBlank() }?.let { return@withLock it }
+            cachedCsrfToken?.takeIf {
+                it.isNotBlank() && cachedCsrfGeneration == generation && cachedCsrfUserId == userId
+            }?.let { return@withLock it }
+            if (userId > 0L) {
+                sessionStore?.savedCsrfToken(userId)?.takeIf { it.isNotBlank() }?.let { restored ->
+                    cachedCsrfToken = restored
+                    cachedCsrfGeneration = generation
+                    cachedCsrfUserId = userId
+                    return@withLock restored
+                }
+            }
         }
-        val generation = sessionStore?.sessionGeneration
-        val token = objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
-        if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+        val now = SystemClock.elapsedRealtime()
+        if (!forceRefresh && csrfFailureGeneration == generation && now < csrfFailureCooldownUntil) {
+            val remainSec = ((csrfFailureCooldownUntil - now + 999L) / 1_000L).coerceAtLeast(1L)
+            throw IOException("CSRF 获取处于冷却期，请在 ${remainSec}s 后重试")
+        }
+        val token = try {
+            objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            csrfFailureGeneration = generation
+            csrfFailureCooldownUntil = SystemClock.elapsedRealtime() + CSRF_FAILURE_COOLDOWN_MS
+            throw error
+        }
+        if (generation != (sessionStore?.sessionGeneration ?: 0L)) throw CancellationException("会话已切换")
         cachedCsrfToken = token
+        cachedCsrfGeneration = generation
+        cachedCsrfUserId = userId
+        csrfFailureCooldownUntil = 0L
+        if (userId > 0L) sessionStore?.saveCsrfToken(userId, token)
         token
     }
 
@@ -1370,6 +1620,96 @@ class TopicRepository(
         }
         catch (_: Exception) { null }
 
+    internal suspend fun getOrLoadMessageBusConfig(
+        generation: Long = sessionStore?.sessionGeneration ?: 0L,
+    ): MessageBusConfiguration = getPollingConfiguration(generation)
+
+    private suspend fun applyPreloadedHomeConfiguration(
+        config: MessageBusConfiguration,
+        generation: Long,
+    ) {
+        sessionStore?.saveCdnConfig(config.cdnUrl, config.s3CdnUrl, config.s3BaseUrl)
+        if (!config.currentUsername.isNullOrBlank() && config.gamificationScore != null) {
+            saveCachedGamificationScore(config.currentUsername, config.gamificationScore)
+        }
+        if (config.preloadedCustomEmojis.isNotEmpty()) {
+            preloadedCustomEmojis = config.preloadedCustomEmojis
+        }
+        val currentUserId = sessionStore?.currentUserId()?.takeIf { it > 0L }
+            ?: config.currentUserId?.takeIf { it > 0L }
+            ?: 0L
+        csrfGate.withLock {
+            if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+            val homeCsrf = config.csrfToken
+            if (!homeCsrf.isNullOrBlank()) {
+                cachedCsrfToken = homeCsrf
+                cachedCsrfGeneration = generation
+                cachedCsrfUserId = currentUserId
+                csrfFailureCooldownUntil = 0L
+                if (currentUserId > 0L) sessionStore?.saveCsrfToken(currentUserId, homeCsrf)
+            }
+        }
+        config.preloadedCategoriesJson?.let { rawArrayJson ->
+            categoryGate.withLock {
+                if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+                val siteCats = runCatching {
+                    val elements = json.parseToJsonElement(rawArrayJson) as? JsonArray ?: return@runCatching emptyList()
+                    elements.map { json.decodeFromJsonElement(Category.serializer(), it) }
+                }.getOrDefault(emptyList())
+                if (siteCats.isNotEmpty()) {
+                    val siteById = siteCats.associateBy { it.id }
+                    val existingList = categoryListCache
+                    val updatedList = if (existingList == null) {
+                        val subsByParent = siteCats.filter { it.parentCategoryId != null }
+                            .groupBy { it.parentCategoryId!! }
+                        siteCats.filter { it.parentCategoryId == null }.map { parent ->
+                            val subs = subsByParent[parent.id].orEmpty()
+                            if (subs.isEmpty()) parent else parent.copy(subcategoryList = subs)
+                        }.ifEmpty { siteCats }
+                    } else if (!hasSyncedCategoryPermissions()) {
+                        fun mergeOne(category: Category): Category {
+                            val siteCat = siteById[category.id]
+                            val mergedSubs = category.subcategoryList.map { sub ->
+                                mergeOne(if (sub.parentCategoryId == null) sub.copy(parentCategoryId = category.id) else sub)
+                            }
+                            return if (siteCat != null) {
+                                category.copy(
+                                    permission = siteCat.permission,
+                                    parentCategoryId = category.parentCategoryId ?: siteCat.parentCategoryId,
+                                    allowedTags = siteCat.allowedTags.ifEmpty { category.allowedTags },
+                                    minimumRequiredTags = siteCat.minimumRequiredTags,
+                                    requiredTagGroups = siteCat.requiredTagGroups.ifEmpty { category.requiredTagGroups },
+                                    allowedTagGroups = siteCat.allowedTagGroups.ifEmpty { category.allowedTagGroups },
+                                    allowGlobalTags = siteCat.allowGlobalTags,
+                                    readRestricted = siteCat.readRestricted,
+                                    subcategoryList = mergedSubs,
+                                )
+                            } else {
+                                category.copy(permission = null, subcategoryList = mergedSubs)
+                            }
+                        }
+                        existingList.map(::mergeOne)
+                    } else {
+                        existingList
+                    }
+                    categoryListCache = updatedList
+                    val flatMap = LinkedHashMap<Int, Category>(siteById)
+                    flattenCategories(updatedList).forEach { flatMap[it.id] = it }
+                    categoryCache = flatMap
+                    categoryPermissionsSyncedGeneration = generation
+                    lastCategoriesRefreshAt = SystemClock.elapsedRealtime()
+                }
+            }
+        }
+        if (tagListCache == null && config.preloadedTopTags.isNotEmpty()) {
+            tagGate.withLock {
+                if (tagListCache == null) {
+                    tagListCache = config.preloadedTopTags
+                }
+            }
+        }
+    }
+
     private suspend fun getPollingConfiguration(generation: Long): MessageBusConfiguration = pollingConfigGate.withLock {
         if (pollingConfigGeneration != generation) {
             pollingConfigGeneration = generation
@@ -1381,8 +1721,8 @@ class TopicRepository(
         if (now < nextPollingConfigAttemptAt) {
             throw HttpStatusException(503, "轮询配置读取正在退避", (nextPollingConfigAttemptAt - now + 999L) / 1_000L)
         }
-        nextPollingConfigAttemptAt = now + 120_000L
-        // 绝对地址让传输层请求 HTML；每个会话只取一次，不逐话题抓取首页。
+        nextPollingConfigAttemptAt = now + 20_000L
+        // 绝对地址让传输层请求 HTML；每个会话只取一次，同时聚合 CDN、CSRF、分类/标签预热与初始频道游标。
         val config = try {
             val html = request(Config.BASE_URL + "/", present = false, retryAllowed = false)
             withContext(Dispatchers.Default) { parseMessageBusConfiguration(html) }
@@ -1390,18 +1730,23 @@ class TopicRepository(
             nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 3_000L
             throw cancelled
         } catch (error: Exception) {
-            diagnostics.log("话题订阅配置未就绪，120秒后可重试(${error.javaClass.simpleName})")
+            val isRateOrChallenge = error is RateLimitException ||
+                error is NeedsInteractiveVerification ||
+                (error is HttpStatusException && error.status in setOf(403, 429))
+            val backoffMs = if (isRateOrChallenge) 120_000L else 20_000L
+            nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + backoffMs
+            diagnostics.log("话题订阅配置未就绪，${backoffMs / 1_000L}秒后可重试(${error.javaClass.simpleName})")
             throw error
         }
         ensureRequestAllowed()
         if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
         pollingConfig = config
         nextPollingConfigAttemptAt = 0L
-        csrfGate.withLock {
-            if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
-            if (cachedCsrfToken.isNullOrBlank()) cachedCsrfToken = config.csrfToken
-        }
-        diagnostics.log("话题订阅使用站点配置: ${config.baseUrl.host}, 共享认证=${!config.sharedSessionKey.isNullOrBlank()}")
+        applyPreloadedHomeConfiguration(config, generation)
+        diagnostics.log(
+            "首页预加载聚合完成: poll=${config.baseUrl.host}, 独立通道=${config.isIndependentHost}, " +
+                "hasCsrf=${!config.csrfToken.isNullOrBlank()}, cdn=${config.cdnUrl ?: "-"}, s3Cdn=${config.s3CdnUrl ?: "-"}",
+        )
         config
     }
 
@@ -1415,112 +1760,163 @@ class TopicRepository(
         }
     }
 
-    /** MessageBus 的 Dont-Chunk 长轮询；不占用整个后台 GET 闸门等待服务端消息。 */
+    /** MessageBus 的 Dont-Chunk 长轮询；话题详情页专属单频道轮询。 */
     suspend fun pollTopicMessages(topicId: Long, clientId: String, cursor: Long, sequence: Long): List<TopicBusMessage> =
         topicPollGate.withLock {
             val generation = sessionStore?.sessionGeneration ?: return@withLock emptyList()
-            val path = "/message-bus/$clientId/poll"
             val config = getPollingConfiguration(generation)
-            var pollRound = currentRateLimitRound()
-            backgroundGetGate.withLock {
-                val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
-                if (wait > 0L) delay(wait)
-                ensureRequestAllowed()
-                throwIfRateLimitCoolingDown()
-                if (isSilentPrefetchBackingOff()) throw NeedsInteractiveVerification("话题订阅正在退避")
-                val pollIsMainSite = config.pollUrl(clientId).host == Config.HOST
-                val slotTicket = acquireGetSlot(
-                    isMainSite = pollIsMainSite,
-                    present = false,
-                    allowClaimProbe = false,
-                ) { generation }
-                // 长轮询会挂起 70 秒，不能占住恢复期的单并发名额；它只服从放行间隔。
-                releaseInFlight(slotTicket)
-                pollRound = slotTicket.round
-                currentCoroutineContext().ensureActive()
-                lastBackgroundGetAt = SystemClock.elapsedRealtime()
-            }
-            val sharedClient = requireNotNull(httpClientProvider?.invoke())
-            val client = sharedClient.newBuilder()
-                .readTimeout(70, TimeUnit.SECONDS)
-                .callTimeout(75, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(false)
-                .followRedirects(false)
-                .cookieJar(CookieJar.NO_COOKIES)
-                .build()
-            val request = Request.Builder()
-                .url(config.pollUrl(clientId))
-                .header("Accept", "application/json")
-                .header("X-Requested-With", "XMLHttpRequest")
-                .header("Dont-Chunk", "true")
-                .header("Discourse-Background", "true")
-                .header("X-SILENCE-LOGGER", "true")
-                .header("Origin", Config.BASE_URL)
-                .header("Referer", "${Config.BASE_URL}/t/$topicId")
-                .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation, sendCookies = config.sendCookies))
-                .apply {
-                    config.sharedSessionKey?.let { header("X-Shared-Session-Key", it) }
-                    sessionStore.userAgentOrNull()?.let { header("User-Agent", it) }
-                }
-                .post(FormBody.Builder().add("/topic/$topicId", cursor.toString())
-                    .add("__seq", sequence.toString()).build())
-                .build()
-            val result = suspendCancellableCoroutine<TransportResult> { continuation ->
-                val call = client.newCall(request)
-                continuation.invokeOnCancellation { call.cancel() }
-                call.enqueue(object : Callback {
-                    override fun onFailure(call: Call, e: IOException) {
-                        if (continuation.isActive) continuation.resumeWith(Result.failure(e))
-                    }
-
-                    override fun onResponse(call: Call, response: Response) {
-                        try {
-                            response.use { incoming ->
-                                val body = incoming.body?.string().orEmpty()
-                                val result = TransportResult(
-                                    status = incoming.code,
-                                    body = body,
-                                    challenged = ChallengeDetector.isChallenge(incoming.code, incoming.header("cf-mitigated"), body),
-                                    retryAfterSeconds = HttpHeaderUtils.extractRetryAfterSeconds(
-                                        incoming.header("Retry-After"), incoming.header("x-ratelimit-reset"), body),
-                                    receivedAtElapsedMs = SystemClock.elapsedRealtime(),
-                                )
-                                if (continuation.isActive) continuation.resumeWith(Result.success(result))
-                            }
-                        } catch (error: Exception) {
-                            if (continuation.isActive) continuation.resumeWith(Result.failure(error))
-                        }
-                    }
-                })
-            }
-            if (generation != sessionStore.sessionGeneration || sessionStore.sessionChanging) {
-                throw CancellationException("会话已切换")
-            }
-            if (result.status in setOf(401, 403, 404)) {
-                pollingConfig = null
-                nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 120_000L
-            }
-            when {
-                result.status == 429 -> {
-                    if (result.challenged) enterSilentPrefetchBackoff(NeedsInteractiveVerification("话题订阅被挑战拦截"))
-                    throw enterRateLimitCooldown(
-                        path = path,
-                        retryAfterSeconds = maxOf(if (result.challenged) 120L else 15L, result.retryAfterSeconds ?: 0L),
-                        cfChallenge = result.challenged,
-                        requestRound = pollRound,
-                        requestGeneration = generation,
-                        receivedAtElapsedMs = result.receivedAtElapsedMs,
-                    )
-                }
-                result.challenged || result.status == 403 -> {
-                    val error = NeedsInteractiveVerification("话题订阅被拦截，停止自动请求")
-                    enterSilentPrefetchBackoff(error)
-                    throw error
-                }
-                result.status !in 200..299 -> throw HttpStatusException(result.status, "话题订阅失败", result.retryAfterSeconds)
-                else -> json.decodeFromString<List<TopicBusMessage>>(result.body)
-            }
+            performMessageBusPoll(
+                config = config,
+                generation = generation,
+                clientId = clientId,
+                channels = mapOf("/topic/$topicId" to cursor),
+                sequence = sequence,
+                referer = "${Config.BASE_URL}/t/$topicId",
+            )
         }
+
+    /**
+     * 对齐 Fluxdo MessageBusService 全局多路复用长轮询：
+     * 仅在 `config.isIndependentHost == true`（如 ping.linux.do 且不带主站 Cookie）时工作，
+     * 同时监听 `/latest`、`/new`、`/unread`、`/unread/{uid}`、`/notification/{uid}`，
+     * 避免常规主站轮询消耗 linux.do Cloudflare 速率配额。
+     */
+    suspend fun pollGlobalMessages(
+        clientId: String,
+        channels: Map<String, Long>,
+        sequence: Long,
+    ): List<TopicBusMessage> = globalPollGate.withLock {
+        if (channels.isEmpty()) return@withLock emptyList()
+        val generation = sessionStore?.sessionGeneration ?: return@withLock emptyList()
+        val config = getPollingConfiguration(generation)
+        if (!config.isIndependentHost) return@withLock emptyList()
+        performMessageBusPoll(
+            config = config,
+            generation = generation,
+            clientId = clientId,
+            channels = channels,
+            sequence = sequence,
+            referer = "${Config.BASE_URL}/",
+        )
+    }
+
+    private suspend fun performMessageBusPoll(
+        config: MessageBusConfiguration,
+        generation: Long,
+        clientId: String,
+        channels: Map<String, Long>,
+        sequence: Long,
+        referer: String,
+    ): List<TopicBusMessage> {
+        val store = sessionStore ?: return emptyList()
+        val pollUrl = config.pollUrl(clientId)
+        val pollIsMainSite = pollUrl.host == Config.HOST
+        var pollRound = currentRateLimitRound()
+        backgroundGetGate.withLock {
+            val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
+            if (wait > 0L) delay(wait)
+            ensureRequestAllowed()
+            throwIfSiteCoolingDown(pollUrl.host)
+            throwIfRateLimitCoolingDown()
+            if (isSilentPrefetchBackingOff()) throw NeedsInteractiveVerification("话题订阅正在退避")
+            val slotTicket = acquireGetSlot(
+                isMainSite = pollIsMainSite,
+                present = false,
+                allowClaimProbe = false,
+            ) { generation }
+            // 长轮询会挂起 70 秒，不能占住恢复期的单并发名额；它只服从放行间隔。
+            releaseInFlight(slotTicket)
+            pollRound = slotTicket.round
+            currentCoroutineContext().ensureActive()
+            lastBackgroundGetAt = SystemClock.elapsedRealtime()
+        }
+        val sharedClient = requireNotNull(httpClientProvider?.invoke())
+        val client = sharedClient.newBuilder()
+            .readTimeout(70, TimeUnit.SECONDS)
+            .callTimeout(75, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
+            .followRedirects(false)
+            .cookieJar(CookieJar.NO_COOKIES)
+            .build()
+        val formBuilder = FormBody.Builder()
+        channels.forEach { (channel, cursor) ->
+            formBuilder.add(channel, cursor.toString())
+        }
+        formBuilder.add("__seq", sequence.toString())
+        val request = Request.Builder()
+            .url(pollUrl)
+            .header("Accept", "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Dont-Chunk", "true")
+            .header("Discourse-Background", "true")
+            .header("X-SILENCE-LOGGER", "true")
+            .header("Origin", Config.BASE_URL)
+            .header("Referer", referer)
+            .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation, sendCookies = config.sendCookies))
+            .apply {
+                config.sharedSessionKey?.let { header("X-Shared-Session-Key", it) }
+                store.userAgentOrNull()?.let { header("User-Agent", it) }
+            }
+            .post(formBuilder.build())
+            .build()
+        val result = suspendCancellableCoroutine<TransportResult> { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) continuation.resumeWith(Result.failure(e))
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { incoming ->
+                            val body = incoming.body?.string().orEmpty()
+                            val result = TransportResult(
+                                status = incoming.code,
+                                body = body,
+                                challenged = ChallengeDetector.isChallenge(incoming.code, incoming.header("cf-mitigated"), body),
+                                retryAfterSeconds = HttpHeaderUtils.extractRetryAfterSeconds(
+                                    incoming.header("Retry-After"), incoming.header("x-ratelimit-reset"), body),
+                                receivedAtElapsedMs = SystemClock.elapsedRealtime(),
+                            )
+                            if (continuation.isActive) continuation.resumeWith(Result.success(result))
+                        }
+                    } catch (error: Exception) {
+                        if (continuation.isActive) continuation.resumeWith(Result.failure(error))
+                    }
+                }
+            })
+        }
+        if (generation != store.sessionGeneration || store.sessionChanging) {
+            throw CancellationException("会话已切换")
+        }
+        if (result.status in setOf(401, 403, 404)) {
+            pollingConfig = null
+            nextPollingConfigAttemptAt = SystemClock.elapsedRealtime() + 120_000L
+        }
+        return when {
+            result.status == 429 -> {
+                if (pollIsMainSite && result.challenged) {
+                    enterSilentPrefetchBackoff(NeedsInteractiveVerification("话题订阅被挑战拦截"))
+                }
+                throw enterRateLimitCooldown(
+                    path = pollUrl.toString(),
+                    retryAfterSeconds = maxOf(if (result.challenged) 120L else 15L, result.retryAfterSeconds ?: 0L),
+                    cfChallenge = result.challenged,
+                    requestRound = pollRound,
+                    requestGeneration = generation,
+                    receivedAtElapsedMs = result.receivedAtElapsedMs,
+                )
+            }
+            result.challenged || result.status == 403 -> {
+                val error = NeedsInteractiveVerification("话题订阅被拦截，停止自动请求")
+                if (pollIsMainSite) enterSilentPrefetchBackoff(error)
+                throw error
+            }
+            result.status !in 200..299 -> throw HttpStatusException(result.status, "话题订阅失败", result.retryAfterSeconds)
+            else -> json.decodeFromString<List<TopicBusMessage>>(result.body)
+        }
+    }
 
     suspend fun categoryById(id: Int?): Category? = id?.let { categories()[it] }
 
@@ -1541,7 +1937,8 @@ class TopicRepository(
 
     suspend fun toggleReaction(postId: Long, reaction: String): Post {
         require(reaction.matches(Regex("[a-zA-Z0-9_+:-]+")))
-        return json.decodeFromString(mutate("/discourse-reactions/posts/$postId/custom-reactions/${encode(reaction)}/toggle.json", "PUT"))
+        val path = "/discourse-reactions/posts/$postId/custom-reactions/${encode(reaction)}/toggle.json"
+        return json.decodeFromString(mutate(path, "PUT", reactionToggle = true))
     }
 
     suspend fun createBoost(postId: Long, raw: String): Boost {
@@ -2164,9 +2561,16 @@ class TopicRepository(
         )
     }
 
+    suspend fun setChatChannelMuted(channelId: Long, muted: Boolean) {
+        require(channelId > 0)
+        val settings = JsonObject(mapOf("muted" to JsonPrimitive(muted)))
+        val body = JsonObject(mapOf("notifications_settings" to settings))
+        mutate("/chat/api/channels/$channelId/notifications-settings/me", "PUT", body.toString())
+    }
+
     suspend fun markChatChannelRead(channelId: Long, messageId: Long?) {
         val query = messageId?.let { "?message_id=$it" }.orEmpty()
-        mutate("/chat/api/channels/$channelId/read$query", "PUT")
+        mutate("/chat/api/channels/$channelId/read$query", "PUT", "{}")
     }
 
     suspend fun sendChatMessage(
@@ -2174,7 +2578,7 @@ class TopicRepository(
         message: String,
         uploadIds: List<Long> = emptyList(),
     ) {
-        require(message.isNotBlank())
+        require(message.isNotBlank() || uploadIds.isNotEmpty())
         val fields = mutableMapOf<String, JsonElement>(
             "message" to JsonPrimitive(message.trim())
         )
@@ -2652,7 +3056,7 @@ class TopicRepository(
                 if (result.status == 429) releaseGetProbeForRound(roundSnapshot)
             }
             if (result.challenged) {
-                cachedCsrfToken = null
+                clearCachedCsrfToken()
                 noteRequestClearanceChallenged(result.sentClearanceFp, "/uploads.json")
                 // 对齐 v1.3.1：撞盾先静默过盾，连 CSRF 一起重取后重传一次。
                 if (!revalidated && sessionStore?.sessionChanging != true && !isRateLimitCoolingDown() &&
@@ -2672,7 +3076,7 @@ class TopicRepository(
             if ((result.status == 403 || result.status == 422) && !csrfRefreshed &&
                 (result.body.contains("BAD CSRF", ignoreCase = true) || result.body.contains("csrf", ignoreCase = true))
             ) {
-                cachedCsrfToken = null
+                clearCachedCsrfToken()
                 csrfRefreshed = true
                 continue
             }
@@ -2681,7 +3085,7 @@ class TopicRepository(
                 val healed = restoreWriteAuthentication(result, expectedUserId, expectedGeneration)
                 if (healed) {
                     diagnostics.log("上传遇 403 未登录，已从本地备份补回会话凭据 _t 并重取 CSRF 重放")
-                    cachedCsrfToken = null
+                    clearCachedCsrfToken()
                     csrfRefreshed = true
                     continue
                 }
@@ -2826,6 +3230,7 @@ class TopicRepository(
         body: String? = null,
         contentType: String = Transport.JSON_CONTENT_TYPE,
         beforeAttempt: () -> Unit = {},
+        reactionToggle: Boolean = false,
     ): String {
         ensureRequestAllowed()
         val expectedUserId = sessionStore?.currentUserId()
@@ -2873,7 +3278,7 @@ class TopicRepository(
                         val serverWait = (result.retryAfterSeconds ?: 0L) > 0L
                         if (requestHost(path) == Config.HOST && !revalidated && !serverWait && sessionStore?.sessionChanging != true) {
                             if (isCarriedClearanceStale(result.sentClearanceFp)) {
-                                cachedCsrfToken = null
+                                clearCachedCsrfToken()
                                 revalidated = true
                                 csrfRefreshed = true
                                 continue
@@ -2881,7 +3286,7 @@ class TopicRepository(
                             if (result.sentClearanceFp == "-" && !isRateLimitCoolingDown() &&
                                 transportProvider().revalidate(path, "-", requestHost = Config.HOST)
                             ) {
-                                cachedCsrfToken = null
+                                clearCachedCsrfToken()
                                 revalidated = true
                                 csrfRefreshed = true
                                 continue
@@ -2895,6 +3300,15 @@ class TopicRepository(
                             requestGeneration = expectedGeneration ?: -1L,
                             receivedAtElapsedMs = receivedAt,
                         )
+                    }
+                    // Discourse 的点赞额度属于帖子回应。全站请求限流和 Cloudflare 响应继续走原有冷却。
+                    if (reactionToggle && !result.challenged &&
+                        result.cfMitigated?.contains("challenge", ignoreCase = true) != true
+                    ) {
+                        val error = parseErrorBody(result.body)
+                        if ((error?.get("error_type") as? JsonPrimitive)?.contentOrNull == "rate_limit") {
+                            throw ReactionRateLimitException(error.serverErrorMessage() ?: "回应次数已达上限，请稍后重试")
+                        }
                     }
                     val cooldownEx = enterRateLimitCooldown(
                         path = path,
@@ -2919,7 +3333,7 @@ class TopicRepository(
                     noteRequestClearanceChallenged(result.sentClearanceFp, path)
                     throw HttpStatusException(result.status, "子站安全验证未通过，请稍后重试", result.retryAfterSeconds)
                 }
-                cachedCsrfToken = null
+                clearCachedCsrfToken()
                 if (!revalidated && isCarriedClearanceStale(result.sentClearanceFp)) {
                     diagnostics.log("写请求携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，直接换新值并重取 CSRF 重放: $path")
                     revalidated = true
@@ -2944,7 +3358,7 @@ class TopicRepository(
             if ((result.status == 403 || result.status == 422) && !csrfRefreshed &&
                 (result.body.contains("BAD CSRF", ignoreCase = true) || result.body.contains("csrf", ignoreCase = true))
             ) {
-                cachedCsrfToken = null
+                clearCachedCsrfToken()
                 csrfRefreshed = true
                 continue
             }
@@ -2953,7 +3367,7 @@ class TopicRepository(
                 val healed = restoreWriteAuthentication(result, expectedUserId, expectedGeneration)
                 if (healed) {
                     diagnostics.log("写请求遇 403 未登录，已从本地备份补回会话凭据 _t 并重取 CSRF 重放: $path")
-                    cachedCsrfToken = null
+                    clearCachedCsrfToken()
                     csrfRefreshed = true
                     continue
                 }
@@ -2963,17 +3377,22 @@ class TopicRepository(
                 if (result.status == 403) {
                     notify403OrChallenged("mutate $path 403")
                 }
-                val serverMessage = runCatching {
-                    (json.parseToJsonElement(result.body).jsonObject["errors"] as? JsonArray)
-                        ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.joinToString("\n")?.take(400)
-                }.getOrNull()
                 val message = if (result.status >= 500) "结果未确认，请刷新楼层后检查提交状态"
-                    else serverMessage?.takeIf { it.isNotBlank() } ?: "操作未提交，请稍后重试"
+                    else parseErrorBody(result.body).serverErrorMessage() ?: "操作未提交，请稍后重试"
                 throw HttpStatusException(result.status, message)
             }
             return result.body
         }
     }
+
+    private class ReactionRateLimitException(message: String) : Exception(message)
+
+    private fun parseErrorBody(body: String): JsonObject? =
+        runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+
+    private fun JsonObject?.serverErrorMessage(): String? =
+        (this?.get("errors") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            ?.joinToString("\n")?.take(400)?.takeIf { it.isNotBlank() }
 
     private fun checkWriteSession(userId: Long?, generation: Long?) {
         val store = sessionStore ?: return
@@ -2991,7 +3410,7 @@ class TopicRepository(
         }
         checkWriteSession(userId, generation)
         if (!healed) return false
-        cachedCsrfToken = null
+        clearCachedCsrfToken()
         if (isRateLimitCoolingDown()) return false
         val response = try {
             getSemaphore.withPermit {
@@ -3867,6 +4286,10 @@ class TopicRepository(
 
     fun cachedCategoryMap(): Map<Int, Category> = categoryCache.orEmpty()
 
+    fun encodeCachedCategoriesJson(): String? = categoryListCache?.takeIf { it.isNotEmpty() }?.let { list ->
+        runCatching { json.encodeToString(CategoryListResponse(CategoryListPayload(list))) }.getOrNull()
+    }
+
     /**
      * 向服务端探测最新分类树（Stale-While-Revalidate）。
      * 若与本地缓存不一致（新增/改名/改色/子分类调整/发帖权限更新），更新内存缓存并返回最新数据与原始 JSON 供持久化落盘；
@@ -4014,7 +4437,7 @@ class TopicRepository(
         val id = user["id"]?.jsonPrimitive?.longOrNull ?: 0L
         val username = user["username"]?.jsonPrimitive?.contentOrNull ?: return null
         if (id <= 0L || username.isBlank()) throw IllegalStateException("会话响应格式不正确")
-        user["gamification_score"]?.jsonPrimitive?.intOrNull?.let { score ->
+        val gamificationScore = user["gamification_score"]?.jsonPrimitive?.intOrNull?.also { score ->
             saveCachedGamificationScore(username, score)
         }
         if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
@@ -4041,6 +4464,7 @@ class TopicRepository(
             animatedAvatar = animated,
             trustLevel = user["trust_level"]?.jsonPrimitive?.intOrNull,
             seeSignatures = seeSignatures,
+            gamificationScore = gamificationScore,
         )
     }
 
@@ -4052,6 +4476,11 @@ class TopicRepository(
             "false", "f", "0", "no" -> false
             else -> null
         }
+    }
+
+    private suspend fun humanGap(minMs: Long, maxMs: Long) {
+        val duration = if (maxMs <= minMs) minMs else Random.nextLong(minMs, maxMs + 1L)
+        if (duration > 0L) delay(duration)
     }
 
     suspend fun fetchTrustReport(present: Boolean = false, allowAuthorization: Boolean = false): TrustReport? {
@@ -4072,10 +4501,21 @@ class TopicRepository(
                 val redirect = "https://connect.linux.do/".toHttpUrl().resolve(redirectUrl)
                 require(redirect != null && isTrustedOAuthUrl(redirect, "connect.linux.do")) { "Connect SSO 跳转地址不受信任" }
                 diagnostics.log("用户触发 Connect SSO 授权，开始握手")
-                val ssoResp = request(redirect.toString(), present = false, retryAllowed = false, beforeDispatch = checkSession)
-                checkSession()
-                html = if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) ssoResp
-                    else request("https://connect.linux.do/", present = present, beforeDispatch = checkSession)
+                html = globalSubsiteOAuthMutex.withLock {
+                    subsiteAuthInProgress.incrementAndGet()
+                    try {
+                        humanGap(600L, 1_200L)
+                        checkSession()
+                        if (isRateLimitCoolingDown()) throw RateLimitException(rateLimitRemainingMs())
+                        val ssoResp = request(redirect.toString(), present = false, retryAllowed = false, beforeDispatch = checkSession)
+                        checkSession()
+                        if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) ssoResp
+                        else request("https://connect.linux.do/", present = present, beforeDispatch = checkSession)
+                    } finally {
+                        subsiteAuthInProgress.decrementAndGet()
+                        enterPostOAuthQuietWindow("Connect SSO")
+                    }
+                }
             }
         }
         checkSession()
@@ -4403,6 +4843,9 @@ class TopicRepository(
             if (!redirect.isNullOrBlank()) {
                 val next = request.url.resolve(redirect)
                 require(next != null && isTrustedOAuthUrl(next, targetHost)) { "OAuth 跳转地址不受信任" }
+                humanGap(600L, 1_100L)
+                checkSiteSession(userId, generation)
+                if (isRateLimitCoolingDown()) throw RateLimitException(rateLimitRemainingMs())
                 request = Request.Builder().url(next).header("Accept", "text/html,application/json").get().build()
             } else if (response.status == 200 && request.url.host == "connect.linux.do") {
                 val document = Jsoup.parse(response.body)
@@ -4432,6 +4875,11 @@ class TopicRepository(
                     else -> null
                 }
                 if (nextRequest == null) return response
+                if (!approveLink.isNullOrBlank() || (form != null && !csrf.isNullOrBlank())) {
+                    humanGap(600L, 1_200L)
+                    checkSiteSession(userId, generation)
+                    if (isRateLimitCoolingDown()) throw RateLimitException(rateLimitRemainingMs())
+                }
                 request = nextRequest.newBuilder().header("Accept", "text/html,application/json").build()
             } else {
                 return response
@@ -4459,7 +4907,14 @@ class TopicRepository(
         }
         if (!owner) return flight.await().also { checkSiteSession(userId, generation) }
         try {
-            val result = performOAuthAuthorization(host, label, userId, generation)
+            val result = globalSubsiteOAuthMutex.withLock {
+                subsiteAuthInProgress.incrementAndGet()
+                try {
+                    performOAuthAuthorization(host, label, userId, generation)
+                } finally {
+                    subsiteAuthInProgress.decrementAndGet()
+                }
+            }
             checkSiteSession(userId, generation)
             if (result) synchronized(oauthFlights) {
                 val now = SystemClock.elapsedRealtime()
@@ -4528,6 +4983,10 @@ class TopicRepository(
                 val expectedState = parsedAuthUrl.queryParameter("state")
                 require(!expectedState.isNullOrBlank()) { "OAuth 授权入口缺少 state" }
                 diagnostics.log("$label OAuth 已取得受信任授权入口")
+                checkSiteSession(userId, generation)
+                if (isRateLimitCoolingDown()) throw RateLimitException(rateLimitRemainingMs())
+                humanGap(800L, 1_500L)
+                checkSiteSession(userId, generation)
 
                 // 2. GET authUrl
                 val authReq = Request.Builder()
@@ -4539,6 +4998,8 @@ class TopicRepository(
                 val authResp = executeTrustedOAuthNavigation(client, authReq, host, "$label OAuth authorize", userId, generation)
                 require(authResp.status in 300..399) { "OAuth 未返回有效授权回调" }
                 val (code, state) = parseTrustedOAuthCallback(authResp.location, host, expectedState)
+                checkSiteSession(userId, generation)
+                humanGap(400L, 900L)
                 checkSiteSession(userId, generation)
 
                 diagnostics.log("$label OAuth 提取到 code 与 state，正在提交 callback...")
@@ -5326,7 +5787,7 @@ class TopicRepository(
                         }
                         if (revalidated) {
                             // 重验证会重新加载首页，Discourse 可能借机换掉 _forum_session
-                            cachedCsrfToken = null
+                            clearCachedCsrfToken()
                         } else {
                             getRevalidateBlockedUntil = SystemClock.elapsedRealtime() + GET_REVALIDATE_FAILURE_COOLDOWN_MS
                             diagnostics.log("GET 撞盾静默过盾未通过，${GET_REVALIDATE_FAILURE_COOLDOWN_MS / 60_000L} 分钟内不再静默重试: $path")
@@ -5363,7 +5824,7 @@ class TopicRepository(
         ensureRequestAllowed()
         throwIfSiteCoolingDown(host)
         awaitGetCooldownOrProbeGate(isMainSite = isMainSite, present = present)
-        return getSemaphore.withPermit {
+        return getSemaphore.withPermit(highPriority = present) {
             ensureRequestAllowed()
             throwIfSiteCoolingDown(host)
             awaitGetCooldownOrProbeGate(isMainSite = isMainSite, present = present)
@@ -5490,7 +5951,7 @@ class TopicRepository(
                         result.status in 200..299 -> {
                             if (isMainSite) onMainSiteGetSucceeded(ticket, sessionStore)
                             probeSettled = true
-                            return result.body
+                            return@withPermit result.body
                         }
                         // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
                         result.status == 0 -> throw NetworkTimeoutException()
@@ -5519,8 +5980,9 @@ class TopicRepository(
         const val MIN_GET_SPACING_MS = 120L
 
         // ── 进程级读写双轨调度器 (策略二核心) ──
-        // 1. 读轨道 (GET)：全应用进程共享，maxConcurrent = 3（对齐 fluxdo），滑动窗口限速 6次/3秒
-        val getSemaphore = Semaphore(3)
+        // 1. 读轨道 (GET)：全应用进程共享，maxConcurrent = 3（对齐 fluxdo），支持前后台优先级排队，滑动窗口限速 6次/3秒
+        internal val getSemaphore = PriorityCoroutineSemaphore(3)
+        private val priorityGetGate = PriorityCoroutineSemaphore(1)
         val getRateLimiterLock = Mutex()
         val getRequestTimestamps = ArrayDeque<Long>(6)
 
@@ -5569,6 +6031,8 @@ class TopicRepository(
         /** 后台静默 GET 的全进程串行闸门与上一次完成时间。 */
         val backgroundGetGate = Mutex()
         private val topicPollGate = Mutex()
+        private val globalPollGate = Mutex()
+        private const val CSRF_FAILURE_COOLDOWN_MS = 30_000L
         @Volatile var lastBackgroundGetAt = 0L
 
         /** GET 静默过盾失败后的冷却截止时间（elapsedRealtime）。 */
@@ -5618,6 +6082,24 @@ class TopicRepository(
         private var postOAuthQuietUntil = 0L
         private var lastOAuthCompletedAt = 0L
         private var postOAuthOutcomeLogged = true
+        /** timings 等非锁死前台的可丢弃请求遇 CF 速率挑战后的后台静默窗口，阻止 card.json / 子站回补继续补刀。 */
+        private var backgroundChallengeQuietUntil = 0L
+
+        fun enterBackgroundChallengeQuietWindow(durationMs: Long) {
+            if (durationMs <= 0L) return
+            val now = SystemClock.elapsedRealtime()
+            noteMainSiteChallengeSignal()
+            synchronized(rateLimitLock) {
+                backgroundChallengeQuietUntil = maxOf(backgroundChallengeQuietUntil, now + durationMs)
+            }
+        }
+
+        fun backgroundChallengeQuietRemainingMs(): Long = synchronized(rateLimitLock) {
+            backgroundChallengeQuietRemainingLocked(SystemClock.elapsedRealtime())
+        }
+
+        private fun backgroundChallengeQuietRemainingLocked(now: Long): Long =
+            (backgroundChallengeQuietUntil - now).coerceAtLeast(0L)
 
         fun enterPostOAuthQuietWindow(reason: String) {
             val now = SystemClock.elapsedRealtime()
@@ -5725,6 +6207,11 @@ class TopicRepository(
         private val siteRateLimitedUntil = mutableMapOf<String, Long>()
         private val oauthFlights = mutableMapOf<String, CompletableDeferred<Boolean>>()
         private val oauthSucceededAt = mutableMapOf<String, Long>()
+        /** 全进程唯一子站授权互斥锁，确保 connect / credit / cdk 任意时刻绝不并发执行 SSO/OAuth 握手。 */
+        private val globalSubsiteOAuthMutex = Mutex()
+        private val subsiteAuthInProgress = java.util.concurrent.atomic.AtomicInteger(0)
+
+        fun isSubsiteAuthInProgress(): Boolean = subsiteAuthInProgress.get() > 0
 
         private data class GetSlotTicket(
             val round: Long,
@@ -5948,7 +6435,7 @@ class TopicRepository(
         val challengeCircuitUntil: kotlinx.coroutines.flow.StateFlow<Long> get() = challengeCircuitUntilFlow
 
         /**
-         * 速率型 429 挑战进入递增冷却（30s → 60s → 120s → 300s），不判废凭据、不弹验证页，也不换线。
+         * 速率型 429 挑战进入递增冷却（60s → 90s → 180s → 300s），不判废凭据、不弹验证页，也不换线。
          * 同轮次并发/重复处理合并计为一次且不重算倒计时；返回冷却毫秒、当前档位与本次是否刚触发熔断。
          */
         fun enterChallenge429Cooldown(
@@ -6042,6 +6529,7 @@ class TopicRepository(
                     ticket.sessionGeneration != currentGen
                 if (!isStaleGeneration) {
                     lastMainSiteSuccessAtElapsed = now
+                    backgroundChallengeQuietUntil = 0L
                     takePostOAuthOutcomeLocked(now)?.let {
                         org.linuxdo.android.net.NetDiagnostics.log("[授权后校准] 子站授权完成后第 ${it / 1_000L}s 的首个主站结果: 成功")
                     }
@@ -6148,6 +6636,7 @@ class TopicRepository(
             synchronized(rateLimitLock) {
                 val now = SystemClock.elapsedRealtime()
                 val hadCircuit = challengeCircuitOpenUntil > 0L
+                backgroundChallengeQuietUntil = 0L
                 serverRateLimitedUntil = serverRateLimitedUntil.takeIf { it > now } ?: 0L
                 rateLimitedUntil = serverRateLimitedUntil
                 rateLimitedByCfChallenge = false
@@ -6254,16 +6743,16 @@ class TopicRepository(
         const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
         /** 前台请求在冷却 / 授权后静默窗口内最多原地等待的时长：不超过就显示加载中、到点再发，超过才提示稍后重试。 */
         private const val FOREGROUND_GATE_MAX_WAIT_MS = 45_000L
-        /** 子站 OAuth 完成后的主站静默时长（实测：授权后 4~14 秒主站请求全部被挑战，39 秒时已恢复）。 */
-        private const val POST_OAUTH_QUIET_MS = 15_000L
+        /** 子站 OAuth 完成后的主站静默时长（实测：授权后 4~14 秒及 17~32 秒仍在被挑战，39 秒时已恢复；仅拦后台）。 */
+        private const val POST_OAUTH_QUIET_MS = 40_000L
         /** 授权后多久内的首个主站结果计入校准诊断。 */
         private const val POST_OAUTH_OUTCOME_TRACK_MS = 3 * 60_000L
         /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
         const val RATE_LIMIT_COOLDOWN_MS = 10_000L
         /** 进程重启后恢复已持久化的服务端 Retry-After 冷却上限（24 小时），避免截断长冷却。 */
         private const val MAX_PERSISTED_COOLDOWN_MS = 86_400_000L
-        /** 速率型 429 挑战的递增冷却档位；挑战期间换线无效，只靠时间降温。 */
-        private val CHALLENGE_429_STEPS_MS = longArrayOf(30_000L, 60_000L, 120_000L, 300_000L)
+        /** 速率型 429 挑战的递增冷却档位；实测 CF 惩罚窗约 60s，首档对齐 60s 避免第 31s 试探撞尾升档；挑战期间换线无效，只靠时间降温。 */
+        private val CHALLENGE_429_STEPS_MS = longArrayOf(60_000L, 90_000L, 180_000L, 300_000L)
         /** 超过该时长无新的 429 挑战，档位从头计。 */
         private const val CHALLENGE_429_STREAK_RESET_MS = 10 * 60_000L
         /** 连续 429 档位成功恢复时，每级至少间隔该时长后再向下退档，避免并发 2xx 瞬间清零。 */
@@ -6313,8 +6802,11 @@ class TopicRepository(
                 expireManualProbeLocked(now)
                 val rem = maxOf(
                     (rateLimitedUntil - now).coerceAtLeast(0L),
-                    // postOAuth 静默窗口只拦后台自动请求，前台用户操作直接放行
-                    if (isMainSite && !present) postOAuthQuietRemainingLocked(now) else 0L,
+                    // postOAuth 与挑战后台静默窗口只拦后台自动请求，前台用户操作直接放行
+                    if (isMainSite && !present) maxOf(
+                        postOAuthQuietRemainingLocked(now),
+                        backgroundChallengeQuietRemainingLocked(now),
+                    ) else 0L,
                 )
                 if (rem > 0L) {
                     rem
@@ -6376,8 +6868,11 @@ class TopicRepository(
                 expireManualProbeLocked(now)
                 val remaining = maxOf(
                     (rateLimitedUntil - now).coerceAtLeast(0L),
-                    // postOAuth 静默窗口只拦后台自动请求，前台用户操作直接放行
-                    if (isMainSite && !present) postOAuthQuietRemainingLocked(now) else 0L,
+                    // postOAuth 与挑战后台静默窗口只拦后台自动请求，前台用户操作直接放行
+                    if (isMainSite && !present) maxOf(
+                        postOAuthQuietRemainingLocked(now),
+                        backgroundChallengeQuietRemainingLocked(now),
+                    ) else 0L,
                 )
                 if (remaining > 0L) {
                     if (!present) throw RateLimitException(remaining)
@@ -6453,7 +6948,9 @@ class TopicRepository(
         fun isMainSiteGateBusy(): Boolean = synchronized(rateLimitLock) {
             val now = SystemClock.elapsedRealtime()
             expireManualProbeLocked(now)
-            now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil || now < postOAuthQuietUntil
+            now < rateLimitedUntil || rateLimitProbeRequired || now < rateLimitRecoveryUntil ||
+                now < postOAuthQuietUntil || now < backgroundChallengeQuietUntil ||
+                subsiteAuthInProgress.get() > 0
         }
 
         /** 到期后允许必要业务读取确认恢复；后台不能抢走用户的手动复核许可。 */
@@ -6472,6 +6969,7 @@ class TopicRepository(
                 (rateLimitedUntil - now).coerceAtLeast(0L),
                 (rateLimitRecoveryUntil - now).coerceAtLeast(0L),
                 postOAuthQuietRemainingLocked(now),
+                backgroundChallengeQuietRemainingLocked(now),
                 if (rateLimitProbeRequired) PROBE_WAIT_BACKOFF_MS else 0L,
             )
         }
@@ -6559,39 +7057,47 @@ class TopicRepository(
         }
 
         private suspend fun <T> acquireGetPacedSlot(
+            highPriority: Boolean = true,
             awaitPreGate: suspend () -> Unit,
             tryClaimOnWindowReady: (now: Long) -> T?,
         ): T {
             while (true) {
                 awaitPreGate()
-                var waitMs = 0L
-                var claimed: T? = null
-                var retryAfterGate = false
-                getRateLimiterLock.withLock {
-                    val now = SystemClock.elapsedRealtime()
-                    while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
-                        getRequestTimestamps.removeFirst()
-                    }
-                    if (getRequestTimestamps.size >= GET_WINDOW_MAX_REQUESTS) {
-                        val oldest = getRequestTimestamps.first()
-                        waitMs = GET_WINDOW_MS - (now - oldest) + 10L
-                    } else {
-                        val lastReq = getRequestTimestamps.lastOrNull() ?: 0L
-                        val elapsedSinceLast = now - lastReq
-                        if (elapsedSinceLast < MIN_GET_SPACING_MS) {
-                            waitMs = MIN_GET_SPACING_MS - elapsedSinceLast
+                val (claimed, waitMs, retryAfterGate) = priorityGetGate.withPermit(highPriority) {
+                    currentCoroutineContext().ensureActive()
+                    awaitPreGate()
+                    var localWaitMs = 0L
+                    var localClaimed: T? = null
+                    var localRetry = false
+                    getRateLimiterLock.withLock {
+                        currentCoroutineContext().ensureActive()
+                        val now = SystemClock.elapsedRealtime()
+                        while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
+                            getRequestTimestamps.removeFirst()
+                        }
+                        if (getRequestTimestamps.size >= GET_WINDOW_MAX_REQUESTS) {
+                            val oldest = getRequestTimestamps.first()
+                            localWaitMs = GET_WINDOW_MS - (now - oldest) + 10L
                         } else {
-                            val token = tryClaimOnWindowReady(now)
-                            if (token != null) {
-                                getRequestTimestamps.addLast(now)
-                                claimed = token
+                            val lastReq = getRequestTimestamps.lastOrNull() ?: 0L
+                            val elapsedSinceLast = now - lastReq
+                            if (elapsedSinceLast < MIN_GET_SPACING_MS) {
+                                localWaitMs = MIN_GET_SPACING_MS - elapsedSinceLast
                             } else {
-                                retryAfterGate = true
+                                val token = tryClaimOnWindowReady(now)
+                                if (token != null) {
+                                    currentCoroutineContext().ensureActive()
+                                    getRequestTimestamps.addLast(now)
+                                    localClaimed = token
+                                } else {
+                                    localRetry = true
+                                }
                             }
                         }
                     }
+                    Triple(localClaimed, localWaitMs, localRetry)
                 }
-                if (claimed != null) return claimed!!
+                if (claimed != null) return claimed
                 if (waitMs > 0L) {
                     delay(waitMs)
                 } else if (retryAfterGate) {
@@ -6603,6 +7109,7 @@ class TopicRepository(
         /** 申请读轨道 (GET) 令牌（供显式登录/授权等仅需滑动窗口限频或自定义冷却判定的调用方使用）。 */
         suspend fun acquireGetSlot(isCoolingDown: () -> Boolean) {
             acquireGetPacedSlot(
+                highPriority = true,
                 awaitPreGate = {
                     if (isCoolingDown()) {
                         val remaining = synchronized(rateLimitLock) {
@@ -6622,6 +7129,7 @@ class TopicRepository(
             allowClaimProbe: Boolean = true,
             sessionGenerationProvider: () -> Long,
         ): GetSlotTicket = acquireGetPacedSlot(
+            highPriority = present,
             awaitPreGate = {
                 awaitGetCooldownOrProbeGate(
                     isMainSite = isMainSite,

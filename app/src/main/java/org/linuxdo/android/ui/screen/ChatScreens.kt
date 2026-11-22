@@ -15,6 +15,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -35,16 +36,25 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -53,6 +63,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import org.linuxdo.android.data.AttachedMedia
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.viewinterop.AndroidView
@@ -102,10 +119,19 @@ fun ChatListScreen(
     onRefresh: () -> Unit,
     onOpenChannel: (ChatChannelSummary) -> Unit,
     onBack: (() -> Unit)? = null,
+    embedded: Boolean = false,
+    headerCustomTitle: (@Composable () -> Unit)? = null,
+    bottomContentPadding: Dp = 0.dp,
+    showTopBar: Boolean = true,
+    externalShowSearch: Boolean? = null,
+    externalSearchQuery: String? = null,
+    onExternalSearchQueryChange: ((String) -> Unit)? = null,
 ) {
     var selectedTab by rememberSaveable { mutableIntStateOf(0) } // 0: 频道, 1: 直接消息
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var showSearch by rememberSaveable { mutableStateOf(false) }
+    val effectiveShowSearch = externalShowSearch ?: showSearch
+    val effectiveSearchQuery = externalSearchQuery ?: searchQuery
 
     LaunchedEffect(active) {
         if (active) onLoad()
@@ -114,12 +140,14 @@ fun ChatListScreen(
     val publicChannels = remember(state.channels) { state.channels.filter { !it.isDirectMessage } }
     val directChannels = remember(state.channels) { state.channels.filter { it.isDirectMessage } }
 
-    val publicUnread = remember(publicChannels) { publicChannels.sumOf { it.unreadCount } }
+    val publicUnread = remember(publicChannels) {
+        publicChannels.filter { it.membership?.muted != true }.sumOf { it.unreadCount }
+    }
     val directUnread = remember(directChannels) { directChannels.sumOf { it.unreadCount } }
 
-    val currentList = remember(selectedTab, publicChannels, directChannels, searchQuery) {
+    val currentList = remember(selectedTab, publicChannels, directChannels, effectiveSearchQuery) {
         val base = if (selectedTab == 0) publicChannels else directChannels
-        val query = searchQuery.trim()
+        val query = effectiveSearchQuery.trim()
         if (query.isEmpty()) base
         else base.filter { channel ->
             channel.displayTitle.contains(query, ignoreCase = true) ||
@@ -129,32 +157,86 @@ fun ChatListScreen(
     }
 
     Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
-        // 顶部导航栏
-        IosNavBar(
-            title = "聊天",
-            onBack = onBack,
-            trailing = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = {
-                        showSearch = !showSearch
-                        if (!showSearch) searchQuery = ""
-                    }) {
-                        Icon(
-                            imageVector = if (showSearch) Icons.Default.Close else Icons.Default.Search,
-                            contentDescription = "搜索",
-                            tint = IosTheme.colors.label,
-                            modifier = Modifier.size(20.dp),
-                        )
+        // 顶部导航栏（嵌入消息 Tab 统一顶栏时由外层托管；独立入口保留自带顶栏）
+        if (showTopBar) {
+            IosNavBar(
+                title = if (embedded && headerCustomTitle != null) "" else "聊天",
+                customTitle = if (embedded) headerCustomTitle else null,
+                onBack = if (embedded) null else onBack,
+                trailing = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = {
+                            showSearch = !showSearch
+                            if (!showSearch) searchQuery = ""
+                        }) {
+                            Icon(
+                                imageVector = if (showSearch) Icons.Default.Close else Icons.Default.Search,
+                                contentDescription = "搜索",
+                                tint = IosTheme.colors.label,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                        TextButton(onClick = onRefresh, enabled = !state.loadingChannels) {
+                            Text("刷新", color = IosTheme.colors.accent)
+                        }
                     }
-                    TextButton(onClick = onRefresh, enabled = !state.loadingChannels) {
-                        Text("刷新", color = IosTheme.colors.accent)
+                },
+            )
+        }
+
+        // 嵌入底部「消息」Tab 时，「频道 / 直接消息」放在顶部二级标签栏（与通知分类胶囊同款风格）
+        if (embedded) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                listOf(
+                    Triple(0, "频道", publicUnread),
+                    Triple(1, "直接消息", directUnread),
+                ).forEach { (tabIndex, label, badge) ->
+                    val selected = selectedTab == tabIndex
+                    val color = if (selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (selected) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card)
+                            .clickable { selectedTab = tabIndex }
+                            .padding(vertical = 10.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = label,
+                            style = IosTheme.type.subheadline.copy(
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            ),
+                            color = color,
+                        )
+                        if (badge > 0) {
+                            Spacer(Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (tabIndex == 0) Color(0xFF0088CC) else IosTheme.colors.accent)
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = if (badge > 99) "99+" else badge.toString(),
+                                    style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White),
+                                )
+                            }
+                        }
                     }
                 }
-            },
-        )
+            }
+        }
 
         // 搜索栏展开
-        AnimatedVisibility(visible = showSearch) {
+        AnimatedVisibility(visible = effectiveShowSearch) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -162,8 +244,11 @@ fun ChatListScreen(
                     .padding(horizontal = 14.dp, vertical = 8.dp),
             ) {
                 BasicTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
+                    value = effectiveSearchQuery,
+                    onValueChange = { next ->
+                        if (onExternalSearchQueryChange != null) onExternalSearchQueryChange(next)
+                        else searchQuery = next
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
@@ -173,7 +258,7 @@ fun ChatListScreen(
                     singleLine = true,
                     cursorBrush = SolidColor(IosTheme.colors.accent),
                     decorationBox = { innerTextField ->
-                        if (searchQuery.isEmpty()) {
+                        if (effectiveSearchQuery.isEmpty()) {
                             Text(
                                 if (selectedTab == 0) "搜索频道..." else "搜索直接消息...",
                                 style = TextStyle(fontSize = 14.sp, color = IosTheme.colors.tertiaryLabel),
@@ -207,7 +292,7 @@ fun ChatListScreen(
                 currentList.isEmpty() -> {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(
-                            text = if (searchQuery.isNotBlank()) "未搜索到匹配项"
+                            text = if (effectiveSearchQuery.isNotBlank()) "未搜索到匹配项"
                             else if (selectedTab == 0) "暂无公共频道" else "暂无直接消息",
                             style = IosTheme.type.footnote,
                             color = IosTheme.colors.secondaryLabel,
@@ -217,12 +302,13 @@ fun ChatListScreen(
                 else -> {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = bottomContentPadding),
                     ) {
                         items(currentList, key = { it.id }) { channel ->
                             if (selectedTab == 0) {
-                                PublicChannelRow(channel = channel, onClick = { onOpenChannel(channel) })
+                                PublicChannelRow(channel = channel, emojiUrls = state.emojiUrls, onClick = { onOpenChannel(channel) })
                             } else {
-                                DirectMessageRow(channel = channel, onClick = { onOpenChannel(channel) })
+                                DirectMessageRow(channel = channel, emojiUrls = state.emojiUrls, onClick = { onOpenChannel(channel) })
                             }
                         }
                     }
@@ -230,37 +316,39 @@ fun ChatListScreen(
             }
         }
 
-        // 底部 PC 样式 Tab 切换栏（频道 / 直接消息）
-        IosDivider()
-        Surface(
-            color = IosTheme.colors.card,
-            modifier = Modifier.fillMaxWidth().navigationBarsPadding(),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(54.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        // 非嵌入模式才在底部显示「频道 / 直接消息」Tab，避免与全局底部 TabBar 冲突
+        if (!embedded) {
+            IosDivider()
+            Surface(
+                color = IosTheme.colors.card,
+                modifier = Modifier.fillMaxWidth().navigationBarsPadding(),
             ) {
-                // 频道 Tab
-                ChatBottomTabItem(
-                    title = "频道",
-                    iconEmoji = "💬",
-                    selected = selectedTab == 0,
-                    badgeCount = publicUnread,
-                    modifier = Modifier.weight(1f),
-                    onClick = { selectedTab = 0 },
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 频道 Tab
+                    ChatBottomTabItem(
+                        title = "频道",
+                        iconEmoji = "💬",
+                        selected = selectedTab == 0,
+                        badgeCount = publicUnread,
+                        modifier = Modifier.weight(1f),
+                        onClick = { selectedTab = 0 },
+                    )
 
-                // 直接消息 Tab
-                ChatBottomTabItem(
-                    title = "直接消息",
-                    iconEmoji = "👥",
-                    selected = selectedTab == 1,
-                    badgeCount = directUnread,
-                    modifier = Modifier.weight(1f),
-                    onClick = { selectedTab = 1 },
-                )
+                    // 直接消息 Tab
+                    ChatBottomTabItem(
+                        title = "直接消息",
+                        iconEmoji = "👥",
+                        selected = selectedTab == 1,
+                        badgeCount = directUnread,
+                        modifier = Modifier.weight(1f),
+                        onClick = { selectedTab = 1 },
+                    )
+                }
             }
         }
     }
@@ -317,8 +405,28 @@ private fun ChatBottomTabItem(
 }
 
 @Composable
-private fun PublicChannelRow(channel: ChatChannelSummary, onClick: () -> Unit) {
+private fun PublicChannelRow(
+    channel: ChatChannelSummary,
+    emojiUrls: Map<String, String> = emptyMap(),
+    onClick: () -> Unit,
+) {
     val lastMessage = channel.lastMessage
+    val preview = remember(lastMessage, channel.categoryName, emojiUrls) {
+        if (lastMessage == null) {
+            AnnotatedString(channel.categoryName ?: "暂无新消息") to emptyMap()
+        } else {
+            val sender = lastMessage.user?.name?.takeIf { it.isNotBlank() } ?: lastMessage.user?.username.orEmpty()
+            val prefix = if (sender.isNotBlank()) "$sender: " else ""
+            buildChatRichText(
+                message = lastMessage.message,
+                cooked = lastMessage.cooked,
+                emojiUrls = emojiUrls,
+                emojiSize = 15.sp,
+                singleLine = true,
+                prefix = prefix,
+            )
+        }
+    }
     Column(
         Modifier
             .fillMaxWidth()
@@ -353,7 +461,10 @@ private fun PublicChannelRow(channel: ChatChannelSummary, onClick: () -> Unit) {
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
                     )
-                    if (channel.unreadCount > 0) {
+                    if (channel.membership?.muted == true) {
+                        Spacer(Modifier.width(6.dp))
+                        Text("免打扰", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    } else if (channel.unreadCount > 0) {
                         Spacer(Modifier.width(6.dp))
                         Box(
                             modifier = Modifier
@@ -364,11 +475,8 @@ private fun PublicChannelRow(channel: ChatChannelSummary, onClick: () -> Unit) {
                     }
                 }
                 Text(
-                    text = lastMessage?.let {
-                        val sender = it.user?.name ?: it.user?.username.orEmpty()
-                        val msg = renderEmojiShortcodes(it.message.ifBlank { it.cooked }, keepUnknown = true).orEmpty()
-                        "$sender: $msg"
-                    } ?: channel.categoryName ?: "暂无新消息",
+                    text = preview.first,
+                    inlineContent = preview.second,
                     style = TextStyle(fontSize = 13.sp, color = IosTheme.colors.secondaryLabel),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -387,9 +495,29 @@ private fun PublicChannelRow(channel: ChatChannelSummary, onClick: () -> Unit) {
 }
 
 @Composable
-private fun DirectMessageRow(channel: ChatChannelSummary, onClick: () -> Unit) {
+private fun DirectMessageRow(
+    channel: ChatChannelSummary,
+    emojiUrls: Map<String, String> = emptyMap(),
+    onClick: () -> Unit,
+) {
     val targetUser = channel.dmUsers.firstOrNull() ?: channel.lastMessage?.user
     val lastMessage = channel.lastMessage
+    val preview = remember(lastMessage, emojiUrls) {
+        if (lastMessage == null) {
+            AnnotatedString("暂无对话") to emptyMap()
+        } else {
+            val sender = lastMessage.user?.name?.takeIf { it.isNotBlank() } ?: lastMessage.user?.username.orEmpty()
+            val prefix = if (sender.isNotBlank()) "$sender: " else ""
+            buildChatRichText(
+                message = lastMessage.message,
+                cooked = lastMessage.cooked,
+                emojiUrls = emojiUrls,
+                emojiSize = 15.sp,
+                singleLine = true,
+                prefix = prefix,
+            )
+        }
+    }
 
     Column(
         Modifier
@@ -425,11 +553,8 @@ private fun DirectMessageRow(channel: ChatChannelSummary, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = lastMessage?.let {
-                        val sender = it.user?.name ?: it.user?.username.orEmpty()
-                        val msg = renderEmojiShortcodes(it.message.ifBlank { it.cooked }, keepUnknown = true).orEmpty()
-                        "$sender: $msg"
-                    } ?: "暂无对话",
+                    text = preview.first,
+                    inlineContent = preview.second,
                     style = TextStyle(fontSize = 13.sp, color = IosTheme.colors.secondaryLabel),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -471,7 +596,8 @@ fun ChatRoomScreen(
     currentUsername: String? = null,
     onLoad: (Long, Boolean) -> Unit,
     onLoadPast: (Long) -> Unit = {},
-    onSend: (Long, String, List<Long>) -> Unit,
+    onSetChannelMuted: (Long, Boolean) -> Unit = { _, _ -> },
+    onSend: (Long, String, List<Long>, () -> Unit) -> Unit,
     onUploadAttachment: (Long, Uri, (AttachedMedia) -> Unit, (String) -> Unit) -> Unit = { _, _, _, _ -> },
     onOpenUser: (String) -> Unit = {},
     onBack: () -> Unit,
@@ -479,11 +605,21 @@ fun ChatRoomScreen(
     val channelId = channel.id
     val messages = state.messagesByChannel[channelId].orEmpty()
     val listState = rememberLazyListState()
-    var draft by remember(channelId) { mutableStateOf("") }
+    var draft by rememberSaveable(channelId) { mutableStateOf("") }
     var showEmojiPicker by remember(channelId) { mutableStateOf(false) }
     var showComposerSheet by remember(channelId) { mutableStateOf(false) }
     var pendingAttachments by remember(channelId) { mutableStateOf<List<AttachedMedia>>(emptyList()) }
     var isUploading by remember(channelId) { mutableStateOf(false) }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val send: (String, List<Long>) -> Unit = { text, uploads ->
+        onSend(channelId, text, uploads) {
+            draft = ""
+            pendingAttachments = emptyList()
+            showComposerSheet = false
+            showEmojiPicker = false
+            keyboard?.hide()
+        }
+    }
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
@@ -562,6 +698,17 @@ fun ChatRoomScreen(
             IosNavBar(
                 title = channel.displayTitle,
                 onBack = onBack,
+                trailing = {
+                    val membership = channel.membership
+                    if (!channel.isDirectMessage && membership != null) {
+                        ChatChannelNotificationMenu(
+                            channelId = channelId,
+                            muted = membership.muted,
+                            enabled = channelId !in state.updatingMuteChannelIds,
+                            onSetMuted = { onSetChannelMuted(channelId, it) },
+                        )
+                    }
+                },
             )
 
         // 错误提示
@@ -616,6 +763,7 @@ fun ChatRoomScreen(
                     ChatMessageBubble(
                         message = message,
                         isMe = isMe,
+                        emojiUrls = state.emojiUrls,
                         onOpenUser = onOpenUser,
                     )
                 }
@@ -781,10 +929,7 @@ fun ChatRoomScreen(
                                 }
                                 if (fullMessage.isNotBlank()) {
                                     val uploadIds = pendingAttachments.mapNotNull { it.uploadId }
-                                    draft = ""
-                                    pendingAttachments = emptyList<AttachedMedia>()
-                                    showEmojiPicker = false
-                                    onSend(channelId, fullMessage, uploadIds)
+                                    send(fullMessage, uploadIds)
                                 }
                             }
                             .padding(horizontal = 14.dp, vertical = 8.dp),
@@ -837,32 +982,220 @@ fun ChatRoomScreen(
             onPickImage = { pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
             onPickFile = { pickFile.launch(arrayOf("*/*")) },
             onSend = { fullMessage, uploadIds ->
-                if (fullMessage.isNotBlank()) {
-                    draft = ""
-                    pendingAttachments = emptyList()
-                    showComposerSheet = false
-                    showEmojiPicker = false
-                    onSend(channelId, fullMessage, uploadIds)
+                if (fullMessage.isNotBlank() || uploadIds.isNotEmpty()) {
+                    send(fullMessage, uploadIds)
                 }
             },
-            onDismiss = { showComposerSheet = false },
+            onDismiss = { keyboard?.hide(); showComposerSheet = false },
         )
     }
     }
 }
 
 @Composable
+private fun ChatChannelNotificationMenu(
+    channelId: Long,
+    muted: Boolean,
+    enabled: Boolean,
+    onSetMuted: (Boolean) -> Unit,
+) {
+    var expanded by remember(channelId) { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }, enabled = enabled) {
+            Icon(
+                imageVector = Icons.Filled.Notifications,
+                contentDescription = if (muted) "频道通知设置，已开启消息免打扰" else "频道通知设置",
+                tint = if (enabled && !muted) IosTheme.colors.accent else IosTheme.colors.secondaryLabel,
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text(if (muted) "关闭消息免打扰" else "开启消息免打扰") },
+                enabled = enabled,
+                onClick = {
+                    expanded = false
+                    onSetMuted(!muted)
+                },
+            )
+        }
+    }
+}
+
+private fun resolveEmojiImageUrl(rawUrl: String): String? {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isEmpty()) return null
+    val resolved = when {
+        trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+        trimmed.startsWith("//") -> "https:$trimmed"
+        trimmed.startsWith("/") -> "${Config.BASE_URL}$trimmed"
+        else -> return null
+    }
+    return Config.resolveUrlWithCdn(resolved)
+}
+
+private fun AnnotatedString.trimWhitespace(): AnnotatedString {
+    var start = 0
+    var end = text.length
+    while (start < end && text[start].isWhitespace()) start++
+    while (end > start && text[end - 1].isWhitespace()) end--
+    return if (start == 0 && end == text.length) this else subSequence(start, end)
+}
+
+/**
+ * 将聊天消息优先从 cooked HTML 解析为带行内表情图片的 AnnotatedString（支持标准 emoji 与论坛自定义表情包），
+ * 纯文本或未 cook 的 :shortcode: 也尝试按 emojiUrls 渲染图片或退化为 Unicode。
+ * inlineContent 的 alternateText 保留可读符号，配合 SelectionContainer 可完整复制。
+ */
+private fun buildChatRichText(
+    message: String,
+    cooked: String,
+    emojiUrls: Map<String, String>,
+    emojiSize: TextUnit,
+    singleLine: Boolean = false,
+    prefix: String = "",
+): Pair<AnnotatedString, Map<String, InlineTextContent>> {
+    val inlineContent = linkedMapOf<String, InlineTextContent>()
+
+    fun registerInlineEmoji(absUrl: String, alt: String): String {
+        val id = "emoji:$absUrl"
+        if (id !in inlineContent) {
+            inlineContent[id] = InlineTextContent(
+                Placeholder(
+                    width = emojiSize,
+                    height = emojiSize,
+                    placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+                ),
+            ) {
+                AsyncImage(
+                    model = absUrl,
+                    contentDescription = alt,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        return id
+    }
+
+    fun AnnotatedString.Builder.appendTextWithShortcodes(rawText: String) {
+        val text = if (singleLine) rawText.replace(Regex("[\\r\\n]+"), " ") else rawText
+        if (text.isEmpty()) return
+        var lastIndex = 0
+        for (match in CLOSED_EMOJI_PATTERN.findAll(text)) {
+            if (match.range.first > lastIndex) {
+                append(text.substring(lastIndex, match.range.first))
+            }
+            val code = match.groupValues[1]
+            val lower = code.lowercase()
+            val mappedUrl = (emojiUrls[code] ?: emojiUrls[lower])?.let(::resolveEmojiImageUrl)
+            if (mappedUrl != null) {
+                val alt = EMOJI_SHORTCODE_MAP[lower] ?: match.value
+                val id = registerInlineEmoji(mappedUrl, alt)
+                appendInlineContent(id, alt)
+            } else {
+                append(EMOJI_SHORTCODE_MAP[lower] ?: match.value)
+            }
+            lastIndex = match.range.last + 1
+        }
+        if (lastIndex < text.length) {
+            append(text.substring(lastIndex))
+        }
+    }
+
+    val bodyText = buildAnnotatedString {
+        if (cooked.isNotBlank()) {
+            val doc = org.jsoup.Jsoup.parseBodyFragment(cooked)
+            var currentLength = 0
+            var endedWithBreak = true
+
+            fun emitText(s: String) {
+                if (s.isEmpty()) return
+                val before = length
+                appendTextWithShortcodes(s)
+                if (length > before) {
+                    currentLength = length
+                    endedWithBreak = toAnnotatedString().text.lastOrNull()?.let { it == '\n' } ?: false
+                }
+            }
+
+            fun emitBreak(forceNewline: Boolean) {
+                if (currentLength == 0 || endedWithBreak) return
+                append(if (singleLine || !forceNewline) " " else "\n")
+                currentLength = length
+                endedWithBreak = true
+            }
+
+            fun walk(node: org.jsoup.nodes.Node) {
+                when (node) {
+                    is org.jsoup.nodes.TextNode -> emitText(node.wholeText)
+                    is org.jsoup.nodes.Element -> {
+                        val tag = node.normalName()
+                        when {
+                            tag == "br" -> emitBreak(forceNewline = true)
+                            tag == "img" -> {
+                                val src = node.attr("src")
+                                val isEmoji = node.hasClass("emoji") || src.contains("/emoji/", ignoreCase = true)
+                                if (isEmoji) {
+                                    val absUrl = resolveEmojiImageUrl(src)
+                                    val alt = node.attr("alt").ifBlank { node.attr("title") }
+                                    val readableAlt = renderEmojiShortcodes(alt, keepUnknown = true).orEmpty().ifBlank { "🙂" }
+                                    if (absUrl != null) {
+                                        val id = registerInlineEmoji(absUrl, readableAlt)
+                                        appendInlineContent(id, readableAlt)
+                                        currentLength = length
+                                        endedWithBreak = false
+                                    } else {
+                                        emitText(alt)
+                                    }
+                                }
+                            }
+                            tag in setOf("p", "div", "li", "blockquote", "pre") -> {
+                                emitBreak(forceNewline = true)
+                                node.childNodes().forEach(::walk)
+                                emitBreak(forceNewline = true)
+                            }
+                            else -> node.childNodes().forEach(::walk)
+                        }
+                    }
+                }
+            }
+
+            doc.body().childNodes().forEach(::walk)
+        }
+    }.trimWhitespace()
+
+    val finalBody = if (bodyText.isNotEmpty() || inlineContent.isNotEmpty()) {
+        bodyText
+    } else {
+        buildAnnotatedString {
+            appendTextWithShortcodes(if (singleLine) message.replace(Regex("\\s+"), " ").trim() else message.trim())
+        }.trimWhitespace()
+    }
+
+    val combined = if (prefix.isEmpty()) finalBody else buildAnnotatedString {
+        append(prefix)
+        append(finalBody)
+    }
+    return combined to inlineContent
+}
+
+@Composable
 private fun ChatMessageBubble(
     message: ChatMessageSummary,
     isMe: Boolean,
+    emojiUrls: Map<String, String> = emptyMap(),
     onOpenUser: (String) -> Unit,
 ) {
     val user = message.user
-    val textContent = remember(message.message, message.cooked) {
-        val raw = if (message.message.isNotBlank()) message.message
-        else android.text.Html.fromHtml(message.cooked, android.text.Html.FROM_HTML_MODE_COMPACT).toString().trim()
-        renderEmojiShortcodes(raw, keepUnknown = true).orEmpty()
+    val (richContent, inlineEmojis) = remember(message.message, message.cooked, emojiUrls) {
+        buildChatRichText(
+            message = message.message,
+            cooked = message.cooked,
+            emojiUrls = emojiUrls,
+            emojiSize = 19.sp,
+            singleLine = false,
+        )
     }
+    val hasText = richContent.text.isNotBlank() || inlineEmojis.isNotEmpty()
     val timeStr = remember(message.createdAt) { RelativeTime.format(message.createdAt) }
     // 图片附件与文件附件分类
     val imageUploads = remember(message.uploads) { message.uploads.filter { it.isImage } }
@@ -918,11 +1251,20 @@ private fun ChatMessageBubble(
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (textContent.isNotBlank()) {
-                        Text(
-                            text = textContent,
-                            style = TextStyle(fontSize = 15.sp, color = Color.White, lineHeight = 21.sp),
+                    if (hasText) {
+                        val meSelectionColors = TextSelectionColors(
+                            handleColor = Color.White,
+                            backgroundColor = Color.White.copy(alpha = 0.35f),
                         )
+                        CompositionLocalProvider(LocalTextSelectionColors provides meSelectionColors) {
+                            SelectionContainer {
+                                Text(
+                                    text = richContent,
+                                    inlineContent = inlineEmojis,
+                                    style = TextStyle(fontSize = 15.sp, color = Color.White, lineHeight = 21.sp),
+                                )
+                            }
+                        }
                     }
                     // 渲染图片附件（缩略图点击可全屏查看）
                     imageUploads.forEach { upload ->
@@ -1001,11 +1343,14 @@ private fun ChatMessageBubble(
                         .padding(horizontal = 14.dp, vertical = 9.dp),
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        if (textContent.isNotBlank()) {
-                            Text(
-                                text = textContent,
-                                style = TextStyle(fontSize = 15.sp, color = IosTheme.colors.label, lineHeight = 21.sp),
-                            )
+                        if (hasText) {
+                            SelectionContainer {
+                                Text(
+                                    text = richContent,
+                                    inlineContent = inlineEmojis,
+                                    style = TextStyle(fontSize = 15.sp, color = IosTheme.colors.label, lineHeight = 21.sp),
+                                )
+                            }
                         }
                         // 渲染图片附件（缩略图点击可全屏查看）
                         imageUploads.forEach { upload ->
@@ -1125,11 +1470,13 @@ private fun ChatComposerBottomSheet(
                 }
 
                 Text(
-                    text = "发表评论",
+                    text = "发送给 $channelTitle",
                     style = IosTheme.type.headline,
                     fontWeight = FontWeight.SemiBold,
                     color = IosTheme.colors.label,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
                 )
 
                 // 右上角全屏切换图标
@@ -1333,7 +1680,7 @@ private fun ChatComposerBottomSheet(
                         IosActivityIndicator(diameter = 16.dp, color = Color.White)
                     } else {
                         Text(
-                            text = "发表",
+                            text = "发送",
                             style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.White),
                         )
                     }

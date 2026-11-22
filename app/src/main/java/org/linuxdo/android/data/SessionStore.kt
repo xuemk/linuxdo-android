@@ -393,9 +393,11 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 失效时由 Cloudflare 重新验证，而不是反复使用一枚已废弃的凭据。
      */
     fun syncFromWebView(): Map<String, String> {
-        // 从持久化存储中排除 CF Cookie（不可跨环境复用）
+        // 从持久化存储中排除 CF Cookie（不可跨环境复用）及子站专属会话 Cookie
         val stored = storedCookies().filterKeys {
-            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !it.startsWith("__cf") && !it.startsWith("_cf")
+            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) &&
+                !it.startsWith("__cf") && !it.startsWith("_cf") &&
+                !isSubsiteOnlyCookie(it)
         }
         if (sessionChanging || isSessionRecoveryPending()) return stored
         val manager = CookieManager.getInstance()
@@ -463,14 +465,16 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             }
         }
         if (web.isEmpty()) return stored
-        // 关键修复：过滤掉 CF Cookie，不保存到持久化存储
+        // 关键修复：过滤掉 CF Cookie 与子站专属会话 Cookie，不保存到持久化存储也不回传主站
         val businessCookies = web.filterKeys {
-            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !it.startsWith("__cf") && !it.startsWith("_cf")
+            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) &&
+                !it.startsWith("__cf") && !it.startsWith("_cf") &&
+                !isSubsiteOnlyCookie(it)
         }
         val merged = stored + businessCookies
         if (merged != stored) save(merged)
-        // 返回完整的 Cookie（包含 CF Cookie），供本次会话使用，但不持久化
-        return stored + web
+        // 返回主站完整 Cookie（包含 CF Cookie），绝不携带子站 Cookie
+        return (stored + web).filterKeys { !isSubsiteOnlyCookie(it) }
     }
 
     /**
@@ -536,7 +540,10 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         if (stored.isEmpty()) return
         val web = parseCookieHeader(manager.getCookie(Config.BASE_URL))
         val missing = stored.filterKeys { key ->
-            key !in web && key !in exclude && !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !key.startsWith("__cf") && !key.startsWith("_cf")
+            key !in web && key !in exclude &&
+                !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) &&
+                !key.startsWith("__cf") && !key.startsWith("_cf") &&
+                !isSubsiteOnlyCookie(key)
         }
         if (missing.isEmpty()) return
         missing.forEach { (name, value) ->
@@ -601,7 +608,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 拿这个已经失效的 token 白跑一次 /session/current,还可能被重新塞回 WebView。
      */
     fun clearSessionCookie() {
-        noteRejectedAuthToken(authTokenHash(storedCookies()[Config.SESSION_COOKIE]), currentUserId(), sessionGeneration)
+        val uid = currentUserId()
+        saveCsrfToken(uid, null)
+        noteRejectedAuthToken(authTokenHash(storedCookies()[Config.SESSION_COOKIE]), uid, sessionGeneration)
         advanceSessionGeneration()
         save(storedCookies() - Config.SESSION_COOKIE - FORUM_SESSION_COOKIE, durable = true)
         val manager = CookieManager.getInstance()
@@ -665,6 +674,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         val cookies = parseCookieHeader(rawHeader)
         if (!cookies.containsKey(FORUM_SESSION_COOKIE)) return true
 
+        saveCsrfToken(currentUserId(), null)
         save(storedCookies() - FORUM_SESSION_COOKIE)
         val domains = listOf(null, Config.HOST, ".${Config.HOST}")
         val attributes = listOf(
@@ -703,6 +713,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
             ?: return false
 
         // 1. 从持久化存储中只保留核心业务凭证（_t）
+        saveCsrfToken(currentUserId(), null)
         val cleanStored = storedCookies().filterKeys { key ->
             key == Config.SESSION_COOKIE || (!key.startsWith("_cf", ignoreCase = true) && !key.startsWith("__cf", ignoreCase = true) && key != FORUM_SESSION_COOKIE && !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true))
         }
@@ -761,6 +772,9 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                     }
                     manager.flush()
                     save(cookies, durable = true, ownerUserId = userId ?: currentUserId())
+                    if (token.isNullOrBlank()) {
+                        saveCsrfToken(userId ?: currentUserId(), null)
+                    }
                     if (userId != null) {
                         if (userId > 0L) saveCurrentUserId(userId) else clearCurrentUserId()
                     }
@@ -777,11 +791,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     private suspend fun clearSubsiteAuthCookies(manager: CookieManager): Set<String> {
-        val sites = mapOf(
-            "auth.session-token" to "connect.linux.do",
-            "linux_do_credit_session_id" to "credit.linux.do",
-            "linux_do_cdk_session_id" to "cdk.linux.do",
-        )
+        val sites = SUBSITE_AUTH_COOKIE_HOSTS
         val deletions = linkedSetOf<Pair<String, String>>()
         val readbackUrls = linkedSetOf<String>()
         val structuredSupported = WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)
@@ -992,7 +1002,10 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 if (requestUrl.toHttpUrl().host == Config.HOST && cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
                     return@forEach
                 }
-                if (requestUrl.toHttpUrl().host == Config.HOST && cookie.matches(Config.BASE_URL.toHttpUrl())) {
+                if (requestUrl.toHttpUrl().host == Config.HOST &&
+                    cookie.matches(Config.BASE_URL.toHttpUrl()) &&
+                    !isSubsiteOnlyCookie(cookie.name)
+                ) {
                     merged[cookie.name] = cookie.value
                 }
                 val normalized = if (mainAuth) cookie.toString().replace(Regex("; domain=[^;]+", RegexOption.IGNORE_CASE), "") else cookie.toString()
@@ -1018,6 +1031,8 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     fun hasSessionCookie(): Boolean = syncFromWebView().containsKey(Config.SESSION_COOKIE)
 
     fun clear() {
+        val uid = currentUserId()
+        saveCsrfToken(uid, null)
         advanceSessionGeneration()
         clearTopicNotificationLevels()
         clearCurrentUserId()
@@ -1032,7 +1047,8 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         val persisted = cookies.filterKeys { key ->
             !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) &&
                 !key.startsWith("__cf", ignoreCase = true) &&
-                !key.startsWith("_cf", ignoreCase = true)
+                !key.startsWith("_cf", ignoreCase = true) &&
+                !isSubsiteOnlyCookie(key)
         }
         val editor = prefs.edit()
             .putString(KEY_COOKIES, JSONObject(persisted as Map<*, *>).toString())
@@ -1192,8 +1208,46 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     private val plainPrefs: SharedPreferences = context.getSharedPreferences(PREFS_PLAIN_NAME, Context.MODE_PRIVATE)
     init {
         NoExcerptModeMigration.applyTo(plainPrefs)
+        loadCdnConfig()
     }
     private val json = Json { ignoreUnknownKeys = true }
+
+    private fun loadCdnConfig() {
+        Config.updateCdnConfig(
+            cdn = plainPrefs.getString(KEY_CDN_URL, null),
+            s3Cdn = plainPrefs.getString(KEY_S3_CDN_URL, null),
+            s3Base = plainPrefs.getString(KEY_S3_BASE_URL, null),
+        )
+    }
+
+    fun saveCdnConfig(cdnUrl: String?, s3CdnUrl: String?, s3BaseUrl: String?) {
+        Config.updateCdnConfig(cdnUrl, s3CdnUrl, s3BaseUrl)
+        plainPrefs.edit().apply {
+            Config.cdnUrl?.let { putString(KEY_CDN_URL, it) }
+            Config.s3CdnUrl?.let { putString(KEY_S3_CDN_URL, it) }
+            Config.s3BaseUrl?.let { putString(KEY_S3_BASE_URL, it) }
+        }.apply()
+    }
+
+    fun savedCsrfToken(userId: Long = currentUserId()): String? {
+        if (userId <= 0L) return null
+        return readDisplayPreference(null) {
+            prefs.getString("${KEY_CSRF_TOKEN_PREFIX}_$userId", null)?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    fun saveCsrfToken(userId: Long = currentUserId(), token: String?) {
+        if (userId <= 0L) return
+        val key = "${KEY_CSRF_TOKEN_PREFIX}_$userId"
+        saveDisplayPreference(key) {
+            val clean = token?.trim()?.takeIf { it.isNotEmpty() }
+            if (clean == null) {
+                prefs.edit().remove(key).apply()
+            } else {
+                prefs.edit().putString(key, clean).apply()
+            }
+        }
+    }
 
     fun saveCategoryOrder(ids: List<Long>) {
         plainPrefs.edit().putString(KEY_CATEGORY_ORDER, ids.filter { it > 0L }.distinct().joinToString(",")).commit()
@@ -1716,6 +1770,33 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_CHALLENGE_MANUAL_PROBE_AT = "challenge_manual_probe_at_wall_ms"
         private const val KEY_RATE_LIMIT_CF_CHALLENGE = "rate_limit_cf_challenge"
         private const val KEY_RATE_LIMIT_PROBE_REQUIRED = "rate_limit_probe_required"
+        private const val KEY_CSRF_TOKEN_PREFIX = "saved_csrf_token"
+        private const val KEY_CDN_URL = "site_cdn_url"
+        private const val KEY_S3_CDN_URL = "site_s3_cdn_url"
+        private const val KEY_S3_BASE_URL = "site_s3_base_url"
+
+        internal val SUBSITE_AUTH_COOKIE_HOSTS = mapOf(
+            "auth.session-token" to "connect.linux.do",
+            "linux_do_credit_session_id" to "credit.linux.do",
+            "linux_do_cdk_session_id" to "cdk.linux.do",
+        )
+
+        internal fun isSubsiteOnlyCookie(name: String): Boolean =
+            SUBSITE_AUTH_COOKIE_HOSTS.keys.any { it.equals(name, ignoreCase = true) }
+
+        internal fun filterSubsiteCookies(host: String, rawHeader: String): String {
+            if (rawHeader.isBlank()) return rawHeader
+            return rawHeader.split(';')
+                .map { it.trim() }
+                .filter { part ->
+                    if (part.isEmpty()) return@filter false
+                    val name = part.substringBefore('=').trim()
+                    val ownerHost = SUBSITE_AUTH_COOKIE_HOSTS.entries
+                        .firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+                    ownerHost == null || ownerHost.equals(host, ignoreCase = true)
+                }
+                .joinToString("; ")
+        }
 
         fun parseCookieHeader(raw: String?): Map<String, String> =
             raw.orEmpty().split(";").mapNotNull { part ->
@@ -1741,6 +1822,25 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                     }
                 }
             }
+
+        /**
+         * 零网络检测指定子站是否已在 WebView CookieJar 中持有非空独立会话 Cookie。
+         */
+        fun hasSubsiteAuthCookie(host: String): Boolean {
+            val cleanHost = host.trim().lowercase().trimEnd('.')
+            val cookieNames = SUBSITE_AUTH_COOKIE_HOSTS
+                .filterValues { it.equals(cleanHost, ignoreCase = true) }
+                .keys
+            if (cookieNames.isEmpty()) return false
+            val rawHeader = runCatching {
+                CookieManager.getInstance()?.getCookie("https://$cleanHost")
+            }.getOrNull().orEmpty()
+            if (rawHeader.isBlank()) return false
+            val parsed = parseCookieHeader(rawHeader)
+            return cookieNames.any { name ->
+                parsed.entries.any { it.key.equals(name, ignoreCase = true) && it.value.isNotBlank() }
+            }
+        }
     }
 }
 

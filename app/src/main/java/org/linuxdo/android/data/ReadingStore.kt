@@ -250,11 +250,11 @@ internal class ConfirmedReadPosts(private val capacity: Int = 200) {
 
 internal data class ReadTimingBatch(val topicTimeMs: Long, val postTimesMs: Map<Int, Long>)
 
-/** 新未读楼层提前合批，成功后留出间隔；失败按 Fluxdo 的 5/10/20/40 秒退避。 */
+/** 新未读楼层提前合批，成功后留出至少 10 秒间隔避免刷长帖频繁 POST；失败按 Fluxdo 的 5/10/20/40 秒退避。 */
 internal class ReadReportSchedule(
     startedAt: Long,
     private val heartbeatMs: Long = 35_000L,
-    private val minimumGapMs: Long = 3_000L,
+    private val minimumGapMs: Long = 10_000L,
 ) {
     private var nextHeartbeatAt = startedAt + heartbeatMs
     private var nextAllowedAt = startedAt

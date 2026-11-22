@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
@@ -45,6 +47,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -84,6 +88,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -464,7 +469,8 @@ fun SphereIconButton(
             text = title,
             style = IosTheme.type.caption.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Normal),
             color = IosTheme.colors.label,
-            maxLines = 1
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -483,6 +489,8 @@ fun ProfileScreen(
     onLogout: () -> Unit = {},
     active: Boolean,
     notificationOnly: Boolean = false,
+    showTopBar: Boolean = true,
+    markAllReadTrigger: Int = 0,
     onBack: (() -> Unit)? = null,
     onReadNotification: (Long) -> Unit = {},
     notificationFilter: NotificationFilter = NotificationFilter.All,
@@ -503,6 +511,8 @@ fun ProfileScreen(
     onOpenBlacklist: () -> Unit = {},
     onOpenLdcStore: () -> Unit = {},
     onOpenLdcMail: () -> Unit = {},
+    onOpenAppsPlaza: () -> Unit = {},
+    customNotificationTitle: (@Composable () -> Unit)? = null,
     onOpenUser: (username: String, primaryAvatar: String?, staticAvatar: String?) -> Unit = { _, _, _ -> },
     onComposePrivateMessage: (String) -> Unit = {},
     onOpenUserReplies: ((String) -> Unit)? = null,
@@ -533,8 +543,8 @@ fun ProfileScreen(
     } }
     LaunchedEffect(section, active) {
         if (active) {
-            onLoad(section, section == ProfileSection.Notifications, false)
-            if (section != ProfileSection.Summary && summaryFields.isEmpty()) {
+            onLoad(section, section == ProfileSection.Notifications && !notificationOnly, false)
+            if (section != ProfileSection.Summary && !notificationOnly && summaryFields.isEmpty()) {
                 onLoad(ProfileSection.Summary, false, false)
             }
             if (section != ProfileSection.Summary && !notificationOnly && userBadges == null && !isUserBadgesLoading) {
@@ -558,6 +568,11 @@ fun ProfileScreen(
     }
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showMarkAllReadConfirmDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(markAllReadTrigger) {
+        if (markAllReadTrigger > 0) {
+            showMarkAllReadConfirmDialog = true
+        }
+    }
     var showAccountSwitchSheet by remember { mutableStateOf(false) }
     val activeAccount = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }
 
@@ -578,8 +593,10 @@ fun ProfileScreen(
         listState = list,
         onBack = if (notificationOnly) null else onBack,
         showLargeTitle = false,
+        showNavBar = showTopBar,
         backLabel = if (notificationOnly) "" else "返回",
         scrollToTopRequest = scrollToTopRequest,
+        customCollapsedTitle = if (notificationOnly) customNotificationTitle else null,
         trailing = {
             if (!notificationOnly) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1033,20 +1050,51 @@ fun ProfileScreen(
                         )
                     }
 
+                    // 5. 5 联微光玻璃球常用工具（LDCstore / 专属邮箱 / 应用广场 / 黑名单 / 更多）
                     Row(
-                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        ProfileQuickLink("LDCstore", "🛍️", onOpenLdcStore, Modifier.weight(1f).fillMaxHeight())
-                        ProfileQuickLink("专属邮箱", "✉️", onOpenLdcMail, Modifier.weight(1f).fillMaxHeight())
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        ProfileQuickLink("实时聊天", "💬", onOpenChat, Modifier.weight(1f).fillMaxHeight())
-                        ProfileQuickLink("本地黑名单", "🚫", onOpenBlacklist, Modifier.weight(1f).fillMaxHeight())
+                        SphereIconButton(
+                            title = "LDCstore",
+                            iconGlyph = "🛍️",
+                            glowColor = Color(0xFFFA8C16),
+                            onClick = onOpenLdcStore,
+                            modifier = Modifier.weight(1f),
+                        )
+                        SphereIconButton(
+                            title = "专属邮箱",
+                            iconGlyph = "✉️",
+                            glowColor = Color(0xFF13C2C2),
+                            onClick = onOpenLdcMail,
+                            modifier = Modifier.weight(1f),
+                        )
+                        SphereIconButton(
+                            title = "应用广场",
+                            iconGlyph = "🧩",
+                            glowColor = Color(0xFF722ED1),
+                            onClick = onOpenAppsPlaza,
+                            modifier = Modifier.weight(1f),
+                        )
+                        SphereIconButton(
+                            title = "黑名单",
+                            iconGlyph = "🚫",
+                            glowColor = Color(0xFFF5222D),
+                            onClick = onOpenBlacklist,
+                            modifier = Modifier.weight(1f),
+                        )
+                        SphereIconButton(
+                            title = "更多",
+                            iconGlyph = "✨",
+                            glowColor = Color(0xFF8C8C8C),
+                            onClick = {
+                                Toast.makeText(context, "敬请期待", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
                     }
 
                     // 6. 徽章展示模块 (玻璃质感大卡片，优先展示已获得，后排未获得，与上方卡片保持统一的 8dp 间距)
@@ -1331,32 +1379,54 @@ fun ProfileScreen(
     }
 }
 
+/** 消息中心顶栏分段切换器（通知 / 聊天） */
 @Composable
-private fun ProfileQuickLink(
-    title: String,
-    icon: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
+fun MessageCenterSegmentedTitle(
+    selectedTab: Int,
+    notificationUnread: Int,
+    chatUnread: Int,
+    onSelect: (Int) -> Unit,
 ) {
     Row(
-        modifier.fillMaxWidth().heightIn(min = 44.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(IosTheme.colors.card)
-            .border(1.dp, IosTheme.colors.separator.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .padding(2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(icon, fontSize = 16.sp)
-        Text(
-            title,
-            style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold),
-            modifier = Modifier.weight(1f),
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text("›", fontSize = 18.sp, color = IosTheme.colors.secondaryLabel)
+        listOf(
+            Triple(0, "通知", notificationUnread > 0),
+            Triple(1, "聊天", chatUnread > 0),
+        ).forEach { (index, label, hasUnread) ->
+            val selected = selectedTab == index
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) IosTheme.colors.card else Color.Transparent)
+                    .clickable { onSelect(index) }
+                    .padding(horizontal = 16.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = label,
+                    style = IosTheme.type.subheadline.copy(
+                        fontSize = 14.sp,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    ),
+                    color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                )
+                if (hasUnread) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFFF3B30)),
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1409,7 +1479,7 @@ private fun ProfileSettingsGearIcon(tint: Color) {
 }
 
 @Composable
-private fun BroomGlyph(tint: Color) {
+internal fun BroomGlyph(tint: Color) {
     Canvas(Modifier.size(20.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val stroke = Stroke(width = 1.7f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
@@ -2091,6 +2161,7 @@ fun SettingsScreen(
     var showNotificationScopeDialog by remember { mutableStateOf(false) }
     var showTestPushLabDialog by remember { mutableStateOf(false) }
     var showSignatureSyncDialog by remember { mutableStateOf(false) }
+    var showFloorNavigationDialog by remember { mutableStateOf(false) }
 
     val prefs = remember { context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE) }
     var devOptionsUnlocked by remember {
@@ -2353,22 +2424,12 @@ fun SettingsScreen(
         if (page == SettingsPage.Reading) item("group-reading") {
             SectionTitle("列表与阅读偏好")
             IosGroupCard {
-                IosRow(onClick = { onShowTopicScrollbar(!showTopicScrollbar) }) {
-                    SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
-                        SettingBookIcon(tint = IosTheme.colors.accent)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                        Text("右侧楼层导航条", style = IosTheme.type.body.copy(fontSize = 14.5.sp))
-                        Text(
-                            "半透明悬浮于右侧，按住时显示清晰，拖动并松手跳转楼层；轻触不会跳转",
-                            style = IosTheme.type.footnote.copy(fontSize = 12.sp),
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.padding(top = 3.dp),
-                        )
-                    }
-                    IosSwitch(checked = showTopicScrollbar, onCheckedChange = onShowTopicScrollbar)
-                }
+                SettingsEntryRow(
+                    title = "选楼方式",
+                    badgeColor = Color(0xFFE8F3FF),
+                    value = if (showTopicScrollbar) "右侧滑动条" else "左下角浮窗",
+                    onClick = { showFloorNavigationDialog = true },
+                ) { SettingBookIcon(tint = IosTheme.colors.accent) }
                 IosDivider()
                 // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
                 // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
@@ -4008,6 +4069,70 @@ fun SettingsScreen(
                 }
             }
             Spacer(Modifier.height(36.dp))
+        }
+    }
+
+    if (showFloorNavigationDialog) {
+        Dialog(onDismissRequest = { showFloorNavigationDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 280.dp, max = 340.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(IosTheme.colors.card)
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("选楼方式", style = IosTheme.type.headline, fontWeight = FontWeight.Bold)
+                Text(
+                    "浏览帖子时只显示选中的一种，选择后立即生效。",
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.secondaryLabel,
+                )
+                Column(Modifier.selectableGroup()) {
+                    listOf(false, true).forEach { useScrollbar ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .selectable(
+                                    selected = showTopicScrollbar == useScrollbar,
+                                    role = Role.RadioButton,
+                                    onClick = {
+                                        onShowTopicScrollbar(useScrollbar)
+                                        showFloorNavigationDialog = false
+                                    },
+                                )
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = showTopicScrollbar == useScrollbar,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = IosTheme.colors.accent,
+                                    unselectedColor = IosTheme.colors.secondaryLabel,
+                                ),
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    if (useScrollbar) "右侧滑动条" else "左下角浮窗",
+                                    style = IosTheme.type.body,
+                                )
+                                Text(
+                                    if (useScrollbar) "沿右侧滑动，松手跳转楼层" else "点击浮窗，可输入楼层或拖动选楼",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.secondaryLabel,
+                                )
+                            }
+                        }
+                    }
+                }
+                TextButton(
+                    onClick = { showFloorNavigationDialog = false },
+                    modifier = Modifier.align(Alignment.End),
+                ) { Text("取消", color = IosTheme.colors.accent) }
+            }
         }
     }
 

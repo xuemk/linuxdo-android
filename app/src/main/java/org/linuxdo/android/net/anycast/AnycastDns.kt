@@ -29,6 +29,8 @@ class AnycastDns(
 ) : Dns {
 
     private val refreshing = AtomicBoolean(false)
+    @Volatile
+    private var lastRefreshAtNanos: Long = 0L
 
     override fun lookup(hostname: String): List<InetAddress> {
         if (!isTargetHost(hostname)) return fallback.lookup(hostname)
@@ -52,14 +54,25 @@ class AnycastDns(
     }
 
     fun scheduleRefreshIfIdle() {
+        val nowNanos = System.nanoTime()
+        val refreshedRecently = lastRefreshAtNanos > 0L && nowNanos - lastRefreshAtNanos < MIN_REFRESH_INTERVAL_NANOS
+        if (pool.hasHealthyProbedNode() && refreshedRecently) return
         if (!refreshing.compareAndSet(false, true)) return
+        lastRefreshAtNanos = nowNanos
         scope.launch {
             try {
                 pool.refresh()
+                if (!pool.hasHealthyProbedNode()) {
+                    lastRefreshAtNanos = 0L
+                }
             } finally {
                 refreshing.set(false)
             }
         }
+    }
+
+    private companion object {
+        const val MIN_REFRESH_INTERVAL_NANOS = 5L * 60L * 1_000_000_000L
     }
 
     /** 必须用 [InetAddress.getByAddress] 绑定原始 hostname，否则 TLS 的 SNI 会变成 IP 字面量。 */

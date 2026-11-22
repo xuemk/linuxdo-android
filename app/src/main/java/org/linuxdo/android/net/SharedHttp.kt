@@ -11,6 +11,8 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.Cookie
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -74,6 +76,7 @@ fun buildSharedHttpClient(
     }
 
     return builder
+        .addInterceptor(StaticCdnRewriteInterceptor())
         .addInterceptor { chain ->
             val request = chain.request()
             val session = request.tag(ActiveSessionRequest::class.java)
@@ -216,7 +219,15 @@ private class SessionHeaderInterceptor(
         val isLinuxDoHost = host == Config.HOST || host.endsWith(".${Config.HOST}")
         val isChallengePlatformHost = host == CHALLENGES_HOST || host.endsWith(".$CHALLENGES_HOST")
         if ((!isLinuxDoHost && !isChallengePlatformHost) || !original.url.isHttps) {
-            return chain.proceed(original.newBuilder().removeHeader("Cookie").removeHeader("X-CSRF-Token").build())
+            val cleanBuilder = original.newBuilder().removeHeader("Cookie").removeHeader("X-CSRF-Token")
+            if (original.url.isHttps && isCdnHost(host)) {
+                val activeUa = runCatching { store.userAgentOrNull() }.getOrNull() ?: userAgent
+                cleanBuilder.header("User-Agent", activeUa)
+                if (original.header("Referer") == null) {
+                    cleanBuilder.header("Referer", "${Config.BASE_URL}/")
+                }
+            }
+            return chain.proceed(cleanBuilder.build())
         }
 
         val generation = original.tag(ActiveSessionRequest::class.java)?.generation
@@ -247,9 +258,11 @@ private class SessionHeaderInterceptor(
             builder.header("Referer", "${Config.BASE_URL}/")
         }
         val encodedPath = original.url.encodedPath
-        val isPublicStaticIcon = isPublicStaticIconUrl(original.url)
+        val isCdnAsset = isCdnHost(host)
+        val isPublicStaticIcon = !isCdnAsset && isPublicStaticIconUrl(original.url)
+        val isCookielessAsset = !sendCookies || isCdnAsset
         var rawWebCookieHeader = ""
-        var cookieHeader = if (!sendCookies) {
+        var cookieHeader = if (isCookielessAsset) {
             ""
         } else if (isPublicStaticIcon) {
             // 对齐 fluxdo：公开静态头像/表情仅只读携带 cf_clearance 等过盾与匿名 Cookie，
@@ -287,7 +300,7 @@ private class SessionHeaderInterceptor(
                 requestUserAgent = store.userAgentOrNull() ?: userAgent
                 rawWebCookieHeader = CookieManager.getInstance().getCookie(original.url.toString()).orEmpty()
                 if (host == Config.HOST) SessionStore.toCookieHeader(store.syncFromWebView())
-                else rawWebCookieHeader
+                else SessionStore.filterSubsiteCookies(host, rawWebCookieHeader)
             }
         }
         val currentUserAgent = store.userAgentOrNull() ?: userAgent
@@ -304,7 +317,7 @@ private class SessionHeaderInterceptor(
         original.tag(ActiveSessionRequest::class.java)?.sentSessionTokenHash =
             SessionStore.authTokenHash(SessionStore.parseCookieHeader(cookieHeader)[Config.SESSION_COOKIE])
         builder.removeHeader("Cookie")
-        if (isPublicStaticIcon || !sendCookies) {
+        if (isPublicStaticIcon || isCookielessAsset) {
             builder.removeHeader("X-CSRF-Token")
         }
         if (cookieHeader.isNotBlank()) {
@@ -372,7 +385,7 @@ private class SessionHeaderInterceptor(
             )
         }
         runCatching { NetDiagnostics.traceOkHttp(chain, outgoing, response, cookieHeader, rawWebCookieHeader, transportLabel) }
-        if (isPublicStaticIcon || !sendCookies) {
+        if (isPublicStaticIcon || isCookielessAsset) {
             return response
         }
         try {
@@ -418,6 +431,47 @@ private class SessionHeaderInterceptor(
     }
 }
 
+/**
+ * 传输层静态资源 CDN 兜底改写拦截器：
+ * 将发往 `https://linux.do` 的头像/表情/内置图/S3 默认上传静态 GET/HEAD 请求强制分流至站点 CDN 域名，
+ * 避免历史缓存链接或遗漏调用点继续消耗主站源站限流配额；仅 `/uploads/default/` 在 CDN 403/404 时安全回退源站。
+ */
+private class StaticCdnRewriteInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if ((request.method != "GET" && request.method != "HEAD") ||
+            request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null
+        ) {
+            return chain.proceed(request)
+        }
+        val url = request.url
+        if (!url.isHttps || !url.host.equals(Config.HOST, ignoreCase = true)) {
+            return chain.proceed(request)
+        }
+        val encodedPath = url.encodedPath
+        if (!Config.isStaticCdnPath(encodedPath)) {
+            return chain.proceed(request)
+        }
+        val cdnBase = (Config.cdnUrl ?: Config.DEFAULT_CDN_URL).toHttpUrlOrNull()
+            ?: return chain.proceed(request)
+        if (cdnBase.host.equals(url.host, ignoreCase = true)) {
+            return chain.proceed(request)
+        }
+        val rewrittenUrl = url.newBuilder()
+            .scheme(cdnBase.scheme)
+            .host(cdnBase.host)
+            .port(cdnBase.port)
+            .build()
+        val rewrittenRequest = request.newBuilder().url(rewrittenUrl).build()
+        val response = chain.proceed(rewrittenRequest)
+        if (encodedPath.startsWith("/uploads/default/") && response.code in setOf(403, 404)) {
+            response.close()
+            return chain.proceed(request)
+        }
+        return response
+    }
+}
+
 data class ActiveSessionRequest(
     val generation: Long,
     @Volatile var sentClearanceFp: String = "-",
@@ -425,6 +479,24 @@ data class ActiveSessionRequest(
     @Volatile var sentSessionTokenHash: String? = null,
     val isClearanceProbe: Boolean = false,
 )
+
+internal fun isCdnHost(host: String): Boolean {
+    val h = host.trimEnd('.').lowercase()
+    if (h == Config.HOST) return false
+    val configuredCdnHost = Config.cdnUrl?.toHttpUrlOrNull()?.host?.lowercase()
+    val configuredS3CdnHost = Config.s3CdnUrl?.toHttpUrlOrNull()?.host?.lowercase()
+    val configuredS3BaseHost = Config.s3BaseUrl?.let {
+        (if (it.startsWith("//")) "https:$it" else it).toHttpUrlOrNull()?.host?.lowercase()
+    }
+    return h == configuredCdnHost ||
+        h == configuredS3CdnHost ||
+        h == configuredS3BaseHost ||
+        h.startsWith("cdn.") ||
+        h.startsWith("cdn3.") ||
+        h.contains(".s3.") ||
+        h == "ldstatic.com" ||
+        h.endsWith(".ldstatic.com")
+}
 
 internal fun isPublicStaticIconUrl(url: okhttp3.HttpUrl): Boolean =
     (url.host == Config.HOST || url.host.endsWith(".${Config.HOST}")) && (
@@ -453,6 +525,7 @@ internal fun shouldInvalidateClearance(request: okhttp3.Request, status: Int, cf
 private fun clearanceRequestPurpose(request: okhttp3.Request): String = when {
     request.tag(ActiveSessionRequest::class.java)?.isClearanceProbe == true -> "验证探针"
     request.tag(SiteImageGateInterceptor.ExplicitDownloadRequest::class.java) != null -> "显式下载"
+    isCdnHost(request.url.host) -> "CDN资源"
     request.url.encodedPath.startsWith("/uploads/") -> "附件资源"
     request.url.encodedPath == "/session/sso_provider" -> "SSO授权"
     request.tag(SiteImageGateInterceptor.SignatureRequest::class.java) != null -> "签名图片"
@@ -509,7 +582,7 @@ internal class SiteImageHttpClientFactory {
     }
 }
 
-/** 头像与正文图片仅在限流后的恢复窗口共用发送预算；未获准的等待不消耗令牌。 */
+/** 头像与正文图片仅在限流后的恢复窗口共用发送预算；未获准或已取消的等待不消耗令牌。 */
 internal class SiteImageRequestPacer(
     private val windowMs: Long = 3_000L,
     private val maxRequests: Int = 6,
@@ -527,8 +600,11 @@ internal class SiteImageRequestPacer(
         recoveryUntil = maxOf(recoveryUntil, untilElapsed)
     }
 
+    /**
+     * 若无需等待，则占用并返回本次预约时间 (>= 0)；否则返回需要等待的毫秒数（以负数表示 `-waitMs`）。
+     */
     @Synchronized
-    fun reserveOrWaitMs(nowElapsed: Long): Long {
+    fun tryAcquireOrWaitMs(nowElapsed: Long): Long {
         if (nowElapsed >= recoveryUntil) {
             sentAt.clear()
             return 0L
@@ -537,8 +613,82 @@ internal class SiteImageRequestPacer(
         val windowWait = if (sentAt.size >= maxRequests) windowMs - (nowElapsed - sentAt.first) else 0L
         val spacingWait = sentAt.peekLast()?.let { minSpacingMs - (nowElapsed - it) } ?: 0L
         val wait = maxOf(windowWait, spacingWait, 0L)
-        if (wait == 0L) sentAt.addLast(nowElapsed)
-        return wait
+        if (wait == 0L) {
+            val slot = nowElapsed.coerceAtLeast(1L)
+            sentAt.addLast(slot)
+            return slot
+        }
+        return -wait
+    }
+
+    @Synchronized
+    fun refund(reservedAt: Long) {
+        if (reservedAt <= 0L) return
+        sentAt.remove(reservedAt)
+    }
+}
+
+/** 支持取消秒跳与高/普通双优先级排队的轻量并发许可池，避免已滑出屏幕取消的图片阻塞后续有效加载。 */
+internal class CancelAwarePrioritySemaphore(
+    private val maxPermits: Int,
+) {
+    private val lock = Object()
+    private var available = maxPermits
+    private var nextSeq = 0L
+
+    private class Waiter(
+        val highPriority: Boolean,
+        val seq: Long,
+    )
+
+    private val waiters = mutableListOf<Waiter>()
+
+    fun tryAcquire(
+        timeoutMs: Long,
+        highPriority: Boolean,
+        isCanceled: () -> Boolean,
+    ): Boolean {
+        if (isCanceled()) return false
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        synchronized(lock) {
+            if (available > 0 && waiters.isEmpty()) {
+                available--
+                return true
+            }
+            val waiter = Waiter(highPriority, nextSeq++)
+            waiters.add(waiter)
+            try {
+                while (true) {
+                    if (isCanceled()) return false
+                    if (available > 0) {
+                        val best = waiters.minWithOrNull(
+                            compareByDescending<Waiter> { it.highPriority }.thenBy { it.seq },
+                        )
+                        if (best === waiter) {
+                            available--
+                            return true
+                        }
+                    }
+                    val remaining = deadline - android.os.SystemClock.elapsedRealtime()
+                    if (remaining <= 0L) return false
+                    lock.wait(minOf(remaining, 80L))
+                }
+            } finally {
+                waiters.remove(waiter)
+                if (available > 0 && waiters.isNotEmpty()) {
+                    lock.notifyAll()
+                }
+            }
+        }
+    }
+
+    fun release() {
+        synchronized(lock) {
+            available = (available + 1).coerceAtMost(maxPermits)
+            if (waiters.isNotEmpty()) {
+                lock.notifyAll()
+            }
+        }
     }
 }
 
@@ -550,6 +700,7 @@ internal class SiteImageRequestPacer(
  * - AVATAR 通道 3 槽（刷长帖时头像与主站 API 共享同一出口的 CF 速率额度，6 槽实测会把正文请求挤进 429 挑战）
  * - MEDIA 通道 4 槽（正文上传大图/附件，独立槽位避免饿死头像）
  * - 限流后的 30 秒恢复窗口内，AVATAR/MEDIA 合计每 3 秒最多 6 次发送、至少间隔 120ms
+ * - 独立 CDN 域名（cdn.linux.do / cdn3.linux.do / ldstatic.com 等）直接放行，不消耗主站限流额度
  *
  * 主站 [org.linuxdo.android.data.TopicRepository] 处于 429 冷却时，图片与其自动重试同步暂缓，不单独冲锋。
  */
@@ -580,9 +731,9 @@ internal object SiteImageGateInterceptor {
     private const val IMAGES_PREFIX = "/images/"
     private val mediaExtensions = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".ico")
 
-    private val emojiPermits = java.util.concurrent.Semaphore(EMOJI_CONCURRENT, true)
-    private val avatarPermits = java.util.concurrent.Semaphore(AVATAR_CONCURRENT, true)
-    private val mediaPermits = java.util.concurrent.Semaphore(MEDIA_CONCURRENT, true)
+    private val emojiPermits = CancelAwarePrioritySemaphore(EMOJI_CONCURRENT)
+    private val avatarPermits = CancelAwarePrioritySemaphore(AVATAR_CONCURRENT)
+    private val mediaPermits = CancelAwarePrioritySemaphore(MEDIA_CONCURRENT)
     private val requestPacer = SiteImageRequestPacer()
     @Volatile private var cooldownUntil = 0L
     @Volatile private var recoveryStore: SessionStore? = null
@@ -593,9 +744,10 @@ internal object SiteImageGateInterceptor {
 
     private fun categorize(url: okhttp3.HttpUrl, isSignature: Boolean = false): ImageCategory {
         val host = url.host.lowercase().trimEnd('.')
+        // 已分流至独立 CDN 域名的静态资源直接放行，不再占用主站并发和限流窗口
+        if (isCdnHost(host)) return ImageCategory.NONE
         val isLinuxDo = host == Config.HOST || host.endsWith(".${Config.HOST}")
-        val isLdStatic = host == "ldstatic.com" || host.endsWith(".ldstatic.com")
-        if (!isLinuxDo && !isLdStatic) return ImageCategory.NONE
+        if (!isLinuxDo) return ImageCategory.NONE
         val path = url.encodedPath
         val lowerPath = path.lowercase()
         return when {
@@ -604,7 +756,6 @@ internal object SiteImageGateInterceptor {
             isSignature -> ImageCategory.MEDIA
             path.startsWith(UPLOADS_PREFIX) || path.startsWith(IMAGES_PREFIX) -> ImageCategory.MEDIA
             mediaExtensions.any { lowerPath.endsWith(it) } -> ImageCategory.MEDIA
-            isLdStatic -> ImageCategory.MEDIA
             else -> ImageCategory.NONE
         }
     }
@@ -642,7 +793,9 @@ internal object SiteImageGateInterceptor {
             ImageCategory.MEDIA -> mediaPermits
             ImageCategory.NONE -> avatarPermits
         }
-        if (!semaphore.tryAcquire(ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        val highPriority = category == ImageCategory.EMOJI || category == ImageCategory.AVATAR
+        if (!semaphore.tryAcquire(ACQUIRE_TIMEOUT_MS, highPriority) { chain.call().isCanceled() }) {
+            if (chain.call().isCanceled()) throw IOException("Canceled")
             throw ThrottledException("站内图片排队超时")
         }
         val response = try {
@@ -661,7 +814,7 @@ internal object SiteImageGateInterceptor {
         return response
     }
 
-    /** 网络拦截器逐次准入，重定向与重试也计数；异步图片使用独立 Dispatcher。 */
+    /** 网络拦截器逐次准入，重定向与重试也计数；异步图片使用独立 Dispatcher，取消时立刻退还时间窗名额。 */
     fun awaitSendSlot(chain: Interceptor.Chain, request: okhttp3.Request, store: SessionStore) {
         if (request.tag(ExplicitDownloadRequest::class.java) != null) return
         val isSignature = request.tag(SignatureRequest::class.java) != null
@@ -675,8 +828,15 @@ internal object SiteImageGateInterceptor {
             }
             checkRecovery(request.url, store, isSignature)
             checkCooldown()
-            val waitMs = requestPacer.reserveOrWaitMs(android.os.SystemClock.elapsedRealtime())
-            if (waitMs == 0L) return
+            val slotOrWait = requestPacer.tryAcquireOrWaitMs(android.os.SystemClock.elapsedRealtime())
+            if (slotOrWait >= 0L) {
+                if (chain.call().isCanceled()) {
+                    requestPacer.refund(slotOrWait)
+                    throw IOException("Canceled")
+                }
+                return
+            }
+            val waitMs = -slotOrWait
             try {
                 Thread.sleep(minOf(waitMs, 100L))
             } catch (interrupted: InterruptedException) {
@@ -789,6 +949,25 @@ internal object ZoneRequestLedger {
             events.forEach { (time, category) -> if (now - time <= windowMs) counts[category]++ }
         }
         return "共 ${counts.sum()} 次（" + labels.indices.joinToString("，") { "${labels[it]} ${counts[it]}" } + "）"
+    }
+
+    /** 最近 [windowMs] 内发往 *.linux.do 的总请求次数（含子站跳转与静态漏网请求）。 */
+    fun recentCount(windowMs: Long): Int {
+        val now = android.os.SystemClock.elapsedRealtime()
+        return synchronized(events) {
+            trimLocked(now)
+            events.count { (time, _) -> now - time <= windowMs }
+        }
+    }
+
+    /** 距离最近一次发往 *.linux.do 请求已静默的毫秒数；无记录时返回 [Long.MAX_VALUE]。 */
+    fun idleSinceLastEventMs(): Long {
+        val now = android.os.SystemClock.elapsedRealtime()
+        return synchronized(events) {
+            trimLocked(now)
+            val last = events.peekLast()?.first ?: return Long.MAX_VALUE
+            (now - last).coerceAtLeast(0L)
+        }
     }
 
     /** 同一波挑战（多张图片同时 429）只记一次快照。 */

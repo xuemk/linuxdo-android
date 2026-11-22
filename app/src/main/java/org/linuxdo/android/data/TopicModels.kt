@@ -478,12 +478,13 @@ private data class ThumbnailCandidate(
 
 private fun normalizeTopicImageUrl(rawUrl: String?): String? {
     val url = rawUrl?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-    return when {
+    val resolved = when {
         url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true) -> url
         url.startsWith("//") -> "https:$url"
-        url.startsWith("/") -> Config.BASE_URL + url
-        else -> "${Config.BASE_URL}/$url"
+        url.startsWith("/") -> url
+        else -> "/$url"
     }
+    return Config.resolveUrlWithCdn(resolved)
 }
 
 @Serializable
@@ -504,6 +505,7 @@ data class DiscourseUser(
     @SerialName("trust_level") val trustLevel: Int? = null,
     /** 网页端个人偏好「启用签名」(discourse-signatures see_signatures)，默认关闭。 */
     @SerialName("see_signatures") val seeSignatures: Boolean? = null,
+    @SerialName("gamification_score") val gamificationScore: Int? = null,
 )
 
 @Serializable
@@ -1131,11 +1133,12 @@ data class UserCardData(
             val path = profileBackgroundUploadUrl?.trim()?.takeIf { it.isNotEmpty() }
                 ?: cardBackgroundUploadUrl?.trim()?.takeIf { it.isNotEmpty() }
                 ?: return null
-            return when {
+            val resolved = when {
                 path.startsWith("//") -> "https:$path"
                 path.startsWith("https://", ignoreCase = true) || path.startsWith("http://", ignoreCase = true) -> path
-                else -> Config.BASE_URL + "/" + path.trimStart('/')
+                else -> "/" + path.trimStart('/')
             }
+            return Config.resolveUrlWithCdn(resolved)
         }
 
     val topicPostCount: Int?
@@ -1722,7 +1725,7 @@ internal object SignaturePolicy {
             extracted.startsWith("//") -> "https:$extracted"
             extracted.startsWith("/") -> "${Config.BASE_URL}$extracted"
             else -> extracted
-        }
+        }.let(Config::resolveUrlWithCdn)
         val parsed = candidate.toHttpUrlOrNull() ?: return null
         if (!isAllowedImageUrl(parsed)) return null
         return parsed.toString()
@@ -2042,14 +2045,16 @@ fun avatarUrlOf(
         }
         val replaced = effectiveAnim.replace("{size}", safeAnimSize.toString())
         val animPath = if (replaced.startsWith("//")) "https:$replaced" else replaced
-        return if (animPath.startsWith("http", ignoreCase = true)) animPath
-        else Config.BASE_URL + (if (animPath.startsWith("/")) animPath else "/$animPath")
+        val normalizedAnim = if (animPath.startsWith("http", ignoreCase = true)) animPath
+        else if (animPath.startsWith("/")) animPath else "/$animPath"
+        return Config.resolveUrlWithCdn(normalizedAnim)
     }
     if (template.isNullOrBlank()) return null
     val path = template.replace("{size}", size.toString())
-    if (path.startsWith("//")) return "https:$path"
-    return if (path.startsWith("http", ignoreCase = true)) path
-    else Config.BASE_URL + (if (path.startsWith("/")) path else "/$path")
+    if (path.startsWith("//")) return Config.resolveUrlWithCdn("https:$path")
+    val normalized = if (path.startsWith("http", ignoreCase = true)) path
+    else if (path.startsWith("/")) path else "/$path"
+    return Config.resolveUrlWithCdn(normalized)
 }
 
 fun avatarUrlOf(template: String?, size: Int): String? = avatarUrlOf(template, null, size)

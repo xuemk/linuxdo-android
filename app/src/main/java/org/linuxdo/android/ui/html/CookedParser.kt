@@ -215,7 +215,7 @@ fun contentUrl(value: String): String? = runCatching {
     }
     URI(Config.BASE_URL + "/").resolve(normalized).takeIf {
         it.scheme?.lowercase() in setOf("http", "https") && !it.host.isNullOrBlank() && it.userInfo == null
-    }?.toASCIIString()
+    }?.toASCIIString()?.let(Config::resolveUrlWithCdn)
 }.getOrNull()
 
 private val ATTACHMENT_EXTENSIONS = setOf(

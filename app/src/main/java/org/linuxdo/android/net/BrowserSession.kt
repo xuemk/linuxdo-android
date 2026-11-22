@@ -228,6 +228,9 @@ class BrowserSession(
         val seeSignatures = if (userObj.has("see_signatures") && !userObj.isNull("see_signatures")) {
             userObj.optBoolean("see_signatures")
         } else null
+        val gamificationScore = if (userObj.has("gamification_score") && !userObj.isNull("gamification_score")) {
+            userObj.optInt("gamification_score")
+        } else null
         return org.linuxdo.android.data.DiscourseUser(
             id = id,
             username = username,
@@ -236,6 +239,7 @@ class BrowserSession(
             animatedAvatar = anim,
             trustLevel = if (userObj.has("trust_level") && !userObj.isNull("trust_level")) userObj.optInt("trust_level") else null,
             seeSignatures = seeSignatures,
+            gamificationScore = gamificationScore,
         )
     }
 

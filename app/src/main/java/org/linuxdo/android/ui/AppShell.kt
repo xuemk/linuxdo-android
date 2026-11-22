@@ -65,6 +65,13 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.Text
 import org.linuxdo.android.ui.screen.PostAction
@@ -77,6 +84,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -116,6 +124,7 @@ import org.linuxdo.android.data.NotificationPollInterval
 import org.linuxdo.android.data.compactCategoryGroups
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosMetrics
+import org.linuxdo.android.ui.design.IosNavBar
 import org.linuxdo.android.ui.design.IosTheme
 import org.linuxdo.android.ui.nav.IosNavHost
 import org.linuxdo.android.ui.nav.NavStack
@@ -679,6 +688,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         key(tab) { rememberSaveable { mutableIntStateOf(0) } }
     }
     var selected by rememberSaveable { mutableStateOf(MainTab.Latest) }
+    var messageSubTab by rememberSaveable { mutableIntStateOf(0) } // 0: 通知(默认), 1: 聊天
     val holder = rememberSaveableStateHolder()
     val stack = stacks.getValue(selected)
     val scrollToTopRequest = scrollRequests.getValue(selected).intValue
@@ -714,6 +724,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val ldcState by viewModel.ldcState.collectAsStateWithLifecycle()
     val cdkScoreState by viewModel.cdkScore.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
+    val chatUnread = remember(chat.channels) {
+        chat.channels.filter { it.membership?.muted != true }.sumOf { it.unreadCount }
+    }
     val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
     val userRepliesStates by viewModel.userRepliesStates.collectAsStateWithLifecycle()
     val topicSortOrder by viewModel.topicSortOrder.collectAsStateWithLifecycle()
@@ -870,9 +883,30 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         }
     }
     val openNotifications = {
+        messageSubTab = 0
         if (stack.current != Route.Notifications) stack.push(Route.Notifications)
         viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true)
         viewModel.refreshUnread(force = true)
+    }
+
+    var lastExitBackPressAt by remember { mutableLongStateOf(0L) }
+    var exitHintToast by remember { mutableStateOf<Toast?>(null) }
+    BackHandler(enabled = browsing && !stack.canPop && !contentObscured) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastExitBackPressAt <= 2_000L) {
+            exitHintToast?.cancel()
+            findHostActivity(context)?.finish()
+        } else {
+            lastExitBackPressAt = now
+            exitHintToast?.cancel()
+            exitHintToast = Toast.makeText(context, "再按一次退出", Toast.LENGTH_SHORT).also { it.show() }
+        }
+    }
+
+    val openChatInMessages = {
+        messageSubTab = 1
+        selected = MainTab.Messages
+        stacks.getValue(MainTab.Messages).popToRoot()
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -1272,7 +1306,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChatInMessages,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1368,7 +1402,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChatInMessages,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1453,10 +1487,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenConnect = { showConnectSheet = true },
                                 onOpenHistory = { stack.push(Route.BrowsingHistory) },
                                 onOpenFollowing = { state.username?.let { stack.push(Route.FollowList(it)) } },
-                                onOpenChat = { stack.push(Route.Chat) },
+                                onOpenChat = openChatInMessages,
                                 onOpenBlacklist = { stack.push(Route.Blacklist) },
                                 onOpenLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onOpenLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
+                                onOpenAppsPlaza = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onOpenUser = { username, primaryAvatar, staticAvatar ->
                                     stack.push(Route.UserProfile(username, primaryAvatar, staticAvatar))
                                 },
@@ -1524,6 +1559,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                             is Route.ChatRoom -> {
                                 val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
                                 val roomActive = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                                LaunchedEffect(roomActive, route.channelId) {
+                                    if (roomActive && chat.channels.isEmpty()) viewModel.loadChatChannels()
+                                }
                                 val channel = chat.channels.firstOrNull { it.id == route.channelId }
                                     ?: org.linuxdo.android.data.ChatChannelSummary(id = route.channelId, title = route.title)
                                 val currentUsername = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }?.username
@@ -1534,6 +1572,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     currentUsername = currentUsername,
                                     onLoad = viewModel::loadChatRoom,
                                     onLoadPast = viewModel::loadMoreChatHistory,
+                                    onSetChannelMuted = viewModel::setChatChannelMuted,
                                     onSend = viewModel::sendChatMessage,
                                     onUploadAttachment = viewModel::uploadChatAttachment,
                                     onOpenUser = viewModel::openUserCard,
@@ -1613,7 +1652,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToCategories = { selected = MainTab.Categories },
                                     onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
                                     onNavigateToConnect = { showConnectSheet = true },
-                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                    onNavigateToChat = openChatInMessages,
                                 onNavigateToApps = { globalBrowserUrl = org.linuxdo.android.ui.screen.LINUXDO_APPS_PLAZA_URL },
                                 onNavigateToLdcStore = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Store.url },
                                 onNavigateToLdcMail = { globalBrowserUrl = org.linuxdo.android.ui.screen.ProfileWebApp.Mail.url },
@@ -1770,29 +1809,136 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onSelfHealNetwork = { viewModel.selfHealNetwork(context) },
                             )
 
-                            Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
-                                onOpenTopic = { id, title, postNumber ->
-                                    viewModel.markNotificationTopicPending(id, postNumber)
-                                    val currentRoute = stack.current
-                                    if (currentRoute is Route.TopicDetail && currentRoute.topicId == id) {
-                                        viewModel.loadTopic(
-                                            id,
-                                            postNumber = postNumber,
-                                            resumePostNumber = viewModel.resolveResumePostNumber(id, postNumber),
-                                            fromNotification = true,
-                                        )
-                                    } else {
-                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                            Route.Notifications -> {
+                                val messagePagerState = rememberPagerState(
+                                    initialPage = messageSubTab.coerceIn(0, 1),
+                                    pageCount = { 2 },
+                                )
+                                LaunchedEffect(messageSubTab) {
+                                    val target = messageSubTab.coerceIn(0, 1)
+                                    if (messagePagerState.currentPage != target) {
+                                        messagePagerState.animateScrollToPage(target)
                                     }
-                                },
-                                onOpenUser = viewModel::openUserCard,
-                                onDiagnostics = { stack.push(Route.Diagnostics) }, onSettings = { stack.push(Route.Settings) },
-                                active = active, notificationOnly = true, onBack = null,
-                                onReadNotification = viewModel::readNotification,
-                                onMarkAllNotificationsRead = viewModel::markAllNotificationsRead,
-                                notificationFilter = notificationFilter,
-                                onNotificationFilter = viewModel::setNotificationFilter,
-                                unreadFilters = state.unreadFilters)
+                                }
+                                LaunchedEffect(messagePagerState.settledPage) {
+                                    if (messageSubTab != messagePagerState.settledPage) {
+                                        messageSubTab = messagePagerState.settledPage
+                                    }
+                                }
+                                var markAllReadTrigger by remember { mutableIntStateOf(0) }
+                                var chatShowSearch by rememberSaveable { mutableStateOf(false) }
+                                var chatSearchQuery by rememberSaveable { mutableStateOf("") }
+
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(IosTheme.colors.groupedBackground),
+                                ) {
+                                    IosNavBar(
+                                        title = "",
+                                        customTitle = {
+                                            MessageCenterSegmentedTitle(
+                                                selectedTab = messagePagerState.currentPage,
+                                                notificationUnread = state.unreadCount,
+                                                chatUnread = chatUnread,
+                                                onSelect = { target -> messageSubTab = target },
+                                            )
+                                        },
+                                        onBack = null,
+                                        trailing = {
+                                            if (messagePagerState.currentPage == 0) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(34.dp)
+                                                        .clip(CircleShape)
+                                                        .clickable { markAllReadTrigger++ },
+                                                    contentAlignment = Alignment.Center,
+                                                ) {
+                                                    BroomGlyph(tint = IosTheme.colors.label)
+                                                }
+                                            } else {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    IconButton(onClick = {
+                                                        chatShowSearch = !chatShowSearch
+                                                        if (!chatShowSearch) chatSearchQuery = ""
+                                                    }) {
+                                                        Icon(
+                                                            imageVector = if (chatShowSearch) Icons.Default.Close else Icons.Default.Search,
+                                                            contentDescription = "搜索",
+                                                            tint = IosTheme.colors.label,
+                                                            modifier = Modifier.size(20.dp),
+                                                        )
+                                                    }
+                                                    TextButton(
+                                                        onClick = { viewModel.loadChatChannels(refresh = true) },
+                                                        enabled = !chat.loadingChannels,
+                                                    ) {
+                                                        Text("刷新", color = IosTheme.colors.accent)
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    )
+                                    HorizontalPager(
+                                        state = messagePagerState,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxWidth(),
+                                        beyondViewportPageCount = 1,
+                                    ) { page ->
+                                        if (page == 0) {
+                                            ProfileScreen(
+                                                state.username,
+                                                profile,
+                                                viewModel::loadProfile,
+                                                onOpenTopic = { id, title, postNumber ->
+                                                    viewModel.markNotificationTopicPending(id, postNumber)
+                                                    val currentRoute = stack.current
+                                                    if (currentRoute is Route.TopicDetail && currentRoute.topicId == id) {
+                                                        viewModel.loadTopic(
+                                                            id,
+                                                            postNumber = postNumber,
+                                                            resumePostNumber = viewModel.resolveResumePostNumber(id, postNumber),
+                                                            fromNotification = true,
+                                                        )
+                                                    } else {
+                                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                                                    }
+                                                },
+                                                onOpenUser = viewModel::openUserCard,
+                                                onDiagnostics = { stack.push(Route.Diagnostics) },
+                                                onSettings = { stack.push(Route.Settings) },
+                                                active = active && messagePagerState.currentPage == 0,
+                                                notificationOnly = true,
+                                                showTopBar = false,
+                                                markAllReadTrigger = markAllReadTrigger,
+                                                onBack = null,
+                                                onReadNotification = viewModel::readNotification,
+                                                onMarkAllNotificationsRead = viewModel::markAllNotificationsRead,
+                                                notificationFilter = notificationFilter,
+                                                onNotificationFilter = viewModel::setNotificationFilter,
+                                                unreadFilters = state.unreadFilters,
+                                                scrollToTopRequest = if (messagePagerState.currentPage == 0) scrollToTopRequest else 0,
+                                            )
+                                        } else {
+                                            ChatListScreen(
+                                                state = chat,
+                                                active = active && messagePagerState.currentPage == 1,
+                                                onLoad = { viewModel.loadChatChannels() },
+                                                onRefresh = { viewModel.loadChatChannels(refresh = true) },
+                                                onOpenChannel = { channel -> stack.push(Route.ChatRoom(channel.id, channel.displayTitle)) },
+                                                onBack = null,
+                                                embedded = true,
+                                                showTopBar = false,
+                                                externalShowSearch = chatShowSearch,
+                                                externalSearchQuery = chatSearchQuery,
+                                                onExternalSearchQueryChange = { chatSearchQuery = it },
+                                                bottomContentPadding = 72.dp,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
 
 
                             Route.Diagnostics -> DiagnosticsScreen(
@@ -1884,7 +2030,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                 selected,
                 homeFeedLabel = state.homeFeed.label,
                 categoriesTabLabel = if (categorySubTab == org.linuxdo.android.ui.CategorySectionTab.TAGS) "标签" else "分类",
-                unreadCount = state.unreadCount,
+                unreadCount = state.unreadCount + chatUnread,
             ) { tab ->
                 if (browsing) {
                     if (tab == selected) {
@@ -2557,4 +2703,10 @@ private fun AttachmentDownloadOverlayCard(
             }
         }
     }
+}
+
+private tailrec fun findHostActivity(context: Context): android.app.Activity? = when (context) {
+    is android.app.Activity -> context
+    is android.content.ContextWrapper -> findHostActivity(context.baseContext)
+    else -> null
 }

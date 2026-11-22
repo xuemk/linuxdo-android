@@ -137,8 +137,10 @@ enum class ApiQuotaPool(
      */
     fun tryAcquire(force: Boolean = false): Boolean {
         if (TopicRepository.isRateLimitCoolingDown()) return false
-        // 子站授权刚完成：主站静默窗口内所有后台池让行（含用户强制刷新的未读，界面会在窗口结束后自然补拉）。
+        if (TopicRepository.isSubsiteAuthInProgress()) return false
+        // 子站授权或 timings 撞 CF 速率挑战后：后台池整体让行（含强制未读刷新），界面会在窗口结束后自然补拉。
         if (TopicRepository.postOAuthQuietRemainingMs() > 0L) return false
+        if (TopicRepository.backgroundChallengeQuietRemainingMs() > 0L) return false
         // 内置浏览器（小程序 / 专属邮箱等）打开期间整体让行，用户主动操作也不例外，避免与页面内验证叠加计数。
         if (inAppBrowserPauseRemainingMs() > 0L) return false
         val now = SystemClock.elapsedRealtime()
@@ -167,6 +169,7 @@ enum class ApiQuotaPool(
         val foregroundWait = if (yieldToForeground) lastActivityAt() + FOREGROUND_QUIET_MS - now else 0L
         return maxOf(
             poolWait, TopicRepository.rateLimitRemainingMs(), TopicRepository.postOAuthQuietRemainingMs(),
+            TopicRepository.backgroundChallengeQuietRemainingMs(),
             foregroundWait, inAppBrowserPauseRemainingMs(), 0L,
         )
     }
@@ -212,6 +215,13 @@ enum class ApiQuotaPool(
         }
 
         private fun lastActivityAt(): Long = maxOf(lastForegroundAt, TopicRepository.lastPostRequestAt)
+
+        /** 距离最近一次前台 GET 或写请求（含 timings）已静默的毫秒数。 */
+        fun sinceLastForegroundActivityMs(): Long {
+            val last = lastActivityAt()
+            if (last <= 0L) return Long.MAX_VALUE
+            return (SystemClock.elapsedRealtime() - last).coerceAtLeast(0L)
+        }
 
         fun foregroundQuietRemainingMs(): Long = maxOf(
             (lastActivityAt() + FOREGROUND_QUIET_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
