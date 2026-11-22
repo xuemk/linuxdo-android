@@ -600,6 +600,7 @@ data class ChatUiState(
     val loadingChannels: Boolean = false,
     val loadingChannelId: Long? = null,
     val sendingChannelId: Long? = null,
+    val updatingMuteChannelIds: Set<Long> = emptySet(),
     val error: String? = null,
 )
 
@@ -1243,6 +1244,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+    private val chatChannelsGate = Mutex()
     private val _chat = MutableStateFlow(ChatUiState())
     val chat: StateFlow<ChatUiState> = _chat.asStateFlow()
     private val _treeView = MutableStateFlow(container.preferences.getBoolean("tree_view", true))
@@ -3963,15 +3965,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun loadChatChannels(refresh: Boolean = false) {
         if (_chat.value.loadingChannels) return
         if (!refresh && _chat.value.channels.isNotEmpty()) return
+        val generation = accountScopeGeneration
         _chat.update { it.copy(loadingChannels = true, error = null) }
         pageJobs["chatChannels"] = viewModelScope.launch {
             try {
-                val channels = repository.fetchChatChannels()
-                _chat.update { it.copy(channels = channels, loadingChannels = false, error = null) }
+                chatChannelsGate.withLock {
+                    if (generation != accountScopeGeneration) return@withLock
+                    val channels = repository.fetchChatChannels()
+                    if (generation == accountScopeGeneration) {
+                        _chat.update { it.copy(channels = channels, loadingChannels = false, error = null) }
+                    }
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _chat.update { it.copy(loadingChannels = false, error = error.message ?: "Chat 频道加载失败") }
+                if (generation == accountScopeGeneration) {
+                    _chat.update { it.copy(loadingChannels = false, error = error.message ?: "Chat 频道加载失败") }
+                }
+            }
+        }
+    }
+
+    fun setChatChannelMuted(channelId: Long, muted: Boolean) {
+        val state = _chat.value
+        val channel = state.channels.firstOrNull { it.id == channelId } ?: return
+        val membership = channel.membership ?: return
+        if (channel.isDirectMessage || membership.muted == muted || channelId in state.updatingMuteChannelIds) return
+
+        val generation = accountScopeGeneration
+        _chat.update { it.copy(updatingMuteChannelIds = it.updatingMuteChannelIds + channelId) }
+        pageJobs["chatMute:$channelId"] = viewModelScope.launch {
+            try {
+                chatChannelsGate.withLock {
+                    if (generation != accountScopeGeneration) return@withLock
+                    repository.setChatChannelMuted(channelId, muted)
+                    if (generation != accountScopeGeneration) return@withLock
+                    _chat.update { state ->
+                        state.copy(channels = state.channels.map { channel ->
+                            val existing = channel.membership
+                            if (channel.id == channelId && existing != null) {
+                                channel.copy(membership = existing.copy(muted = muted))
+                            } else channel
+                        })
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (generation == accountScopeGeneration) {
+                    Toast.makeText(getApplication(), error.message ?: "消息免打扰设置失败", Toast.LENGTH_LONG).show()
+                    handlePageFailure(error) { setChatChannelMuted(channelId, muted) }
+                }
+            } finally {
+                if (generation == accountScopeGeneration) {
+                    _chat.update { it.copy(updatingMuteChannelIds = it.updatingMuteChannelIds - channelId) }
+                }
             }
         }
     }

@@ -2174,6 +2174,13 @@ class TopicRepository(
         )
     }
 
+    suspend fun setChatChannelMuted(channelId: Long, muted: Boolean) {
+        require(channelId > 0)
+        val settings = JsonObject(mapOf("muted" to JsonPrimitive(muted)))
+        val body = JsonObject(mapOf("notifications_settings" to settings))
+        mutate("/chat/api/channels/$channelId/notifications-settings/me", "PUT", body.toString())
+    }
+
     suspend fun markChatChannelRead(channelId: Long, messageId: Long?) {
         val query = messageId?.let { "?message_id=$it" }.orEmpty()
         mutate("/chat/api/channels/$channelId/read$query", "PUT")

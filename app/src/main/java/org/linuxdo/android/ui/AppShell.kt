@@ -1462,6 +1462,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                             is Route.ChatRoom -> {
                                 val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
                                 val roomActive = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                                LaunchedEffect(roomActive, route.channelId) {
+                                    if (roomActive && chat.channels.isEmpty()) viewModel.loadChatChannels()
+                                }
                                 val channel = chat.channels.firstOrNull { it.id == route.channelId }
                                     ?: org.linuxdo.android.data.ChatChannelSummary(id = route.channelId, title = route.title)
                                 val currentUsername = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }?.username
@@ -1472,6 +1475,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     currentUsername = currentUsername,
                                     onLoad = viewModel::loadChatRoom,
                                     onLoadPast = viewModel::loadMoreChatHistory,
+                                    onSetChannelMuted = viewModel::setChatChannelMuted,
                                     onSend = viewModel::sendChatMessage,
                                     onUploadAttachment = viewModel::uploadChatAttachment,
                                     onOpenUser = viewModel::openUserCard,
