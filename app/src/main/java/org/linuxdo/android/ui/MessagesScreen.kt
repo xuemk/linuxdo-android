@@ -105,6 +105,7 @@ internal fun MessagesScreen(
                 selected = if (directMessages) 1 else 0,
                 onSelect = { onDirectMessages(it == 1) },
                 active = active && chatOpen,
+                compactHeader = true,
                 unread = { index -> unreadChannels.any { it.isDirectMessage == (index == 1) } },
             ) { page ->
                 val direct = page == 1
@@ -117,6 +118,7 @@ internal fun MessagesScreen(
                 selected = filter.ordinal,
                 onSelect = { onFilter(filters[it]) },
                 active = active && !chatOpen,
+                compactHeader = true,
                 unread = { index ->
                     val tab = filters[index]
                     tab != NotificationFilter.All && (tab in unreadFilters ||
@@ -152,6 +154,7 @@ private fun MessagePages(
     onSelect: (Int) -> Unit,
     active: Boolean,
     swipeContent: Boolean = true,
+    compactHeader: Boolean = false,
     unread: (Int) -> Boolean,
     actionWidth: Dp = 0.dp,
     actions: @Composable () -> Unit = {},
@@ -216,6 +219,7 @@ private fun MessagePages(
                 modifier = if (swipeContent) Modifier else gesture,
                 indicatorPosition = { pager.currentPage + pager.currentPageOffsetFraction },
                 unread = unread,
+                compact = compactHeader,
                 actionWidth = actionWidth,
                 actions = actions,
             )

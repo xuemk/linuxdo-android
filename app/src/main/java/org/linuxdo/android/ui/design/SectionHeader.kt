@@ -21,6 +21,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
@@ -41,16 +42,22 @@ internal fun SectionHeader(
     modifier: Modifier = Modifier,
     indicatorPosition: (() -> Float)? = null,
     unread: (Int) -> Boolean = { false },
+    compact: Boolean = false,
     actionWidth: Dp = 0.dp,
     actions: @Composable () -> Unit = {},
 ) {
     val accent = IosTheme.colors.accent
     val animatedIndex = animateFloatAsState(selected.toFloat(), tween(170), label = "section indicator")
+    val tabWidth = if (compact) {
+        maxOf(68.dp, with(LocalDensity.current) { 68.sp.toDp() })
+    } else 80.dp
+    val selectedFontSize = if (compact) 14.5.sp else 17.5.sp
+    val unselectedFontSize = if (compact) 13.sp else 15.sp
     Box(modifier.fillMaxWidth().height(IosMetrics.largeTitleHeight)
         .background(IosTheme.colors.groupedBackground), contentAlignment = Alignment.Center) {
         Box(Modifier.fillMaxWidth().padding(horizontal = maxOf(IosMetrics.screenPadding, actionWidth)),
             contentAlignment = Alignment.Center) {
-            Row(Modifier.widthIn(max = (80 * labels.size).dp).fillMaxWidth()
+            Row(Modifier.widthIn(max = tabWidth * labels.size).fillMaxWidth()
                 .then(if (onSelect != null) Modifier.selectableGroup() else Modifier)
                 .drawWithContent {
                     drawContent()
@@ -73,7 +80,7 @@ internal fun SectionHeader(
                         contentAlignment = Alignment.Center) {
                         Box {
                             Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                fontSize = if (isSelected) 17.5.sp else 15.sp,
+                                fontSize = if (isSelected) selectedFontSize else unselectedFontSize,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                 color = if (isSelected) IosTheme.colors.label else IosTheme.colors.secondaryLabel)
                             if (hasUnread) Spacer(Modifier.align(Alignment.TopEnd).offset(x = 6.dp)
