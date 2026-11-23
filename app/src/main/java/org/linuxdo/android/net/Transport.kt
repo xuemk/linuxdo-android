@@ -90,6 +90,26 @@ interface Transport {
     companion object {
         const val JSON_CONTENT_TYPE = "application/json; charset=utf-8"
         const val FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=utf-8"
+
+        private val TRACK_VIEW_TOPIC_PATH_REGEX =
+            Regex("""^/t/(\d+)(?:/\d+)?\.json\?(?:.*&)?track_visit=true(?:&.*)?$""")
+
+        /**
+         * Discourse 3.4+ (PR #27533) 将话题浏览统计(TopicViewItem/topic_views，即 connect 的浏览话题数)
+         * 收敛至 Middleware::RequestTracker，仅在携带 Discourse-Track-View 与 Discourse-Track-View-Topic-Id 时记账。
+         * 仅匹配前台(present=true)且显式标记 track_visit=true 的话题详情 GET 请求。
+         */
+        fun trackViewTopicId(path: String, present: Boolean, method: String = "GET"): Long? {
+            if (!present || !method.equals("GET", ignoreCase = true)) return null
+            val normalized = if (path.startsWith(Config.BASE_URL)) {
+                path.removePrefix(Config.BASE_URL)
+            } else {
+                path
+            }
+            val idStr = TRACK_VIEW_TOPIC_PATH_REGEX.matchEntire(normalized)?.groupValues?.getOrNull(1)
+                ?: return null
+            return idStr.toLongOrNull()?.takeIf { it > 0L }
+        }
     }
 }
 

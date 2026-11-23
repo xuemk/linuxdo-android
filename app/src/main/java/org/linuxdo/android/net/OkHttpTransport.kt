@@ -134,6 +134,10 @@ class OkHttpTransport(
                     } else if (present) {
                         header("Discourse-Present", "true")
                     }
+                    Transport.trackViewTopicId(path, present = present, method = method)?.let { topicId ->
+                        header("Discourse-Track-View", "1")
+                        header("Discourse-Track-View-Topic-Id", topicId.toString())
+                    }
                 }
                 if (method != "GET") {
                     method(method, (body ?: "").toRequestBody(contentType.toMediaType()))

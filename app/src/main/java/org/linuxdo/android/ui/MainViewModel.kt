@@ -1900,12 +1900,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setFeedDisplayMode(mode: String) {
         store.setFeedDisplayMode(mode)
-        _feedDisplayMode.value = mode
-        _feedGraphicMode.value = (mode == "graphic")
+        _feedDisplayMode.value = store.getFeedDisplayMode()
+        _feedGraphicMode.value = false
     }
 
     fun setFeedGraphicMode(enabled: Boolean) {
-        val mode = if (enabled) "graphic" else if (_feedDisplayMode.value == "graphic") "small_image" else _feedDisplayMode.value
+        val mode = if (enabled) "no_excerpt" else if (_feedDisplayMode.value == "no_excerpt") "small_image" else _feedDisplayMode.value
         setFeedDisplayMode(mode)
     }
 

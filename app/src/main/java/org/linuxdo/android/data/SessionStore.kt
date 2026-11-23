@@ -1569,18 +1569,29 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         plainPrefs.edit().putBoolean(KEY_DOH_FORCE_OVER_PROXY, enabled).apply()
     }
 
-    /** 首页信息流显示模式：强制全量收敛为无正文模式（图文模式代码保留后续再优化） */
-    fun getFeedDisplayMode(): String = "no_excerpt"
-
-    fun setFeedDisplayMode(mode: String) {
-        plainPrefs.edit().putString(KEY_FEED_DISPLAY_MODE, "no_excerpt").apply()
+    /** 首页信息流显示模式：允许 大图(no_excerpt) / 小图(small_image) / 无图(text_only)，全部只显示标题不抓正文。 */
+    fun getFeedDisplayMode(): String = when (plainPrefs.getString(KEY_FEED_DISPLAY_MODE, "no_excerpt")) {
+        "small_image" -> "small_image"
+        "text_only" -> "text_only"
+        else -> "no_excerpt"
     }
 
-    // 兼容旧接口（强制关闭图文大卡片）
+    fun setFeedDisplayMode(mode: String) {
+        val normalized = when (mode) {
+            "small_image", "text_only" -> mode
+            else -> "no_excerpt"
+        }
+        plainPrefs.edit().putString(KEY_FEED_DISPLAY_MODE, normalized).apply()
+    }
+
+    // 兼容旧接口（图文大卡片始终关闭）
     fun isFeedGraphicMode(): Boolean = false
 
     fun setFeedGraphicMode(enabled: Boolean) {
-        setFeedDisplayMode("no_excerpt")
+        val target = if (!enabled && getFeedDisplayMode() == "text_only") "text_only"
+        else if (!enabled) "small_image"
+        else "no_excerpt"
+        setFeedDisplayMode(target)
     }
 
     /** 搜索历史记录（最多保留20条，最新在最前） */

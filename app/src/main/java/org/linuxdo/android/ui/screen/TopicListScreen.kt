@@ -102,7 +102,10 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInParent
@@ -136,6 +139,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -322,23 +326,127 @@ fun TopicListScreen(
         }
     }
     val pullState = rememberPullToRefreshState()
+    val haptic = LocalHapticFeedback.current
+    val canPullMiniApps = active && currentFeed != null && onNavigateToApps != null
     val latestOnOpenMiniApps by rememberUpdatedState(onNavigateToApps)
-    val miniAppsHeaderThreshold = with(LocalDensity.current) { 72.dp.toPx() }
-    val miniAppsHeaderGesture = if (active && currentFeed != null && onNavigateToApps != null) {
-        Modifier.pointerInput(listState, miniAppsHeaderThreshold) {
-            var pullDistance = 0f
+    val latestCanPullMiniApps by rememberUpdatedState(canPullMiniApps)
+    val latestRefreshing by rememberUpdatedState(effectiveState.refreshing)
+    val miniAppsPullThresholdPx = with(LocalDensity.current) { 72.dp.toPx() }
+    var miniAppPullDistancePx by remember { mutableFloatStateOf(0f) }
+    var containerWidthPx by remember { mutableFloatStateOf(0f) }
+    var containerHeightPx by remember { mutableFloatStateOf(0f) }
+    val latestContainerHeightPx by rememberUpdatedState(containerHeightPx)
+    var pullStartedInTopThird by remember { mutableStateOf(false) }
+    var miniAppHapticTriggered by remember { mutableStateOf(false) }
+    val settleMiniAppPull: () -> Unit = {
+        val shouldOpen = latestCanPullMiniApps &&
+            !latestRefreshing &&
+            !listState.canScrollBackward &&
+            miniAppPullDistancePx >= miniAppsPullThresholdPx
+        miniAppPullDistancePx = 0f
+        miniAppHapticTriggered = false
+        pullStartedInTopThird = false
+        if (shouldOpen) {
+            latestOnOpenMiniApps?.invoke()
+        }
+    }
+    LaunchedEffect(canPullMiniApps) {
+        if (!canPullMiniApps) {
+            miniAppPullDistancePx = 0f
+            miniAppHapticTriggered = false
+            pullStartedInTopThird = false
+        }
+    }
+    val miniAppsHeaderGesture = if (canPullMiniApps) {
+        Modifier.pointerInput(listState, miniAppsPullThresholdPx) {
             detectVerticalDragGestures(
-                onDragStart = { pullDistance = 0f },
-                onDragCancel = { pullDistance = 0f },
-                onDragEnd = {
-                    if (pullDistance >= miniAppsHeaderThreshold && !listState.canScrollBackward) latestOnOpenMiniApps?.invoke()
+                onDragStart = {
+                    miniAppPullDistancePx = 0f
+                    miniAppHapticTriggered = false
                 },
+                onDragCancel = {
+                    miniAppPullDistancePx = 0f
+                    miniAppHapticTriggered = false
+                },
+                onDragEnd = { settleMiniAppPull() },
                 onVerticalDrag = { change, amount ->
-                    if (!listState.canScrollBackward) { pullDistance = (pullDistance + amount).coerceAtLeast(0f); change.consume() }
+                    if (!latestRefreshing && !listState.canScrollBackward) {
+                        miniAppPullDistancePx = (miniAppPullDistancePx + amount * 0.55f).coerceAtLeast(0f)
+                        change.consume()
+                    }
                 },
             )
         }
     } else Modifier
+    val pullZoneObserverModifier = if (canPullMiniApps) {
+        Modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                val h = latestContainerHeightPx.takeIf { it > 0f } ?: size.height.toFloat()
+                val inTopThird = h > 0f && down.position.y <= h / 3f
+                pullStartedInTopThird = inTopThird
+                if (!inTopThird) {
+                    miniAppPullDistancePx = 0f
+                    miniAppHapticTriggered = false
+                }
+                do {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                } while (event.changes.any { it.pressed })
+                settleMiniAppPull()
+            }
+        }
+    } else Modifier
+    // 上 1/3 下拉只驱动小程序手势并消费多余垂直 overscroll，阻止 PullToRefreshBox 同步触发列表刷新。
+    val miniAppNestedScrollConnection = remember(miniAppsPullThresholdPx) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source != NestedScrollSource.UserInput || miniAppPullDistancePx <= 0f || available.y >= 0f) {
+                    return Offset.Zero
+                }
+                val consumedRaw = maxOf(available.y, -miniAppPullDistancePx / 0.55f)
+                miniAppPullDistancePx = (miniAppPullDistancePx + consumedRaw * 0.55f).coerceAtLeast(0f)
+                return Offset(0f, consumedRaw)
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source == NestedScrollSource.UserInput &&
+                    latestCanPullMiniApps &&
+                    pullStartedInTopThird &&
+                    !latestRefreshing &&
+                    available.y > 0f
+                ) {
+                    miniAppPullDistancePx += available.y * 0.55f
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (miniAppPullDistancePx > 0f) {
+                    settleMiniAppPull()
+                    return available
+                }
+                return Velocity.Zero
+            }
+        }
+    }
+    val miniAppPullFraction = if (miniAppsPullThresholdPx > 0f) {
+        (miniAppPullDistancePx / miniAppsPullThresholdPx).coerceAtLeast(0f)
+    } else 0f
+    LaunchedEffect(miniAppPullFraction >= 1f, miniAppPullDistancePx > 0f) {
+        if (miniAppPullDistancePx <= 0f) {
+            miniAppHapticTriggered = false
+        } else if (miniAppPullFraction >= 1f && !miniAppHapticTriggered) {
+            miniAppHapticTriggered = true
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        } else if (miniAppPullFraction < 1f) {
+            miniAppHapticTriggered = false
+        }
+    }
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
     var noticeToast by remember { mutableStateOf<String?>(null) }
@@ -417,31 +525,11 @@ fun TopicListScreen(
     }
     val currentVisibleTopics by rememberUpdatedState(visiblePreviewTopics)
     val currentPrefetchExcerpt by rememberUpdatedState(onPrefetchExcerpt)
-    LaunchedEffect(active, listState, listState.isScrollInProgress, feedDisplayMode, state.refreshing, state.initialLoading, filteredItems) {
-        try {
-            currentPrefetchExcerpt?.invoke(scrollBusySource, emptyList()) { emptySet() }
-            if (!active || listState.isScrollInProgress || feedDisplayMode == "no_excerpt" ||
-                state.refreshing || state.initialLoading
-            ) return@LaunchedEffect
-            delay(400L)
-            // 一次停顿只拍下这一屏的候选，正文回填引起的布局变化不会追加更多卡片。
-            val candidates = currentVisibleTopics.filter { getTopicRealExcerpt(it) == null }.take(6).map { it.id }
-            currentPrefetchExcerpt?.invoke(scrollBusySource, candidates) {
-                currentVisibleTopics.map { it.id }.toSet()
-            }
-            awaitCancellation()
-        } finally {
-            currentPrefetchExcerpt?.invoke(scrollBusySource, emptyList()) { emptySet() }
-        }
+    // 全量模式（大图 / 小图 / 无图）均不主动爬取话题正文，只展示列表接口自带标题与元信息。
+    LaunchedEffect(active, currentPrefetchExcerpt) {
+        currentPrefetchExcerpt?.invoke(scrollBusySource, emptyList()) { emptySet() }
     }
 
-    LaunchedEffect(active, filteredItems, feedDisplayMode) {
-        if (active && feedDisplayMode != "no_excerpt" && filteredItems.isNotEmpty()) {
-            onPrefetchExcerpts?.invoke(filteredItems.map { it.topic })
-        }
-    }
-
-    var containerWidthPx by remember { mutableFloatStateOf(0f) }
     val feedDragOffsetPx = remember { Animatable(0f) }
     var manualTargetFeed by remember { mutableStateOf<HomeFeedType?>(null) }
 
@@ -667,8 +755,9 @@ fun TopicListScreen(
                 when {
                     feedDisplayMode == "graphic" -> "topic-graphic"
                     feedDisplayMode == "no_excerpt" -> "topic-no-excerpt"
-                    item.topic.thumbnailUrlForList() != null -> "topic-with-thumbnail"
-                    else -> "topic-text"
+                    feedDisplayMode == "text_only" -> "topic-text-only"
+                    item.topic.thumbnailUrlForList() != null -> "topic-small-image-thumb"
+                    else -> "topic-small-image-text"
                 }
             },
         ) { index, item ->
@@ -733,42 +822,61 @@ fun TopicListScreen(
     PullToRefreshBox(
         isRefreshing = effectiveState.refreshing,
         onRefresh = {
-            if (active && currentFeed != null && onNavigateToApps != null && pullState.distanceFraction >= 1.55f) {
-                onNavigateToApps()
+            if (canPullMiniApps && pullStartedInTopThird) {
+                pullStartedInTopThird = false
+                scope.launch { runCatching { pullState.animateToHidden() } }
             } else {
+                pullStartedInTopThird = false
                 onRefresh()
             }
         },
         state = pullState,
         modifier = modifier
-            .onSizeChanged { containerWidthPx = it.width.toFloat() }
+            .onSizeChanged {
+                containerWidthPx = it.width.toFloat()
+                containerHeightPx = it.height.toFloat()
+            }
+            .then(pullZoneObserverModifier)
             .then(homeFeedSwipeModifier)
             .nestedScroll(nestedScrollConnection),
         indicator = {
-            val fraction = pullState.distanceFraction
-            // 初始加载时列表中央已有加载指示，这里再叠一个下拉转圈就成了两个圈。
-            if (!effectiveState.initialLoading && (effectiveState.refreshing || fraction > 0f)) {
+            val isMiniAppPulling = canPullMiniApps && !effectiveState.refreshing && miniAppPullFraction > 0f
+            val isListRefreshingOrPulling = !effectiveState.initialLoading && (effectiveState.refreshing || pullState.distanceFraction > 0f)
+            if (isMiniAppPulling) {
                 Box(
                     Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = IosMetrics.navBarHeight + 10.dp)
                         .graphicsLayer {
-                            alpha = if (effectiveState.refreshing) 1f else min(1f, fraction * 1.4f)
+                            alpha = min(1f, miniAppPullFraction * 1.4f)
                         },
                 ) {
-                    if (currentFeed != null && onNavigateToApps != null && fraction >= 1.55f && !effectiveState.refreshing) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            WeChatThreeDotsLoader()
-                            Text("松开进入小程序", color = IosTheme.colors.secondaryLabel, fontSize = 12.sp)
-                        }
-                    } else {
-                        IosActivityIndicator(diameter = 22.dp)
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        WeChatThreeDotsLoader()
+                        Text(
+                            text = if (miniAppPullFraction >= 1f) "松开进入小程序" else "继续下拉进入小程序",
+                            color = IosTheme.colors.secondaryLabel,
+                            fontSize = 12.sp,
+                        )
                     }
+                }
+            } else if (isListRefreshingOrPulling) {
+                // 初始加载时列表中央已有加载指示，这里再叠一个下拉转圈就成了两个圈。
+                Box(
+                    Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = IosMetrics.navBarHeight + 10.dp)
+                        .graphicsLayer {
+                            alpha = if (effectiveState.refreshing) 1f else min(1f, pullState.distanceFraction * 1.4f)
+                        },
+                ) {
+                    IosActivityIndicator(diameter = 22.dp)
                 }
             }
         },
     ) {
         IosLargeTitleScaffold(
+            modifier = Modifier.nestedScroll(miniAppNestedScrollConnection),
             title = title,
             listState = listState,
             onBack = onBack,
@@ -2243,12 +2351,8 @@ fun TopicRow(
     val needle = query?.trim().orEmpty()
     val accent = IosTheme.colors.accent
 
-    // 观察响应式真实正文（一旦预取成功或点开详情，立即自动重组刷新）
-    val realExcerpt = when {
-        feedDisplayMode == "no_excerpt" -> null
-        query != null || item.bookmarkId != null -> topic.excerpt
-        else -> getTopicRealExcerpt(topic)
-    }
+    // 搜索结果 / 书签保留服务端自带命中摘要，正常信息流模式全量不显示也不抓取正文
+    val realExcerpt = if (query != null || item.bookmarkId != null) topic.excerpt else null
 
     val excerpt = remember(realExcerpt, needle, accent) {
         val raw = realExcerpt
@@ -2583,116 +2687,119 @@ fun TopicRow(
                     compact = false,
                 )
             } else {
-                // ── 小图与纯文模式: 统一知乎结构 (大标题置顶 -> 作者行 -> 2行正文摘要 -> 底部操作行) ──
-                // 1. 标题置顶 (大一号半粗)
-                Text(
-                    text = titleWithBadges(
-                        topic = topic,
-                        accent = IosTheme.colors.accent,
-                        query = query,
-                        includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
-                    ),
-                    style = IosTheme.type.body.copy(
-                        fontSize = 15.2.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        lineHeight = 21.5.sp,
-                        letterSpacing = 0.15.sp,
-                    ),
-                    color = IosTheme.colors.label,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    inlineContent = unseenDotContent(IosTheme.colors.accent),
-                )
+                // ── 小图与无图模式：正常信息流只显示标题与元信息（不获取也不占位正文）；搜索/书签保留命中摘要 ──
+                val hasSmallCover = feedDisplayMode == "small_image" && smallThumbnailUrl != null
 
-                Spacer(Modifier.height(6.dp))
-
-                // 2. 标题下方作者与分类行
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Row(
-                        Modifier.weight(1f),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box {
-                            UserAvatar(
-                                avatarUrl = item.avatarUrl,
-                                fallbackUrl = item.staticAvatarUrl,
-                                username = item.authorUsername,
-                                modifier = Modifier
-                                    .size(22.dp)
-                                    .clickable(enabled = !item.authorUsername.isNullOrBlank()) {
-                                        item.authorUsername?.let { u ->
-                                            onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
-                                        }
-                                    },
-                                cornerRadius = 4.dp,
-                            )
-                            if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && topic.unseen) {
-                                Box(
-                                    Modifier
-                                        .size(6.5.dp)
-                                        .align(Alignment.TopEnd)
-                                        .offset(x = 1.dp, y = (-1).dp)
-                                        .clip(CircleShape)
-                                        .background(IosTheme.colors.card)
-                                        .padding(1.dp)
-                                        .clip(CircleShape)
-                                        .background(IosTheme.colors.accent)
+                @Composable
+                fun CompactAuthorCategoryRow() {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box {
+                                UserAvatar(
+                                    avatarUrl = item.avatarUrl,
+                                    fallbackUrl = item.staticAvatarUrl,
+                                    username = item.authorUsername,
+                                    modifier = Modifier
+                                        .size(22.dp)
+                                        .clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                            item.authorUsername?.let { u ->
+                                                onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                            }
+                                        },
+                                    cornerRadius = 4.dp,
                                 )
+                                if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && topic.unseen) {
+                                    Box(
+                                        Modifier
+                                            .size(6.5.dp)
+                                            .align(Alignment.TopEnd)
+                                            .offset(x = 1.dp, y = (-1).dp)
+                                            .clip(CircleShape)
+                                            .background(IosTheme.colors.card)
+                                            .padding(1.dp)
+                                            .clip(CircleShape)
+                                            .background(IosTheme.colors.accent)
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = item.displayName.ifBlank { "匿名" },
+                                style = IosTheme.type.footnote.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                                color = IosTheme.colors.secondaryLabel,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                    item.authorUsername?.let { u ->
+                                        onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                    }
+                                },
+                            )
+                            item.trustLevel?.takeIf { it > 0 }?.let { level ->
+                                Spacer(Modifier.width(4.dp))
+                                LevelBadge(level)
                             }
                         }
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = item.displayName.ifBlank { "匿名" },
-                            style = IosTheme.type.footnote.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium),
-                            color = IosTheme.colors.secondaryLabel,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.clickable(enabled = !item.authorUsername.isNullOrBlank()) {
-                                item.authorUsername?.let { u ->
-                                    onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
-                                }
-                            },
-                        )
-                        item.trustLevel?.takeIf { it > 0 }?.let { level ->
-                            Spacer(Modifier.width(4.dp))
-                            LevelBadge(level)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
+                                TopicNotificationLevelTag(level)
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            item.category?.let { CategoryTag(it) }
                         }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
-                            TopicNotificationLevelTag(level)
-                            Spacer(Modifier.width(6.dp))
-                        }
-                        item.category?.let { CategoryTag(it) }
                     }
                 }
 
-                NotificationLevelMenu(
-                    expanded = showLevelMenu && hasAnyLongPress,
-                    currentLevel = item.notificationLevel,
-                    updating = item.notificationLevelUpdating,
-                    previewTopic = topic,
-                    previewCategory = item.category,
-                    onOpenTopic = onClick,
-                    onDismiss = { showLevelMenu = false },
-                    onPick = onSetNotificationLevel,
-                    onCopyLink = onCopyLink,
-                    onBookmark = onBookmark,
-                    onFlag = onFlag,
-                    onSave = onSave,
-                )
+                @Composable
+                fun CompactTopicTitle() {
+                    Text(
+                        text = titleWithBadges(
+                            topic = topic,
+                            accent = IosTheme.colors.accent,
+                            query = query,
+                            includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
+                        ),
+                        style = IosTheme.type.body.copy(
+                            fontSize = 15.2.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            lineHeight = 21.5.sp,
+                            letterSpacing = 0.15.sp,
+                        ),
+                        color = IosTheme.colors.label,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        inlineContent = unseenDotContent(IosTheme.colors.accent),
+                    )
+                }
 
-                Spacer(Modifier.height(6.dp))
-
-                // 3. 两行正文摘要 (有图时小图右置混排，无图整宽，永远保持两行正文)
-                val hasSmallCover = feedDisplayMode == "small_image" && smallThumbnailUrl != null
-                if (hasSmallCover) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(modifier = Modifier.weight(1f)) {
-                            if (excerpt != null) {
+                if (excerpt != null) {
+                    CompactTopicTitle()
+                    Spacer(Modifier.height(6.dp))
+                    CompactAuthorCategoryRow()
+                    NotificationLevelMenu(
+                        expanded = showLevelMenu && hasAnyLongPress,
+                        currentLevel = item.notificationLevel,
+                        updating = item.notificationLevelUpdating,
+                        previewTopic = topic,
+                        previewCategory = item.category,
+                        onOpenTopic = onClick,
+                        onDismiss = { showLevelMenu = false },
+                        onPick = onSetNotificationLevel,
+                        onCopyLink = onCopyLink,
+                        onBookmark = onBookmark,
+                        onFlag = onFlag,
+                        onSave = onSave,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    if (hasSmallCover) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = excerpt,
                                     style = IosTheme.type.footnote.copy(fontSize = 13.sp, lineHeight = 18.5.sp, fontWeight = FontWeight.Normal),
@@ -2700,25 +2807,38 @@ fun TopicRow(
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                            } else {
-                                Column(modifier = Modifier.padding(vertical = 2.dp)) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth(0.9f)
-                                            .height(12.dp)
-                                            .clip(RoundedCornerShape(3.dp))
-                                            .background(IosTheme.colors.separator.copy(alpha = 0.22f))
-                                    )
-                                    Spacer(Modifier.height(5.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth(0.55f)
-                                            .height(12.dp)
-                                            .clip(RoundedCornerShape(3.dp))
-                                            .background(IosTheme.colors.separator.copy(alpha = 0.16f))
-                                    )
-                                }
                             }
+                            Spacer(Modifier.width(10.dp))
+                            TopicThumbnailImage(
+                                thumbnailUrl = smallThumbnailUrl!!,
+                                fallbackUrl = originalImageUrl,
+                                widthPx = 240,
+                                heightPx = 168,
+                                modifier = Modifier
+                                    .size(width = 74.dp, height = 52.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(IosTheme.colors.fieldBackground),
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = excerpt,
+                            style = IosTheme.type.footnote.copy(fontSize = 13.sp, lineHeight = 18.5.sp, fontWeight = FontWeight.Normal),
+                            color = IosTheme.colors.secondaryLabel,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Spacer(Modifier.height(7.dp))
+                } else if (hasSmallCover) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            CompactTopicTitle()
+                            Spacer(Modifier.height(6.dp))
+                            CompactAuthorCategoryRow()
                         }
                         Spacer(Modifier.width(10.dp))
                         TopicThumbnailImage(
@@ -2727,49 +2847,52 @@ fun TopicRow(
                             widthPx = 240,
                             heightPx = 168,
                             modifier = Modifier
-                                .size(width = 74.dp, height = 52.dp)
+                                .size(width = 80.dp, height = 56.dp)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(IosTheme.colors.fieldBackground),
                         )
                     }
+                    NotificationLevelMenu(
+                        expanded = showLevelMenu && hasAnyLongPress,
+                        currentLevel = item.notificationLevel,
+                        updating = item.notificationLevelUpdating,
+                        previewTopic = topic,
+                        previewCategory = item.category,
+                        onOpenTopic = onClick,
+                        onDismiss = { showLevelMenu = false },
+                        onPick = onSetNotificationLevel,
+                        onCopyLink = onCopyLink,
+                        onBookmark = onBookmark,
+                        onFlag = onFlag,
+                        onSave = onSave,
+                    )
+                    Spacer(Modifier.height(8.dp))
                 } else {
-                    if (excerpt != null) {
-                        Text(
-                            text = excerpt,
-                            style = IosTheme.type.footnote.copy(fontSize = 13.sp, lineHeight = 18.5.sp, fontWeight = FontWeight.Normal),
-                            color = IosTheme.colors.secondaryLabel,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    } else {
-                        Column(modifier = Modifier.padding(vertical = 2.dp)) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth(0.92f)
-                                    .height(12.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(IosTheme.colors.separator.copy(alpha = 0.22f))
-                            )
-                            Spacer(Modifier.height(5.dp))
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth(0.58f)
-                                    .height(12.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(IosTheme.colors.separator.copy(alpha = 0.16f))
-                            )
-                        }
-                    }
+                    CompactTopicTitle()
+                    Spacer(Modifier.height(6.dp))
+                    CompactAuthorCategoryRow()
+                    NotificationLevelMenu(
+                        expanded = showLevelMenu && hasAnyLongPress,
+                        currentLevel = item.notificationLevel,
+                        updating = item.notificationLevelUpdating,
+                        previewTopic = topic,
+                        previewCategory = item.category,
+                        onOpenTopic = onClick,
+                        onDismiss = { showLevelMenu = false },
+                        onPick = onSetNotificationLevel,
+                        onCopyLink = onCopyLink,
+                        onBookmark = onBookmark,
+                        onFlag = onFlag,
+                        onSave = onSave,
+                    )
+                    Spacer(Modifier.height(7.dp))
                 }
 
-                Spacer(Modifier.height(7.dp))
-
-                // 4. 底部紧凑互动行（左侧：评论 / 浏览 / 时间；右侧：标签与快捷分享）
+                // 4. 底部紧凑互动行（左侧：评论 / 浏览 / 时间；右侧：快捷分享，隐藏标签）
                 TopicCardMetaBar(
                     topic = topic,
                     onShare = { showShareSheet = true },
                     compact = true,
-                    trailingTags = topic.tags.take(2),
                 )
             }
         }

@@ -4465,6 +4465,7 @@ class BrowserSession(
         } else {
             "${Config.BASE_URL}${if (path.startsWith("/")) "" else "/"}$path"
         }
+        val trackViewTopicId = Transport.trackViewTopicId(path, present = present, method = method)
         return """
         (function () {
           var id = ${JSONObject.quote(id)};
@@ -4481,6 +4482,7 @@ class BrowserSession(
             'X-Requested-With': 'XMLHttpRequest'
             ${if (present) ", 'Discourse-Present': 'true'" else ""}
             ${if (path.startsWith("/topics/timings")) ", 'Discourse-Background': 'true', 'X-SILENCE-LOGGER': 'true'" else ""}
+            ${if (trackViewTopicId != null) ", 'Discourse-Track-View': '1', 'Discourse-Track-View-Topic-Id': '$trackViewTopicId'" else ""}
             ${if (body == null) "" else ", 'Content-Type': " + JSONObject.quote(contentType)}
           };
           if (csrfToken) {

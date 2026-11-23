@@ -188,6 +188,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.ui.focus.FocusRequester
@@ -724,11 +727,12 @@ fun ProfileScreen(
                                     ProfileVerifiedBadge()
                                 }
 
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp),
                                 ) {
                                     // 社区分胶囊
+                                    val cdkAccent = if (isDark) Color(0xFF7DD3FC) else Color(0xFF096DD9)
                                     Box(
                                         modifier = Modifier
                                             .clip(RoundedCornerShape(50))
@@ -747,19 +751,74 @@ fun ProfileScreen(
                                             .padding(horizontal = 8.dp, vertical = 2.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
-                                        Text(
-                                            text = when {
-                                                cdkLoading -> "社区分 ${cdkScore ?: "-"} · 获取中"
-                                                cdkNeedsAuthorization -> "社区分 ${cdkScore ?: "-"} · 点击授权"
-                                                cdkScore == null -> "社区分 - · 点击重试"
-                                                else -> "社区分 $cdkScore"
-                                            },
-                                            style = IosTheme.type.caption.copy(
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = if (isDark) Color(0xFF7DD3FC) else Color(0xFF096DD9),
-                                            ),
-                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                        ) {
+                                            when {
+                                                cdkLoading -> {
+                                                    Text(
+                                                        text = if (cdkScore != null) "社区分 $cdkScore" else "社区分",
+                                                        style = IosTheme.type.caption.copy(
+                                                            fontSize = 11.sp,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = cdkAccent,
+                                                        ),
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                    IosActivityIndicator(diameter = 10.dp, color = cdkAccent)
+                                                }
+                                                cdkScore == null -> {
+                                                    Text(
+                                                        text = "社区分",
+                                                        style = IosTheme.type.caption.copy(
+                                                            fontSize = 11.sp,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = cdkAccent,
+                                                        ),
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                    Icon(
+                                                        imageVector = Icons.Default.Refresh,
+                                                        contentDescription = "刷新社区分",
+                                                        tint = cdkAccent,
+                                                        modifier = Modifier.size(13.dp),
+                                                    )
+                                                }
+                                                cdkNeedsAuthorization -> {
+                                                    Text(
+                                                        text = "社区分 $cdkScore",
+                                                        style = IosTheme.type.caption.copy(
+                                                            fontSize = 11.sp,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = cdkAccent,
+                                                        ),
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                    Icon(
+                                                        imageVector = Icons.Default.Refresh,
+                                                        contentDescription = "刷新社区分",
+                                                        tint = cdkAccent,
+                                                        modifier = Modifier.size(13.dp),
+                                                    )
+                                                }
+                                                else -> {
+                                                    Text(
+                                                        text = "社区分 $cdkScore",
+                                                        style = IosTheme.type.caption.copy(
+                                                            fontSize = 11.sp,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = cdkAccent,
+                                                        ),
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
 
                                     // 获赞胶囊
@@ -783,10 +842,14 @@ fun ProfileScreen(
                                                 fontSize = 11.sp,
                                                 color = IosTheme.colors.secondaryLabel
                                             ),
+                                            maxLines = 1,
+                                            softWrap = false,
                                         )
                                     }
                                 }
                             }
+
+                            Spacer(Modifier.width(8.dp))
 
                             // 切换账号胶囊 (参考图右侧圆角胶囊按钮)
                             Box(
@@ -809,6 +872,8 @@ fun ProfileScreen(
                                     text = "切换 ⇄",
                                     style = IosTheme.type.caption.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
                                     color = IosTheme.colors.secondaryLabel,
+                                    maxLines = 1,
+                                    softWrap = false,
                                 )
                             }
                         }
@@ -2314,10 +2379,9 @@ fun SettingsScreen(
                     title = SettingsPage.Reading.title,
                     badgeColor = Color(0xFFFFF4E5),
                     value = when (feedDisplayMode) {
-                        "graphic" -> "图文模式"
-                        "no_excerpt" -> "无正文模式"
-                        "text_only" -> "纯文模式"
-                        else -> "小图模式"
+                        "small_image" -> "小图模式"
+                        "text_only" -> "无图模式"
+                        else -> "大图模式"
                     },
                     onClick = { onOpenPage(SettingsPage.Reading) },
                 ) { SettingBookIcon(tint = Color(0xFFFF9500)) }
@@ -2431,9 +2495,7 @@ fun SettingsScreen(
                     onClick = { showFloorNavigationDialog = true },
                 ) { SettingBookIcon(tint = IosTheme.colors.accent) }
                 IosDivider()
-                // 2.0 展现模式分段选择器（图文模式 / 小图模式 / 纯文模式）
-                // [临时屏蔽] 强制使用无正文模式展示以避免爬取正文风险，保留代码供后续优化
-                if (false) {
+                // 2.0 展现模式分段选择器（大图模式 / 小图模式 / 无图模式，仅显示标题不获取正文）
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2449,10 +2511,9 @@ fun SettingsScreen(
                         Column {
                             Text("信息流展现样式", style = IosTheme.type.body.copy(fontSize = 14.5.sp), fontWeight = FontWeight.Medium)
                             val desc = when (feedDisplayMode) {
-                                "graphic" -> "图文模式：微博风格大卡片，大图与三栏互动"
-                                "no_excerpt" -> "无正文模式：微博式上下排版，聚焦标题与缩略图"
-                                "text_only" -> "纯文模式：极客纯文字排版，无图超省流"
-                                else -> "小图模式：经典双列排版，右侧小图，紧凑舒适"
+                                "small_image" -> "小图模式：紧凑排版，仅显示标题与右侧小图，不获取正文"
+                                "text_only" -> "无图模式：极简纯文排版，仅显示标题，无封面图更省流"
+                                else -> "大图模式：卡片展示标题与大封面图，不获取正文"
                             }
                             Text(
                                 text = desc,
@@ -2465,7 +2526,7 @@ fun SettingsScreen(
 
                     Spacer(Modifier.height(10.dp))
 
-                    // 四胶囊分段选择器（素雅黑白高亮，包含无正文模式）
+                    // 三胶囊分段选择器（大图模式 / 小图模式 / 无图模式）
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2474,13 +2535,16 @@ fun SettingsScreen(
                             .padding(3.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
+                        val normalizedMode = when (feedDisplayMode) {
+                            "small_image", "text_only" -> feedDisplayMode
+                            else -> "no_excerpt"
+                        }
                         listOf(
-                            "no_excerpt" to "无正文模式",
-                            "graphic" to "图文模式",
+                            "no_excerpt" to "大图模式",
                             "small_image" to "小图模式",
-                            "text_only" to "纯文模式",
+                            "text_only" to "无图模式",
                         ).forEach { (modeKey, label) ->
-                            val isSelected = feedDisplayMode == modeKey
+                            val isSelected = normalizedMode == modeKey
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -2498,7 +2562,7 @@ fun SettingsScreen(
                             ) {
                                 Text(
                                     text = label,
-                                    fontSize = 11.5.sp,
+                                    fontSize = 12.sp,
                                     fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
                                     color = if (isSelected) {
                                         if (IosTheme.colors.isDark) Color(0xFF181818) else Color.White
@@ -2511,7 +2575,6 @@ fun SettingsScreen(
                 }
 
                 IosDivider()
-                }
 
                 // 2.1 树形查看话题
                 IosRow(onClick = { onTreeView(!treeView) }) {
