@@ -248,6 +248,7 @@ import org.linuxdo.android.data.postAncestorIds
 import org.linuxdo.android.data.resolveTopicFloor
 import org.linuxdo.android.data.InternalTopicLink
 import org.linuxdo.android.data.parseInternalTopicUrl
+import org.linuxdo.android.data.parseInternalUserProfileUrl
 import org.linuxdo.android.ui.IosTextAction
 import org.linuxdo.android.ui.ComposerTarget
 import org.linuxdo.android.ui.ComposerUiState
@@ -466,6 +467,7 @@ fun TopicDetailScreen(
     onDeleteBoost: (Long, Long) -> Unit,
     onFlagBoost: (Long, Long, Int, String?) -> Unit = { _, _, _, _ -> },
     onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
+    onOpenUserProfile: (String) -> Unit,
     onRefreshPost: (Long) -> Unit,
     onSolution: (Long) -> Unit,
     composer: ComposerUiState,
@@ -1348,7 +1350,10 @@ fun TopicDetailScreen(
     CompositionLocalProvider(
         LocalOpenTopic provides onOpenTopic,
         LocalSelectionResetKey provides selectionResetKey,
-        LocalOpenExternalUrl provides { browserUrl = it },
+        LocalOpenExternalUrl provides { url ->
+            val username = parseInternalUserProfileUrl(url)
+            if (username != null) onOpenUserProfile(username) else browserUrl = url
+        },
         LocalVotePoll provides onVotePoll,
         LocalPollBusy provides { postId -> postId in state.reactingPosts },
         LocalPollError provides { postId -> state.reactionErrors[postId] },

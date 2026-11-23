@@ -1098,6 +1098,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         viewModel.flagBoost(route.topicId, postId, boostId, reasonId, message)
                                     },
                                     onOpenUser = viewModel::openUserCard,
+                                    onOpenUserProfile = { username -> stack.push(Route.UserProfile(username)) },
                                     onRefreshPost = { viewModel.refreshPost(route.topicId, it) },
                                     onSolution = { viewModel.setSolution(route.topicId, it) },
                                     composer = composer,
