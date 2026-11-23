@@ -87,3 +87,18 @@
 - **L 站原贴**：https://linux.do/t/topic/2998703
 - 感谢 [LINUX DO](https://linux.do/) 社区佬友们的建议、测试与支持！
 - Special thanks to the [LINUX DO](https://linux.do/) community for feedback and support.
+
+---
+
+## 📜 授权协议与衍生版本说明
+
+本项目采用 **非商业授权协议**（详见根目录 [LICENSE](./LICENSE)）：
+
+- **允许**：个人学习、修改源码、公开维护 Fork，以及免费编译并分发非官方衍生 APK。
+- **禁止**：**严禁任何商业用途**（包括但不限于收费下载、付费解锁、商业套壳、导流变现等），**严禁植入任何广告、推广弹窗或未告知用户的追踪代码**。
+- **衍生版发布要求**：
+  1. 保留原作者署名、原仓库链接及 `LICENSE`，并显著标注为**非官方衍生版本**且说明主要改动；
+  2. 必须修改 `app/build.gradle.kts` 中的 `applicationId`（勿复用 `org.linuxdo.android`），避免与原版安装冲突；
+  3. 必须修改或关闭 `Config.kt` 中指向原仓库的 `version.json` / Releases 应用内更新地址，并区分应用名称/图标；
+  4. 仓库内附带文件与组件仅限随本项目或其免费非商业无广告衍生版本一同使用和分发，不得单独拆分用于其他项目或商业用途；
+  5. 项目所依赖的第三方开源组件（GeckoView / OkHttp / AndroidX / Jsoup 等）仍需遵守其各自原有协议。

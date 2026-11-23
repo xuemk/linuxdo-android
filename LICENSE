@@ -1,0 +1,60 @@
+LinuxDo Android Non-Commercial License
+Copyright (c) 2026 xuemk (https://github.com/xuemk/linuxdo-android)
+
+1. Grant of License
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this repository and its associated files (the "Software"), to use, copy, modify,
+merge, publish, and distribute modified source code and compiled APK packages
+strictly for personal, educational, and non-commercial community purposes,
+subject to the following conditions:
+
+  (a) Non-Commercial & No-Ads Restriction:
+      You MAY NOT use the Software or any derivative work for any commercial
+      purpose (including, without limitation, paid distribution, paywalled
+      features, commercial rebranding, or monetization), and you MAY NOT inject
+      or bundle any advertisements, promotional popups, affiliate redirects, or
+      undisclosed tracking/telemetry code.
+
+  (b) Attribution & Non-Official Notice:
+      The copyright notice, this license text, and a clear link to the original
+      repository (https://github.com/xuemk/linuxdo-android) must be retained in
+      all copies and derivative works. Any distributed fork or derivative APK
+      must clearly state that it is an unofficial derivative work and describe
+      the modifications made.
+
+  (c) Technical Isolation for Derivative APKs:
+      Before distributing any compiled derivative APK, you must:
+      - Change `applicationId` (do not reuse `org.linuxdo.android`);
+      - Update or disable the in-app update endpoints pointing to
+        `xuemk/linuxdo-android` (`version.json` and Releases);
+      - Distinctly differentiate the application name and branding so users are
+        not misled into treating it as an official release.
+
+  (d) Downstream Terms:
+      Any redistributed source code or derivative work must remain subject to
+      the same non-commercial and no-ads restrictions.
+
+  (e) Scope of Reuse:
+      Files and components included in this repository are licensed for use and
+      distribution only as part of this project or its free, non-commercial,
+      ad-free derivative works, and may not be extracted separately for
+      unrelated projects or commercial use.
+
+2. No Trademark Grant
+This license does not grant permission to use the original author's name,
+trademarks, logos, or official branding to endorse or imply official status for
+any derivative work.
+
+3. Third-Party Components
+Third-party open-source dependencies used by this project (including Mozilla
+GeckoView under MPL-2.0, AndroidX/OkHttp/Coil under Apache-2.0, Jakarta Mail
+under EPL-2.0, Jsoup under MIT, etc.) remain governed by their respective
+licenses.
+
+4. Disclaimer of Warranty & Limitation of Liability
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, ACCOUNT RISKS,
+OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR DISTRIBUTION OF ANY DERIVATIVE WORK.
