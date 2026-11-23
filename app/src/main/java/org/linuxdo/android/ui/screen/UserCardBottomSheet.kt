@@ -46,8 +46,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
-import org.jsoup.Jsoup
-import org.jsoup.nodes.TextNode
 import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.AvatarCache
@@ -55,6 +53,7 @@ import org.linuxdo.android.ui.UserCardUiState
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosTheme
 import org.linuxdo.android.ui.design.sheetScrollable
+import org.linuxdo.android.ui.design.UserBioText
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -159,16 +158,13 @@ private fun UserCardContent(
         )
 
         // 个性签名 / 简介 (固定占位，杜绝异步数据插入导致弹窗与图像上下跳动)
-        val rawBio = user.bioExcerpt?.let(::bioPlainText)?.trim()
-        val bioText = if (!rawBio.isNullOrBlank()) rawBio else "这个人很懒，没有写签名！"
-        val isBioEmpty = rawBio.isNullOrBlank()
-
-        Text(
-            text = bioText,
+        UserBioText(
+            html = user.bioExcerpt,
+            emptyText = "这个人很懒，没有写签名！",
             style = IosTheme.type.body.copy(fontSize = 14.sp),
-            color = if (isBioEmpty) IosTheme.colors.secondaryLabel.copy(alpha = 0.65f) else IosTheme.colors.label,
+            color = IosTheme.colors.label,
+            emptyColor = IosTheme.colors.secondaryLabel.copy(alpha = 0.65f),
             maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 2.dp),
@@ -602,24 +598,3 @@ private fun formatJoinDate(raw: String?): String {
         datePart
     }
 }
-
-/**
- * 资料卡接口返回的 `bio_excerpt` 是 HTML 片段（含 `<br>`、`<img class="emoji">`），
- * 直接喂给 Text 会把标签原样显示。这里只做降级为纯文本：emoji 用 alt 还原成 `:cat:` 短码，
- * 其余标签丢弃、块级换行保留。
- */
-private fun bioPlainText(html: String): String {
-    val document = Jsoup.parse(html)
-    document.select("br").forEach { it.replaceWith(TextNode(NEWLINE_MARKER)) }
-    document.select("p").forEach { it.append(NEWLINE_MARKER) }
-    document.select("img").forEach { image ->
-        image.replaceWith(TextNode(image.attr("alt")))
-    }
-    return document.text()
-        .replace(NEWLINE_MARKER, "\n")
-        .replace(Regex("\n{3,}"), "\n\n")
-        .trim()
-}
-
-/** `<br>`/`<p>` 的换行占位符。Document.text() 会把空白折叠掉，必须用可见字符占位再还原。 */
-private const val NEWLINE_MARKER = "\u0001"
