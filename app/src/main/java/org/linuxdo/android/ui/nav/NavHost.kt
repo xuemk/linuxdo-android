@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -148,6 +149,7 @@ fun IosNavHost(
         rendered.forEachIndexed { index, entry ->
             if (index != lastIndex && index != belowIndex) return@forEachIndexed
             val isTop = index == lastIndex
+            val acceptsInput = isTop && entry.id == stack.entries.last().id
 
             key(entry.id) {
                 Box(
@@ -156,6 +158,16 @@ fun IosNavHost(
                         .graphicsLayer {
                             val distance = (index - position.value) / transitionSpan
                             translationX = distance * width * if (distance >= 0f) 1f else BelowShift
+                        }
+                        .pointerInput(acceptsInput) {
+                            // 整页参与命中测试，避免简介、留白等无点击控件的区域穿透到上一页。
+                            // 下层只用于返回预览；当前层不消费事件，保留子控件和边缘返回手势。
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    if (!acceptsInput) event.changes.forEach { it.consume() }
+                                }
+                            }
                         },
                 ) {
                     // 当前页左侧的投影,画在页面之外;页面归位时正好在屏幕外。
