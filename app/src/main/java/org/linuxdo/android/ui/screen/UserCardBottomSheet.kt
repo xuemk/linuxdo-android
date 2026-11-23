@@ -21,16 +21,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.text.InlineTextContent
-import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.Placeholder
-import androidx.compose.ui.text.PlaceholderVerticalAlign
-import androidx.compose.ui.text.buildAnnotatedString
 import android.widget.Toast
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -44,7 +39,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,8 +46,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
-import org.jsoup.Jsoup
-import org.jsoup.nodes.TextNode
 import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.AvatarCache
@@ -61,8 +53,7 @@ import org.linuxdo.android.ui.UserCardUiState
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosTheme
 import org.linuxdo.android.ui.design.sheetScrollable
-import org.linuxdo.android.ui.html.InlineText
-import org.linuxdo.android.ui.html.contentUrl
+import org.linuxdo.android.ui.design.UserBioText
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -167,36 +158,13 @@ private fun UserCardContent(
         )
 
         // 个性签名 / 简介 (固定占位，杜绝异步数据插入导致弹窗与图像上下跳动)
-        val bioRuns = remember(user.bioExcerpt) { bioInlineText(user.bioExcerpt.orEmpty()) }
-        val bioText = remember(bioRuns) {
-            buildAnnotatedString {
-                bioRuns.forEach { run ->
-                    val url = run.emojiUrl
-                    if (url == null) append(run.text) else appendInlineContent(url, run.text.ifBlank { "表情" })
-                }
-            }
-        }
-        val bioEmojis = remember(bioRuns) {
-            bioRuns.mapNotNull { it.emojiUrl }.distinct().associateWith { url ->
-                InlineTextContent(Placeholder(16.sp, 16.sp, PlaceholderVerticalAlign.TextCenter)) { alt ->
-                    AsyncImage(
-                        model = url,
-                        contentDescription = alt,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-            }
-        }
-        val isBioEmpty = bioText.isBlank()
-
-        Text(
-            text = if (isBioEmpty) AnnotatedString("这个人很懒，没有写签名！") else bioText,
-            inlineContent = bioEmojis,
+        UserBioText(
+            html = user.bioExcerpt,
+            emptyText = "这个人很懒，没有写签名！",
             style = IosTheme.type.body.copy(fontSize = 14.sp),
-            color = if (isBioEmpty) IosTheme.colors.secondaryLabel.copy(alpha = 0.65f) else IosTheme.colors.label,
+            color = IosTheme.colors.label,
+            emptyColor = IosTheme.colors.secondaryLabel.copy(alpha = 0.65f),
             maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 2.dp),
@@ -630,43 +598,3 @@ private fun formatJoinDate(raw: String?): String {
         datePart
     }
 }
-
-/**
- * 资料卡接口返回的 `bio_excerpt` 是 HTML 片段（含 `<br>`、`<img class="emoji">`），
- * 保留 emoji 图片供 Text 行内渲染，其余图片降级为 alt 文本，块级换行保留。
- */
-private fun bioInlineText(html: String): List<InlineText> {
-    val document = Jsoup.parse(html)
-    val emojis = mutableListOf<InlineText>()
-    document.select("br").forEach { it.replaceWith(TextNode(NEWLINE_MARKER)) }
-    document.select("p").forEach { it.append(NEWLINE_MARKER) }
-    document.select("img").forEach { image ->
-        val url = image.attr("src").takeIf { it.isNotBlank() }?.let(::contentUrl)
-        val alt = image.attr("alt")
-        if (image.hasClass("emoji") && url != null) {
-            // 使用非空白占位符，避免简介首尾的表情被 Jsoup.text() 的 trim 移除。
-            val marker = "\uE000${emojis.size}\uE001"
-            emojis += InlineText(text = alt, emojiUrl = url)
-            image.replaceWith(TextNode(marker))
-        } else {
-            image.replaceWith(TextNode(alt))
-        }
-    }
-    val text = document.text()
-        .replace(NEWLINE_MARKER, "\n")
-        .replace(Regex("\n{3,}"), "\n\n")
-        .trim()
-    return buildList {
-        var offset = 0
-        BIO_EMOJI_MARKER.findAll(text).forEach { match ->
-            if (match.range.first > offset) add(InlineText(text.substring(offset, match.range.first)))
-            add(emojis.getOrNull(match.groupValues[1].toIntOrNull() ?: -1) ?: InlineText(match.value))
-            offset = match.range.last + 1
-        }
-        if (offset < text.length) add(InlineText(text.substring(offset)))
-    }
-}
-
-/** `<br>`/`<p>` 的换行占位符。Document.text() 会把空白折叠掉，必须用可见字符占位再还原。 */
-private const val NEWLINE_MARKER = "\u0001"
-private val BIO_EMOJI_MARKER = Regex("\uE000(\\d+)\uE001")

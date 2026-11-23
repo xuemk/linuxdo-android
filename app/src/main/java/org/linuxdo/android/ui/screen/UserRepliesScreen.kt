@@ -25,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -81,6 +82,7 @@ import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosLoadingBox
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.UserBioText
 
 @Composable
 fun UserRepliesScreen(
@@ -310,6 +312,7 @@ fun UserProfileScreen(
     val repo = (context.applicationContext as? App)?.container?.topicRepository
     var userCard by remember(username) { mutableStateOf<UserCardData?>(repo?.getCachedUserCard(username)) }
     var selectedTab by rememberSaveable(username) { mutableIntStateOf(0) }
+    var bioExpanded by rememberSaveable(username) { mutableStateOf(false) }
     val tabEntries = remember { UserProfileTab.entries }
 
     var summaryData by remember(username) { mutableStateOf<UserSummaryData?>(null) }
@@ -597,27 +600,30 @@ fun UserProfileScreen(
             }
 
             // 个性签名药丸卡片
-            val bio = card?.bioExcerpt?.let {
-                org.jsoup.Jsoup.parse(it).text()
-            }?.takeIf { it.isNotBlank() } ?: "这个人很懒，什么都没写"
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 18.dp, vertical = 6.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(Color(0xFF222226))
+                    .clickable { bioExpanded = !bioExpanded }
                     .padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = bio,
-                    fontSize = 13.5.sp,
+                UserBioText(
+                    html = card?.bioExcerpt,
+                    emptyText = "这个人很懒，什么都没写",
+                    style = IosTheme.type.body.copy(fontSize = 13.5.sp),
                     color = Color(0xFFD4D4D8),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    maxLines = if (bioExpanded) Int.MAX_VALUE else 1,
                     modifier = Modifier.weight(1f),
                 )
-                Text("›", fontSize = 16.sp, color = Color(0xFF71717A))
+                Text(
+                    "›",
+                    fontSize = 16.sp,
+                    color = Color(0xFF71717A),
+                    modifier = Modifier.rotate(if (bioExpanded) 90f else 0f),
+                )
             }
 
             // 获赞、访问、话题、回复指标行
