@@ -4004,7 +4004,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * 开始为这次阅读计时。
-     * 新未读楼层有效停留后提前合批，相邻成功批次至少间隔 10 秒；
+     * 新未读楼层有效停留后提前合批，相邻成功批次至少间隔 3 秒；
      * 已读楼层保持 35 秒心跳，上报成功才消点。
      */
     private fun beginReadTracking(topicId: Long) {
@@ -4021,7 +4021,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         readReportJobs[topicId] = viewModelScope.launch {
             val schedule = ReadReportSchedule(now, Config.READ_REPORT_HEARTBEAT_MS)
             while (isActive && isTopicActive(topicId) && readTrackers[topicId] === tracker) {
-                delay(tracker.nextCheckDelayMs(alreadyReadPostsForTracker(topicId)))
+                val loopNow = SystemClock.elapsedRealtime()
+                val alreadyRead = alreadyReadPostsForTracker(topicId)
+                var nextDelay = tracker.nextCheckDelayMs(alreadyRead, loopNow)
+                if (topicId !in topicLiveScrolling) {
+                    val settleWait = (READ_REPORT_SCROLL_SETTLE_MS - (loopNow - (topicScrollSettledAt[topicId] ?: 0L)))
+                        .coerceAtLeast(0L)
+                    if (settleWait > 0L) {
+                        nextDelay = maxOf(nextDelay, settleWait).coerceIn(100L, 1_000L)
+                    } else if (tracker.hasRush(alreadyRead) && !schedule.canSend(loopNow, true)) {
+                        nextDelay = schedule.remainingWaitMs(loopNow, true).coerceIn(100L, 1_000L)
+                    }
+                }
+                delay(nextDelay)
                 if (!isTopicActive(topicId) || readTrackers[topicId] !== tracker) break
                 val tickAt = SystemClock.elapsedRealtime()
                 if (repository.readTimingsCooldownRemainingMs() > 0L || tracker.isIdle(tickAt)) {
@@ -4030,7 +4042,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 tracker.tick(tickAt)
                 if (readSendJobs[topicId]?.isActive == true) continue
-                // 滑动中及停滑后 2.5s 内只累计停留时间，不发 CSRF + timings，避免与分页/头像请求叠进同一速率窗口。
+                // 滑动中及停滑后 0.8s 内只累计停留时间，不发 CSRF + timings，躲开快速甩屏叠加分页请求。
                 if (topicId in topicLiveScrolling ||
                     tickAt - (topicScrollSettledAt[topicId] ?: 0L) < READ_REPORT_SCROLL_SETTLE_MS) continue
                 val rush = tracker.hasRush(alreadyReadPostsForTracker(topicId))
@@ -10330,8 +10342,8 @@ fun openTopicSearch(topicId: Long, title: String) {
         private val VERIFY_RATE_LIMIT_BACKOFF_MS = longArrayOf(10_000L, 18_000L, 28_000L)
         private const val POST_VERIFY_RUNWAY_MIN_MS = 8_000L
         private const val POST_VERIFY_RUNWAY_MAX_MS = 10_000L
-        /** 详情页停滑后再等这么久才发 timings（含 CSRF），避免与滚动触发的分页/图片请求叠在同一速率窗口。 */
-        const val READ_REPORT_SCROLL_SETTLE_MS = 2_500L
+        /** 详情页停滑后再等这么久才发 timings（含 CSRF），躲开快速甩屏并与分页请求轻微错峰。 */
+        const val READ_REPORT_SCROLL_SETTLE_MS = 800L
         /** 长帖切倒序时一次拉取的尾部楼层数,与 fetchPosts 的单批上限一致。 */
         const val TAIL_WINDOW = 20
 

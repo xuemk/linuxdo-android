@@ -250,11 +250,11 @@ internal class ConfirmedReadPosts(private val capacity: Int = 200) {
 
 internal data class ReadTimingBatch(val topicTimeMs: Long, val postTimesMs: Map<Int, Long>)
 
-/** 新未读楼层提前合批，成功后留出至少 10 秒间隔避免刷长帖频繁 POST；失败按 Fluxdo 的 5/10/20/40 秒退避。 */
+/** 新未读楼层提前合批，成功后留出至少 3 秒合批间隔；失败按 Fluxdo 的 5/10/20/40 秒退避。 */
 internal class ReadReportSchedule(
     startedAt: Long,
     private val heartbeatMs: Long = 35_000L,
-    private val minimumGapMs: Long = 10_000L,
+    private val minimumGapMs: Long = 3_000L,
 ) {
     private var nextHeartbeatAt = startedAt + heartbeatMs
     private var nextAllowedAt = startedAt
@@ -262,6 +262,11 @@ internal class ReadReportSchedule(
 
     fun canSend(now: Long, rush: Boolean): Boolean =
         now >= nextAllowedAt && (rush || now >= nextHeartbeatAt)
+
+    fun remainingWaitMs(now: Long, rush: Boolean): Long {
+        val target = if (rush) nextAllowedAt else maxOf(nextAllowedAt, nextHeartbeatAt)
+        return (target - now).coerceAtLeast(0L)
+    }
 
     fun completed(now: Long, success: Boolean, serverCooldownMs: Long = 0L) {
         failures = if (success) 0 else (failures + 1).coerceAtMost(4)
@@ -313,13 +318,16 @@ internal class TopicReadTracker {
     fun hasRush(alreadyReadPosts: Set<Int>): Boolean =
         topicTimeMs > 0L && postTimesMs.any { (number, time) -> time >= MIN_POST_DWELL_MS && number !in alreadyReadPosts }
 
-    fun nextCheckDelayMs(alreadyReadPosts: Set<Int>): Long {
-        if (!active || visiblePosts.isEmpty()) return 1_000L
-        val maxUnreadElapsed = visiblePosts.asSequence()
-            .filter { it !in alreadyReadPosts }
-            .map { postTimesMs[it] ?: 0L }
-            .filter { it in 1 until MIN_POST_DWELL_MS }
-            .maxOrNull() ?: return 1_000L
+    fun nextCheckDelayMs(alreadyReadPosts: Set<Int>, now: Long): Long {
+        if (!active) return 1_000L
+        if (visiblePosts.isEmpty()) return 300L
+        val pendingTickMs = if (lastTickAt > 0L) (now - lastTickAt).coerceAtLeast(0L) else 0L
+        val unreadVisible = visiblePosts.asSequence().filter { it !in alreadyReadPosts }.toList()
+        if (unreadVisible.isEmpty()) return 1_000L
+        val maxUnreadElapsed = unreadVisible
+            .map { (postTimesMs[it] ?: 0L) + pendingTickMs }
+            .maxOrNull() ?: 0L
+        if (maxUnreadElapsed >= MIN_POST_DWELL_MS) return 150L
         return (MIN_POST_DWELL_MS - maxUnreadElapsed).coerceIn(100L, 1_000L)
     }
 
