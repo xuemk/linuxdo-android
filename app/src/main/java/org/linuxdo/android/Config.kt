@@ -156,20 +156,19 @@ object Config {
      */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
-          "versionCode": 19,
-          "versionName": "1.6.1",
+          "versionCode": 20,
+          "versionName": "1.6.2",
           "forceUpdate": false,
           "minVersionCode": 1,
-          "title": "LINUX DO Android v1.6.1 正式版更新说明",
+          "title": "LINUX DO Android v1.6.2 正式版更新说明",
           "changelog": [
-            "1、专属邮箱原生收发：内置 LINUX DO 邮箱收件箱、读信与写信，支持 H5 网页邮箱一键自动登录",
-            "2、附件高速下载与灵动进度条：三通道智能防截断（直连/系统通道/内置浏览器），支持顶部悬浮进度条与离开话题后台持续下载",
-            "3、阅读与交互体验升级：支持全局字体缩放（80%~120%）、右侧悬浮楼层导航条、用户签名小尾巴与超链接大图/商店直跳",
-            "4、后台通知与角标进化：前台高敏轮询 + 息屏阶梯闹钟低功耗守护，深度适配主流国产系统桌面未读角标",
-            "5、网络与风控稳定性加固：彻底根治新安装与日常 429 速率挑战循环，优化 Anycast 冷启动选优、VPN 智能让渡与会话保护"
+            "1、修复浏览话题数不增加问题：补齐 Discourse 3.4+ 话题浏览统计请求头（Discourse-Track-View），解决 Connect 浏览话题数不增长问题",
+            "2、合并社区佬友多项 PR 贡献：隐藏本人帖子/回复点赞按钮、点赞受限与全站冷却解耦、优化选楼方式与滑动条跳楼定位、聊天频道免打扰与长按文字复制",
+            "3、消息与浏览交互升级：整合通知与实时聊天横滑切换、恢复大图/小图/无图三种列表模式、列表顶部 1/3 下拉直达小程序与未读蓝点极速消除",
+            "4、429 风控与网络深度治理：静态资源全量 CDN 分流、低峰期串行子站自动授权与冷启动防抖加固"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.6.1/linuxdo-1.6.1-release.apk",
-          "apkSha256": "a776f371cc95175a32cd2906c8684f6045c9175218a691a733010dc8bf7a1f8c"
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.6.2/linuxdo-1.6.2-release.apk",
+          "apkSha256": "5726077f2618ac526760f764b3d818cb29d77a6e3075259b9267396e44b4044f"
         }
     """
 }

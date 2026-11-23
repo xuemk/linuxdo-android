@@ -12,7 +12,7 @@
 
 ## 💡 直击痛点：告别折腾，体验升级
 
-| 常见痛点（Web / 旧体验） | LinuxDo Android v1.6.1 解决方案 |
+| 常见痛点（Web / 旧体验） | LinuxDo Android v1.6.2 解决方案 |
 |:---|:---|
 | **界面单调呆板？**<br>论坛排版看久了审美疲劳，缺少现代 APP 的精致质感 | **UI 又又重构，对标当下热门主流 APP**<br>全新打磨的视觉质感与卡片层次，支持大图/小图/无图三种浏览模式，6 款多彩轻主题随心切换 |
 | **大号小号来回切？**<br>小号看帖大号发帖，每次切换都要退登重新输账号甚至过盾 | **应用内多账号秒切**<br>多账号热插拔隔离架构，会话、草稿、角标互不串扰，一键无感丝滑切换 |
@@ -76,9 +76,9 @@
 
 ## 📥 最新版本下载
 
-- **当前版本**：`v1.6.1`
-- **APK 下载**：[前往 Releases 下载 `linuxdo-1.6.1-release.apk`](https://github.com/xuemk/linuxdo-android/releases/latest)
-- **SHA-256**：`A776F371CC95175A32CD2906C8684F6045C9175218A691A733010DC8BF7A1F8C`
+- **当前版本**：`v1.6.2`
+- **APK 下载**：[前往 Releases 下载 `linuxdo-1.6.2-release.apk`](https://github.com/xuemk/linuxdo-android/releases/latest)
+- **SHA-256**：`5726077F2618AC526760F764B3D818CB29D77A6E3075259B9267396E44B4044F`
 
 ---
 
